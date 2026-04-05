@@ -3,7 +3,6 @@ import glob
 import re
 import subprocess
 import sys
-import datetime
 import fnmatch
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -15,13 +14,27 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QColor, QFont, QClipboard
 
-# --- CONFIGURATION ---
-BASE_WS_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/WS"
+# =====================================================================
+# --- CONFIGURATION BLOCK (Project Dependent) ---
+# =====================================================================
+PROJECT_PREFIX = "S5K2P5SP"
+
+BASE_WS_FE_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/WS"
+BASE_WS_BE_DIR = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
+
 BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
+
 SUMMARY_SCRIPT = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
 FIREFOX_PATH = "/usr/bin/firefox"
+# =====================================================================
 
 # --- LOGIC HELPERS ---
+
+def normalize_rtl(rtl_str):
+    """Ensures RTL strings uniformly contain the project prefix."""
+    if rtl_str and rtl_str.startswith("EVT"):
+        return f"{PROJECT_PREFIX}_{rtl_str}"
+    return rtl_str
 
 def format_log_date(date_str):
     match = re.search(r'([A-Z][a-z]{2})\s+([A-Z][a-z]{2})\s+(\d+)\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})', str(date_str))
@@ -123,7 +136,7 @@ def extract_rtl(run_dir):
         with open(f[0], 'r') as file:
             for line in file:
                 m = re.search(r'^\s*all\s*=\s*"(.*?)"', line)
-                if m: return m.group(1)
+                if m: return normalize_rtl(m.group(1))
     except: pass
     return "Unknown"
 
@@ -133,7 +146,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Dashboard Settings")
-        self.resize(350, 150)
+        self.resize(350, 180)
         
         layout = QFormLayout(self)
         
@@ -146,6 +159,11 @@ class SettingsDialog(QDialog):
         current_size = QApplication.font().pointSize()
         self.size_spin.setValue(current_size if current_size > 0 else 10)
         layout.addRow("Font Size:", self.size_spin)
+        
+        self.space_spin = QSpinBox()
+        self.space_spin.setRange(0, 20)
+        self.space_spin.setValue(parent.row_spacing if parent else 2)
+        layout.addRow("Row Spacing (Padding):", self.space_spin)
         
         self.theme_cb = QCheckBox("Enable Dark Mode")
         self.theme_cb.setChecked(parent.is_dark_mode if parent else False)
@@ -166,9 +184,13 @@ class ScannerWorker(QThread):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
         out_data = {"releases": {}, "blocks": set(), "all_runs": []}
 
-        if os.path.exists(BASE_WS_DIR):
-            for ws_name in os.listdir(BASE_WS_DIR):
-                ws_path = os.path.join(BASE_WS_DIR, ws_name)
+        # 1. WS SCAN (FE & BE logic)
+        ws_bases = [BASE_WS_FE_DIR, BASE_WS_BE_DIR]
+        for ws_base in ws_bases:
+            if not os.path.exists(ws_base): continue
+            
+            for ws_name in os.listdir(ws_base):
+                ws_path = os.path.join(ws_base, ws_name)
                 if not os.path.isdir(ws_path): continue
                 
                 current_rtl = "Unknown"
@@ -177,23 +199,31 @@ class ScannerWorker(QThread):
                         with open(sf, 'r') as f:
                             lbls = re.findall(r'/([^/]+_syn\d*)\.config', f.read())
                             for l in set(lbls):
-                                self._map_release(ws_data, l, ws_path)
-                                current_rtl = l
+                                current_rtl = normalize_rtl(l)
+                                self._map_release(ws_data, current_rtl, ws_path)
                     except: pass
                 
                 for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
                     ent_name = os.path.basename(ent_path)
                     
-                    for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
-                        ws_data["blocks"].add(ent_name)
-                        ws_data["all_runs"].append(self._process_run(ent_name, rd, ws_path, current_rtl, "WS", "FE"))
+                    # Process FE ONLY in the FE Area
+                    if ws_base == BASE_WS_FE_DIR:
+                        for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
+                            ws_data["blocks"].add(ent_name)
+                            ws_data["all_runs"].append(self._process_run(ent_name, rd, ws_path, current_rtl, "WS", "FE"))
                         
+                    # Process BE in BOTH Areas
                     be_patterns = ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]
                     for pat in be_patterns:
                         for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
+                            # Check dump vars for specific BE rtl release mapping
+                            be_rtl = extract_rtl(rd)
+                            if be_rtl == "Unknown": be_rtl = current_rtl
+                            
                             ws_data["blocks"].add(ent_name)
-                            ws_data["all_runs"].append(self._process_run(ent_name, rd, ws_path, current_rtl, "WS", "BE"))
+                            ws_data["all_runs"].append(self._process_run(ent_name, rd, ws_path, be_rtl, "WS", "BE"))
 
+        # 2. OUTFEED SCAN
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
                 ent_path = os.path.join(BASE_OUTFEED_DIR, ent_name)
@@ -222,8 +252,8 @@ class ScannerWorker(QThread):
         if re.search(r'EVT\d+_ML\d+_DEV\d+', rtl):
             rtl = re.sub(r'EVT\d+_ML\d+_DEV\d+', phys_evt, rtl)
         elif rtl == "Unknown":
-            rtl = phys_evt
-        return rtl
+            rtl = normalize_rtl(phys_evt)
+        return normalize_rtl(rtl)
 
     def _process_run(self, b_name, rd, parent_path, rtl, source, run_type):
         r_name = os.path.basename(rd)
@@ -245,6 +275,7 @@ class ScannerWorker(QThread):
                         step_name = os.path.basename(s_dir)
                         rpt = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
                         log = os.path.join(rd, "logs", f"{step_name}.log")
+                        stage_path = os.path.join(rd, "outputs", step_name)
                         
                         fm_u_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
                         fm_n_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2n_func", "reports", "*.failpoint.rpt"))
@@ -258,7 +289,7 @@ class ScannerWorker(QThread):
                             "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
                             "vslp_status": get_vslp_info(st_vslp_rpt),
                             "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt,
-                            "qor_path": qor_path
+                            "qor_path": qor_path, "stage_path": stage_path
                         })
             elif source == "OUTFEED":
                 for s_dir in glob.glob(os.path.join(rd, "*")):
@@ -267,6 +298,7 @@ class ScannerWorker(QThread):
                         if step_name in ["reports", "logs", "pass", "fail", "outputs"]: continue
                         rpt = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
                         log = os.path.join(s_dir, "logs", f"{step_name}.log")
+                        stage_path = os.path.join(rd, step_name)
                         
                         fm_u_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
                         fm_n_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2n_func", "reports", "*.failpoint.rpt"))
@@ -282,7 +314,7 @@ class ScannerWorker(QThread):
                             "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
                             "vslp_status": get_vslp_info(st_vslp_rpt),
                             "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt,
-                            "qor_path": qor_path
+                            "qor_path": qor_path, "stage_path": stage_path
                         })
 
         return {
@@ -312,6 +344,7 @@ class PDDashboard(QMainWindow):
         self.ws_data = {}
         self.out_data = {}
         self.is_dark_mode = False
+        self.row_spacing = 2
         
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -335,7 +368,7 @@ class PDDashboard(QMainWindow):
         
         top.addWidget(QLabel("RTL:"))
         self.rel_combo = QComboBox()
-        self.rel_combo.setMinimumWidth(300)
+        self.rel_combo.setMinimumWidth(350)
         self.rel_combo.currentIndexChanged.connect(self.refresh_view)
         top.addWidget(self.rel_combo)
         
@@ -365,9 +398,20 @@ class PDDashboard(QMainWindow):
         # --- Draggable Splitter Panels ---
         self.splitter = QSplitter(Qt.Horizontal)
         
-        self.blk_list = QListWidget()
-        self.splitter.addWidget(self.blk_list)
+        # Left Panel (Blocks)
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0,0,0,0)
+        lbl = QLabel("<b>Blocks</b>")
+        left_layout.addWidget(lbl)
         
+        self.blk_list = QListWidget()
+        self.blk_list.itemChanged.connect(lambda: self.search_timer.start(50)) # Triggers instant updates when checked
+        left_layout.addWidget(self.blk_list)
+        
+        self.splitter.addWidget(left_panel)
+        
+        # Right Panel (Tree)
         self.tree = QTreeWidget()
         self.tree.setColumnCount(16) 
         self.tree.setAlternatingRowColors(True)
@@ -380,7 +424,7 @@ class PDDashboard(QMainWindow):
         self.tree.header().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.header().customContextMenuRequested.connect(self.on_header_context_menu)
         
-        self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(1, 220); self.tree.setColumnWidth(2, 90)
+        self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(1, 280); self.tree.setColumnWidth(2, 90)
         self.tree.setColumnWidth(5, 160); self.tree.setColumnWidth(6, 160); self.tree.setColumnWidth(7, 200)
         
         for i in range(11, 16): self.tree.setColumnHidden(i, True)
@@ -394,38 +438,43 @@ class PDDashboard(QMainWindow):
         
         layout.addWidget(self.splitter)
         self.prog = QProgressBar(); self.prog.setVisible(False); layout.addWidget(self.prog)
+        
+        self.apply_theme_and_spacing()
 
     def open_settings(self):
         dlg = SettingsDialog(self)
         if dlg.exec_():
-            # Apply chosen font
             font = dlg.font_combo.currentFont()
             font.setPointSize(dlg.size_spin.value())
             QApplication.setFont(font)
             
-            # Apply theme if toggled
-            if dlg.theme_cb.isChecked() != self.is_dark_mode:
-                self.is_dark_mode = dlg.theme_cb.isChecked()
-                self.apply_theme()
+            self.is_dark_mode = dlg.theme_cb.isChecked()
+            self.row_spacing = dlg.space_spin.value()
+            self.apply_theme_and_spacing()
 
-    def apply_theme(self):
+    def apply_theme_and_spacing(self):
+        pad = self.row_spacing
         if self.is_dark_mode:
-            dark_stylesheet = """
-                QMainWindow, QWidget, QDialog { background-color: #2b2b2b; color: #e0e0e0; }
-                QTreeWidget, QListWidget { background-color: #333333; color: #e0e0e0; alternate-background-color: #3a3a3a; }
-                QHeaderView::section { background-color: #444444; color: white; border: 1px solid #2b2b2b; padding: 4px;}
-                QLineEdit, QComboBox, QSpinBox { background-color: #444444; color: white; border: 1px solid #555; padding: 2px;}
-                QPushButton { background-color: #555555; color: white; border: 1px solid #333; padding: 4px; border-radius: 2px;}
-                QPushButton:hover { background-color: #666666; }
-                QSplitter::handle { background-color: #555555; }
-                QMenu { border: 1px solid gray; background-color: #333; color: white; }
-                QMenu::item:selected { background-color: #555; }
+            stylesheet = f"""
+                QMainWindow, QWidget, QDialog {{ background-color: #2b2b2b; color: #e0e0e0; }}
+                QTreeWidget, QListWidget {{ background-color: #333333; color: #e0e0e0; alternate-background-color: #3a3a3a; }}
+                QHeaderView::section {{ background-color: #444444; color: white; border: 1px solid #2b2b2b; padding: 4px;}}
+                QLineEdit, QComboBox, QSpinBox {{ background-color: #444444; color: white; border: 1px solid #555; padding: 2px;}}
+                QPushButton {{ background-color: #555555; color: white; border: 1px solid #333; padding: 4px; border-radius: 2px;}}
+                QPushButton:hover {{ background-color: #666666; }}
+                QSplitter::handle {{ background-color: #555555; }}
+                QMenu {{ border: 1px solid gray; background-color: #333; color: white; }}
+                QMenu::item:selected {{ background-color: #555; }}
+                QTreeView::item {{ padding: {pad}px; }}
+                QListWidget::item {{ padding: {pad}px; }}
             """
-            self.setStyleSheet(dark_stylesheet)
         else:
-            self.setStyleSheet("") 
+            stylesheet = f"""
+                QTreeView::item {{ padding: {pad}px; }}
+                QListWidget::item {{ padding: {pad}px; }}
+            """
         
-        # Trigger an active refresh so the tree row text colors update instantly based on the theme state
+        self.setStyleSheet(stylesheet)
         self.refresh_view()
 
     def start_fs_scan(self):
@@ -467,28 +516,32 @@ class PDDashboard(QMainWindow):
         child.setText(0, " " + run["r_name"])
         child.setText(1, run["rtl"]) 
         child.setText(2, run["source"]) 
-        child.setText(3, "COMPLETED" if run["is_comp"] else "RUNNING")
-        child.setText(4, "COMPLETED" if run["is_comp"] else run["info"]["last_stage"])
-        child.setText(5, f"NONUPF - {run['st_n']}") 
-        child.setText(6, f"UPF - {run['st_u']}")
-        child.setText(7, run["vslp_status"]) 
-        child.setText(8, run["info"]["runtime"]); child.setText(9, run["info"]["start"]); child.setText(10, run["info"]["end"])
-        child.setText(11, run["path"]); child.setText(12, os.path.join(run["path"], "logs/compile_opt.log"))
-        child.setText(13, run["fm_u_path"]); child.setText(14, run["fm_n_path"])
-        child.setText(15, run["vslp_rpt_path"])
-        
-        if "FAILS" in run["st_n"]: child.setForeground(5, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-        elif "PASS" in run["st_n"]: child.setForeground(5, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-        
-        if "FAILS" in run["st_u"]: child.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-        elif "PASS" in run["st_u"]: child.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-        
-        if "Error" in run["vslp_status"] and "Error: 0" not in run["vslp_status"]: child.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-        elif "Error: 0" in run["vslp_status"]: child.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
         
         if run["source"] == "OUTFEED": child.setForeground(2, QColor("#b39ddb" if self.is_dark_mode else "#5e35b1")) 
         else: child.setForeground(2, QColor("#ffb74d" if self.is_dark_mode else "#f57c00")) 
-        child.setForeground(3, QColor("#81c784" if run["is_comp"] else "#4fc3f7") if self.is_dark_mode else QColor("#2e7d32" if run["is_comp"] else "#0277bd"))
+        
+        # If it's a BE run parent node, we LEAVE THE REST BLANK.
+        if run["run_type"] == "FE":
+            child.setText(3, "COMPLETED" if run["is_comp"] else "RUNNING")
+            child.setText(4, "COMPLETED" if run["is_comp"] else run["info"]["last_stage"])
+            child.setText(5, f"NONUPF - {run['st_n']}") 
+            child.setText(6, f"UPF - {run['st_u']}")
+            child.setText(7, run["vslp_status"]) 
+            child.setText(8, run["info"]["runtime"]); child.setText(9, run["info"]["start"]); child.setText(10, run["info"]["end"])
+            child.setText(11, run["path"]); child.setText(12, os.path.join(run["path"], "logs/compile_opt.log"))
+            child.setText(13, run["fm_u_path"]); child.setText(14, run["fm_n_path"])
+            child.setText(15, run["vslp_rpt_path"])
+            
+            if "FAILS" in run["st_n"]: child.setForeground(5, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "PASS" in run["st_n"]: child.setForeground(5, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            
+            if "FAILS" in run["st_u"]: child.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "PASS" in run["st_u"]: child.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            
+            if "Error" in run["vslp_status"] and "Error: 0" not in run["vslp_status"]: child.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "Error: 0" in run["vslp_status"]: child.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            
+            child.setForeground(3, QColor("#81c784" if run["is_comp"] else "#4fc3f7") if self.is_dark_mode else QColor("#2e7d32" if run["is_comp"] else "#0277bd"))
         
         return child
 
@@ -562,7 +615,7 @@ class PDDashboard(QMainWindow):
                                     st_item.setText(8, stage["info"]["runtime"])
                                     st_item.setText(9, stage["info"]["start"])
                                     st_item.setText(10, stage["info"]["end"])
-                                    st_item.setText(11, be_run["path"]) 
+                                    st_item.setText(11, stage["stage_path"]) # Uses specific stage path based on source
                                     st_item.setText(12, stage["log"])
                                     st_item.setText(13, stage["fm_u_path"])
                                     st_item.setText(14, stage["fm_n_path"])
@@ -602,7 +655,7 @@ class PDDashboard(QMainWindow):
                             st_item.setText(8, stage["info"]["runtime"])
                             st_item.setText(9, stage["info"]["start"])
                             st_item.setText(10, stage["info"]["end"])
-                            st_item.setText(11, be_run["path"])
+                            st_item.setText(11, stage["stage_path"])
                             st_item.setText(12, stage["log"])
                             st_item.setText(13, stage["fm_u_path"])
                             st_item.setText(14, stage["fm_n_path"])
@@ -648,8 +701,16 @@ class PDDashboard(QMainWindow):
         item = self.tree.itemAt(pos)
         if not item or not item.parent(): return
         
+        col = self.tree.columnAt(pos.x())
         m = QMenu()
         
+        # Grab precise cell text for right click "Copy Text"
+        cell_text = item.text(col).strip()
+        copy_cell_act = None
+        if cell_text:
+            copy_cell_act = m.addAction(f"Copy Cell Text")
+            m.addSeparator()
+            
         fm_u_path = item.text(13)
         fm_n_path = item.text(14)
         vslp_path = item.text(15)
@@ -677,7 +738,9 @@ class PDDashboard(QMainWindow):
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         
         if res:
-            if res == fm_n_act:
+            if copy_cell_act and res == copy_cell_act:
+                QApplication.clipboard().setText(cell_text)
+            elif res == fm_n_act:
                 subprocess.Popen(['gvim', fm_n_path])
             elif res == fm_u_act:
                 subprocess.Popen(['gvim', fm_u_path])
