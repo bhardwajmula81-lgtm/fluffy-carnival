@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import fnmatch
+import concurrent.futures
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QComboBox, QLineEdit, 
@@ -31,7 +32,6 @@ FIREFOX_PATH = "/usr/bin/firefox"
 # --- LOGIC HELPERS ---
 
 def normalize_rtl(rtl_str):
-    """Ensures RTL strings uniformly contain the project prefix."""
     if rtl_str and rtl_str.startswith("EVT"):
         return f"{PROJECT_PREFIX}_{rtl_str}"
     return rtl_str
@@ -53,11 +53,12 @@ def get_fm_info(report_path):
     if not report_path or not os.path.exists(report_path): return "N/A"
     try:
         with open(report_path, 'r') as f:
-            content = f.read()
-            if "No failing compare points" in content: return "PASS"
-            m = re.search(r'(\d+)\s+Failing compare points', content)
-            return f"{m.group(1)} FAILS" if m else "ERR"
-    except: return "ERR"
+            for line in f:
+                if "No failing compare points" in line: return "PASS"
+                m = re.search(r'(\d+)\s+Failing compare points', line)
+                if m: return f"{m.group(1)} FAILS"
+    except: pass
+    return "ERR"
 
 def get_vslp_info(report_path):
     if not report_path or not os.path.exists(report_path): return "N/A"
@@ -174,17 +175,20 @@ class SettingsDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-
-# --- BACKGROUND WORKER THREAD ---
+# --- BACKGROUND WORKER THREAD (NOW MULTITHREADED!) ---
 
 class ScannerWorker(QThread):
     finished = pyqtSignal(dict, dict)
+    progress_update = pyqtSignal(int, int) # completed, total
 
     def run(self):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
         out_data = {"releases": {}, "blocks": set(), "all_runs": []}
 
-        # 1. WS SCAN (FE & BE logic)
+        tasks = []
+
+        # 1. PHASE 1: Rapid Task Gathering (Pure Directory Traversing)
+        # -----------------------------------------------------------
         ws_bases = [BASE_WS_FE_DIR, BASE_WS_BE_DIR]
         for ws_base in ws_bases:
             if not os.path.exists(ws_base): continue
@@ -206,24 +210,15 @@ class ScannerWorker(QThread):
                 for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
                     ent_name = os.path.basename(ent_path)
                     
-                    # Process FE ONLY in the FE Area
                     if ws_base == BASE_WS_FE_DIR:
                         for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
-                            ws_data["blocks"].add(ent_name)
-                            ws_data["all_runs"].append(self._process_run(ent_name, rd, ws_path, current_rtl, "WS", "FE"))
+                            tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
                         
-                    # Process BE in BOTH Areas
                     be_patterns = ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]
                     for pat in be_patterns:
                         for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
-                            # Check dump vars for specific BE rtl release mapping
-                            be_rtl = extract_rtl(rd)
-                            if be_rtl == "Unknown": be_rtl = current_rtl
-                            
-                            ws_data["blocks"].add(ent_name)
-                            ws_data["all_runs"].append(self._process_run(ent_name, rd, ws_path, be_rtl, "WS", "BE"))
+                            tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
-        # 2. OUTFEED SCAN
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
                 ent_path = os.path.join(BASE_OUTFEED_DIR, ent_name)
@@ -233,20 +228,58 @@ class ScannerWorker(QThread):
                     phys_evt = os.path.basename(evt_dir) 
                     
                     for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
-                        rtl = self._resolve_outfeed_rtl(rd, phys_evt)
-                        self._map_release(out_data, rtl, rd)
-                        out_data["blocks"].add(ent_name)
-                        out_data["all_runs"].append(self._process_run(ent_name, rd, rd, rtl, "OUTFEED", "FE"))
+                        tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
                         
                     be_runs = glob.glob(os.path.join(evt_dir, "fc", "*-BE")) + glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE"))
                     for rd in be_runs:
-                        rtl = self._resolve_outfeed_rtl(rd, phys_evt)
-                        self._map_release(out_data, rtl, rd)
-                        out_data["blocks"].add(ent_name)
-                        out_data["all_runs"].append(self._process_run(ent_name, rd, rd, rtl, "OUTFEED", "BE"))
+                        tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+
+        # 2. PHASE 2: Parallel I/O Parsing (The massive speedup)
+        # -----------------------------------------------------------
+        total_tasks = len(tasks)
+        completed_tasks = 0
+
+        # Run up to 40 threads simultaneously against the Network File System
+        with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:
+            future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
+            
+            for future in concurrent.futures.as_completed(future_to_task):
+                try:
+                    result = future.result()
+                    if result:
+                        if result["source"] == "WS":
+                            ws_data["blocks"].add(result["block"])
+                            ws_data["all_runs"].append(result)
+                            if result["run_type"] == "BE":
+                                self._map_release(ws_data, result["rtl"], result["parent"])
+                        else:
+                            out_data["blocks"].add(result["block"])
+                            out_data["all_runs"].append(result)
+                            self._map_release(out_data, result["rtl"], result["path"])
+                except Exception as e:
+                    pass 
+                
+                # Update UI Progress Bar live
+                completed_tasks += 1
+                self.progress_update.emit(completed_tasks, total_tasks)
 
         self.finished.emit(ws_data, out_data)
+
+    def _thread_process_run(self, task_tuple):
+        b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
         
+        # Parallel RTL resolving
+        if source == "OUTFEED":
+            rtl = self._resolve_outfeed_rtl(rd, phys_evt)
+        else:
+            if run_type == "BE":
+                extracted = extract_rtl(rd)
+                rtl = extracted if extracted != "Unknown" else base_rtl
+            else:
+                rtl = base_rtl
+                
+        return self._process_run(b_name, rd, parent_path, rtl, source, run_type)
+
     def _resolve_outfeed_rtl(self, rd, phys_evt):
         rtl = extract_rtl(rd)
         if re.search(r'EVT\d+_ML\d+_DEV\d+', rtl):
@@ -338,7 +371,7 @@ class ScannerWorker(QThread):
 class PDDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unified PD Dashboard - Clean Edition")
+        self.setWindowTitle("Unified PD Dashboard - Pro Multi-Threaded Edition")
         self.resize(1900, 950)
         
         self.ws_data = {}
@@ -406,7 +439,7 @@ class PDDashboard(QMainWindow):
         left_layout.addWidget(lbl)
         
         self.blk_list = QListWidget()
-        self.blk_list.itemChanged.connect(lambda: self.search_timer.start(50)) # Triggers instant updates when checked
+        self.blk_list.itemChanged.connect(lambda: self.search_timer.start(50)) 
         left_layout.addWidget(self.blk_list)
         
         self.splitter.addWidget(left_panel)
@@ -437,7 +470,12 @@ class PDDashboard(QMainWindow):
         self.splitter.setSizes([200, 1700]) 
         
         layout.addWidget(self.splitter)
-        self.prog = QProgressBar(); self.prog.setVisible(False); layout.addWidget(self.prog)
+        
+        # Live Progress bar 
+        self.prog = QProgressBar()
+        self.prog.setVisible(False)
+        self.prog.setFormat(" Scanning Network Files... %v / %m runs fetched ")
+        layout.addWidget(self.prog)
         
         self.apply_theme_and_spacing()
 
@@ -480,7 +518,13 @@ class PDDashboard(QMainWindow):
     def start_fs_scan(self):
         self.prog.setVisible(True); self.prog.setRange(0, 0)
         self.worker = ScannerWorker()
-        self.worker.finished.connect(self.on_scan_finished); self.worker.start()
+        self.worker.progress_update.connect(self.update_progress)
+        self.worker.finished.connect(self.on_scan_finished)
+        self.worker.start()
+        
+    def update_progress(self, current, total):
+        self.prog.setRange(0, total)
+        self.prog.setValue(current)
 
     def on_scan_finished(self, ws, out):
         self.ws_data, self.out_data = ws, out
@@ -520,7 +564,6 @@ class PDDashboard(QMainWindow):
         if run["source"] == "OUTFEED": child.setForeground(2, QColor("#b39ddb" if self.is_dark_mode else "#5e35b1")) 
         else: child.setForeground(2, QColor("#ffb74d" if self.is_dark_mode else "#f57c00")) 
         
-        # If it's a BE run parent node, we LEAVE THE REST BLANK.
         if run["run_type"] == "FE":
             child.setText(3, "COMPLETED" if run["is_comp"] else "RUNNING")
             child.setText(4, "COMPLETED" if run["is_comp"] else run["info"]["last_stage"])
@@ -615,7 +658,7 @@ class PDDashboard(QMainWindow):
                                     st_item.setText(8, stage["info"]["runtime"])
                                     st_item.setText(9, stage["info"]["start"])
                                     st_item.setText(10, stage["info"]["end"])
-                                    st_item.setText(11, stage["stage_path"]) # Uses specific stage path based on source
+                                    st_item.setText(11, stage["stage_path"]) 
                                     st_item.setText(12, stage["log"])
                                     st_item.setText(13, stage["fm_u_path"])
                                     st_item.setText(14, stage["fm_n_path"])
@@ -704,7 +747,6 @@ class PDDashboard(QMainWindow):
         col = self.tree.columnAt(pos.x())
         m = QMenu()
         
-        # Grab precise cell text for right click "Copy Text"
         cell_text = item.text(col).strip()
         copy_cell_act = None
         if cell_text:
