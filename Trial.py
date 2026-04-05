@@ -175,11 +175,11 @@ class SettingsDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-# --- BACKGROUND WORKER THREAD (NOW MULTITHREADED!) ---
+# --- BACKGROUND WORKER THREAD ---
 
 class ScannerWorker(QThread):
     finished = pyqtSignal(dict, dict)
-    progress_update = pyqtSignal(int, int) # completed, total
+    progress_update = pyqtSignal(int, int) 
 
     def run(self):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
@@ -187,8 +187,7 @@ class ScannerWorker(QThread):
 
         tasks = []
 
-        # 1. PHASE 1: Rapid Task Gathering (Pure Directory Traversing)
-        # -----------------------------------------------------------
+        # 1. PHASE 1: Rapid Task Gathering
         ws_bases = [BASE_WS_FE_DIR, BASE_WS_BE_DIR]
         for ws_base in ws_bases:
             if not os.path.exists(ws_base): continue
@@ -234,12 +233,10 @@ class ScannerWorker(QThread):
                     for rd in be_runs:
                         tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
-        # 2. PHASE 2: Parallel I/O Parsing (The massive speedup)
-        # -----------------------------------------------------------
+        # 2. PHASE 2: Parallel I/O Parsing
         total_tasks = len(tasks)
         completed_tasks = 0
 
-        # Run up to 40 threads simultaneously against the Network File System
         with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
             
@@ -259,7 +256,6 @@ class ScannerWorker(QThread):
                 except Exception as e:
                     pass 
                 
-                # Update UI Progress Bar live
                 completed_tasks += 1
                 self.progress_update.emit(completed_tasks, total_tasks)
 
@@ -268,7 +264,6 @@ class ScannerWorker(QThread):
     def _thread_process_run(self, task_tuple):
         b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
         
-        # Parallel RTL resolving
         if source == "OUTFEED":
             rtl = self._resolve_outfeed_rtl(rd, phys_evt)
         else:
@@ -339,8 +334,8 @@ class ScannerWorker(QThread):
                         st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
                         st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
                         
-                        qor_path = os.path.join(s_dir, "reports", step_name)
-                        if not qor_path.endswith("/"): qor_path += "/"
+                        # --- UPDATED: Passing the -BE base path for OUTFEED stages ---
+                        qor_path = rd if rd.endswith("/") else rd + "/"
                         
                         stages.append({
                             "name": step_name, "rpt": rpt, "log": log, "info": parse_pnr_runtime_rpt(rpt),
@@ -390,7 +385,6 @@ class PDDashboard(QMainWindow):
         central = QWidget(); self.setCentralWidget(central)
         layout = QVBoxLayout(central)
         
-        # --- Top Filter & Action Bar ---
         top = QHBoxLayout()
         
         top.addWidget(QLabel("Source:"))
@@ -428,10 +422,8 @@ class PDDashboard(QMainWindow):
         
         layout.addLayout(top)
         
-        # --- Draggable Splitter Panels ---
         self.splitter = QSplitter(Qt.Horizontal)
         
-        # Left Panel (Blocks)
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0,0,0,0)
@@ -444,7 +436,6 @@ class PDDashboard(QMainWindow):
         
         self.splitter.addWidget(left_panel)
         
-        # Right Panel (Tree)
         self.tree = QTreeWidget()
         self.tree.setColumnCount(16) 
         self.tree.setAlternatingRowColors(True)
@@ -471,7 +462,6 @@ class PDDashboard(QMainWindow):
         
         layout.addWidget(self.splitter)
         
-        # Live Progress bar 
         self.prog = QProgressBar()
         self.prog.setVisible(False)
         self.prog.setFormat(" Scanning Network Files... %v / %m runs fetched ")
@@ -542,13 +532,20 @@ class PDDashboard(QMainWindow):
             releases.update(self.out_data.get("releases", {}).keys())
             blocks.update(self.out_data.get("blocks", set()))
 
+        saved_states = {}
+        for i in range(self.blk_list.count()):
+            item = self.blk_list.item(i)
+            saved_states[item.text()] = item.checkState()
+
         self.rel_combo.blockSignals(True); self.rel_combo.clear()
         self.rel_combo.addItems(["[ SHOW ALL ]"] + sorted(list(releases)))
         self.rel_combo.blockSignals(False)
         
         self.blk_list.blockSignals(True); self.blk_list.clear()
         for b in sorted(list(blocks)):
-            it = QListWidgetItem(b); it.setFlags(it.flags() | Qt.ItemIsUserCheckable); it.setCheckState(Qt.Checked)
+            it = QListWidgetItem(b)
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(saved_states.get(b, Qt.Checked))
             self.blk_list.addItem(it)
         self.blk_list.blockSignals(False); self.refresh_view()
 
@@ -587,6 +584,19 @@ class PDDashboard(QMainWindow):
             child.setForeground(3, QColor("#81c784" if run["is_comp"] else "#4fc3f7") if self.is_dark_mode else QColor("#2e7d32" if run["is_comp"] else "#0277bd"))
         
         return child
+
+    def _get_other_pnr_parent(self, block_item):
+        for i in range(block_item.childCount()):
+            child = block_item.child(i)
+            if child.text(0).strip() == "Other PNR runs":
+                return child
+        p = QTreeWidgetItem(block_item)
+        p.setText(0, " Other PNR runs")
+        p.setFlags(p.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        p.setCheckState(0, Qt.Unchecked)
+        p.setExpanded(True)
+        p.setBackground(0, QColor("#3c3c3c") if self.is_dark_mode else QColor("#e0e0e0"))
+        return p
 
     def refresh_view(self):
         self.tree.setUpdatesEnabled(False)
@@ -635,7 +645,7 @@ class PDDashboard(QMainWindow):
                     fe_base = fe_run["r_name"].replace("-FE", "")
                     
                     for be_run in be_runs:
-                        if be_run["block"] == fe_run["block"] and be_run["source"] == fe_run["source"]:
+                        if be_run["block"] == fe_run["block"]:
                             if f"_{fe_base}_" in be_run["r_name"] or be_run["r_name"].startswith(f"{fe_base}_"):
                                 be_item = self._create_run_item(fe_item, be_run)
                                 matched_be_runs.add(id(be_run))
@@ -649,9 +659,20 @@ class PDDashboard(QMainWindow):
                                     st_item.setData(1, Qt.UserRole, stage["name"])
                                     st_item.setData(2, Qt.UserRole, stage["qor_path"])
                                     
+                                    stage_status = "COMPLETED"
+                                    if be_run["source"] == "WS" and not os.path.exists(stage["rpt"]):
+                                        stage_status = "RUNNING"
+                                        if os.path.exists(stage["log"]):
+                                            try:
+                                                with open(stage["log"], 'r', encoding='utf-8', errors='ignore') as f:
+                                                    for line in f:
+                                                        if "START_CMD:" in line:
+                                                            stage_status = line.strip()
+                                            except: pass
+                                    
                                     st_item.setText(0, "    ↳ " + stage["name"])
                                     st_item.setText(2, be_run["source"])
-                                    st_item.setText(4, stage["info"]["last_stage"])
+                                    st_item.setText(4, stage_status) 
                                     st_item.setText(5, f"NONUPF - {stage['st_n']}") 
                                     st_item.setText(6, f"UPF - {stage['st_u']}")
                                     st_item.setText(7, stage["vslp_status"])
@@ -678,7 +699,8 @@ class PDDashboard(QMainWindow):
                 if be_run["parent"] in target_paths and be_run["block"] in checked_blks:
                     if fnmatch.fnmatch(be_run["r_name"].lower(), search_pattern) or fnmatch.fnmatch(be_run["block"].lower(), search_pattern):
                         block_item = self._get_parent(be_run["block"])
-                        be_item = self._create_run_item(block_item, be_run)
+                        other_pnr_item = self._get_other_pnr_parent(block_item) 
+                        be_item = self._create_run_item(other_pnr_item, be_run)
                         
                         for stage in be_run["stages"]:
                             st_item = QTreeWidgetItem(be_item)
@@ -689,9 +711,20 @@ class PDDashboard(QMainWindow):
                             st_item.setData(1, Qt.UserRole, stage["name"])
                             st_item.setData(2, Qt.UserRole, stage["qor_path"])
                             
+                            stage_status = "COMPLETED"
+                            if be_run["source"] == "WS" and not os.path.exists(stage["rpt"]):
+                                stage_status = "RUNNING"
+                                if os.path.exists(stage["log"]):
+                                    try:
+                                        with open(stage["log"], 'r', encoding='utf-8', errors='ignore') as f:
+                                            for line in f:
+                                                if "START_CMD:" in line:
+                                                    stage_status = line.strip()
+                                    except: pass
+                            
                             st_item.setText(0, "    ↳ " + stage["name"])
                             st_item.setText(2, be_run["source"])
-                            st_item.setText(4, stage["info"]["last_stage"])
+                            st_item.setText(4, stage_status) 
                             st_item.setText(5, f"NONUPF - {stage['st_n']}") 
                             st_item.setText(6, f"UPF - {stage['st_u']}")
                             st_item.setText(7, stage["vslp_status"])
