@@ -98,7 +98,7 @@ def parse_pnr_runtime_rpt(file_path):
     d = {"start": "N/A", "end": "N/A", "runtime": "00h:00m:00s", "last_stage": "N/A"}
     if not os.path.exists(file_path): return d
     try:
-        first_ts, last_ts, total_cputime = None, None, None
+        first_ts, last_ts, final_time_str = None, None, None
         months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
         
         with open(file_path, 'r') as f:
@@ -106,15 +106,17 @@ def parse_pnr_runtime_rpt(file_path):
                 parts = line.split()
                 if len(parts) >= 3:
                     ts_match = re.search(r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})', line)
-                    cpu_match = re.search(r'(\d+)d:(\d+)h:(\d+)m:(\d+)s', line)
                     
-                    if ts_match and cpu_match:
+                    # Grabbing REALTIME (First time match array in the standard summary log)
+                    time_matches = re.findall(r'(\d+)d:(\d+)h:(\d+)m:(\d+)s', line)
+                    
+                    if ts_match and time_matches:
                         if not first_ts: first_ts = ts_match
                         last_ts = ts_match
                         
-                        days, hours, mins, secs = map(int, cpu_match.groups())
+                        days, hours, mins, secs = map(int, time_matches[0]) # Enforces selection of the first duration
                         total_hours = days * 24 + hours
-                        total_cputime = f"{total_hours:02}h:{mins:02}m:{secs:02}s"
+                        final_time_str = f"{total_hours:02}h:{mins:02}m:{secs:02}s"
                         
                         if len(parts) > 1 and not parts[1].isdigit():
                             d["last_stage"] = parts[1]
@@ -125,8 +127,8 @@ def parse_pnr_runtime_rpt(file_path):
         if last_ts:
             y, m, day, H, M = last_ts.groups()
             d["end"] = f"{months[int(m)-1]} {int(day):02d}, {y} - {H}:{M}"
-        if total_cputime:
-            d["runtime"] = total_cputime
+        if final_time_str:
+            d["runtime"] = final_time_str
     except Exception: pass
     return d
 
@@ -175,7 +177,41 @@ class SettingsDialog(QDialog):
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
-# --- BACKGROUND WORKER THREAD ---
+# --- BACKGROUND WORKER THREADS ---
+
+class SizeWorker(QThread):
+    """ Secondary Background Worker purely for fetching rapid du -sh queries without locking UI """
+    size_calculated = pyqtSignal(str, str) 
+
+    def __init__(self, tasks):
+        super().__init__()
+        self.tasks = tasks 
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(self.get_size, path): item_id for item_id, path in self.tasks}
+            for future in concurrent.futures.as_completed(futures):
+                if self._is_cancelled:
+                    break
+                item_id = futures[future]
+                try:
+                    size = future.result()
+                    self.size_calculated.emit(item_id, size)
+                except:
+                    self.size_calculated.emit(item_id, "N/A")
+
+    def get_size(self, path):
+        if not path or not os.path.exists(path): return "N/A"
+        try:
+            # Using OS native du -sh for blazing fast, optimized block calculations
+            out = subprocess.check_output(['du', '-sh', path], stderr=subprocess.DEVNULL).decode('utf-8')
+            return out.split()[0]
+        except:
+            return "N/A"
 
 class ScannerWorker(QThread):
     finished = pyqtSignal(dict, dict)
@@ -184,14 +220,11 @@ class ScannerWorker(QThread):
     def run(self):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
         out_data = {"releases": {}, "blocks": set(), "all_runs": []}
-
         tasks = []
 
-        # 1. PHASE 1: Rapid Task Gathering
         ws_bases = [BASE_WS_FE_DIR, BASE_WS_BE_DIR]
         for ws_base in ws_bases:
             if not os.path.exists(ws_base): continue
-            
             for ws_name in os.listdir(ws_base):
                 ws_path = os.path.join(ws_base, ws_name)
                 if not os.path.isdir(ws_path): continue
@@ -208,7 +241,6 @@ class ScannerWorker(QThread):
                 
                 for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
                     ent_name = os.path.basename(ent_path)
-                    
                     if ws_base == BASE_WS_FE_DIR:
                         for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
                             tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
@@ -222,24 +254,19 @@ class ScannerWorker(QThread):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
                 ent_path = os.path.join(BASE_OUTFEED_DIR, ent_name)
                 if not os.path.isdir(ent_path): continue
-                
                 for evt_dir in glob.glob(os.path.join(ent_path, "EVT*")):
                     phys_evt = os.path.basename(evt_dir) 
-                    
                     for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
                         tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
-                        
                     be_runs = glob.glob(os.path.join(evt_dir, "fc", "*-BE")) + glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE"))
                     for rd in be_runs:
                         tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
-        # 2. PHASE 2: Parallel I/O Parsing
         total_tasks = len(tasks)
         completed_tasks = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
-            
             for future in concurrent.futures.as_completed(future_to_task):
                 try:
                     result = future.result()
@@ -253,9 +280,7 @@ class ScannerWorker(QThread):
                             out_data["blocks"].add(result["block"])
                             out_data["all_runs"].append(result)
                             self._map_release(out_data, result["rtl"], result["path"])
-                except Exception as e:
-                    pass 
-                
+                except Exception: pass 
                 completed_tasks += 1
                 self.progress_update.emit(completed_tasks, total_tasks)
 
@@ -263,7 +288,6 @@ class ScannerWorker(QThread):
 
     def _thread_process_run(self, task_tuple):
         b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
-        
         if source == "OUTFEED":
             rtl = self._resolve_outfeed_rtl(rd, phys_evt)
         else:
@@ -272,7 +296,6 @@ class ScannerWorker(QThread):
                 rtl = extracted if extracted != "Unknown" else base_rtl
             else:
                 rtl = base_rtl
-                
         return self._process_run(b_name, rd, parent_path, rtl, source, run_type)
 
     def _resolve_outfeed_rtl(self, rd, phys_evt):
@@ -292,7 +315,6 @@ class ScannerWorker(QThread):
         fm_n = os.path.join(evt_base, "fm", clean_run, "r2n", "reports", f"{b_name}_r2n.failpoint.rpt")
         fm_u = os.path.join(evt_base, "fm", clean_run, "r2upf", "reports", f"{b_name}_r2upf.failpoint.rpt")
         vslp_rpt = os.path.join(evt_base, "vslp", clean_run, "pre", "reports", "report_lp.rpt")
-        
         info = parse_runtime_rpt(os.path.join(rd, "reports/runtime.V2.rpt"))
         
         stages = []
@@ -310,6 +332,8 @@ class ScannerWorker(QThread):
                         st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
                         st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
                         st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
+                        sta_rpt = os.path.join(evt_base, "pt", step_name, "reports", "sta", "summary", "summary.rpt")
+                        
                         qor_path = rd if rd.endswith("/") else rd + "/"
                         
                         stages.append({
@@ -317,7 +341,7 @@ class ScannerWorker(QThread):
                             "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
                             "vslp_status": get_vslp_info(st_vslp_rpt),
                             "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt,
-                            "qor_path": qor_path, "stage_path": stage_path
+                            "sta_rpt_path": sta_rpt, "qor_path": qor_path, "stage_path": stage_path
                         })
             elif source == "OUTFEED":
                 for s_dir in glob.glob(os.path.join(rd, "*")):
@@ -333,6 +357,7 @@ class ScannerWorker(QThread):
                         st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
                         st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
                         st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
+                        sta_rpt = os.path.join(evt_base, "pt", step_name, "reports", "sta", "summary", "summary.rpt")
                         
                         qor_path = rd if rd.endswith("/") else rd + "/"
                         
@@ -341,7 +366,7 @@ class ScannerWorker(QThread):
                             "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
                             "vslp_status": get_vslp_info(st_vslp_rpt),
                             "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt,
-                            "qor_path": qor_path, "stage_path": stage_path
+                            "sta_rpt_path": sta_rpt, "qor_path": qor_path, "stage_path": stage_path
                         })
 
         return {
@@ -372,6 +397,9 @@ class PDDashboard(QMainWindow):
         self.out_data = {}
         self.is_dark_mode = False
         self.row_spacing = 2
+        
+        self.item_map = {} # Maps item ID to GUI Element
+        self.size_worker = None
         
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -436,21 +464,23 @@ class PDDashboard(QMainWindow):
         self.splitter.addWidget(left_panel)
         
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(16) 
+        self.tree.setColumnCount(18) # Appended columns 
         self.tree.setAlternatingRowColors(True)
         
-        headers = ["Run Name (Select)", "RTL Release Version", "Source", "Status", "Stage", 
+        headers = ["Run Name (Select)", "RTL Release Version", "Source", "Status", "Stage", "Size",
                    "FM - NONUPF", "FM - UPF", "VSLP Status", "Runtime", "Start", "End", 
-                   "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT"]
+                   "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT", "STA_RPT"]
         self.tree.setHeaderLabels(headers)
         
         self.tree.header().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.header().customContextMenuRequested.connect(self.on_header_context_menu)
         
         self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(1, 280); self.tree.setColumnWidth(2, 90)
-        self.tree.setColumnWidth(5, 160); self.tree.setColumnWidth(6, 160); self.tree.setColumnWidth(7, 200)
+        self.tree.setColumnWidth(5, 80) # Size Column Width
+        self.tree.setColumnWidth(6, 160); self.tree.setColumnWidth(7, 160); self.tree.setColumnWidth(8, 200)
         
-        for i in range(11, 16): self.tree.setColumnHidden(i, True)
+        # Hide backend paths columns
+        for i in range(12, 18): self.tree.setColumnHidden(i, True)
         
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.on_context_menu)
@@ -531,10 +561,8 @@ class PDDashboard(QMainWindow):
             releases.update(self.out_data.get("releases", {}).keys())
             blocks.update(self.out_data.get("blocks", set()))
 
-        # Preserve currently selected RTL version
         current_rtl = self.rel_combo.currentText()
 
-        # Preserve currently selected Blocks
         saved_states = {}
         for i in range(self.blk_list.count()):
             item = self.blk_list.item(i)
@@ -574,25 +602,33 @@ class PDDashboard(QMainWindow):
         if run["run_type"] == "FE":
             child.setText(3, "COMPLETED" if run["is_comp"] else "RUNNING")
             child.setText(4, "COMPLETED" if run["is_comp"] else run["info"]["last_stage"])
-            child.setText(5, f"NONUPF - {run['st_n']}") 
-            child.setText(6, f"UPF - {run['st_u']}")
-            child.setText(7, run["vslp_status"]) 
-            child.setText(8, run["info"]["runtime"]); child.setText(9, run["info"]["start"]); child.setText(10, run["info"]["end"])
-            child.setText(11, run["path"]); child.setText(12, os.path.join(run["path"], "logs/compile_opt.log"))
-            child.setText(13, run["fm_u_path"]); child.setText(14, run["fm_n_path"])
-            child.setText(15, run["vslp_rpt_path"])
+            child.setText(5, "...") # Default Size Placeholder
+            child.setText(6, f"NONUPF - {run['st_n']}") 
+            child.setText(7, f"UPF - {run['st_u']}")
+            child.setText(8, run["vslp_status"]) 
+            child.setText(9, run["info"]["runtime"])
+            child.setText(10, run["info"]["start"])
+            child.setText(11, run["info"]["end"])
+            child.setText(12, run["path"])
+            child.setText(13, os.path.join(run["path"], "logs/compile_opt.log"))
+            child.setText(14, run["fm_u_path"])
+            child.setText(15, run["fm_n_path"])
+            child.setText(16, run["vslp_rpt_path"])
+            child.setText(17, "") # No STA for FE
             
-            if "FAILS" in run["st_n"]: child.setForeground(5, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-            elif "PASS" in run["st_n"]: child.setForeground(5, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            if "FAILS" in run["st_n"]: child.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "PASS" in run["st_n"]: child.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
             
-            if "FAILS" in run["st_u"]: child.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-            elif "PASS" in run["st_u"]: child.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            if "FAILS" in run["st_u"]: child.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "PASS" in run["st_u"]: child.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
             
-            if "Error" in run["vslp_status"] and "Error: 0" not in run["vslp_status"]: child.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-            elif "Error: 0" in run["vslp_status"]: child.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            if "Error" in run["vslp_status"] and "Error: 0" not in run["vslp_status"]: child.setForeground(8, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "Error: 0" in run["vslp_status"]: child.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
             
             child.setForeground(3, QColor("#81c784" if run["is_comp"] else "#4fc3f7") if self.is_dark_mode else QColor("#2e7d32" if run["is_comp"] else "#0277bd"))
-        
+        else:
+            child.setText(5, "...") # Parent BE Node Size Placeholder
+            
         return child
 
     def _get_other_pnr_parent(self, block_item):
@@ -604,25 +640,34 @@ class PDDashboard(QMainWindow):
         p.setText(0, " Other PNR runs")
         p.setFlags(p.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         p.setCheckState(0, Qt.Unchecked)
-        p.setExpanded(True)
+        p.setExpanded(False) 
         p.setBackground(0, QColor("#3c3c3c") if self.is_dark_mode else QColor("#e0e0e0"))
         return p
 
+    def update_item_size(self, item_id, size_str):
+        """ Callback triggered individually as SizeWorker finishes folder calculation """
+        item = self.item_map.get(item_id)
+        if item: item.setText(5, size_str)
+
     def refresh_view(self):
+        # Cancel any active size calculations to prevent overlapping states
+        if self.size_worker and self.size_worker.isRunning():
+            self.size_worker.cancel()
+            
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
         self.tree.setSortingEnabled(False)
+        
+        self.item_map = {}
+        size_tasks = []
         
         src_mode = self.src_combo.currentText()
         sel_rtl = self.rel_combo.currentText()
         
         raw_query = self.search.text().lower()
-        if not raw_query:
-            search_pattern = "*"
-        elif '*' not in raw_query:
-            search_pattern = f"*{raw_query}*"
-        else:
-            search_pattern = raw_query
+        if not raw_query: search_pattern = "*"
+        elif '*' not in raw_query: search_pattern = f"*{raw_query}*"
+        else: search_pattern = raw_query
             
         checked_blks = [self.blk_list.item(i).text() for i in range(self.blk_list.count()) if self.blk_list.item(i).checkState() == Qt.Checked]
         
@@ -652,6 +697,11 @@ class PDDashboard(QMainWindow):
                     block_item = self._get_parent(fe_run["block"])
                     fe_item = self._create_run_item(block_item, fe_run)
                     
+                    # Queue FE folder size calculation
+                    item_id = str(id(fe_item))
+                    self.item_map[item_id] = fe_item
+                    size_tasks.append((item_id, fe_run["path"]))
+                    
                     fe_base = fe_run["r_name"].replace("-FE", "")
                     
                     for be_run in be_runs:
@@ -659,6 +709,11 @@ class PDDashboard(QMainWindow):
                             if f"_{fe_base}_" in be_run["r_name"] or be_run["r_name"].startswith(f"{fe_base}_"):
                                 be_item = self._create_run_item(fe_item, be_run)
                                 matched_be_runs.add(id(be_run))
+                                
+                                # Queue Total BE Folder Size calculation
+                                be_item_id = str(id(be_item))
+                                self.item_map[be_item_id] = be_item
+                                size_tasks.append((be_item_id, be_run["path"]))
                                 
                                 for stage in be_run["stages"]:
                                     st_item = QTreeWidgetItem(be_item)
@@ -683,26 +738,33 @@ class PDDashboard(QMainWindow):
                                     st_item.setText(0, "    ↳ " + stage["name"])
                                     st_item.setText(2, be_run["source"])
                                     st_item.setText(4, stage_status) 
-                                    st_item.setText(5, f"NONUPF - {stage['st_n']}") 
-                                    st_item.setText(6, f"UPF - {stage['st_u']}")
-                                    st_item.setText(7, stage["vslp_status"])
-                                    st_item.setText(8, stage["info"]["runtime"])
-                                    st_item.setText(9, stage["info"]["start"])
-                                    st_item.setText(10, stage["info"]["end"])
-                                    st_item.setText(11, stage["stage_path"]) 
-                                    st_item.setText(12, stage["log"])
-                                    st_item.setText(13, stage["fm_u_path"])
-                                    st_item.setText(14, stage["fm_n_path"])
-                                    st_item.setText(15, stage["vslp_rpt_path"])
+                                    st_item.setText(5, "...") # Stage size placeholder
+                                    st_item.setText(6, f"NONUPF - {stage['st_n']}") 
+                                    st_item.setText(7, f"UPF - {stage['st_u']}")
+                                    st_item.setText(8, stage["vslp_status"])
+                                    st_item.setText(9, stage["info"]["runtime"])
+                                    st_item.setText(10, stage["info"]["start"])
+                                    st_item.setText(11, stage["info"]["end"])
+                                    st_item.setText(12, stage["stage_path"]) 
+                                    st_item.setText(13, stage["log"])
+                                    st_item.setText(14, stage["fm_u_path"])
+                                    st_item.setText(15, stage["fm_n_path"])
+                                    st_item.setText(16, stage["vslp_rpt_path"])
+                                    st_item.setText(17, stage["sta_rpt_path"]) 
+                                    
+                                    # Queue Individual Stage Folder Size
+                                    st_item_id = str(id(st_item))
+                                    self.item_map[st_item_id] = st_item
+                                    size_tasks.append((st_item_id, stage["stage_path"]))
                                     
                                     dim_color = QColor("#aaaaaa") if self.is_dark_mode else QColor("#616161")
                                     st_item.setForeground(0, dim_color) 
-                                    if "FAILS" in stage["st_n"]: st_item.setForeground(5, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                                    elif "PASS" in stage["st_n"]: st_item.setForeground(5, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                                    if "FAILS" in stage["st_u"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                                    elif "PASS" in stage["st_u"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                                    if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                                    elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+                                    if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+                                    elif "PASS" in stage["st_n"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+                                    if "FAILS" in stage["st_u"]: st_item.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+                                    elif "PASS" in stage["st_u"]: st_item.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+                                    if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(8, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+                                    elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
 
         for be_run in be_runs:
             if id(be_run) not in matched_be_runs:
@@ -711,6 +773,10 @@ class PDDashboard(QMainWindow):
                         block_item = self._get_parent(be_run["block"])
                         other_pnr_item = self._get_other_pnr_parent(block_item) 
                         be_item = self._create_run_item(other_pnr_item, be_run)
+                        
+                        be_item_id = str(id(be_item))
+                        self.item_map[be_item_id] = be_item
+                        size_tasks.append((be_item_id, be_run["path"]))
                         
                         for stage in be_run["stages"]:
                             st_item = QTreeWidgetItem(be_item)
@@ -735,31 +801,42 @@ class PDDashboard(QMainWindow):
                             st_item.setText(0, "    ↳ " + stage["name"])
                             st_item.setText(2, be_run["source"])
                             st_item.setText(4, stage_status) 
-                            st_item.setText(5, f"NONUPF - {stage['st_n']}") 
-                            st_item.setText(6, f"UPF - {stage['st_u']}")
-                            st_item.setText(7, stage["vslp_status"])
-                            st_item.setText(8, stage["info"]["runtime"])
-                            st_item.setText(9, stage["info"]["start"])
-                            st_item.setText(10, stage["info"]["end"])
-                            st_item.setText(11, stage["stage_path"])
-                            st_item.setText(12, stage["log"])
-                            st_item.setText(13, stage["fm_u_path"])
-                            st_item.setText(14, stage["fm_n_path"])
-                            st_item.setText(15, stage["vslp_rpt_path"])
+                            st_item.setText(5, "...")
+                            st_item.setText(6, f"NONUPF - {stage['st_n']}") 
+                            st_item.setText(7, f"UPF - {stage['st_u']}")
+                            st_item.setText(8, stage["vslp_status"])
+                            st_item.setText(9, stage["info"]["runtime"])
+                            st_item.setText(10, stage["info"]["start"])
+                            st_item.setText(11, stage["info"]["end"])
+                            st_item.setText(12, stage["stage_path"])
+                            st_item.setText(13, stage["log"])
+                            st_item.setText(14, stage["fm_u_path"])
+                            st_item.setText(15, stage["fm_n_path"])
+                            st_item.setText(16, stage["vslp_rpt_path"])
+                            st_item.setText(17, stage["sta_rpt_path"])
+                            
+                            st_item_id = str(id(st_item))
+                            self.item_map[st_item_id] = st_item
+                            size_tasks.append((st_item_id, stage["stage_path"]))
                             
                             dim_color = QColor("#aaaaaa") if self.is_dark_mode else QColor("#616161")
                             st_item.setForeground(0, dim_color)
-                            if "FAILS" in stage["st_n"]: st_item.setForeground(5, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                            elif "PASS" in stage["st_n"]: st_item.setForeground(5, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                            if "FAILS" in stage["st_u"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                            elif "PASS" in stage["st_u"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                            if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                            elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+                            if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+                            elif "PASS" in stage["st_n"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+                            if "FAILS" in stage["st_u"]: st_item.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+                            elif "PASS" in stage["st_u"]: st_item.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+                            if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(8, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+                            elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
 
         self.tree.setSortingEnabled(True)
         for i in range(self.tree.topLevelItemCount()):
             self.tree.topLevelItem(i).setExpanded(True)
         self.tree.setUpdatesEnabled(True)
+        
+        # Dispatch background size calculation
+        self.size_worker = SizeWorker(size_tasks)
+        self.size_worker.size_calculated.connect(self.update_item_size)
+        self.size_worker.start()
 
     def _get_parent(self, name):
         for i in range(self.tree.topLevelItemCount()):
@@ -771,13 +848,12 @@ class PDDashboard(QMainWindow):
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { border: 1px solid gray; }" if self.is_dark_mode else "")
         
-        for i in range(1, 16): 
+        for i in range(1, 18): 
             action = QWidgetAction(menu)
             cb = QCheckBox(self.tree.headerItem().text(i))
             cb.setChecked(not self.tree.isColumnHidden(i))
             cb.setStyleSheet("margin: 2px 8px; background: transparent; color: inherit;")
             cb.toggled.connect(lambda checked, col=i: self.tree.setColumnHidden(col, not checked))
-            
             action.setDefaultWidget(cb)
             menu.addAction(action)
             
@@ -796,10 +872,11 @@ class PDDashboard(QMainWindow):
             copy_cell_act = m.addAction(f"Copy Cell Text")
             m.addSeparator()
             
-        fm_u_path = item.text(13)
-        fm_n_path = item.text(14)
-        vslp_path = item.text(15)
-        log_path = item.text(12)
+        fm_u_path = item.text(14)
+        fm_n_path = item.text(15)
+        vslp_path = item.text(16)
+        sta_path = item.text(17)
+        log_path = item.text(13)
         
         fm_n_act = None
         if fm_n_path and fm_n_path != "N/A" and os.path.exists(fm_n_path):
@@ -813,12 +890,16 @@ class PDDashboard(QMainWindow):
         if vslp_path and vslp_path != "N/A" and os.path.exists(vslp_path):
             v_act = m.addAction("Open VSLP Report")
             
+        sta_act = None
+        if sta_path and sta_path != "N/A" and os.path.exists(sta_path):
+            sta_act = m.addAction("Open PT STA Summary")
+            
         log_act = None
         if log_path and log_path != "N/A" and os.path.exists(log_path):
             log_act = m.addAction("Open Log File")
             
         m.addSeparator()
-        c_act = m.addAction("Copy log path")
+        c_act = m.addAction("Copy Path")
         
         qor_act = None
         if item.data(0, Qt.UserRole) == "STAGE":
@@ -836,10 +917,12 @@ class PDDashboard(QMainWindow):
                 subprocess.Popen(['gvim', fm_u_path])
             elif res == v_act:
                 subprocess.Popen(['gvim', vslp_path])
+            elif sta_act and res == sta_act:
+                subprocess.Popen(['gvim', sta_path])
             elif log_act and res == log_act:
                 subprocess.Popen(['gvim', log_path])
             elif res == c_act:
-                QApplication.clipboard().setText(item.text(12))
+                QApplication.clipboard().setText(item.text(12)) # Caches internal file path
             elif qor_act and res == qor_act:
                 step_name = item.data(1, Qt.UserRole)
                 qor_path = item.data(2, Qt.UserRole)
@@ -849,7 +932,7 @@ class PDDashboard(QMainWindow):
 
     def on_item_double_clicked(self, item, col):
         if item.parent():
-            log = item.text(12)
+            log = item.text(13)
             if log and os.path.exists(log): subprocess.Popen(['gvim', log])
 
     def run_qor_comparison(self):
@@ -861,7 +944,7 @@ class PDDashboard(QMainWindow):
                 c = node.child(i)
                 if c.checkState(0) == Qt.Checked:
                     if c.data(0, Qt.UserRole) != "STAGE":
-                        qor_path = c.text(11) 
+                        qor_path = c.text(12) # Points to new path column index
                         run_source = c.text(2)
                         
                         if run_source == "OUTFEED" and qor_path:
