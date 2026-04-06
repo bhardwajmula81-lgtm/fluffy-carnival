@@ -107,14 +107,14 @@ def parse_pnr_runtime_rpt(file_path):
                 if len(parts) >= 3:
                     ts_match = re.search(r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})', line)
                     
-                    # Grabbing REALTIME (First time match array in the standard summary log)
+                    # Targeting REALTIME instead of CPUTIME
                     time_matches = re.findall(r'(\d+)d:(\d+)h:(\d+)m:(\d+)s', line)
                     
                     if ts_match and time_matches:
                         if not first_ts: first_ts = ts_match
                         last_ts = ts_match
                         
-                        days, hours, mins, secs = map(int, time_matches[0]) # Enforces selection of the first duration
+                        days, hours, mins, secs = map(int, time_matches[0]) 
                         total_hours = days * 24 + hours
                         final_time_str = f"{total_hours:02}h:{mins:02}m:{secs:02}s"
                         
@@ -179,39 +179,24 @@ class SettingsDialog(QDialog):
 
 # --- BACKGROUND WORKER THREADS ---
 
-class SizeWorker(QThread):
-    """ Secondary Background Worker purely for fetching rapid du -sh queries without locking UI """
-    size_calculated = pyqtSignal(str, str) 
+class SingleSizeWorker(QThread):
+    """ Manual, On-Demand Size Calculator for a selected item """
+    result = pyqtSignal(object, str)
 
-    def __init__(self, tasks):
+    def __init__(self, item, path):
         super().__init__()
-        self.tasks = tasks 
-        self._is_cancelled = False
-
-    def cancel(self):
-        self._is_cancelled = True
+        self.item = item
+        self.path = path
 
     def run(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(self.get_size, path): item_id for item_id, path in self.tasks}
-            for future in concurrent.futures.as_completed(futures):
-                if self._is_cancelled:
-                    break
-                item_id = futures[future]
-                try:
-                    size = future.result()
-                    self.size_calculated.emit(item_id, size)
-                except:
-                    self.size_calculated.emit(item_id, "N/A")
-
-    def get_size(self, path):
-        if not path or not os.path.exists(path): return "N/A"
+        if not self.path or not os.path.exists(self.path):
+            self.result.emit(self.item, "N/A")
+            return
         try:
-            # Using OS native du -sh for blazing fast, optimized block calculations
-            out = subprocess.check_output(['du', '-sh', path], stderr=subprocess.DEVNULL).decode('utf-8')
-            return out.split()[0]
+            out = subprocess.check_output(['du', '-sh', self.path], stderr=subprocess.DEVNULL).decode('utf-8')
+            self.result.emit(self.item, out.split()[0])
         except:
-            return "N/A"
+            self.result.emit(self.item, "N/A")
 
 class ScannerWorker(QThread):
     finished = pyqtSignal(dict, dict)
@@ -332,8 +317,8 @@ class ScannerWorker(QThread):
                         st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
                         st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
                         st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
-                        sta_rpt = os.path.join(evt_base, "pt", step_name, "reports", "sta", "summary", "summary.rpt")
                         
+                        sta_rpt = os.path.join(evt_base, "pt", r_name, step_name, "reports", "sta", "summary", "summary.rpt")
                         qor_path = rd if rd.endswith("/") else rd + "/"
                         
                         stages.append({
@@ -357,8 +342,8 @@ class ScannerWorker(QThread):
                         st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
                         st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
                         st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
-                        sta_rpt = os.path.join(evt_base, "pt", step_name, "reports", "sta", "summary", "summary.rpt")
                         
+                        sta_rpt = os.path.join(evt_base, "pt", r_name, step_name, "reports", "sta", "summary", "summary.rpt")
                         qor_path = rd if rd.endswith("/") else rd + "/"
                         
                         stages.append({
@@ -398,8 +383,7 @@ class PDDashboard(QMainWindow):
         self.is_dark_mode = False
         self.row_spacing = 2
         
-        self.item_map = {} # Maps item ID to GUI Element
-        self.size_worker = None
+        self.size_workers = [] 
         
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -464,7 +448,7 @@ class PDDashboard(QMainWindow):
         self.splitter.addWidget(left_panel)
         
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(18) # Appended columns 
+        self.tree.setColumnCount(18) 
         self.tree.setAlternatingRowColors(True)
         
         headers = ["Run Name (Select)", "RTL Release Version", "Source", "Status", "Stage", "Size",
@@ -476,10 +460,9 @@ class PDDashboard(QMainWindow):
         self.tree.header().customContextMenuRequested.connect(self.on_header_context_menu)
         
         self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(1, 280); self.tree.setColumnWidth(2, 90)
-        self.tree.setColumnWidth(5, 80) # Size Column Width
+        self.tree.setColumnWidth(5, 80) 
         self.tree.setColumnWidth(6, 160); self.tree.setColumnWidth(7, 160); self.tree.setColumnWidth(8, 200)
         
-        # Hide backend paths columns
         for i in range(12, 18): self.tree.setColumnHidden(i, True)
         
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -602,7 +585,7 @@ class PDDashboard(QMainWindow):
         if run["run_type"] == "FE":
             child.setText(3, "COMPLETED" if run["is_comp"] else "RUNNING")
             child.setText(4, "COMPLETED" if run["is_comp"] else run["info"]["last_stage"])
-            child.setText(5, "...") # Default Size Placeholder
+            child.setText(5, "-") 
             child.setText(6, f"NONUPF - {run['st_n']}") 
             child.setText(7, f"UPF - {run['st_u']}")
             child.setText(8, run["vslp_status"]) 
@@ -614,7 +597,7 @@ class PDDashboard(QMainWindow):
             child.setText(14, run["fm_u_path"])
             child.setText(15, run["fm_n_path"])
             child.setText(16, run["vslp_rpt_path"])
-            child.setText(17, "") # No STA for FE
+            child.setText(17, "") 
             
             if "FAILS" in run["st_n"]: child.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
             elif "PASS" in run["st_n"]: child.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
@@ -627,7 +610,8 @@ class PDDashboard(QMainWindow):
             
             child.setForeground(3, QColor("#81c784" if run["is_comp"] else "#4fc3f7") if self.is_dark_mode else QColor("#2e7d32" if run["is_comp"] else "#0277bd"))
         else:
-            child.setText(5, "...") # Parent BE Node Size Placeholder
+            child.setText(5, "-") 
+            child.setText(12, run["path"]) 
             
         return child
 
@@ -644,22 +628,30 @@ class PDDashboard(QMainWindow):
         p.setBackground(0, QColor("#3c3c3c") if self.is_dark_mode else QColor("#e0e0e0"))
         return p
 
-    def update_item_size(self, item_id, size_str):
-        """ Callback triggered individually as SizeWorker finishes folder calculation """
-        item = self.item_map.get(item_id)
-        if item: item.setText(5, size_str)
+    def _get_item_path_id(self, item):
+        """ Helper to build a unique string path for tree memory (e.g. Block|Run-FE|Stage) """
+        parts = []
+        while item is not None:
+            parts.insert(0, item.text(0).strip())
+            item = item.parent()
+        return "|".join(parts)
 
     def refresh_view(self):
-        # Cancel any active size calculations to prevent overlapping states
-        if self.size_worker and self.size_worker.isRunning():
-            self.size_worker.cancel()
-            
+        # 1. Capture current expand/collapse state before wiping the tree
+        expanded_states = {}
+        
+        def save_state(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                expanded_states[self._get_item_path_id(child)] = child.isExpanded()
+                save_state(child)
+                
+        save_state(self.tree.invisibleRootItem())
+
+        # 2. Clear and rebuild
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
         self.tree.setSortingEnabled(False)
-        
-        self.item_map = {}
-        size_tasks = []
         
         src_mode = self.src_combo.currentText()
         sel_rtl = self.rel_combo.currentText()
@@ -696,12 +688,6 @@ class PDDashboard(QMainWindow):
                     
                     block_item = self._get_parent(fe_run["block"])
                     fe_item = self._create_run_item(block_item, fe_run)
-                    
-                    # Queue FE folder size calculation
-                    item_id = str(id(fe_item))
-                    self.item_map[item_id] = fe_item
-                    size_tasks.append((item_id, fe_run["path"]))
-                    
                     fe_base = fe_run["r_name"].replace("-FE", "")
                     
                     for be_run in be_runs:
@@ -709,11 +695,6 @@ class PDDashboard(QMainWindow):
                             if f"_{fe_base}_" in be_run["r_name"] or be_run["r_name"].startswith(f"{fe_base}_"):
                                 be_item = self._create_run_item(fe_item, be_run)
                                 matched_be_runs.add(id(be_run))
-                                
-                                # Queue Total BE Folder Size calculation
-                                be_item_id = str(id(be_item))
-                                self.item_map[be_item_id] = be_item
-                                size_tasks.append((be_item_id, be_run["path"]))
                                 
                                 for stage in be_run["stages"]:
                                     st_item = QTreeWidgetItem(be_item)
@@ -738,7 +719,7 @@ class PDDashboard(QMainWindow):
                                     st_item.setText(0, "    ↳ " + stage["name"])
                                     st_item.setText(2, be_run["source"])
                                     st_item.setText(4, stage_status) 
-                                    st_item.setText(5, "...") # Stage size placeholder
+                                    st_item.setText(5, "-") 
                                     st_item.setText(6, f"NONUPF - {stage['st_n']}") 
                                     st_item.setText(7, f"UPF - {stage['st_u']}")
                                     st_item.setText(8, stage["vslp_status"])
@@ -751,11 +732,6 @@ class PDDashboard(QMainWindow):
                                     st_item.setText(15, stage["fm_n_path"])
                                     st_item.setText(16, stage["vslp_rpt_path"])
                                     st_item.setText(17, stage["sta_rpt_path"]) 
-                                    
-                                    # Queue Individual Stage Folder Size
-                                    st_item_id = str(id(st_item))
-                                    self.item_map[st_item_id] = st_item
-                                    size_tasks.append((st_item_id, stage["stage_path"]))
                                     
                                     dim_color = QColor("#aaaaaa") if self.is_dark_mode else QColor("#616161")
                                     st_item.setForeground(0, dim_color) 
@@ -773,10 +749,6 @@ class PDDashboard(QMainWindow):
                         block_item = self._get_parent(be_run["block"])
                         other_pnr_item = self._get_other_pnr_parent(block_item) 
                         be_item = self._create_run_item(other_pnr_item, be_run)
-                        
-                        be_item_id = str(id(be_item))
-                        self.item_map[be_item_id] = be_item
-                        size_tasks.append((be_item_id, be_run["path"]))
                         
                         for stage in be_run["stages"]:
                             st_item = QTreeWidgetItem(be_item)
@@ -801,7 +773,7 @@ class PDDashboard(QMainWindow):
                             st_item.setText(0, "    ↳ " + stage["name"])
                             st_item.setText(2, be_run["source"])
                             st_item.setText(4, stage_status) 
-                            st_item.setText(5, "...")
+                            st_item.setText(5, "-")
                             st_item.setText(6, f"NONUPF - {stage['st_n']}") 
                             st_item.setText(7, f"UPF - {stage['st_u']}")
                             st_item.setText(8, stage["vslp_status"])
@@ -815,10 +787,6 @@ class PDDashboard(QMainWindow):
                             st_item.setText(16, stage["vslp_rpt_path"])
                             st_item.setText(17, stage["sta_rpt_path"])
                             
-                            st_item_id = str(id(st_item))
-                            self.item_map[st_item_id] = st_item
-                            size_tasks.append((st_item_id, stage["stage_path"]))
-                            
                             dim_color = QColor("#aaaaaa") if self.is_dark_mode else QColor("#616161")
                             st_item.setForeground(0, dim_color)
                             if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
@@ -829,14 +797,28 @@ class PDDashboard(QMainWindow):
                             elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
 
         self.tree.setSortingEnabled(True)
-        for i in range(self.tree.topLevelItemCount()):
-            self.tree.topLevelItem(i).setExpanded(True)
+
+        # 3. Restore Expansion States
+        def restore_state(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                path_key = self._get_item_path_id(child)
+                
+                if path_key in expanded_states:
+                    child.setExpanded(expanded_states[path_key])
+                else:
+                    # Smart defaults if newly added
+                    if child.parent() is None: 
+                        child.setExpanded(True) # Keep Main blocks open
+                    elif child.text(0).strip() == "Other PNR runs":
+                        child.setExpanded(False) # Keep other PNRs closed
+                    else:
+                        child.setExpanded(False) # Keep runs closed
+                        
+                restore_state(child)
+
+        restore_state(self.tree.invisibleRootItem())
         self.tree.setUpdatesEnabled(True)
-        
-        # Dispatch background size calculation
-        self.size_worker = SizeWorker(size_tasks)
-        self.size_worker.size_calculated.connect(self.update_item_size)
-        self.size_worker.start()
 
     def _get_parent(self, name):
         for i in range(self.tree.topLevelItemCount()):
@@ -877,7 +859,13 @@ class PDDashboard(QMainWindow):
         vslp_path = item.text(16)
         sta_path = item.text(17)
         log_path = item.text(13)
+        run_path = item.text(12) 
         
+        calc_size_act = None
+        if run_path and run_path != "N/A" and os.path.exists(run_path):
+            calc_size_act = m.addAction("Calculate Folder Size")
+            m.addSeparator()
+
         fm_n_act = None
         if fm_n_path and fm_n_path != "N/A" and os.path.exists(fm_n_path):
             fm_n_act = m.addAction("Open NONUPF Formality Report")
@@ -911,6 +899,14 @@ class PDDashboard(QMainWindow):
         if res:
             if copy_cell_act and res == copy_cell_act:
                 QApplication.clipboard().setText(cell_text)
+            elif calc_size_act and res == calc_size_act:
+                item.setText(5, "Calc...")
+                worker = SingleSizeWorker(item, run_path)
+                worker.result.connect(lambda it, sz: it.setText(5, sz))
+                if not hasattr(self, 'size_workers'): self.size_workers = []
+                self.size_workers.append(worker)
+                worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
+                worker.start()
             elif res == fm_n_act:
                 subprocess.Popen(['gvim', fm_n_path])
             elif res == fm_u_act:
@@ -922,7 +918,7 @@ class PDDashboard(QMainWindow):
             elif log_act and res == log_act:
                 subprocess.Popen(['gvim', log_path])
             elif res == c_act:
-                QApplication.clipboard().setText(item.text(12)) # Caches internal file path
+                QApplication.clipboard().setText(run_path) 
             elif qor_act and res == qor_act:
                 step_name = item.data(1, Qt.UserRole)
                 qor_path = item.data(2, Qt.UserRole)
@@ -944,7 +940,7 @@ class PDDashboard(QMainWindow):
                 c = node.child(i)
                 if c.checkState(0) == Qt.Checked:
                     if c.data(0, Qt.UserRole) != "STAGE":
-                        qor_path = c.text(12) # Points to new path column index
+                        qor_path = c.text(12) 
                         run_source = c.text(2)
                         
                         if run_source == "OUTFEED" and qor_path:
