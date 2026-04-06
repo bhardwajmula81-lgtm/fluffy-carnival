@@ -107,7 +107,6 @@ def parse_pnr_runtime_rpt(file_path):
                 if len(parts) >= 3:
                     ts_match = re.search(r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})', line)
                     
-                    # Targeting REALTIME instead of CPUTIME
                     time_matches = re.findall(r'(\d+)d:(\d+)h:(\d+)m:(\d+)s', line)
                     
                     if ts_match and time_matches:
@@ -179,24 +178,62 @@ class SettingsDialog(QDialog):
 
 # --- BACKGROUND WORKER THREADS ---
 
+class BatchSizeWorker(QThread):
+    """ Processes multiple folder sizes asynchronously in the background """
+    size_calculated = pyqtSignal(str, str)
+    
+    def __init__(self, tasks):
+        super().__init__()
+        self.tasks = tasks
+        self._is_cancelled = False
+
+    def run(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(self.get_size, path): item_id for item_id, path in self.tasks}
+            for future in concurrent.futures.as_completed(futures):
+                if self._is_cancelled:
+                    break
+                item_id = futures[future]
+                try:
+                    size = future.result()
+                    self.size_calculated.emit(item_id, size)
+                except:
+                    self.size_calculated.emit(item_id, "N/A")
+
+    def get_size(self, path):
+        if not path or not os.path.exists(path): return "N/A"
+        try:
+            out = subprocess.check_output(['du', '-sh', path], stderr=subprocess.DEVNULL).decode('utf-8')
+            return out.split()[0]
+        except:
+            return "N/A"
+
+    def cancel(self):
+        self._is_cancelled = True
+
 class SingleSizeWorker(QThread):
-    """ Manual, On-Demand Size Calculator for a selected item """
     result = pyqtSignal(object, str)
 
     def __init__(self, item, path):
         super().__init__()
         self.item = item
         self.path = path
+        self._is_cancelled = False
 
     def run(self):
-        if not self.path or not os.path.exists(self.path):
+        if self._is_cancelled or not self.path or not os.path.exists(self.path):
             self.result.emit(self.item, "N/A")
             return
         try:
             out = subprocess.check_output(['du', '-sh', self.path], stderr=subprocess.DEVNULL).decode('utf-8')
-            self.result.emit(self.item, out.split()[0])
+            if not self._is_cancelled:
+                self.result.emit(self.item, out.split()[0])
         except:
-            self.result.emit(self.item, "N/A")
+            if not self._is_cancelled:
+                self.result.emit(self.item, "N/A")
+
+    def cancel(self):
+        self._is_cancelled = True
 
 class ScannerWorker(QThread):
     finished = pyqtSignal(dict, dict)
@@ -383,7 +420,8 @@ class PDDashboard(QMainWindow):
         self.is_dark_mode = False
         self.row_spacing = 2
         
-        self.size_workers = [] 
+        self.size_workers = []
+        self.item_map = {} 
         
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -415,13 +453,26 @@ class PDDashboard(QMainWindow):
         self.search.textChanged.connect(lambda: self.search_timer.start(300))
         top.addWidget(self.search)
         
-        self.exp_btn = QPushButton("Expand All")
-        self.exp_btn.clicked.connect(lambda: self.tree.expandAll())
-        top.addWidget(self.exp_btn)
+        # Tools Dropdown Button
+        self.tools_btn = QPushButton("Tools")
+        self.tools_menu = QMenu(self)
         
-        self.col_btn = QPushButton("Collapse All")
-        self.col_btn.clicked.connect(lambda: self.tree.collapseAll())
-        top.addWidget(self.col_btn)
+        fit_act = self.tools_menu.addAction("Fit Columns")
+        fit_act.triggered.connect(self.fit_all_columns)
+        
+        exp_act = self.tools_menu.addAction("Expand All")
+        exp_act.triggered.connect(lambda: self.tree.expandAll())
+        
+        col_act = self.tools_menu.addAction("Collapse All")
+        col_act.triggered.connect(lambda: self.tree.collapseAll())
+        
+        self.tools_menu.addSeparator()
+        
+        calc_act = self.tools_menu.addAction("Calculate All Run Sizes")
+        calc_act.triggered.connect(self.calculate_all_sizes)
+        
+        self.tools_btn.setMenu(self.tools_menu)
+        top.addWidget(self.tools_btn)
         
         btn = QPushButton("Compare QoR")
         btn.clicked.connect(self.run_qor_comparison)
@@ -456,6 +507,9 @@ class PDDashboard(QMainWindow):
                    "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT", "STA_RPT"]
         self.tree.setHeaderLabels(headers)
         
+        for i in range(self.tree.columnCount()):
+            self.tree.headerItem().setTextAlignment(i, Qt.AlignCenter)
+        
         self.tree.header().setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.header().customContextMenuRequested.connect(self.on_header_context_menu)
         
@@ -480,6 +534,38 @@ class PDDashboard(QMainWindow):
         layout.addWidget(self.prog)
         
         self.apply_theme_and_spacing()
+
+    def fit_all_columns(self):
+        for i in range(self.tree.columnCount()):
+            if not self.tree.isColumnHidden(i):
+                self.tree.resizeColumnToContents(i)
+
+    def calculate_all_sizes(self):
+        size_tasks = []
+        def gather_tasks(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                path = child.text(12) 
+                if path and path != "N/A" and child.text(5) in ["-", "N/A", "Calc..."]:
+                    item_id = str(id(child))
+                    self.item_map[item_id] = child
+                    size_tasks.append((item_id, path))
+                    child.setText(5, "Calc...")
+                gather_tasks(child)
+        
+        gather_tasks(self.tree.invisibleRootItem())
+        
+        if size_tasks:
+            worker = BatchSizeWorker(size_tasks)
+            worker.size_calculated.connect(self.update_item_size)
+            self.size_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
+            worker.start()
+
+    def update_item_size(self, item_id, size_str):
+        item = self.item_map.get(item_id)
+        if item:
+            item.setText(5, size_str)
 
     def open_settings(self):
         dlg = SettingsDialog(self)
@@ -629,7 +715,6 @@ class PDDashboard(QMainWindow):
         return p
 
     def _get_item_path_id(self, item):
-        """ Helper to build a unique string path for tree memory (e.g. Block|Run-FE|Stage) """
         parts = []
         while item is not None:
             parts.insert(0, item.text(0).strip())
@@ -637,9 +722,13 @@ class PDDashboard(QMainWindow):
         return "|".join(parts)
 
     def refresh_view(self):
-        # 1. Capture current expand/collapse state before wiping the tree
-        expanded_states = {}
+        # Cancel running workers so they don't try to apply sizes to deleted items
+        for w in self.size_workers:
+            if hasattr(w, 'cancel'):
+                w.cancel()
+        self.item_map.clear()
         
+        expanded_states = {}
         def save_state(node):
             for i in range(node.childCount()):
                 child = node.child(i)
@@ -648,7 +737,6 @@ class PDDashboard(QMainWindow):
                 
         save_state(self.tree.invisibleRootItem())
 
-        # 2. Clear and rebuild
         self.tree.setUpdatesEnabled(False)
         self.tree.clear()
         self.tree.setSortingEnabled(False)
@@ -798,7 +886,6 @@ class PDDashboard(QMainWindow):
 
         self.tree.setSortingEnabled(True)
 
-        # 3. Restore Expansion States
         def restore_state(node):
             for i in range(node.childCount()):
                 child = node.child(i)
@@ -807,13 +894,12 @@ class PDDashboard(QMainWindow):
                 if path_key in expanded_states:
                     child.setExpanded(expanded_states[path_key])
                 else:
-                    # Smart defaults if newly added
                     if child.parent() is None: 
-                        child.setExpanded(True) # Keep Main blocks open
+                        child.setExpanded(True) 
                     elif child.text(0).strip() == "Other PNR runs":
-                        child.setExpanded(False) # Keep other PNRs closed
+                        child.setExpanded(False) 
                     else:
-                        child.setExpanded(False) # Keep runs closed
+                        child.setExpanded(False) 
                         
                 restore_state(child)
 
