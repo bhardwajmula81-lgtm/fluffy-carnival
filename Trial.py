@@ -334,7 +334,6 @@ class ScannerWorker(QThread):
                         st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
                         st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
                         
-                        # --- UPDATED: Passing the -BE base path for OUTFEED stages ---
                         qor_path = rd if rd.endswith("/") else rd + "/"
                         
                         stages.append({
@@ -532,13 +531,24 @@ class PDDashboard(QMainWindow):
             releases.update(self.out_data.get("releases", {}).keys())
             blocks.update(self.out_data.get("blocks", set()))
 
+        # Preserve currently selected RTL version
+        current_rtl = self.rel_combo.currentText()
+
+        # Preserve currently selected Blocks
         saved_states = {}
         for i in range(self.blk_list.count()):
             item = self.blk_list.item(i)
             saved_states[item.text()] = item.checkState()
 
         self.rel_combo.blockSignals(True); self.rel_combo.clear()
-        self.rel_combo.addItems(["[ SHOW ALL ]"] + sorted(list(releases)))
+        new_releases = ["[ SHOW ALL ]"] + sorted(list(releases))
+        self.rel_combo.addItems(new_releases)
+        
+        if current_rtl in new_releases:
+            self.rel_combo.setCurrentText(current_rtl)
+        else:
+            self.rel_combo.setCurrentIndex(0)
+            
         self.rel_combo.blockSignals(False)
         
         self.blk_list.blockSignals(True); self.blk_list.clear()
@@ -789,6 +799,7 @@ class PDDashboard(QMainWindow):
         fm_u_path = item.text(13)
         fm_n_path = item.text(14)
         vslp_path = item.text(15)
+        log_path = item.text(12)
         
         fm_n_act = None
         if fm_n_path and fm_n_path != "N/A" and os.path.exists(fm_n_path):
@@ -801,6 +812,10 @@ class PDDashboard(QMainWindow):
         v_act = None
         if vslp_path and vslp_path != "N/A" and os.path.exists(vslp_path):
             v_act = m.addAction("Open VSLP Report")
+            
+        log_act = None
+        if log_path and log_path != "N/A" and os.path.exists(log_path):
+            log_act = m.addAction("Open Log File")
             
         m.addSeparator()
         c_act = m.addAction("Copy log path")
@@ -821,6 +836,8 @@ class PDDashboard(QMainWindow):
                 subprocess.Popen(['gvim', fm_u_path])
             elif res == v_act:
                 subprocess.Popen(['gvim', vslp_path])
+            elif log_act and res == log_act:
+                subprocess.Popen(['gvim', log_path])
             elif res == c_act:
                 QApplication.clipboard().setText(item.text(12))
             elif qor_act and res == qor_act:
