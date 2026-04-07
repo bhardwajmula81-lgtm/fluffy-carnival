@@ -25,6 +25,10 @@ BASE_WS_BE_DIR = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
 
 BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
 
+# Define the PNR tool directories to scan (space separated).
+# Examples: "fc", "innovus", or "fc innovus"
+PNR_TOOL_NAMES = "fc innovus"
+
 SUMMARY_SCRIPT = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
 FIREFOX_PATH = "/usr/bin/firefox"
 # =====================================================================
@@ -113,7 +117,10 @@ def parse_pnr_runtime_rpt(file_path):
                         if not first_ts: first_ts = ts_match
                         last_ts = ts_match
                         
-                        days, hours, mins, secs = map(int, time_matches[0]) 
+                        # Use the second time match (REALTIME) if available, fallback to first if only 1 exists
+                        target_match = time_matches[1] if len(time_matches) > 1 else time_matches[0]
+                        
+                        days, hours, mins, secs = map(int, target_match) 
                         total_hours = days * 24 + hours
                         final_time_str = f"{total_hours:02}h:{mins:02}m:{secs:02}s"
                         
@@ -179,7 +186,6 @@ class SettingsDialog(QDialog):
 # --- BACKGROUND WORKER THREADS ---
 
 class BatchSizeWorker(QThread):
-    """ Processes multiple folder sizes asynchronously in the background """
     size_calculated = pyqtSignal(str, str)
     
     def __init__(self, tasks):
@@ -243,6 +249,8 @@ class ScannerWorker(QThread):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
         out_data = {"releases": {}, "blocks": set(), "all_runs": []}
         tasks = []
+        
+        tools_to_scan = PNR_TOOL_NAMES.split()
 
         ws_bases = [BASE_WS_FE_DIR, BASE_WS_BE_DIR]
         for ws_base in ws_bases:
@@ -263,14 +271,15 @@ class ScannerWorker(QThread):
                 
                 for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
                     ent_name = os.path.basename(ent_path)
-                    if ws_base == BASE_WS_FE_DIR:
-                        for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
-                            tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
-                        
-                    be_patterns = ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]
-                    for pat in be_patterns:
-                        for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
-                            tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                    for tool in tools_to_scan:
+                        if ws_base == BASE_WS_FE_DIR:
+                            for rd in glob.glob(os.path.join(ent_path, tool, "*-FE")):
+                                tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
+                            
+                        be_patterns = ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]
+                        for pat in be_patterns:
+                            for rd in glob.glob(os.path.join(ent_path, tool, pat)):
+                                tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
@@ -278,11 +287,12 @@ class ScannerWorker(QThread):
                 if not os.path.isdir(ent_path): continue
                 for evt_dir in glob.glob(os.path.join(ent_path, "EVT*")):
                     phys_evt = os.path.basename(evt_dir) 
-                    for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
-                        tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
-                    be_runs = glob.glob(os.path.join(evt_dir, "fc", "*-BE")) + glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE"))
-                    for rd in be_runs:
-                        tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                    for tool in tools_to_scan:
+                        for rd in glob.glob(os.path.join(evt_dir, tool, "*", "*-FE")):
+                            tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
+                        be_runs = glob.glob(os.path.join(evt_dir, tool, "*-BE")) + glob.glob(os.path.join(evt_dir, tool, "*", "*-BE"))
+                        for rd in be_runs:
+                            tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
         total_tasks = len(tasks)
         completed_tasks = 0
@@ -453,7 +463,6 @@ class PDDashboard(QMainWindow):
         self.search.textChanged.connect(lambda: self.search_timer.start(300))
         top.addWidget(self.search)
         
-        # Tools Dropdown Button
         self.tools_btn = QPushButton("Tools")
         self.tools_menu = QMenu(self)
         
@@ -722,7 +731,6 @@ class PDDashboard(QMainWindow):
         return "|".join(parts)
 
     def refresh_view(self):
-        # Cancel running workers so they don't try to apply sizes to deleted items
         for w in self.size_workers:
             if hasattr(w, 'cancel'):
                 w.cancel()
