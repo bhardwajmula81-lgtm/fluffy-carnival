@@ -1,3 +1,59 @@
+# ---------------------------------------------------------
+# Step 0: Initialize Dashboard Tracking (Smart Refresh & No Cursor)
+# ---------------------------------------------------------
+setup_tracker:
+	@mkdir -p .run_status
+	@echo "In progress" > .run_status/synth.stat
+	@echo "Waiting" > .run_status/fm_upf.stat
+	@echo "Waiting" > .run_status/fm_non_upf.stat
+	@echo "Waiting" > .run_status/vslp.stat
+	@echo "Waiting" > .run_status/pre_sta.stat
+	@echo '#!/bin/bash' > tracker.sh
+	@echo '# Hide the cursor to prevent flickering' >> tracker.sh
+	@echo 'printf "\033[?25l"' >> tracker.sh
+	@echo '# Restore the cursor when the script exits or is killed' >> tracker.sh
+	@echo 'trap "printf \"\033[?25h\"; exit" INT TERM EXIT' >> tracker.sh
+	@echo 'prev_S1=""; prev_F1=""; prev_F2=""; prev_V1=""; prev_P1=""' >> tracker.sh
+	@echo 'clear' >> tracker.sh
+	@echo 'while true; do' >> tracker.sh
+	@echo '  S1=$$(cat .run_status/synth.stat 2>/dev/null)' >> tracker.sh
+	@echo '  F1=$$(cat .run_status/fm_upf.stat 2>/dev/null)' >> tracker.sh
+	@echo '  F2=$$(cat .run_status/fm_non_upf.stat 2>/dev/null)' >> tracker.sh
+	@echo '  V1=$$(cat .run_status/vslp.stat 2>/dev/null)' >> tracker.sh
+	@echo '  P1=$$(cat .run_status/pre_sta.stat 2>/dev/null)' >> tracker.sh
+	@echo '  # ONLY redraw the screen if one of the statuses has actually changed' >> tracker.sh
+	@echo '  if [[ "$$S1" != "$$prev_S1" || "$$F1" != "$$prev_F1" || "$$F2" != "$$prev_F2" || "$$V1" != "$$prev_V1" || "$$P1" != "$$prev_P1" ]]; then' >> tracker.sh
+	@echo '    printf "\033[1;1H"' >> tracker.sh
+	@echo '    echo "=========================================================================================="' >> tracker.sh
+	@echo '    echo "                                PARALLEL RUN STATUS TRACKER                               "' >> tracker.sh
+	@echo '    echo "=========================================================================================="' >> tracker.sh
+	@echo '    printf "%-16s | %-14s | %-14s | %-14s | %-14s\n" "SYNTHESIS" "FM UPF" "FM NON-UPF" "VSLP" "PRE-STA"' >> tracker.sh
+	@echo '    echo "-----------------|----------------|----------------|----------------|----------------"' >> tracker.sh
+	@echo '    printf "%-16s | %-14s | %-14s | %-14s | %-14s\n" "$$S1" "$$F1" "$$F2" "$$V1" "$$P1"' >> tracker.sh
+	@echo '    echo ""' >> tracker.sh
+	@echo '    echo "=========================================================================================="' >> tracker.sh
+	@echo '    echo "                                      RUN DIRECTORIES                                     "' >> tracker.sh
+	@echo '    echo "=========================================================================================="' >> tracker.sh
+	@echo '    printf "%-12s : %s\n" "SYNTHESIS" "$$(pwd)"' >> tracker.sh
+	@echo '    printf "%-12s : %s\n" "FM UPF" "$(FM_DIR1)"' >> tracker.sh
+	@echo '    printf "%-12s : %s\n" "FM NON-UPF" "$(FM_DIR2)"' >> tracker.sh
+	@echo '    printf "%-12s : %s\n" "VSLP" "$(VSLP_DIR)"' >> tracker.sh
+	@echo '    printf "%-12s : %s\n" "PRE-STA" "$(PRE_STA_DIR)"' >> tracker.sh
+	@echo '    # Update previous states' >> tracker.sh
+	@echo '    prev_S1="$$S1"; prev_F1="$$F1"; prev_F2="$$F2"; prev_V1="$$V1"; prev_P1="$$P1"' >> tracker.sh
+	@echo '  fi' >> tracker.sh
+	@echo '  if [[ "$$S1" == "Completed" && "$$F1" == "Completed" && "$$F2" == "Completed" && "$$V1" == "Completed" && "$$P1" == "Completed" ]]; then' >> tracker.sh
+	@echo '    echo -e "\nAll runs completed successfully! Window will close in 10s..."; sleep 10; exit 0' >> tracker.sh
+	@echo '  fi' >> tracker.sh
+	@echo '  sleep 2' >> tracker.sh
+	@echo 'done' >> tracker.sh
+	@chmod +x tracker.sh
+	@xterm -T "Job Tracker: $(DESIGN)" -geometry 120x20 -e ./tracker.sh 2>/dev/null &
+
+
+
+
+
 #SHELL = /bin/sh
 DESIGN = AUTO_DETECT
 WAIT_TIME = 30
