@@ -60,13 +60,22 @@ setup_tracker:
 	@echo '  V1=$$(cat .run_status/vslp.stat 2>/dev/null)' >> tracker.sh
 	@echo '  P1=$$(cat .run_status/pre_sta.stat 2>/dev/null)' >> tracker.sh
 	@echo '  printf "%-16s | %-14s | %-14s | %-14s | %-14s\n" "$$S1" "$$F1" "$$F2" "$$V1" "$$P1"' >> tracker.sh
+	@echo '  echo ""' >> tracker.sh
+	@echo '  echo "=========================================================================================="' >> tracker.sh
+	@echo '  echo "                                      RUN DIRECTORIES                                     "' >> tracker.sh
+	@echo '  echo "=========================================================================================="' >> tracker.sh
+	@echo '  printf "%-12s : %s\n" "SYNTHESIS" "$$(pwd)"' >> tracker.sh
+	@echo '  printf "%-12s : %s\n" "FM UPF" "$(FM_DIR1)"' >> tracker.sh
+	@echo '  printf "%-12s : %s\n" "FM NON-UPF" "$(FM_DIR2)"' >> tracker.sh
+	@echo '  printf "%-12s : %s\n" "VSLP" "$(VSLP_DIR)"' >> tracker.sh
+	@echo '  printf "%-12s : %s\n" "PRE-STA" "$(PRE_STA_DIR)"' >> tracker.sh
 	@echo '  if [[ "$$S1" == "Completed" && "$$F1" == "Completed" && "$$F2" == "Completed" && "$$V1" == "Completed" && "$$P1" == "Completed" ]]; then' >> tracker.sh
 	@echo '    echo -e "\nAll runs completed successfully! Window will close in 10s..."; sleep 10; exit 0' >> tracker.sh
 	@echo '  fi' >> tracker.sh
 	@echo '  sleep 2' >> tracker.sh
 	@echo 'done' >> tracker.sh
 	@chmod +x tracker.sh
-	@xterm -T "Job Tracker: $(DESIGN)" -geometry 100x12 -e ./tracker.sh 2>/dev/null &
+	@xterm -T "Job Tracker: $(DESIGN)" -geometry 120x20 -e ./tracker.sh 2>/dev/null &
 
 # ---------------------------------------------------------
 # Step 1-3: Linear execution up to Configuration
