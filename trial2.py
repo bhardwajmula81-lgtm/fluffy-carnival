@@ -143,50 +143,84 @@ endif
  FM_DIR2 	       := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/fm/r2n
  IMP_PRJCONFIG		:= $(IMPL_DIR)/${PROJECT_NAME}/PRJENV/prj.config
  VSLP_DIR	       := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/vslp/pre
+ PRE_STA_DIR	       := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/sta/pre
+ PATH_FROM_EXPORT_LOG  := $(shell cat export.log | grep "netlist" | awk '{print $$NF}')
+ PRE_NET_VER	       := $(shell echo $(PATH_FROM_EXPORT_LOG) | awk -F'/' '{print $$7}')
+ PRE_REVISION	       := $(shell echo $(PATH_FROM_EXPORT_LOG) | awk -F'/' '{print $$9}')
+ CLEAN_SCRIPT	       := :clean.sh
+ PRE_STA_RUN_FILE      := :pre.sh
+ EXPORT_STA_RUN_FILE   := :export.sh
 
 
 
 # Default/first goal
-  all: wait_for_pass export_fc subs update_config run_fm export_fm run_vslp export_vslp
-  wait_for_pass:
-	make compile_opt
+ all: wait_for_pass export_fc update_config run_fm run_vslp run_pre_sta export_pre_sta
+ run_fm: fm_upf fm_non_upf
+ 
+ wait_for_pass:
+	make clean && make compile_opt
 	@echo "Waiting for compile_opt.pass file ..."
 	@while [ ! -f pass/compile_opt.pass ] || [ ! -f 0__read_floorplan.compile_opt.log ] ; do \
 	sleep 10; \
 	done
-	@echo "compile_opt.pass and 0__read_floorplan.compile_opt.log found"
+	@echo "compile_opt.pass and 0__read_floorplan.compilupdate_confige_opt.log found"
 
  export_fc: 
 	make export
 
- subs: export_fc
-	PATH_FROM_LOG := $(shell cat export.log | grep "netlist" | awk '{print $$NF}') 
-	PRE_NET_VER := $(shell echo $(PATH_FROM_LOG) | awk -F'/' '{print $$7}') 
-	PRE_REVISION := $(shell echo $(PATH_FROM_LOG) | awk -F'/' '{print $$9}') 
-
- update_config: subs
+ update_config: export_fc
 	@echo "Extracted PRE_$(DESIGN)_NET_VER: $(PRE_NET_VER)"
 	@echo "Extracted PRE_$(DESIGN)_REVISION: $(PRE_REVISION)"
 	sed -i "s/^PRE_$(DESIGN)_NET_VER.*/PRE_$(DESIGN)_NET_VER                    $(PRE_NET_VER)/" $(IMPL_DIR)/${PROJECT_NAME}/PRJENV/prj.config
 	sed -i "s/^PRE_$(DESIGN)_REVISION.*/PRE_$(DESIGN)_REVISION                    $(PRE_REVISION)/" $(IMPL_DIR)/${PROJECT_NAME}/PRJENV/prj.config
- run_fm: update_config
-	@echo "Starting UPF and NONUPF FM Runs for : $(PATH_FROM_LOG) "
-	#source $(PROJECT_DIR)/PRJENV/prj.cshrc
-	cd $(FM_DIR1) && make
-	cd $(FM_DIR2) && make
 
- export_fm: run_fm
-	@echo "Export UPF and NONUPF FM Runs for : $(PATH_FROM_LOG) "
-	cd $(FM_DIR1) && make export
-	cd $(FM_DIR2) && make export
+ fm_upf: update_config
+	@echo "Starting UPF FM Run for : $(PATH_FROM_EXPORT_LOG) "
+	@cd $(FM_DIR1) && make clean
+	@cd $(FM_DIR1) && make
+	@echo "Waiting for any *.final.rpt in reports..."
+	@while [ -z "$$(ls reports/*.final.rpt 2>/dev/null)" ]; do \
+		sleep 5; \
+		echo "Still waiting for FM UPF run to be completed..."; \
+	done
+	@echo "Run is completed"
+	make export
+
+ fm_non_upf: update_config
+	@echo "Starting NON-UPF FM Run for : $(PATH_FROM_EXPORT_LOG) "
+	@cd $(FM_DIR2) && make clean
+	@cd $(FM_DIR2) && make
+	@echo "Waiting for any *.final.rpt in reports..."
+	@while [ -z "$$(ls reports/*.final.rpt 2>/dev/null)" ]; do \
+		sleep 5; \
+		echo "Still waiting for FM NON-UPF run  to be completed..."; \
+	done
+	@echo "Run is completed"
+	make export
 
  run_vslp: update_config
-	@echo "Starting VSLP run for : $(PATH_FROM_LOG)"
+	@echo "Starting VSLP run for : $(PATH_FROM_EXPORT_LOG)"
+	cd $(VSLP_DIR) && make clean
 	cd $(VSLP_DIR) && make
-
- export_vslp: run_vslp
-	@echo "Export VSLP run for : $(PATH_FROM_LOG)"
+	@while [ -z "$$(ls vslp.done 2>/dev/null)" ]; do \
+		sleep 5; \
+		echo "Still waiting for VSLP run  to be completed..."; \
+	done
+	@echo "Export VSLP run for : $(PATH_FROM_EXPORT_LOG)"
 	cd $(VSLP_DIR) && make export
 
- .PHONY: all wait_for_pass export_fc subs update_config run_fm export_fm run_vslp export_vslp
+ run_pre_sta: update_config
+	@echo "Starting PRE-STA Run for : $(PATH_FROM_EXPORT_LOG) "
+	@cd $(PRE_STA_DIR) &&  ./$(CLEAN_SCRIPT); \
+	./$(PRE_STA_RUN_FILE)
+	
+ export_pre_sta: run_pre_sta
+	@echo "Exporting PRE-STA Run for : $(PATH_FROM_EXPORT_LOG) "
+	@cd $(PRE_STA_DIR) &&  ./$(EXPORT_STA_RUN_FILE)
+
+  
+ .PHONY: all wait_for_pass export_fc update_config run_fm run_vslp run_pre_sta export_pre_sta
   default : all
+
+
+
