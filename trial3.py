@@ -2,7 +2,7 @@
 DESIGN = AUTO_DETECT
 WAIT_TIME = 30
 
-# Force Make to run independent targets in parallel
+# Request parallel execution for targets within this makefile
 MAKEFLAGS += -j
 
 ifeq ($(DESIGN),AUTO_DETECT)
@@ -25,10 +25,12 @@ IMP_PRJCONFIG         := $(IMPL_DIR)/${PROJECT_NAME}/PRJENV/prj.config
 VSLP_DIR              := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/vslp/pre
 PRE_STA_DIR           := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/sta/pre
 
+# Deferred Evaluation '=' ensures these only execute AFTER export.log is created
 PATH_FROM_EXPORT_LOG  = $(shell cat export.log | grep "netlist" | awk '{print $$NF}')
 PRE_NET_VER           = $(shell echo $(PATH_FROM_EXPORT_LOG) | awk -F'/' '{print $$7}')
 PRE_REVISION          = $(shell echo $(PATH_FROM_EXPORT_LOG) | awk -F'/' '{print $$9}')
 
+# Maintained colons as requested
 CLEAN_SCRIPT          := :clean.sh
 PRE_STA_RUN_FILE      := :pre.sh
 EXPORT_STA_RUN_FILE   := :export.sh
@@ -37,7 +39,7 @@ EXPORT_STA_RUN_FILE   := :export.sh
 all: run_fm run_vslp export_pre_sta
 
 # ---------------------------------------------------------
-# Step 0: Initialize Dashboard Tracking
+# Step 0: Initialize Dashboard Tracking (Flicker-Free)
 # ---------------------------------------------------------
 setup_tracker:
 	@mkdir -p .run_status
@@ -47,8 +49,9 @@ setup_tracker:
 	@echo "Waiting" > .run_status/vslp.stat
 	@echo "Waiting" > .run_status/pre_sta.stat
 	@echo '#!/bin/bash' > tracker.sh
+	@echo 'clear' >> tracker.sh
 	@echo 'while true; do' >> tracker.sh
-	@echo '  clear' >> tracker.sh
+	@echo '  printf "\033[1;1H"' >> tracker.sh
 	@echo '  echo "=========================================================================================="' >> tracker.sh
 	@echo '  echo "                                PARALLEL RUN STATUS TRACKER                               "' >> tracker.sh
 	@echo '  echo "=========================================================================================="' >> tracker.sh
@@ -80,8 +83,17 @@ setup_tracker:
 # ---------------------------------------------------------
 # Step 1-3: Linear execution up to Configuration
 # ---------------------------------------------------------
-wait_for_pass: setup_tracker
-	make clean && make compile_opt
+wait_for_pass:
+	@echo "Cleaning directory..."
+	make clean -j1
+	
+	@echo "Setting up dashboard..."
+	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) setup_tracker
+	
+	@echo "Starting compilation..."
+	# IMPORTANT: Change "prj.sh" if your env script is different.
+	source $(PROJECT_DIR)/PRJENV/prj.sh && make compile_opt -j1
+	
 	@echo "Waiting for compile_opt.pass file ..."
 	@while [ ! -f pass/compile_opt.pass ] || [ ! -f 0__read_floorplan.compile_opt.log ] ; do \
 		sleep 10; \
@@ -90,7 +102,13 @@ wait_for_pass: setup_tracker
 	@echo "Completed" > .run_status/synth.stat
 
 export_fc: wait_for_pass
-	make export
+	@echo "Starting export..."
+	make export -j1
+	@echo "Waiting for export.log to show '# INFO : Exporting Finished'..."
+	@while [ ! -f export.log ] || ! grep -q "# INFO : Exporting Finished" export.log; do \
+		sleep 5; \
+	done
+	@echo "Export finished confirmed!"
 
 update_config: export_fc
 	@echo "Extracted PRE_$(DESIGN)_NET_VER: $(PRE_NET_VER)"
@@ -103,21 +121,21 @@ update_config: export_fc
 fm_upf: update_config
 	@echo "In progress" > .run_status/fm_upf.stat
 	@echo "Starting UPF FM Run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(FM_DIR1) && make clean && make
+	@cd $(FM_DIR1) && make clean -j1 && make
 	@while [ -z "$$(ls $(FM_DIR1)/reports/*.final.rpt 2>/dev/null)" ]; do \
 		sleep 5; \
 	done
-	@cd $(FM_DIR1) && make export
+	@cd $(FM_DIR1) && make export -j1
 	@echo "Completed" > .run_status/fm_upf.stat
 
 fm_non_upf: update_config
 	@echo "In progress" > .run_status/fm_non_upf.stat
 	@echo "Starting NON-UPF FM Run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(FM_DIR2) && make clean && make
+	@cd $(FM_DIR2) && make clean -j1 && make
 	@while [ -z "$$(ls $(FM_DIR2)/reports/*.final.rpt 2>/dev/null)" ]; do \
 		sleep 5; \
 	done
-	@cd $(FM_DIR2) && make export
+	@cd $(FM_DIR2) && make export -j1
 	@echo "Completed" > .run_status/fm_non_upf.stat
 
 run_fm: fm_upf fm_non_upf
@@ -125,11 +143,11 @@ run_fm: fm_upf fm_non_upf
 run_vslp: update_config
 	@echo "In progress" > .run_status/vslp.stat
 	@echo "Starting VSLP run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(VSLP_DIR) && make clean && make
+	@cd $(VSLP_DIR) && make clean -j1 && make
 	@while [ ! -f $(VSLP_DIR)/vslp.done ]; do \
 		sleep 5; \
 	done
-	@cd $(VSLP_DIR) && make export
+	@cd $(VSLP_DIR) && make export -j1
 	@echo "Completed" > .run_status/vslp.stat
 
 run_pre_sta: update_config
