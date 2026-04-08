@@ -1,220 +1,97 @@
-# ---------------------------------------------------------
-# Step 0: Initialize Dashboard Tracking (Smart Refresh & No Cursor)
-# ---------------------------------------------------------
-setup_tracker:
-	@mkdir -p .run_status
-	@echo "In progress" > .run_status/synth.stat
-	@echo "Waiting" > .run_status/fm_upf.stat
-	@echo "Waiting" > .run_status/fm_non_upf.stat
-	@echo "Waiting" > .run_status/vslp.stat
-	@echo "Waiting" > .run_status/pre_sta.stat
-	@echo '#!/bin/bash' > tracker.sh
-	@echo '# Hide the cursor to prevent flickering' >> tracker.sh
-	@echo 'printf "\033[?25l"' >> tracker.sh
-	@echo '# Restore the cursor when the script exits or is killed' >> tracker.sh
-	@echo 'trap "printf \"\033[?25h\"; exit" INT TERM EXIT' >> tracker.sh
-	@echo 'prev_S1=""; prev_F1=""; prev_F2=""; prev_V1=""; prev_P1=""' >> tracker.sh
-	@echo 'clear' >> tracker.sh
-	@echo 'while true; do' >> tracker.sh
-	@echo '  S1=$$(cat .run_status/synth.stat 2>/dev/null)' >> tracker.sh
-	@echo '  F1=$$(cat .run_status/fm_upf.stat 2>/dev/null)' >> tracker.sh
-	@echo '  F2=$$(cat .run_status/fm_non_upf.stat 2>/dev/null)' >> tracker.sh
-	@echo '  V1=$$(cat .run_status/vslp.stat 2>/dev/null)' >> tracker.sh
-	@echo '  P1=$$(cat .run_status/pre_sta.stat 2>/dev/null)' >> tracker.sh
-	@echo '  # ONLY redraw the screen if one of the statuses has actually changed' >> tracker.sh
-	@echo '  if [[ "$$S1" != "$$prev_S1" || "$$F1" != "$$prev_F1" || "$$F2" != "$$prev_F2" || "$$V1" != "$$prev_V1" || "$$P1" != "$$prev_P1" ]]; then' >> tracker.sh
-	@echo '    printf "\033[1;1H"' >> tracker.sh
-	@echo '    echo "=========================================================================================="' >> tracker.sh
-	@echo '    echo "                                PARALLEL RUN STATUS TRACKER                               "' >> tracker.sh
-	@echo '    echo "=========================================================================================="' >> tracker.sh
-	@echo '    printf "%-16s | %-14s | %-14s | %-14s | %-14s\n" "SYNTHESIS" "FM UPF" "FM NON-UPF" "VSLP" "PRE-STA"' >> tracker.sh
-	@echo '    echo "-----------------|----------------|----------------|----------------|----------------"' >> tracker.sh
-	@echo '    printf "%-16s | %-14s | %-14s | %-14s | %-14s\n" "$$S1" "$$F1" "$$F2" "$$V1" "$$P1"' >> tracker.sh
-	@echo '    echo ""' >> tracker.sh
-	@echo '    echo "=========================================================================================="' >> tracker.sh
-	@echo '    echo "                                      RUN DIRECTORIES                                     "' >> tracker.sh
-	@echo '    echo "=========================================================================================="' >> tracker.sh
-	@echo '    printf "%-12s : %s\n" "SYNTHESIS" "$$(pwd)"' >> tracker.sh
-	@echo '    printf "%-12s : %s\n" "FM UPF" "$(FM_DIR1)"' >> tracker.sh
-	@echo '    printf "%-12s : %s\n" "FM NON-UPF" "$(FM_DIR2)"' >> tracker.sh
-	@echo '    printf "%-12s : %s\n" "VSLP" "$(VSLP_DIR)"' >> tracker.sh
-	@echo '    printf "%-12s : %s\n" "PRE-STA" "$(PRE_STA_DIR)"' >> tracker.sh
-	@echo '    # Update previous states' >> tracker.sh
-	@echo '    prev_S1="$$S1"; prev_F1="$$F1"; prev_F2="$$F2"; prev_V1="$$V1"; prev_P1="$$P1"' >> tracker.sh
-	@echo '  fi' >> tracker.sh
-	@echo '  if [[ "$$S1" == "Completed" && "$$F1" == "Completed" && "$$F2" == "Completed" && "$$V1" == "Completed" && "$$P1" == "Completed" ]]; then' >> tracker.sh
-	@echo '    echo -e "\nAll runs completed successfully! Window will close in 10s..."; sleep 10; exit 0' >> tracker.sh
-	@echo '  fi' >> tracker.sh
-	@echo '  sleep 2' >> tracker.sh
-	@echo 'done' >> tracker.sh
-	@chmod +x tracker.sh
-	@xterm -T "Job Tracker: $(DESIGN)" -geometry 120x20 -e ./tracker.sh 2>/dev/null &
+#!/usr/bin/python
+import subprocess
+import os
+import re
+import sys
 
+def read_config(cfg):
+    cfg_data = {}
 
+    with open(cfg) as f:
+        for line in f:
+            if re.search(r"^\s*#", line) or not line.strip():
+                continue
+            
+            if re.search(r"=", line):
+                ldata = line.split("=")
+                if not ldata or len(ldata) < 2:
+                    print(f"\t[Error]: Could not extract key-value pair from line: {line}")
+                    continue
 
+                cfg_data[ldata[0].strip()] = ldata[1].strip()
+    return cfg_data
 
+def run_option(run_type):
+    return 1 if run_type == "synth" else 2
 
-#SHELL = /bin/sh
-DESIGN = AUTO_DETECT
-WAIT_TIME = 30
+# Helper function to determine the PASS_NAME before we generate anything
+def get_pass_name(blk, cfg):
+    default_pass = cfg.get("DEFAULT_PASS_NAME", "").strip()
+    blk_pass     = cfg.get(f"{blk}_PASS_NAME", "").strip()
+    return blk_pass if blk_pass else default_pass
 
-# Request parallel execution for targets within this makefile
-MAKEFLAGS += -j
+def gen_blk_makefile(blk, run_dir, cfg):
+    makefile_path = os.path.join(run_dir, f"makefile.{blk}")
+    pass_name = get_pass_name(blk, cfg)
+    
+    # -------------------------
+    with open(makefile_path, 'w') as f:
+        f.write("\nMPNR_CMD=$(COMMON_IMPL_DIR)/common_tcl/mpnr.tcl\n")
+        f.write(f"PASS_NAME={pass_name}\n")
+        f.write(f"RUN_TYPE={cfg.get('RUN_TYPE')}\n")
+        f.write(f"RUN_OPTION={run_option(cfg.get('RUN_TYPE'))}\n")
+        f.write(f"RUN_DIR={run_dir}\n")
+        f.write(f"\n\nrun_mpnr:\n")
+        f.write(f'\t@cd $(RUN_DIR) && echo -e "$(RUN_OPTION)\\n$(PASS_NAME)\\n\\n" | $(MPNR_CMD)\n')
+        f.write(f"\tcp -rf /user/s5k2p5sx.fe1/s5k2p5sp/WS/mohit.bhar_S5K2P5SP_ws_22/IMPLEMENTATION/S5K2P5SP/SOC/BLK_CMU/fc/python_script/makefile.flow $(RUN_DIR)/$(PASS_NAME)-FE/\n")
+        f.write(f"\tcd $(RUN_DIR)/$(PASS_NAME)-FE && make -f makefile.flow\n")
+        f.write(f"\n\ndefault:\n")
+        f.write(f"\trun_mpnr\n")
 
-ifeq ($(DESIGN),AUTO_DETECT)
-   DESIGN     := $(shell /bin/pwd | sed -e "s/.*\/SOC\///" | sed -e "s/\/.*//")
-endif
+    return makefile_path
 
-HPDF_BLK              := $(shell projconf.pl -get HPDF_BLK)
-TEST_BLK              := $(shell projconf.pl -get TEST_BLK)
-MODEM_HPDF_BLK_SYN    := $(shell projconf.pl -get MODEM_HPDF_BLK_SYN)
-BIG_BLK               := $(shell projconf.pl -get BIG_BLK)
-HPDF_IP               := $(shell projconf.pl -get HPDF_IP)
-TOP_DESIGN            := $(shell projconf.pl -get TOP_DESIGN)
-PROJECT_NAME          := $(shell projconf.pl -get PROJECT_NAME)
-PROJECT_NICKNAME      := $(shell projconf.pl -get PROJECT_NICKNAME)
-NDM_DIR               := $(shell projconf.pl -get NDM_DIR)
-PROJECT_DIR           := $(shell projconf.pl -get PROJECT_DIR)
-FM_DIR1               := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/fm/r2upf
-FM_DIR2               := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/fm/r2n
-IMP_PRJCONFIG         := $(IMPL_DIR)/${PROJECT_NAME}/PRJENV/prj.config
-VSLP_DIR              := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/vslp/pre
-PRE_STA_DIR           := $(IMPL_DIR)/${PROJECT_NAME}/SOC/${DESIGN}/sta/pre
+def command(terminal_cmd: str):
+    r = subprocess.run(f"{terminal_cmd}", shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    return r.stdout.decode().strip()
 
-# Deferred Evaluation '=' ensures these only execute AFTER export.log is created
-PATH_FROM_EXPORT_LOG  = $(shell cat export.log | grep "netlist" | awk '{print $$NF}')
-PRE_NET_VER           = $(shell echo $(PATH_FROM_EXPORT_LOG) | awk -F'/' '{print $$7}')
-PRE_REVISION          = $(shell echo $(PATH_FROM_EXPORT_LOG) | awk -F'/' '{print $$9}')
+def run_dir_of_blk(blk_name, cfg):
+    ws_name = os.getenv("WorkSpace")
+    prj_name = command("projconf.pl -get PROJECT_NAME")
+    run_path = os.path.join(ws_name, "IMPLEMENTATION", prj_name, "SOC", blk_name, cfg["TOOL_TYPE"])
+    return run_path
 
-# Maintained colons as requested
-CLEAN_SCRIPT          := :clean.sh
-PRE_STA_RUN_FILE      := :pre.sh
-EXPORT_STA_RUN_FILE   := :export.sh
+cfg = read_config("/user/s5k2p5sx.fe1/s5k2p5sp/WS/mohit.bhar_S5K2P5SP_ws_22/IMPLEMENTATION/S5K2P5SP/SOC/BLK_CMU/fc/python_script_edit/config.cfg")
+hpdf_blk = sys.argv[2]
+print(f"Target Blocks: {hpdf_blk}")
 
-# The 'all' target endpoints
-all: run_fm run_vslp export_pre_sta
+mf_lst = []
 
-# ---------------------------------------------------------
-# Step 0: Initialize Dashboard Tracking (Flicker-Free)
-# ---------------------------------------------------------
-setup_tracker:
-	@mkdir -p .run_status
-	@echo "In progress" > .run_status/synth.stat
-	@echo "Waiting" > .run_status/fm_upf.stat
-	@echo "Waiting" > .run_status/fm_non_upf.stat
-	@echo "Waiting" > .run_status/vslp.stat
-	@echo "Waiting" > .run_status/pre_sta.stat
-	@echo '#!/bin/bash' > tracker.sh
-	@echo 'clear' >> tracker.sh
-	@echo 'while true; do' >> tracker.sh
-	@echo '  printf "\033[1;1H"' >> tracker.sh
-	@echo '  echo "=========================================================================================="' >> tracker.sh
-	@echo '  echo "                                PARALLEL RUN STATUS TRACKER                               "' >> tracker.sh
-	@echo '  echo "=========================================================================================="' >> tracker.sh
-	@echo '  printf "%-16s | %-14s | %-14s | %-14s | %-14s\n" "SYNTHESIS" "FM UPF" "FM NON-UPF" "VSLP" "PRE-STA"' >> tracker.sh
-	@echo '  echo "-----------------|----------------|----------------|----------------|----------------"' >> tracker.sh
-	@echo '  S1=$$(cat .run_status/synth.stat 2>/dev/null)' >> tracker.sh
-	@echo '  F1=$$(cat .run_status/fm_upf.stat 2>/dev/null)' >> tracker.sh
-	@echo '  F2=$$(cat .run_status/fm_non_upf.stat 2>/dev/null)' >> tracker.sh
-	@echo '  V1=$$(cat .run_status/vslp.stat 2>/dev/null)' >> tracker.sh
-	@echo '  P1=$$(cat .run_status/pre_sta.stat 2>/dev/null)' >> tracker.sh
-	@echo '  printf "%-16s | %-14s | %-14s | %-14s | %-14s\n" "$$S1" "$$F1" "$$F2" "$$V1" "$$P1"' >> tracker.sh
-	@echo '  echo ""' >> tracker.sh
-	@echo '  echo "=========================================================================================="' >> tracker.sh
-	@echo '  echo "                                      RUN DIRECTORIES                                     "' >> tracker.sh
-	@echo '  echo "=========================================================================================="' >> tracker.sh
-	@echo '  printf "%-12s : %s\n" "SYNTHESIS" "$$(pwd)"' >> tracker.sh
-	@echo '  printf "%-12s : %s\n" "FM UPF" "$(FM_DIR1)"' >> tracker.sh
-	@echo '  printf "%-12s : %s\n" "FM NON-UPF" "$(FM_DIR2)"' >> tracker.sh
-	@echo '  printf "%-12s : %s\n" "VSLP" "$(VSLP_DIR)"' >> tracker.sh
-	@echo '  printf "%-12s : %s\n" "PRE-STA" "$(PRE_STA_DIR)"' >> tracker.sh
-	@echo '  if [[ "$$S1" == "Completed" && "$$F1" == "Completed" && "$$F2" == "Completed" && "$$V1" == "Completed" && "$$P1" == "Completed" ]]; then' >> tracker.sh
-	@echo '    echo -e "\nAll runs completed successfully! Window will close in 10s..."; sleep 10; exit 0' >> tracker.sh
-	@echo '  fi' >> tracker.sh
-	@echo '  sleep 2' >> tracker.sh
-	@echo 'done' >> tracker.sh
-	@chmod +x tracker.sh
-	@xterm -T "Job Tracker: $(DESIGN)" -geometry 120x20 -e ./tracker.sh 2>/dev/null &
+for blk in hpdf_blk.split():
+    run_dir = run_dir_of_blk(blk, cfg)
 
-# ---------------------------------------------------------
-# Step 1-3: Linear execution up to Configuration
-# ---------------------------------------------------------
-wait_for_pass:
-	@echo "Cleaning directory..."
-	make clean -j1
-	
-	@echo "Setting up dashboard..."
-	$(MAKE) -f $(firstword $(MAKEFILE_LIST)) setup_tracker
-	
-	@echo "Starting compilation..."
-	# IMPORTANT: Change "prj.sh" if your env script is different.
-	source $(PROJECT_DIR)/PRJENV/prj.sh && make compile_opt -j1
-	
-	@echo "Waiting for compile_opt.pass file ..."
-	@while [ ! -f pass/compile_opt.pass ] || [ ! -f 0__read_floorplan.compile_opt.log ] ; do \
-		sleep 10; \
-	done
-	@echo "compile_opt.pass and 0__read_floorplan.compile_opt.log found"
-	@echo "Completed" > .run_status/synth.stat
+    if not os.path.exists(run_dir):
+       print(f"\t[Warning]: Run directory does not exist for {blk}. Skipping...")
+       continue
+    
+    # Check if the PASS_NAME-FE directory already exists
+    pass_name = get_pass_name(blk, cfg)
+    fe_dir = os.path.join(run_dir, f"{pass_name}-FE")
+    
+    if os.path.exists(fe_dir):
+        print(f"\t[WARNING]: Tag directory '{pass_name}-FE' already exists for block '{blk}'. Skipping this block to prevent overwrite.")
+        continue
+    
+    # If it doesn't exist, safely generate the makefile and add to run list
+    mk = gen_blk_makefile(blk, run_dir , cfg)
+    mf_lst.append(mk)
 
-export_fc: wait_for_pass
-	@echo "Starting export..."
-	make export -j1
-	@echo "Waiting for export.log to show '# INFO : Exporting Finished'..."
-	@while [ ! -f export.log ] || ! grep -q "# INFO : Exporting Finished" export.log; do \
-		sleep 5; \
-	done
-	@echo "Export finished confirmed!"
-
-update_config: export_fc
-	@echo "Extracted PRE_$(DESIGN)_NET_VER: $(PRE_NET_VER)"
-	@echo "Extracted PRE_$(DESIGN)_REVISION: $(PRE_REVISION)"
-	@flock $(IMP_PRJCONFIG) -c 'sed -i "s/^PRE_$(DESIGN)_NET_VER.*/PRE_$(DESIGN)_NET_VER                    $(PRE_NET_VER)/" $(IMP_PRJCONFIG) && sed -i "s/^PRE_$(DESIGN)_REVISION.*/PRE_$(DESIGN)_REVISION                    $(PRE_REVISION)/" $(IMP_PRJCONFIG)'
-
-# ---------------------------------------------------------
-# Step 4: Parallel Branching with Status Updates
-# ---------------------------------------------------------
-fm_upf: update_config
-	@echo "In progress" > .run_status/fm_upf.stat
-	@echo "Starting UPF FM Run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(FM_DIR1) && make clean -j1 && make
-	@while [ -z "$$(ls $(FM_DIR1)/reports/*.final.rpt 2>/dev/null)" ]; do \
-		sleep 5; \
-	done
-	@cd $(FM_DIR1) && make export -j1
-	@echo "Completed" > .run_status/fm_upf.stat
-
-fm_non_upf: update_config
-	@echo "In progress" > .run_status/fm_non_upf.stat
-	@echo "Starting NON-UPF FM Run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(FM_DIR2) && make clean -j1 && make
-	@while [ -z "$$(ls $(FM_DIR2)/reports/*.final.rpt 2>/dev/null)" ]; do \
-		sleep 5; \
-	done
-	@cd $(FM_DIR2) && make export -j1
-	@echo "Completed" > .run_status/fm_non_upf.stat
-
-run_fm: fm_upf fm_non_upf
-
-run_vslp: update_config
-	@echo "In progress" > .run_status/vslp.stat
-	@echo "Starting VSLP run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(VSLP_DIR) && make clean -j1 && make
-	@while [ ! -f $(VSLP_DIR)/vslp.done ]; do \
-		sleep 5; \
-	done
-	@cd $(VSLP_DIR) && make export -j1
-	@echo "Completed" > .run_status/vslp.stat
-
-run_pre_sta: update_config
-	@echo "In progress" > .run_status/pre_sta.stat
-	@echo "Starting PRE-STA Run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(PRE_STA_DIR) && ./$(CLEAN_SCRIPT) && ./$(PRE_STA_RUN_FILE)
-
-export_pre_sta: run_pre_sta
-	@echo "Exporting PRE-STA Run for : $(PATH_FROM_EXPORT_LOG)"
-	@cd $(PRE_STA_DIR) && ./$(EXPORT_STA_RUN_FILE)
-	@echo "Completed" > .run_status/pre_sta.stat
-
-.PHONY: all setup_tracker wait_for_pass export_fc update_config run_fm fm_upf fm_non_upf run_vslp run_pre_sta export_pre_sta
-default: all
+# Write the shell script
+with open("run.sh", "w") as f:
+    if not mf_lst:
+        f.write("echo 'No new blocks to run. All requested tags already exist.'\n")
+    else:
+        for l in mf_lst:
+            # Added the -j flag here so they actually trigger the parallel flow!
+            f.write(f"make -j -f {l} &\n")
+        f.write("wait\n")
+        f.write("echo 'All block executions have finished.'\n")
