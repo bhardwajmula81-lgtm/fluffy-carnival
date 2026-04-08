@@ -95,3 +95,4 @@ with open("run.sh", "w") as f:
             f.write(f"make -j -f {l} &\n")
         f.write("wait\n")
         f.write("echo 'All block executions have finished.'\n")
+
