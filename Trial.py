@@ -689,15 +689,7 @@ class PDDashboard(QMainWindow):
         p.setText(0, text)
         p.setExpanded(True)
         
-        is_dark = self.is_dark_mode
-        if node_type == "BLOCK" or node_type == "IGNORED_ROOT":
-            p.setBackground(0, QColor("#333333") if is_dark else QColor("#d9d9d9"))
-            font = p.font(0); font.setBold(True); p.setFont(0, font)
-        elif node_type == "RTL":
-            p.setBackground(0, QColor("#444444") if is_dark else QColor("#e8e8e8"))
-            font = p.font(0); font.setBold(True); p.setFont(0, font)
-        elif node_type == "OTHER":
-            p.setBackground(0, QColor("#3c3c3c") if is_dark else QColor("#e0e0e0"))
+        if node_type == "OTHER":
             p.setExpanded(False)
             
         return p
@@ -707,7 +699,7 @@ class PDDashboard(QMainWindow):
         child.setFlags(child.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         child.setCheckState(0, Qt.Unchecked)
         
-        child.setText(0, " " + run["r_name"])
+        child.setText(0, run["r_name"])
         child.setText(1, run["rtl"]) 
         child.setText(2, run["source"]) 
         
@@ -772,7 +764,7 @@ class PDDashboard(QMainWindow):
                                     stage_status = line.strip()
                     except: pass
             
-            st_item.setText(0, "    " + stage["name"])
+            st_item.setText(0, stage["name"])
             st_item.setText(2, be_run["source"])
             st_item.setText(4, stage_status) 
             st_item.setText(5, "-") 
@@ -884,10 +876,15 @@ class PDDashboard(QMainWindow):
         # Build Main Tree
         for fe_run in fe_runs:
             blk_name = fe_run["block"]
-            if not blk_name.startswith("BLK_"): blk_name = "BLK_" + blk_name
             
-            block_node = self._get_node(root, " " + blk_name, "BLOCK")
-            rtl_node = self._get_node(block_node, " " + fe_run["rtl"], "RTL")
+            base_rtl = re.sub(r'_syn\d+$', '', fe_run["rtl"])
+            if sel_rtl == "[ SHOW ALL ]":
+                display_rtl = base_rtl
+            else:
+                display_rtl = fe_run["rtl"]
+                
+            block_node = self._get_node(root, blk_name, "BLOCK")
+            rtl_node = self._get_node(block_node, display_rtl, "RTL")
             
             fe_item = self._create_run_item(rtl_node, fe_run)
             fe_base = fe_run["r_name"].replace("-FE", "")
@@ -901,24 +898,34 @@ class PDDashboard(QMainWindow):
         for be_run in be_runs:
             if id(be_run) not in matched_be_ids:
                 blk_name = be_run["block"]
-                if not blk_name.startswith("BLK_"): blk_name = "BLK_" + blk_name
                 
-                block_node = self._get_node(root, " " + blk_name, "BLOCK")
-                rtl_node = self._get_node(block_node, " " + be_run["rtl"], "RTL")
-                other_pnr_node = self._get_node(rtl_node, " Other PNR runs", "OTHER")
+                base_rtl = re.sub(r'_syn\d+$', '', be_run["rtl"])
+                if sel_rtl == "[ SHOW ALL ]":
+                    display_rtl = base_rtl
+                else:
+                    display_rtl = be_run["rtl"]
+                
+                block_node = self._get_node(root, blk_name, "BLOCK")
+                rtl_node = self._get_node(block_node, display_rtl, "RTL")
+                other_pnr_node = self._get_node(rtl_node, "Other PNR runs", "OTHER")
                 
                 be_item = self._create_run_item(other_pnr_node, be_run)
                 self._add_stages(be_item, be_run)
 
         # Build Ignored Runs Tree
         if ignored_runs_list:
-            ignored_root = self._get_node(root, " 🚫 Ignored Runs", "IGNORED_ROOT")
+            ignored_root = self._get_node(root, "🚫 Ignored Runs", "IGNORED_ROOT")
             for run in ignored_runs_list:
                 blk_name = run["block"]
-                if not blk_name.startswith("BLK_"): blk_name = "BLK_" + blk_name
                 
-                block_node = self._get_node(ignored_root, " " + blk_name, "BLOCK")
-                rtl_node = self._get_node(block_node, " " + run["rtl"], "RTL")
+                base_rtl = re.sub(r'_syn\d+$', '', run["rtl"])
+                if sel_rtl == "[ SHOW ALL ]":
+                    display_rtl = base_rtl
+                else:
+                    display_rtl = run["rtl"]
+                
+                block_node = self._get_node(ignored_root, blk_name, "BLOCK")
+                rtl_node = self._get_node(block_node, display_rtl, "RTL")
                 
                 item = self._create_run_item(rtl_node, run)
                 if run["run_type"] == "BE":
@@ -981,7 +988,6 @@ class PDDashboard(QMainWindow):
         log_path = item.text(13)
         run_path = item.text(12) 
         
-        # New Ignore/Restore Functionality
         ignore_act = None
         restore_act = None
         is_stage = item.data(0, Qt.UserRole) == "STAGE"
