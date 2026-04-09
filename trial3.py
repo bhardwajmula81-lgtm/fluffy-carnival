@@ -1,3 +1,4 @@
+
 #!/usr/bin/python
 import subprocess
 import os
@@ -18,6 +19,7 @@ def read_config(cfg):
                     print(f"\t[Error]: Could not extract key-value pair from line: {line}")
                     continue
 
+                # .strip() cleans spaces around keys and values seamlessly
                 cfg_data[ldata[0].strip()] = ldata[1].strip()
     return cfg_data
 
@@ -34,6 +36,30 @@ def gen_blk_makefile(blk, run_dir, cfg):
     makefile_path = os.path.join(run_dir, f"makefile.{blk}")
     pass_name = get_pass_name(blk, cfg)
     
+    # --- Extract TCL variables for this specific block from config ---
+    sed_commands = []
+    final_vars = {}
+    
+    # 1. First, find all DEFAULT_user_vars
+    def_prefix = "DEFAULT_user_vars("
+    for key, val in cfg.items():
+        if key.startswith(def_prefix) and key.endswith(")"):
+            inner_vars = key[len(def_prefix):-1]
+            final_vars[inner_vars] = val
+            
+    # 2. Next, find all block-specific vars (These will override the defaults)
+    blk_prefix = f"BLK_{blk}_user_vars("
+    for key, val in cfg.items():
+        if key.startswith(blk_prefix) and key.endswith(")"):
+            inner_vars = key[len(blk_prefix):-1]
+            final_vars[inner_vars] = val  # Overwrites default if it exists
+            
+    # 3. Generate the sed commands for the final merged variables
+    for inner_vars, val in final_vars.items():
+        # This regex isolates the quoted value and preserves the semicolon and trailing spaces perfectly
+        sed_cmd = f"\t@sed -i 's/\\(^[ \\t]*set[ \\t]*user_vars({inner_vars})[ \\t]*\\)\"[^\"]*\"/\\1\"{val}\"/' $(RUN_DIR)/$(PASS_NAME)-FE/user_design_setup.tcl\n"
+        sed_commands.append(sed_cmd)
+    
     # -------------------------
     with open(makefile_path, 'w') as f:
         f.write("\nMPNR_CMD=$(COMMON_IMPL_DIR)/common_tcl/mpnr.tcl\n")
@@ -44,6 +70,13 @@ def gen_blk_makefile(blk, run_dir, cfg):
         f.write(f"\n\nrun_mpnr:\n")
         f.write(f'\t@cd $(RUN_DIR) && echo -e "$(RUN_OPTION)\\n$(PASS_NAME)\\n\\n" | $(MPNR_CMD)\n')
         f.write(f"\tcp -rf /user/s5k2p5sx.fe1/s5k2p5sp/WS/mohit.bhar_S5K2P5SP_ws_22/IMPLEMENTATION/S5K2P5SP/SOC/BLK_CMU/fc/python_script/makefile.flow $(RUN_DIR)/$(PASS_NAME)-FE/\n")
+        
+        # Write the sed commands right after the folder is populated
+        if sed_commands:
+            f.write("\t@echo 'Applying user_vars from config (Overrides > Defaults)...'\n")
+            for cmd in sed_commands:
+                f.write(cmd)
+                
         f.write(f"\tcd $(RUN_DIR)/$(PASS_NAME)-FE && make -f makefile.flow\n")
         f.write(f"\n\ndefault:\n")
         f.write(f"\trun_mpnr\n")
@@ -60,6 +93,7 @@ def run_dir_of_blk(blk_name, cfg):
     run_path = os.path.join(ws_name, "IMPLEMENTATION", prj_name, "SOC", blk_name, cfg["TOOL_TYPE"])
     return run_path
 
+# Main Execution
 cfg = read_config("/user/s5k2p5sx.fe1/s5k2p5sp/WS/mohit.bhar_S5K2P5SP_ws_22/IMPLEMENTATION/S5K2P5SP/SOC/BLK_CMU/fc/python_script_edit/config.cfg")
 hpdf_blk = sys.argv[2]
 print(f"Target Blocks: {hpdf_blk}")
@@ -91,8 +125,7 @@ with open("run.sh", "w") as f:
         f.write("echo 'No new blocks to run. All requested tags already exist.'\n")
     else:
         for l in mf_lst:
-            # Added the -j flag here so they actually trigger the parallel flow!
+            # The -j flag ensures the parallel flow inside makefile.flow actually triggers!
             f.write(f"make -j -f {l} &\n")
         f.write("wait\n")
         f.write("echo 'All block executions have finished.'\n")
-
