@@ -25,6 +25,11 @@ BASE_WS_BE_DIR = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
 
 BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
 
+# Define the PNR tool directories to scan for BE runs (space separated).
+# FE runs will ALWAYS be scanned from the 'fc' directory regardless of this setting.
+# Examples: "fc", "innovus", or "fc innovus"
+PNR_TOOL_NAMES = "fc innovus"
+
 SUMMARY_SCRIPT = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
 FIREFOX_PATH = "/usr/bin/firefox"
 # =====================================================================
@@ -244,6 +249,8 @@ class ScannerWorker(QThread):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
         out_data = {"releases": {}, "blocks": set(), "all_runs": []}
         tasks = []
+        
+        tools_to_scan = PNR_TOOL_NAMES.split()
 
         ws_bases = [BASE_WS_FE_DIR, BASE_WS_BE_DIR]
         for ws_base in ws_bases:
@@ -264,14 +271,21 @@ class ScannerWorker(QThread):
                 
                 for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
                     ent_name = os.path.basename(ent_path)
+                    
                     if ws_base == BASE_WS_FE_DIR:
                         for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
                             tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
                         
-                    be_patterns = ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]
-                    for pat in be_patterns:
-                        for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
-                            tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                    if "fc" in tools_to_scan:
+                        be_patterns = ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]
+                        for pat in be_patterns:
+                            for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
+                                tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                                
+                    if "innovus" in tools_to_scan:
+                        for rd in glob.glob(os.path.join(ent_path, "innovus", "EVT*_ML*_DEV*_*")):
+                            if os.path.isdir(rd):
+                                tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
@@ -279,11 +293,20 @@ class ScannerWorker(QThread):
                 if not os.path.isdir(ent_path): continue
                 for evt_dir in glob.glob(os.path.join(ent_path, "EVT*")):
                     phys_evt = os.path.basename(evt_dir) 
+                    
                     for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
                         tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
-                    be_runs = glob.glob(os.path.join(evt_dir, "fc", "*-BE")) + glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE"))
-                    for rd in be_runs:
-                        tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                    
+                    if "fc" in tools_to_scan:
+                        be_runs = glob.glob(os.path.join(evt_dir, "fc", "*-BE")) + glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE"))
+                        for rd in be_runs:
+                            tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                            
+                    if "innovus" in tools_to_scan:
+                        in_runs = glob.glob(os.path.join(evt_dir, "innovus", "*"))
+                        for rd in in_runs:
+                            if os.path.isdir(rd):
+                                tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
         total_tasks = len(tasks)
         completed_tasks = 0
@@ -423,6 +446,7 @@ class PDDashboard(QMainWindow):
         
         self.size_workers = []
         self.item_map = {} 
+        self.ignored_paths = set() 
         
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -450,7 +474,7 @@ class PDDashboard(QMainWindow):
         top.addWidget(self.rel_combo)
         
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Filter runs (e.g. *run1*)...")
+        self.search.setPlaceholderText("Global Search (Runs, Blocks, Status, Runtime, etc.)...")
         self.search.textChanged.connect(lambda: self.search_timer.start(300))
         top.addWidget(self.search)
         
@@ -656,6 +680,28 @@ class PDDashboard(QMainWindow):
             self.blk_list.addItem(it)
         self.blk_list.blockSignals(False); self.refresh_view()
 
+    def _get_node(self, parent, text, node_type="DEFAULT"):
+        for i in range(parent.childCount()):
+            if parent.child(i).text(0) == text:
+                return parent.child(i)
+        
+        p = QTreeWidgetItem(parent)
+        p.setText(0, text)
+        p.setExpanded(True)
+        
+        is_dark = self.is_dark_mode
+        if node_type == "BLOCK" or node_type == "IGNORED_ROOT":
+            p.setBackground(0, QColor("#333333") if is_dark else QColor("#d9d9d9"))
+            font = p.font(0); font.setBold(True); p.setFont(0, font)
+        elif node_type == "RTL":
+            p.setBackground(0, QColor("#444444") if is_dark else QColor("#e8e8e8"))
+            font = p.font(0); font.setBold(True); p.setFont(0, font)
+        elif node_type == "OTHER":
+            p.setBackground(0, QColor("#3c3c3c") if is_dark else QColor("#e0e0e0"))
+            p.setExpanded(False)
+            
+        return p
+
     def _create_run_item(self, parent_item, run):
         child = QTreeWidgetItem(parent_item)
         child.setFlags(child.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -699,20 +745,60 @@ class PDDashboard(QMainWindow):
             child.setText(5, "-") 
             child.setText(12, run["path"]) 
             
+        for i in range(1, 18):
+            child.setTextAlignment(i, Qt.AlignCenter)
+        child.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+        
         return child
 
-    def _get_other_pnr_parent(self, block_item):
-        for i in range(block_item.childCount()):
-            child = block_item.child(i)
-            if child.text(0).strip() == "Other PNR runs":
-                return child
-        p = QTreeWidgetItem(block_item)
-        p.setText(0, " Other PNR runs")
-        p.setFlags(p.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        p.setCheckState(0, Qt.Unchecked)
-        p.setExpanded(False) 
-        p.setBackground(0, QColor("#3c3c3c") if self.is_dark_mode else QColor("#e0e0e0"))
-        return p
+    def _add_stages(self, be_item, be_run):
+        for stage in be_run["stages"]:
+            st_item = QTreeWidgetItem(be_item)
+            st_item.setFlags(st_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            st_item.setCheckState(0, Qt.Unchecked)
+            
+            st_item.setData(0, Qt.UserRole, "STAGE")
+            st_item.setData(1, Qt.UserRole, stage["name"])
+            st_item.setData(2, Qt.UserRole, stage["qor_path"])
+            
+            stage_status = "COMPLETED"
+            if be_run["source"] == "WS" and not os.path.exists(stage["rpt"]):
+                stage_status = "RUNNING"
+                if os.path.exists(stage["log"]):
+                    try:
+                        with open(stage["log"], 'r', encoding='utf-8', errors='ignore') as f:
+                            for line in f:
+                                if "START_CMD:" in line:
+                                    stage_status = line.strip()
+                    except: pass
+            
+            st_item.setText(0, "    " + stage["name"])
+            st_item.setText(2, be_run["source"])
+            st_item.setText(4, stage_status) 
+            st_item.setText(5, "-") 
+            st_item.setText(6, f"NONUPF - {stage['st_n']}") 
+            st_item.setText(7, f"UPF - {stage['st_u']}")
+            st_item.setText(8, stage["vslp_status"])
+            st_item.setText(9, stage["info"]["runtime"])
+            st_item.setText(10, stage["info"]["start"])
+            st_item.setText(11, stage["info"]["end"])
+            st_item.setText(12, stage["stage_path"]) 
+            st_item.setText(13, stage["log"])
+            st_item.setText(14, stage["fm_u_path"])
+            st_item.setText(15, stage["fm_n_path"])
+            st_item.setText(16, stage["vslp_rpt_path"])
+            st_item.setText(17, stage["sta_rpt_path"]) 
+            
+            if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "PASS" in stage["st_n"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            if "FAILS" in stage["st_u"]: st_item.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "PASS" in stage["st_u"]: st_item.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(8, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+
+            for i in range(1, 18):
+                st_item.setTextAlignment(i, Qt.AlignCenter)
+            st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
 
     def _get_item_path_id(self, item):
         parts = []
@@ -751,137 +837,92 @@ class PDDashboard(QMainWindow):
         checked_blks = [self.blk_list.item(i).text() for i in range(self.blk_list.count()) if self.blk_list.item(i).checkState() == Qt.Checked]
         
         runs_to_process = []
-        target_paths = set()
-
         if src_mode in ["WS", "ALL"] and self.ws_data:
             runs_to_process.extend(self.ws_data.get("all_runs", []))
-            if sel_rtl == "[ SHOW ALL ]":
-                for r in self.ws_data.get("releases", {}): target_paths.update(self.ws_data["releases"][r])
-            else: target_paths.update(self.ws_data.get("releases", {}).get(sel_rtl, []))
-
         if src_mode in ["OUTFEED", "ALL"] and self.out_data:
             runs_to_process.extend(self.out_data.get("all_runs", []))
-            if sel_rtl == "[ SHOW ALL ]":
-                for r in self.out_data.get("releases", {}): target_paths.update(self.out_data["releases"][r])
-            else: target_paths.update(self.out_data.get("releases", {}).get(sel_rtl, []))
 
-        fe_runs = [r for r in runs_to_process if r["run_type"] == "FE"]
-        be_runs = [r for r in runs_to_process if r["run_type"] == "BE"]
-        matched_be_runs = set()
+        ignored_runs_list = []
+        normal_runs_list = []
 
+        for run in runs_to_process:
+            if run["path"] in self.ignored_paths:
+                ignored_runs_list.append(run)
+                continue
+                
+            if run["block"] not in checked_blks:
+                continue
+                
+            if sel_rtl != "[ SHOW ALL ]":
+                if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")):
+                    continue
+
+            # Universal Global Search Logic
+            if search_pattern != "*":
+                combined_text = f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} {run['st_n']} {run['st_u']} {run['vslp_status']} {run['info']['runtime']} {run['info']['start']} {run['info']['end']}".lower()
+                matches = fnmatch.fnmatch(combined_text, search_pattern)
+                
+                # Check substages if main run doesn't match
+                if not matches and run["run_type"] == "BE":
+                    for stage in run["stages"]:
+                        st_comb = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
+                        if fnmatch.fnmatch(st_comb, search_pattern):
+                            matches = True
+                            break
+                            
+                if not matches:
+                    continue
+
+            normal_runs_list.append(run)
+
+        fe_runs = [r for r in normal_runs_list if r["run_type"] == "FE"]
+        be_runs = [r for r in normal_runs_list if r["run_type"] == "BE"]
+        matched_be_ids = set()
+
+        root = self.tree.invisibleRootItem()
+
+        # Build Main Tree
         for fe_run in fe_runs:
-            if fe_run["parent"] in target_paths and fe_run["block"] in checked_blks:
-                if fnmatch.fnmatch(fe_run["r_name"].lower(), search_pattern) or fnmatch.fnmatch(fe_run["block"].lower(), search_pattern):
-                    
-                    block_item = self._get_parent(fe_run["block"])
-                    fe_item = self._create_run_item(block_item, fe_run)
-                    fe_base = fe_run["r_name"].replace("-FE", "")
-                    
-                    for be_run in be_runs:
-                        if be_run["block"] == fe_run["block"]:
-                            if f"_{fe_base}_" in be_run["r_name"] or be_run["r_name"].startswith(f"{fe_base}_"):
-                                be_item = self._create_run_item(fe_item, be_run)
-                                matched_be_runs.add(id(be_run))
-                                
-                                for stage in be_run["stages"]:
-                                    st_item = QTreeWidgetItem(be_item)
-                                    st_item.setFlags(st_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                                    st_item.setCheckState(0, Qt.Unchecked)
-                                    
-                                    st_item.setData(0, Qt.UserRole, "STAGE")
-                                    st_item.setData(1, Qt.UserRole, stage["name"])
-                                    st_item.setData(2, Qt.UserRole, stage["qor_path"])
-                                    
-                                    stage_status = "COMPLETED"
-                                    if be_run["source"] == "WS" and not os.path.exists(stage["rpt"]):
-                                        stage_status = "RUNNING"
-                                        if os.path.exists(stage["log"]):
-                                            try:
-                                                with open(stage["log"], 'r', encoding='utf-8', errors='ignore') as f:
-                                                    for line in f:
-                                                        if "START_CMD:" in line:
-                                                            stage_status = line.strip()
-                                            except: pass
-                                    
-                                    st_item.setText(0, "    " + stage["name"])
-                                    st_item.setText(2, be_run["source"])
-                                    st_item.setText(4, stage_status) 
-                                    st_item.setText(5, "-") 
-                                    st_item.setText(6, f"NONUPF - {stage['st_n']}") 
-                                    st_item.setText(7, f"UPF - {stage['st_u']}")
-                                    st_item.setText(8, stage["vslp_status"])
-                                    st_item.setText(9, stage["info"]["runtime"])
-                                    st_item.setText(10, stage["info"]["start"])
-                                    st_item.setText(11, stage["info"]["end"])
-                                    st_item.setText(12, stage["stage_path"]) 
-                                    st_item.setText(13, stage["log"])
-                                    st_item.setText(14, stage["fm_u_path"])
-                                    st_item.setText(15, stage["fm_n_path"])
-                                    st_item.setText(16, stage["vslp_rpt_path"])
-                                    st_item.setText(17, stage["sta_rpt_path"]) 
-                                    
-                                    dim_color = QColor("#aaaaaa") if self.is_dark_mode else QColor("#616161")
-                                    st_item.setForeground(0, dim_color) 
-                                    if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                                    elif "PASS" in stage["st_n"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                                    if "FAILS" in stage["st_u"]: st_item.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                                    elif "PASS" in stage["st_u"]: st_item.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                                    if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(8, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                                    elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            blk_name = fe_run["block"]
+            if not blk_name.startswith("BLK_"): blk_name = "BLK_" + blk_name
+            
+            block_node = self._get_node(root, " " + blk_name, "BLOCK")
+            rtl_node = self._get_node(block_node, " " + fe_run["rtl"], "RTL")
+            
+            fe_item = self._create_run_item(rtl_node, fe_run)
+            fe_base = fe_run["r_name"].replace("-FE", "")
+            
+            for be_run in be_runs:
+                if be_run["block"] == fe_run["block"] and (f"_{fe_base}_" in be_run["r_name"] or be_run["r_name"].startswith(f"{fe_base}_")):
+                    be_item = self._create_run_item(fe_item, be_run)
+                    self._add_stages(be_item, be_run)
+                    matched_be_ids.add(id(be_run))
 
         for be_run in be_runs:
-            if id(be_run) not in matched_be_runs:
-                if be_run["parent"] in target_paths and be_run["block"] in checked_blks:
-                    if fnmatch.fnmatch(be_run["r_name"].lower(), search_pattern) or fnmatch.fnmatch(be_run["block"].lower(), search_pattern):
-                        block_item = self._get_parent(be_run["block"])
-                        other_pnr_item = self._get_other_pnr_parent(block_item) 
-                        be_item = self._create_run_item(other_pnr_item, be_run)
-                        
-                        for stage in be_run["stages"]:
-                            st_item = QTreeWidgetItem(be_item)
-                            st_item.setFlags(st_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-                            st_item.setCheckState(0, Qt.Unchecked)
-                            
-                            st_item.setData(0, Qt.UserRole, "STAGE")
-                            st_item.setData(1, Qt.UserRole, stage["name"])
-                            st_item.setData(2, Qt.UserRole, stage["qor_path"])
-                            
-                            stage_status = "COMPLETED"
-                            if be_run["source"] == "WS" and not os.path.exists(stage["rpt"]):
-                                stage_status = "RUNNING"
-                                if os.path.exists(stage["log"]):
-                                    try:
-                                        with open(stage["log"], 'r', encoding='utf-8', errors='ignore') as f:
-                                            for line in f:
-                                                if "START_CMD:" in line:
-                                                    stage_status = line.strip()
-                                    except: pass
-                            
-                            st_item.setText(0, "    " + stage["name"])
-                            st_item.setText(2, be_run["source"])
-                            st_item.setText(4, stage_status) 
-                            st_item.setText(5, "-")
-                            st_item.setText(6, f"NONUPF - {stage['st_n']}") 
-                            st_item.setText(7, f"UPF - {stage['st_u']}")
-                            st_item.setText(8, stage["vslp_status"])
-                            st_item.setText(9, stage["info"]["runtime"])
-                            st_item.setText(10, stage["info"]["start"])
-                            st_item.setText(11, stage["info"]["end"])
-                            st_item.setText(12, stage["stage_path"])
-                            st_item.setText(13, stage["log"])
-                            st_item.setText(14, stage["fm_u_path"])
-                            st_item.setText(15, stage["fm_n_path"])
-                            st_item.setText(16, stage["vslp_rpt_path"])
-                            st_item.setText(17, stage["sta_rpt_path"])
-                            
-                            dim_color = QColor("#aaaaaa") if self.is_dark_mode else QColor("#616161")
-                            st_item.setForeground(0, dim_color)
-                            if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                            elif "PASS" in stage["st_n"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                            if "FAILS" in stage["st_u"]: st_item.setForeground(7, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                            elif "PASS" in stage["st_u"]: st_item.setForeground(7, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
-                            if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(8, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
-                            elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            if id(be_run) not in matched_be_ids:
+                blk_name = be_run["block"]
+                if not blk_name.startswith("BLK_"): blk_name = "BLK_" + blk_name
+                
+                block_node = self._get_node(root, " " + blk_name, "BLOCK")
+                rtl_node = self._get_node(block_node, " " + be_run["rtl"], "RTL")
+                other_pnr_node = self._get_node(rtl_node, " Other PNR runs", "OTHER")
+                
+                be_item = self._create_run_item(other_pnr_node, be_run)
+                self._add_stages(be_item, be_run)
+
+        # Build Ignored Runs Tree
+        if ignored_runs_list:
+            ignored_root = self._get_node(root, " 🚫 Ignored Runs", "IGNORED_ROOT")
+            for run in ignored_runs_list:
+                blk_name = run["block"]
+                if not blk_name.startswith("BLK_"): blk_name = "BLK_" + blk_name
+                
+                block_node = self._get_node(ignored_root, " " + blk_name, "BLOCK")
+                rtl_node = self._get_node(block_node, " " + run["rtl"], "RTL")
+                
+                item = self._create_run_item(rtl_node, run)
+                if run["run_type"] == "BE":
+                    self._add_stages(item, run)
 
         self.tree.setSortingEnabled(True)
 
@@ -904,12 +945,6 @@ class PDDashboard(QMainWindow):
 
         restore_state(self.tree.invisibleRootItem())
         self.tree.setUpdatesEnabled(True)
-
-    def _get_parent(self, name):
-        for i in range(self.tree.topLevelItemCount()):
-            if self.tree.topLevelItem(i).text(0) == name: return self.tree.topLevelItem(i)
-        p = QTreeWidgetItem(self.tree); p.setText(0, name); p.setExpanded(True); p.setBackground(0, QColor("#424242") if self.is_dark_mode else QColor("#f0f0f0"))
-        return p
 
     def on_header_context_menu(self, pos):
         menu = QMenu(self)
@@ -946,6 +981,18 @@ class PDDashboard(QMainWindow):
         log_path = item.text(13)
         run_path = item.text(12) 
         
+        # New Ignore/Restore Functionality
+        ignore_act = None
+        restore_act = None
+        is_stage = item.data(0, Qt.UserRole) == "STAGE"
+        
+        if run_path and run_path != "N/A" and not is_stage:
+            if run_path in self.ignored_paths:
+                restore_act = m.addAction("Restore Run (Un-ignore)")
+            else:
+                ignore_act = m.addAction("Ignore Run (Hide)")
+            m.addSeparator()
+        
         calc_size_act = None
         if run_path and run_path != "N/A" and os.path.exists(run_path):
             calc_size_act = m.addAction("Calculate Folder Size")
@@ -975,14 +1022,20 @@ class PDDashboard(QMainWindow):
         c_act = m.addAction("Copy Path")
         
         qor_act = None
-        if item.data(0, Qt.UserRole) == "STAGE":
+        if is_stage:
             m.addSeparator()
             qor_act = m.addAction("Run Single Stage QoR")
 
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         
         if res:
-            if copy_cell_act and res == copy_cell_act:
+            if ignore_act and res == ignore_act:
+                self.ignored_paths.add(run_path)
+                self.refresh_view()
+            elif restore_act and res == restore_act:
+                self.ignored_paths.discard(run_path)
+                self.refresh_view()
+            elif copy_cell_act and res == copy_cell_act:
                 QApplication.clipboard().setText(cell_text)
             elif calc_size_act and res == calc_size_act:
                 item.setText(5, "Calc...")
