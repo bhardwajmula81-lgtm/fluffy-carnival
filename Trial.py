@@ -46,9 +46,12 @@ class CustomTreeItem(QTreeWidgetItem):
             if t1 == "Other PNR runs": return False
             if t2 == "Other PNR runs": return True
             
-            m_order = {"INITIAL RELEASE": 1, "PRE-SVP": 2, "SVP": 3, "FFN": 4, "OTHER RELEASES": 5}
+            m_order = {"INITIAL RELEASE": 1, "PRE-SVP": 2, "SVP": 3, "FFN": 4}
             if t1 in m_order and t2 in m_order:
-                return m_order[t1] < m_order[t2]
+                if self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder:
+                    return m_order[t1] < m_order[t2]
+                else:
+                    return m_order[t1] > m_order[t2]
                 
         return t1 < t2
 
@@ -71,7 +74,7 @@ def get_milestone(rtl_str):
     if "_ML2_" in rtl_str: return "PRE-SVP"
     if "_ML3_" in rtl_str: return "SVP"
     if "_ML4_" in rtl_str: return "FFN"
-    return "OTHER RELEASES"
+    return None 
 
 def format_log_date(date_str):
     match = re.search(r'([A-Z][a-z]{2})\s+([A-Z][a-z]{2})\s+(\d+)\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})', str(date_str))
@@ -253,8 +256,31 @@ class SingleSizeWorker(QThread):
     def cancel(self): self._is_cancelled = True
 
 class ScannerWorker(QThread):
-    finished = pyqtSignal(dict, dict)
+    finished = pyqtSignal(dict, dict, dict)
     progress_update = pyqtSignal(int, int) 
+
+    def scan_ir_dir(self):
+        ir_data = {}
+        ir_base = "/user/s5k2p5sx.be1/LAYOUT/IR/"
+        if os.path.exists(ir_base):
+            for root_dir, dirs, files in os.walk(ir_base):
+                if "redhawk.log" in files:
+                    log_path = os.path.join(root_dir, "redhawk.log")
+                    run_be_name, inst_line, inst_value = None, "", ""
+                    try:
+                        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            for line in f:
+                                if line.startswith("Parsing ") and "S5K2P5SP.lef.list" in line:
+                                    m = re.search(r'/fc/([^/]+-BE)/', line)
+                                    if m: run_be_name = m.group(1)
+                                elif line.startswith("INST ") and "mV" in line:
+                                    inst_line = line.strip()
+                                    m2 = re.search(r'INST\s+(\S+mV)', inst_line)
+                                    if m2: inst_value = m2.group(1)
+                    except: pass
+                    if run_be_name:
+                        ir_data[run_be_name] = {"log": log_path, "line": inst_line, "value": inst_value}
+        return ir_data
 
     def run(self):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
@@ -314,6 +340,8 @@ class ScannerWorker(QThread):
         completed_tasks = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=40) as executor:
+            ir_future = executor.submit(self.scan_ir_dir)
+            
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
             for future in concurrent.futures.as_completed(future_to_task):
                 try:
@@ -331,8 +359,10 @@ class ScannerWorker(QThread):
                 except Exception: pass 
                 completed_tasks += 1
                 self.progress_update.emit(completed_tasks, total_tasks)
+                
+            ir_data = ir_future.result()
 
-        self.finished.emit(ws_data, out_data)
+        self.finished.emit(ws_data, out_data, ir_data)
 
     def _thread_process_run(self, task_tuple):
         b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
@@ -417,6 +447,7 @@ class PDDashboard(QMainWindow):
         
         self.ws_data = {}
         self.out_data = {}
+        self.ir_data = {}
         self.is_dark_mode = False
         self.row_spacing = 2
         
@@ -512,12 +543,12 @@ class PDDashboard(QMainWindow):
         self.splitter.addWidget(left_panel)
         
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(18) 
+        self.tree.setColumnCount(20) 
         self.tree.setAlternatingRowColors(True)
         
         headers = ["Run Name (Select)", "RTL Release Version", "Source", "Status", "Stage", "Size",
-                   "FM - NONUPF", "FM - UPF", "VSLP Status", "Runtime", "Start", "End", 
-                   "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT", "STA_RPT"]
+                   "FM - NONUPF", "FM - UPF", "VSLP Status", "Static IR", "Runtime", "Start", "End", 
+                   "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT", "STA_RPT", "IR_LOG"]
         self.tree.setHeaderLabels(headers)
         
         for i in range(self.tree.columnCount()):
@@ -529,8 +560,9 @@ class PDDashboard(QMainWindow):
         self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(1, 280); self.tree.setColumnWidth(2, 90)
         self.tree.setColumnWidth(5, 80) 
         self.tree.setColumnWidth(6, 160); self.tree.setColumnWidth(7, 160); self.tree.setColumnWidth(8, 200)
+        self.tree.setColumnWidth(9, 100) 
         
-        for i in range(12, 18): self.tree.setColumnHidden(i, True)
+        for i in range(13, 20): self.tree.setColumnHidden(i, True)
         
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.on_context_menu)
@@ -569,7 +601,7 @@ class PDDashboard(QMainWindow):
         def gather_tasks(node):
             for i in range(node.childCount()):
                 child = node.child(i)
-                path = child.text(12) 
+                path = child.text(13) 
                 if path and path != "N/A" and child.text(5) in ["-", "N/A", "Calc..."]:
                     item_id = str(id(child))
                     self.item_map[item_id] = child
@@ -643,8 +675,8 @@ class PDDashboard(QMainWindow):
         self.prog.setRange(0, total)
         self.prog.setValue(current)
 
-    def on_scan_finished(self, ws, out):
-        self.ws_data, self.out_data = ws, out
+    def on_scan_finished(self, ws, out, ir):
+        self.ws_data, self.out_data, self.ir_data = ws, out, ir
         self.prog.setVisible(False)
         self.on_source_changed()
 
@@ -667,7 +699,7 @@ class PDDashboard(QMainWindow):
 
         self.rel_combo.blockSignals(True); self.rel_combo.clear()
         
-        valid_releases = [r for r in releases if "Unknown" not in r]
+        valid_releases = [r for r in releases if "Unknown" not in r and get_milestone(r) is not None]
         new_releases = ["[ SHOW ALL ]"] + sorted(list(valid_releases))
         self.rel_combo.addItems(new_releases)
         
@@ -708,7 +740,15 @@ class PDDashboard(QMainWindow):
         child.setText(1, run["rtl"]) 
         child.setText(2, run["source"]) 
         
-        tooltip_text = f"Owner: {run.get('owner', 'Unknown')}\nSize: Pending\nRuntime: {run['info']['runtime']}\nNONUPF: {run['st_n']}\nUPF: {run['st_u']}\nVSLP: {run['vslp_status']}"
+        ir_info = self.ir_data.get(run["r_name"], {"log": "", "line": "N/A", "value": "-"})
+        
+        tooltip_text = (f"Owner: {run.get('owner', 'Unknown')}\n"
+                        f"Size: Pending\n"
+                        f"Runtime: {run['info']['runtime']}\n"
+                        f"NONUPF: {run['st_n']}\n"
+                        f"UPF: {run['st_u']}\n"
+                        f"VSLP: {run['vslp_status']}\n"
+                        f"Static IR: {ir_info['line']}")
         child.setToolTip(0, tooltip_text)
         
         child.setExpanded(False)
@@ -723,15 +763,17 @@ class PDDashboard(QMainWindow):
             child.setText(6, f"NONUPF - {run['st_n']}") 
             child.setText(7, f"UPF - {run['st_u']}")
             child.setText(8, run["vslp_status"]) 
-            child.setText(9, run["info"]["runtime"])
-            child.setText(10, run["info"]["start"])
-            child.setText(11, run["info"]["end"])
-            child.setText(12, run["path"])
-            child.setText(13, os.path.join(run["path"], "logs/compile_opt.log"))
-            child.setText(14, run["fm_u_path"])
-            child.setText(15, run["fm_n_path"])
-            child.setText(16, run["vslp_rpt_path"])
-            child.setText(17, "") 
+            child.setText(9, "-") 
+            child.setText(10, run["info"]["runtime"])
+            child.setText(11, run["info"]["start"])
+            child.setText(12, run["info"]["end"])
+            child.setText(13, run["path"])
+            child.setText(14, os.path.join(run["path"], "logs/compile_opt.log"))
+            child.setText(15, run["fm_u_path"])
+            child.setText(16, run["fm_n_path"])
+            child.setText(17, run["vslp_rpt_path"])
+            child.setText(18, "") 
+            child.setText(19, "") 
             
             if "FAILS" in run["st_n"]: child.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
             elif "PASS" in run["st_n"]: child.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
@@ -745,9 +787,11 @@ class PDDashboard(QMainWindow):
             child.setForeground(3, QColor("#81c784" if run["is_comp"] else "#4fc3f7") if self.is_dark_mode else QColor("#2e7d32" if run["is_comp"] else "#0277bd"))
         else:
             child.setText(5, "-") 
-            child.setText(12, run["path"]) 
+            child.setText(9, ir_info["value"])
+            child.setText(13, run["path"]) 
+            child.setText(19, ir_info["log"]) 
             
-        for i in range(1, 18):
+        for i in range(1, 20):
             child.setTextAlignment(i, Qt.AlignCenter)
         child.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
         
@@ -755,6 +799,8 @@ class PDDashboard(QMainWindow):
 
     def _add_stages(self, be_item, be_run):
         owner = be_run.get("owner", "Unknown")
+        ir_info = self.ir_data.get(be_run["r_name"], {"log": "", "line": "N/A", "value": "-"})
+        
         for stage in be_run["stages"]:
             st_item = CustomTreeItem(be_item)
             st_item.setFlags(st_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -764,7 +810,13 @@ class PDDashboard(QMainWindow):
             st_item.setData(1, Qt.UserRole, stage["name"])
             st_item.setData(2, Qt.UserRole, stage["qor_path"])
             
-            tooltip_text = f"Owner: {owner}\nSize: Pending\nRuntime: {stage['info']['runtime']}\nNONUPF: {stage['st_n']}\nUPF: {stage['st_u']}\nVSLP: {stage['vslp_status']}"
+            tooltip_text = (f"Owner: {owner}\n"
+                            f"Size: Pending\n"
+                            f"Runtime: {stage['info']['runtime']}\n"
+                            f"NONUPF: {stage['st_n']}\n"
+                            f"UPF: {stage['st_u']}\n"
+                            f"VSLP: {stage['vslp_status']}\n"
+                            f"Static IR: {ir_info['line']}")
             st_item.setToolTip(0, tooltip_text)
             
             stage_status = "COMPLETED"
@@ -785,15 +837,17 @@ class PDDashboard(QMainWindow):
             st_item.setText(6, f"NONUPF - {stage['st_n']}") 
             st_item.setText(7, f"UPF - {stage['st_u']}")
             st_item.setText(8, stage["vslp_status"])
-            st_item.setText(9, stage["info"]["runtime"])
-            st_item.setText(10, stage["info"]["start"])
-            st_item.setText(11, stage["info"]["end"])
-            st_item.setText(12, stage["stage_path"]) 
-            st_item.setText(13, stage["log"])
-            st_item.setText(14, stage["fm_u_path"])
-            st_item.setText(15, stage["fm_n_path"])
-            st_item.setText(16, stage["vslp_rpt_path"])
-            st_item.setText(17, stage["sta_rpt_path"]) 
+            st_item.setText(9, "-")
+            st_item.setText(10, stage["info"]["runtime"])
+            st_item.setText(11, stage["info"]["start"])
+            st_item.setText(12, stage["info"]["end"])
+            st_item.setText(13, stage["stage_path"]) 
+            st_item.setText(14, stage["log"])
+            st_item.setText(15, stage["fm_u_path"])
+            st_item.setText(16, stage["fm_n_path"])
+            st_item.setText(17, stage["vslp_rpt_path"])
+            st_item.setText(18, stage["sta_rpt_path"]) 
+            st_item.setText(19, "")
             
             if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
             elif "PASS" in stage["st_n"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
@@ -802,7 +856,7 @@ class PDDashboard(QMainWindow):
             if "Error" in stage["vslp_status"] and "Error: 0" not in stage["vslp_status"]: st_item.setForeground(8, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
             elif "Error: 0" in stage["vslp_status"]: st_item.setForeground(8, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
 
-            for i in range(1, 18):
+            for i in range(1, 20):
                 st_item.setTextAlignment(i, Qt.AlignCenter)
             st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
 
@@ -857,6 +911,10 @@ class PDDashboard(QMainWindow):
                 continue
                 
             if run["block"] not in checked_blks:
+                continue
+                
+            base_rtl_filter = re.sub(r'_syn\d+$', '', run["rtl"])
+            if get_milestone(base_rtl_filter) is None:
                 continue
                 
             if sel_rtl != "[ SHOW ALL ]":
@@ -926,15 +984,12 @@ class PDDashboard(QMainWindow):
                     milestone = get_milestone(base_rtl)
                     m_node = self._get_node(block_node, milestone, "MILESTONE")
                     rtl_node = self._get_node(m_node, base_rtl, "RTL")
-                    other_pnr_node = self._get_node(rtl_node, "Other PNR runs", "OTHER")
-                    parent_for_run = other_pnr_node
+                    parent_for_run = rtl_node
                 elif sel_rtl == base_rtl and has_syn:
                     syn_node = self._get_node(block_node, run_rtl, "RTL")
-                    other_pnr_node = self._get_node(syn_node, "Other PNR runs", "OTHER")
-                    parent_for_run = other_pnr_node
+                    parent_for_run = syn_node
                 else:
-                    other_pnr_node = self._get_node(block_node, "Other PNR runs", "OTHER")
-                    parent_for_run = other_pnr_node
+                    parent_for_run = block_node
                 
                 be_item = self._create_run_item(parent_for_run, be_run)
                 self._add_stages(be_item, be_run)
@@ -971,7 +1026,7 @@ class PDDashboard(QMainWindow):
                 child = node.child(i)
                 path_key = self._get_item_path_id(child)
                 node_type = child.data(0, Qt.UserRole)
-                is_run = bool(child.text(12)) 
+                is_run = bool(child.text(13)) 
                 
                 if path_key in expanded_states:
                     child.setExpanded(expanded_states[path_key])
@@ -979,8 +1034,6 @@ class PDDashboard(QMainWindow):
                     if child.parent() is None: 
                         child.setExpanded(True) 
                     elif node_type == "MILESTONE":
-                        child.setExpanded(False) 
-                    elif child.text(0).strip() == "Other PNR runs":
                         child.setExpanded(False) 
                     elif is_run:
                         child.setExpanded(False) 
@@ -996,7 +1049,7 @@ class PDDashboard(QMainWindow):
         menu = QMenu(self)
         menu.setStyleSheet("QMenu { border: 1px solid gray; }" if self.is_dark_mode else "")
         
-        for i in range(1, 18): 
+        for i in range(1, 20): 
             action = QWidgetAction(menu)
             cb = QCheckBox(self.tree.headerItem().text(i))
             cb.setChecked(not self.tree.isColumnHidden(i))
@@ -1020,12 +1073,13 @@ class PDDashboard(QMainWindow):
             copy_cell_act = m.addAction(f"Copy Cell Text")
             m.addSeparator()
             
-        fm_u_path = item.text(14)
-        fm_n_path = item.text(15)
-        vslp_path = item.text(16)
-        sta_path = item.text(17)
-        log_path = item.text(13)
-        run_path = item.text(12) 
+        run_path = item.text(13) 
+        log_path = item.text(14)
+        fm_u_path = item.text(15)
+        fm_n_path = item.text(16)
+        vslp_path = item.text(17)
+        sta_path = item.text(18)
+        ir_path = item.text(19)
         
         ignore_checked_act = m.addAction("Ignore All Checked Runs")
         m.addSeparator()
@@ -1062,6 +1116,10 @@ class PDDashboard(QMainWindow):
         if sta_path and sta_path != "N/A" and os.path.exists(sta_path):
             sta_act = m.addAction("Open PT STA Summary")
             
+        ir_act = None
+        if ir_path and ir_path != "N/A" and os.path.exists(ir_path):
+            ir_act = m.addAction("Open Static IR Log")
+            
         log_act = None
         if log_path and log_path != "N/A" and os.path.exists(log_path):
             log_act = m.addAction("Open Log File")
@@ -1082,7 +1140,7 @@ class PDDashboard(QMainWindow):
                     for i in range(node.childCount()):
                         c = node.child(i)
                         if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
-                            p = c.text(12)
+                            p = c.text(13)
                             if p and p != "N/A": self.ignored_paths.add(p)
                         ignore_checked(c)
                 ignore_checked(self.tree.invisibleRootItem())
@@ -1111,6 +1169,8 @@ class PDDashboard(QMainWindow):
                 subprocess.Popen(['gvim', vslp_path])
             elif sta_act and res == sta_act:
                 subprocess.Popen(['gvim', sta_path])
+            elif ir_act and res == ir_act:
+                subprocess.Popen(['gvim', ir_path])
             elif log_act and res == log_act:
                 subprocess.Popen(['gvim', log_path])
             elif res == c_act:
@@ -1124,7 +1184,7 @@ class PDDashboard(QMainWindow):
 
     def on_item_double_clicked(self, item, col):
         if item.parent():
-            log = item.text(13)
+            log = item.text(14)
             if log and os.path.exists(log): subprocess.Popen(['gvim', log])
 
     def run_qor_comparison(self):
@@ -1136,7 +1196,7 @@ class PDDashboard(QMainWindow):
                 c = node.child(i)
                 if c.checkState(0) == Qt.Checked:
                     if c.data(0, Qt.UserRole) != "STAGE":
-                        qor_path = c.text(12) 
+                        qor_path = c.text(13) 
                         run_source = c.text(2)
                         
                         if run_source == "OUTFEED" and qor_path:
