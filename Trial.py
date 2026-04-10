@@ -5,6 +5,7 @@ import subprocess
 import sys
 import fnmatch
 import concurrent.futures
+import pwd
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QComboBox, QLineEdit, 
@@ -31,7 +32,34 @@ SUMMARY_SCRIPT = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
 FIREFOX_PATH = "/usr/bin/firefox"
 # =====================================================================
 
+# --- CUSTOM SORTING UI CLASS ---
+class CustomTreeItem(QTreeWidgetItem):
+    def __lt__(self, other):
+        col = self.treeWidget().sortColumn()
+        t1 = self.text(col).strip() if self.text(col) else ""
+        t2 = other.text(col).strip() if other.text(col) else ""
+        
+        if col == 0:
+            if t1 == "[ Ignored Runs ]": return False
+            if t2 == "[ Ignored Runs ]": return True
+            
+            if t1 == "Other PNR runs": return False
+            if t2 == "Other PNR runs": return True
+            
+            m_order = {"INITIAL RELEASE": 1, "PRE-SVP": 2, "SVP": 3, "FFN": 4, "OTHER RELEASES": 5}
+            if t1 in m_order and t2 in m_order:
+                return m_order[t1] < m_order[t2]
+                
+        return t1 < t2
+
 # --- LOGIC HELPERS ---
+
+def get_owner(path):
+    if not path or not os.path.exists(path): return "Unknown"
+    try:
+        return pwd.getpwuid(os.stat(path).st_uid).pw_name
+    except Exception:
+        return "Unknown"
 
 def normalize_rtl(rtl_str):
     if rtl_str and rtl_str.startswith("EVT"):
@@ -327,6 +355,7 @@ class ScannerWorker(QThread):
         clean_run = r_name.replace("-FE", "").replace("-BE", "")
         clean_be_run = re.sub(r'^EVT\d+_ML\d+_DEV\d+(_syn\d+)?_', '', r_name) 
         evt_base = get_dynamic_evt_path(rtl, b_name)
+        owner = get_owner(rd)
         
         fm_n = os.path.join(evt_base, "fm", clean_run, "r2n", "reports", f"{b_name}_r2n.failpoint.rpt")
         fm_u = os.path.join(evt_base, "fm", clean_run, "r2upf", "reports", f"{b_name}_r2upf.failpoint.rpt")
@@ -364,7 +393,7 @@ class ScannerWorker(QThread):
 
         return {
             "block": b_name, "path": rd, "parent": parent_path, "rtl": rtl, "r_name": r_name,
-            "run_type": run_type, "stages": stages, "source": source,
+            "run_type": run_type, "stages": stages, "source": source, "owner": owner,
             "is_comp": True if source == "OUTFEED" else os.path.exists(os.path.join(rd, "pass/compile_opt.pass")),
             "st_n": get_fm_info(fm_n), "st_u": get_fm_info(fm_u), "vslp_status": get_vslp_info(vslp_rpt),
             "info": info, "fm_n_path": fm_n, "fm_u_path": fm_u, "vslp_rpt_path": vslp_rpt
@@ -399,7 +428,6 @@ class PDDashboard(QMainWindow):
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.refresh_view)
         
-        # Auto-refresh timer
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.timeout.connect(self.start_fs_scan)
         
@@ -429,8 +457,7 @@ class PDDashboard(QMainWindow):
         self.search.textChanged.connect(lambda: self.search_timer.start(300))
         top.addWidget(self.search)
         
-        # --- NEW REFRESH CONTROLS ---
-        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.start_fs_scan)
         top.addWidget(self.refresh_btn)
         
@@ -439,7 +466,6 @@ class PDDashboard(QMainWindow):
         self.auto_combo.addItems(["Off", "1 Min", "5 Min", "10 Min"])
         self.auto_combo.currentIndexChanged.connect(self.on_auto_refresh_changed)
         top.addWidget(self.auto_combo)
-        # ----------------------------
 
         self.tools_btn = QPushButton("Tools")
         self.tools_menu = QMenu(self)
@@ -564,6 +590,10 @@ class PDDashboard(QMainWindow):
         item = self.item_map.get(item_id)
         if item:
             item.setText(5, size_str)
+            old_tooltip = item.toolTip(0)
+            if old_tooltip:
+                new_tooltip = re.sub(r'Size: .*?\n', f'Size: {size_str}\n', old_tooltip)
+                item.setToolTip(0, new_tooltip)
 
     def open_settings(self):
         dlg = SettingsDialog(self)
@@ -600,7 +630,6 @@ class PDDashboard(QMainWindow):
         self.refresh_view()
 
     def start_fs_scan(self):
-        # Prevent overlapping scans if the user clicks refresh quickly
         if hasattr(self, 'worker') and self.worker.isRunning():
             return
             
@@ -637,7 +666,9 @@ class PDDashboard(QMainWindow):
             saved_states[item.text()] = item.checkState()
 
         self.rel_combo.blockSignals(True); self.rel_combo.clear()
-        new_releases = ["[ SHOW ALL ]"] + sorted(list(releases))
+        
+        valid_releases = [r for r in releases if "Unknown" not in r]
+        new_releases = ["[ SHOW ALL ]"] + sorted(list(valid_releases))
         self.rel_combo.addItems(new_releases)
         
         if current_rtl in new_releases: self.rel_combo.setCurrentText(current_rtl)
@@ -658,9 +689,10 @@ class PDDashboard(QMainWindow):
             if parent.child(i).text(0) == text:
                 return parent.child(i)
         
-        p = QTreeWidgetItem(parent)
+        p = CustomTreeItem(parent)
         p.setText(0, text)
-        p.setExpanded(True) # Keep structural folders expanded by default
+        p.setData(0, Qt.UserRole, node_type)
+        p.setExpanded(True) 
         
         if node_type == "MILESTONE":
             p.setForeground(0, QColor("#1976D2") if not self.is_dark_mode else QColor("#64B5F6"))
@@ -668,7 +700,7 @@ class PDDashboard(QMainWindow):
         return p
 
     def _create_run_item(self, parent_item, run):
-        child = QTreeWidgetItem(parent_item)
+        child = CustomTreeItem(parent_item)
         child.setFlags(child.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
         child.setCheckState(0, Qt.Unchecked)
         
@@ -676,7 +708,9 @@ class PDDashboard(QMainWindow):
         child.setText(1, run["rtl"]) 
         child.setText(2, run["source"]) 
         
-        # We explicitly DO NOT expand the run itself so BE stages stay hidden
+        tooltip_text = f"Owner: {run.get('owner', 'Unknown')}\nSize: Pending\nRuntime: {run['info']['runtime']}\nNONUPF: {run['st_n']}\nUPF: {run['st_u']}\nVSLP: {run['vslp_status']}"
+        child.setToolTip(0, tooltip_text)
+        
         child.setExpanded(False)
         
         if run["source"] == "OUTFEED": child.setForeground(2, QColor("#b39ddb" if self.is_dark_mode else "#5e35b1")) 
@@ -720,14 +754,18 @@ class PDDashboard(QMainWindow):
         return child
 
     def _add_stages(self, be_item, be_run):
+        owner = be_run.get("owner", "Unknown")
         for stage in be_run["stages"]:
-            st_item = QTreeWidgetItem(be_item)
+            st_item = CustomTreeItem(be_item)
             st_item.setFlags(st_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             st_item.setCheckState(0, Qt.Unchecked)
             
             st_item.setData(0, Qt.UserRole, "STAGE")
             st_item.setData(1, Qt.UserRole, stage["name"])
             st_item.setData(2, Qt.UserRole, stage["qor_path"])
+            
+            tooltip_text = f"Owner: {owner}\nSize: Pending\nRuntime: {stage['info']['runtime']}\nNONUPF: {stage['st_n']}\nUPF: {stage['st_u']}\nVSLP: {stage['vslp_status']}"
+            st_item.setToolTip(0, tooltip_text)
             
             stage_status = "COMPLETED"
             if be_run["source"] == "WS" and not os.path.exists(stage["rpt"]):
@@ -902,7 +940,7 @@ class PDDashboard(QMainWindow):
                 self._add_stages(be_item, be_run)
 
         if ignored_runs_list:
-            ignored_root = self._get_node(root, "🚫 Ignored Runs", "IGNORED_ROOT")
+            ignored_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
             for run in ignored_runs_list:
                 blk_name = run["block"]
                 run_rtl = run["rtl"]
@@ -928,27 +966,25 @@ class PDDashboard(QMainWindow):
 
         self.tree.setSortingEnabled(True)
 
-        # Smart Restore State
         def restore_state(node):
             for i in range(node.childCount()):
                 child = node.child(i)
                 path_key = self._get_item_path_id(child)
-                
-                # Check if it's an actual run item (has a path in column 12)
-                is_run = bool(child.text(12))
+                node_type = child.data(0, Qt.UserRole)
+                is_run = bool(child.text(12)) 
                 
                 if path_key in expanded_states:
                     child.setExpanded(expanded_states[path_key])
                 else:
                     if child.parent() is None: 
                         child.setExpanded(True) 
+                    elif node_type == "MILESTONE":
+                        child.setExpanded(False) 
                     elif child.text(0).strip() == "Other PNR runs":
                         child.setExpanded(False) 
                     elif is_run:
-                        # Collapse the runs natively so -BE stages hide
                         child.setExpanded(False) 
                     else:
-                        # Expand grouping folders (Block, Milestone, RTL)
                         child.setExpanded(True) 
                         
                 restore_state(child)
@@ -1062,7 +1098,7 @@ class PDDashboard(QMainWindow):
             elif calc_size_act and res == calc_size_act:
                 item.setText(5, "Calc...")
                 worker = SingleSizeWorker(item, run_path)
-                worker.result.connect(lambda it, sz: it.setText(5, sz))
+                worker.result.connect(lambda it, sz: (it.setText(5, sz), it.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {sz}\n', it.toolTip(0) if it.toolTip(0) else ""))))
                 if not hasattr(self, 'size_workers'): self.size_workers = []
                 self.size_workers.append(worker)
                 worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
