@@ -25,9 +25,6 @@ BASE_WS_BE_DIR = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
 
 BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
 
-# Define the PNR tool directories to scan for BE runs (space separated).
-# FE runs will ALWAYS be scanned from the 'fc' directory regardless of this setting.
-# Examples: "fc", "innovus", or "fc innovus"
 PNR_TOOL_NAMES = "fc innovus"
 
 SUMMARY_SCRIPT = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
@@ -40,6 +37,13 @@ def normalize_rtl(rtl_str):
     if rtl_str and rtl_str.startswith("EVT"):
         return f"{PROJECT_PREFIX}_{rtl_str}"
     return rtl_str
+
+def get_milestone(rtl_str):
+    if "_ML1_" in rtl_str: return "INITIAL RELEASE"
+    if "_ML2_" in rtl_str: return "PRE-SVP"
+    if "_ML3_" in rtl_str: return "SVP"
+    if "_ML4_" in rtl_str: return "FFN"
+    return "OTHER RELEASES"
 
 def format_log_date(date_str):
     match = re.search(r'([A-Z][a-z]{2})\s+([A-Z][a-z]{2})\s+(\d+)\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})', str(date_str))
@@ -111,7 +115,6 @@ def parse_pnr_runtime_rpt(file_path):
                 parts = line.split()
                 if len(parts) >= 3:
                     ts_match = re.search(r'(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})', line)
-                    
                     time_matches = re.findall(r'(\d+)d:(\d+)h:(\d+)m:(\d+)s', line)
                     
                     if ts_match and time_matches:
@@ -119,7 +122,6 @@ def parse_pnr_runtime_rpt(file_path):
                         last_ts = ts_match
                         
                         target_match = time_matches[1] if len(time_matches) > 1 else time_matches[0]
-                        
                         days, hours, mins, secs = map(int, target_match) 
                         total_hours = days * 24 + hours
                         final_time_str = f"{total_hours:02}h:{mins:02}m:{secs:02}s"
@@ -156,7 +158,6 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Dashboard Settings")
         self.resize(350, 180)
-        
         layout = QFormLayout(self)
         
         self.font_combo = QFontComboBox()
@@ -187,59 +188,41 @@ class SettingsDialog(QDialog):
 
 class BatchSizeWorker(QThread):
     size_calculated = pyqtSignal(str, str)
-    
     def __init__(self, tasks):
         super().__init__()
         self.tasks = tasks
         self._is_cancelled = False
-
     def run(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
             futures = {executor.submit(self.get_size, path): item_id for item_id, path in self.tasks}
             for future in concurrent.futures.as_completed(futures):
-                if self._is_cancelled:
-                    break
+                if self._is_cancelled: break
                 item_id = futures[future]
                 try:
-                    size = future.result()
-                    self.size_calculated.emit(item_id, size)
+                    self.size_calculated.emit(item_id, future.result())
                 except:
                     self.size_calculated.emit(item_id, "N/A")
-
     def get_size(self, path):
         if not path or not os.path.exists(path): return "N/A"
         try:
-            out = subprocess.check_output(['du', '-sh', path], stderr=subprocess.DEVNULL).decode('utf-8')
-            return out.split()[0]
-        except:
-            return "N/A"
-
-    def cancel(self):
-        self._is_cancelled = True
+            return subprocess.check_output(['du', '-sh', path], stderr=subprocess.DEVNULL).decode('utf-8').split()[0]
+        except: return "N/A"
+    def cancel(self): self._is_cancelled = True
 
 class SingleSizeWorker(QThread):
     result = pyqtSignal(object, str)
-
     def __init__(self, item, path):
         super().__init__()
-        self.item = item
-        self.path = path
-        self._is_cancelled = False
-
+        self.item = item; self.path = path; self._is_cancelled = False
     def run(self):
         if self._is_cancelled or not self.path or not os.path.exists(self.path):
-            self.result.emit(self.item, "N/A")
-            return
+            self.result.emit(self.item, "N/A"); return
         try:
-            out = subprocess.check_output(['du', '-sh', self.path], stderr=subprocess.DEVNULL).decode('utf-8')
-            if not self._is_cancelled:
-                self.result.emit(self.item, out.split()[0])
+            sz = subprocess.check_output(['du', '-sh', self.path], stderr=subprocess.DEVNULL).decode('utf-8').split()[0]
+            if not self._is_cancelled: self.result.emit(self.item, sz)
         except:
-            if not self._is_cancelled:
-                self.result.emit(self.item, "N/A")
-
-    def cancel(self):
-        self._is_cancelled = True
+            if not self._is_cancelled: self.result.emit(self.item, "N/A")
+    def cancel(self): self._is_cancelled = True
 
 class ScannerWorker(QThread):
     finished = pyqtSignal(dict, dict)
@@ -249,7 +232,6 @@ class ScannerWorker(QThread):
         ws_data = {"releases": {}, "blocks": set(), "all_runs": []}
         out_data = {"releases": {}, "blocks": set(), "all_runs": []}
         tasks = []
-        
         tools_to_scan = PNR_TOOL_NAMES.split()
 
         ws_bases = [BASE_WS_FE_DIR, BASE_WS_BE_DIR]
@@ -271,17 +253,13 @@ class ScannerWorker(QThread):
                 
                 for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
                     ent_name = os.path.basename(ent_path)
-                    
                     if ws_base == BASE_WS_FE_DIR:
                         for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
                             tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
-                        
                     if "fc" in tools_to_scan:
-                        be_patterns = ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]
-                        for pat in be_patterns:
+                        for pat in ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]:
                             for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
                                 tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
-                                
                     if "innovus" in tools_to_scan:
                         for rd in glob.glob(os.path.join(ent_path, "innovus", "EVT*_ML*_DEV*_*")):
                             if os.path.isdir(rd):
@@ -293,18 +271,14 @@ class ScannerWorker(QThread):
                 if not os.path.isdir(ent_path): continue
                 for evt_dir in glob.glob(os.path.join(ent_path, "EVT*")):
                     phys_evt = os.path.basename(evt_dir) 
-                    
                     for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
                         tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
-                    
                     if "fc" in tools_to_scan:
                         be_runs = glob.glob(os.path.join(evt_dir, "fc", "*-BE")) + glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE"))
                         for rd in be_runs:
                             tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
-                            
                     if "innovus" in tools_to_scan:
-                        in_runs = glob.glob(os.path.join(evt_dir, "innovus", "*"))
-                        for rd in in_runs:
+                        for rd in glob.glob(os.path.join(evt_dir, "innovus", "*")):
                             if os.path.isdir(rd):
                                 tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
@@ -334,22 +308,18 @@ class ScannerWorker(QThread):
 
     def _thread_process_run(self, task_tuple):
         b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
-        if source == "OUTFEED":
-            rtl = self._resolve_outfeed_rtl(rd, phys_evt)
+        if source == "OUTFEED": rtl = self._resolve_outfeed_rtl(rd, phys_evt)
         else:
             if run_type == "BE":
                 extracted = extract_rtl(rd)
                 rtl = extracted if extracted != "Unknown" else base_rtl
-            else:
-                rtl = base_rtl
+            else: rtl = base_rtl
         return self._process_run(b_name, rd, parent_path, rtl, source, run_type)
 
     def _resolve_outfeed_rtl(self, rd, phys_evt):
         rtl = extract_rtl(rd)
-        if re.search(r'EVT\d+_ML\d+_DEV\d+', rtl):
-            rtl = re.sub(r'EVT\d+_ML\d+_DEV\d+', phys_evt, rtl)
-        elif rtl == "Unknown":
-            rtl = normalize_rtl(phys_evt)
+        if re.search(r'EVT\d+_ML\d+_DEV\d+', rtl): rtl = re.sub(r'EVT\d+_ML\d+_DEV\d+', phys_evt, rtl)
+        elif rtl == "Unknown": rtl = normalize_rtl(phys_evt)
         return normalize_rtl(rtl)
 
     def _process_run(self, b_name, rd, parent_path, rtl, source, run_type):
@@ -365,55 +335,32 @@ class ScannerWorker(QThread):
         
         stages = []
         if run_type == "BE":
-            if source == "WS":
-                for s_dir in glob.glob(os.path.join(rd, "outputs", "*")):
-                    if os.path.isdir(s_dir):
-                        step_name = os.path.basename(s_dir)
-                        rpt = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
-                        log = os.path.join(rd, "logs", f"{step_name}.log")
-                        stage_path = os.path.join(rd, "outputs", step_name)
-                        
-                        fm_u_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
-                        fm_n_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2n_func", "reports", "*.failpoint.rpt"))
-                        st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
-                        st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
-                        st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
-                        
-                        sta_rpt = os.path.join(evt_base, "pt", r_name, step_name, "reports", "sta", "summary", "summary.rpt")
-                        qor_path = rd if rd.endswith("/") else rd + "/"
-                        
-                        stages.append({
-                            "name": step_name, "rpt": rpt, "log": log, "info": parse_pnr_runtime_rpt(rpt),
-                            "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
-                            "vslp_status": get_vslp_info(st_vslp_rpt),
-                            "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt,
-                            "sta_rpt_path": sta_rpt, "qor_path": qor_path, "stage_path": stage_path
-                        })
-            elif source == "OUTFEED":
-                for s_dir in glob.glob(os.path.join(rd, "*")):
-                    if os.path.isdir(s_dir):
-                        step_name = os.path.basename(s_dir)
-                        if step_name in ["reports", "logs", "pass", "fail", "outputs"]: continue
-                        rpt = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
-                        log = os.path.join(s_dir, "logs", f"{step_name}.log")
-                        stage_path = os.path.join(rd, step_name)
-                        
-                        fm_u_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
-                        fm_n_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2n_func", "reports", "*.failpoint.rpt"))
-                        st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
-                        st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
-                        st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
-                        
-                        sta_rpt = os.path.join(evt_base, "pt", r_name, step_name, "reports", "sta", "summary", "summary.rpt")
-                        qor_path = rd if rd.endswith("/") else rd + "/"
-                        
-                        stages.append({
-                            "name": step_name, "rpt": rpt, "log": log, "info": parse_pnr_runtime_rpt(rpt),
-                            "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
-                            "vslp_status": get_vslp_info(st_vslp_rpt),
-                            "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt,
-                            "sta_rpt_path": sta_rpt, "qor_path": qor_path, "stage_path": stage_path
-                        })
+            search_glob = os.path.join(rd, "outputs", "*") if source == "WS" else os.path.join(rd, "*")
+            for s_dir in glob.glob(search_glob):
+                if os.path.isdir(s_dir):
+                    step_name = os.path.basename(s_dir)
+                    if source == "OUTFEED" and step_name in ["reports", "logs", "pass", "fail", "outputs"]: continue
+                    
+                    rpt = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt") if source == "WS" else os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
+                    log = os.path.join(rd, "logs", f"{step_name}.log") if source == "WS" else os.path.join(s_dir, "logs", f"{step_name}.log")
+                    stage_path = os.path.join(rd, "outputs", step_name) if source == "WS" else os.path.join(rd, step_name)
+                    
+                    fm_u_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
+                    fm_n_glob = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2n_func", "reports", "*.failpoint.rpt"))
+                    st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
+                    st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
+                    st_vslp_rpt = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
+                    
+                    sta_rpt = os.path.join(evt_base, "pt", r_name, step_name, "reports", "sta", "summary", "summary.rpt")
+                    qor_path = rd if rd.endswith("/") else rd + "/"
+                    
+                    stages.append({
+                        "name": step_name, "rpt": rpt, "log": log, "info": parse_pnr_runtime_rpt(rpt),
+                        "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
+                        "vslp_status": get_vslp_info(st_vslp_rpt),
+                        "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt,
+                        "sta_rpt_path": sta_rpt, "qor_path": qor_path, "stage_path": stage_path
+                    })
 
         return {
             "block": b_name, "path": rd, "parent": parent_path, "rtl": rtl, "r_name": r_name,
@@ -452,6 +399,10 @@ class PDDashboard(QMainWindow):
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.refresh_view)
         
+        # Auto-refresh timer
+        self.auto_refresh_timer = QTimer(self)
+        self.auto_refresh_timer.timeout.connect(self.start_fs_scan)
+        
         self.init_ui()
         self.start_fs_scan()
 
@@ -478,6 +429,18 @@ class PDDashboard(QMainWindow):
         self.search.textChanged.connect(lambda: self.search_timer.start(300))
         top.addWidget(self.search)
         
+        # --- NEW REFRESH CONTROLS ---
+        self.refresh_btn = QPushButton("🔄 Refresh")
+        self.refresh_btn.clicked.connect(self.start_fs_scan)
+        top.addWidget(self.refresh_btn)
+        
+        top.addWidget(QLabel("Auto-Update:"))
+        self.auto_combo = QComboBox()
+        self.auto_combo.addItems(["Off", "1 Min", "5 Min", "10 Min"])
+        self.auto_combo.currentIndexChanged.connect(self.on_auto_refresh_changed)
+        top.addWidget(self.auto_combo)
+        # ----------------------------
+
         self.tools_btn = QPushButton("Tools")
         self.tools_menu = QMenu(self)
         
@@ -559,6 +522,17 @@ class PDDashboard(QMainWindow):
         
         self.apply_theme_and_spacing()
 
+    def on_auto_refresh_changed(self):
+        val = self.auto_combo.currentText()
+        if val == "Off":
+            self.auto_refresh_timer.stop()
+        elif val == "1 Min":
+            self.auto_refresh_timer.start(60 * 1000)
+        elif val == "5 Min":
+            self.auto_refresh_timer.start(5 * 60 * 1000)
+        elif val == "10 Min":
+            self.auto_refresh_timer.start(10 * 60 * 1000)
+
     def fit_all_columns(self):
         for i in range(self.tree.columnCount()):
             if not self.tree.isColumnHidden(i):
@@ -597,7 +571,6 @@ class PDDashboard(QMainWindow):
             font = dlg.font_combo.currentFont()
             font.setPointSize(dlg.size_spin.value())
             QApplication.setFont(font)
-            
             self.is_dark_mode = dlg.theme_cb.isChecked()
             self.row_spacing = dlg.space_spin.value()
             self.apply_theme_and_spacing()
@@ -623,11 +596,14 @@ class PDDashboard(QMainWindow):
                 QTreeView::item {{ padding: {pad}px; }}
                 QListWidget::item {{ padding: {pad}px; }}
             """
-        
         self.setStyleSheet(stylesheet)
         self.refresh_view()
 
     def start_fs_scan(self):
+        # Prevent overlapping scans if the user clicks refresh quickly
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            return
+            
         self.prog.setVisible(True); self.prog.setRange(0, 0)
         self.worker = ScannerWorker()
         self.worker.progress_update.connect(self.update_progress)
@@ -655,7 +631,6 @@ class PDDashboard(QMainWindow):
             blocks.update(self.out_data.get("blocks", set()))
 
         current_rtl = self.rel_combo.currentText()
-
         saved_states = {}
         for i in range(self.blk_list.count()):
             item = self.blk_list.item(i)
@@ -665,14 +640,12 @@ class PDDashboard(QMainWindow):
         new_releases = ["[ SHOW ALL ]"] + sorted(list(releases))
         self.rel_combo.addItems(new_releases)
         
-        if current_rtl in new_releases:
-            self.rel_combo.setCurrentText(current_rtl)
-        else:
-            self.rel_combo.setCurrentIndex(0)
+        if current_rtl in new_releases: self.rel_combo.setCurrentText(current_rtl)
+        else: self.rel_combo.setCurrentIndex(0)
             
         self.rel_combo.blockSignals(False)
-        
         self.blk_list.blockSignals(True); self.blk_list.clear()
+        
         for b in sorted(list(blocks)):
             it = QListWidgetItem(b)
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
@@ -687,10 +660,10 @@ class PDDashboard(QMainWindow):
         
         p = QTreeWidgetItem(parent)
         p.setText(0, text)
-        p.setExpanded(True)
+        p.setExpanded(True) # Keep structural folders expanded by default
         
-        if node_type == "OTHER":
-            p.setExpanded(False)
+        if node_type == "MILESTONE":
+            p.setForeground(0, QColor("#1976D2") if not self.is_dark_mode else QColor("#64B5F6"))
             
         return p
 
@@ -702,6 +675,9 @@ class PDDashboard(QMainWindow):
         child.setText(0, run["r_name"])
         child.setText(1, run["rtl"]) 
         child.setText(2, run["source"]) 
+        
+        # We explicitly DO NOT expand the run itself so BE stages stay hidden
+        child.setExpanded(False)
         
         if run["source"] == "OUTFEED": child.setForeground(2, QColor("#b39ddb" if self.is_dark_mode else "#5e35b1")) 
         else: child.setForeground(2, QColor("#ffb74d" if self.is_dark_mode else "#f57c00")) 
@@ -849,12 +825,10 @@ class PDDashboard(QMainWindow):
                 if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")):
                     continue
 
-            # Universal Global Search Logic
             if search_pattern != "*":
                 combined_text = f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} {run['st_n']} {run['st_u']} {run['vslp_status']} {run['info']['runtime']} {run['info']['start']} {run['info']['end']}".lower()
                 matches = fnmatch.fnmatch(combined_text, search_pattern)
                 
-                # Check substages if main run doesn't match
                 if not matches and run["run_type"] == "BE":
                     for stage in run["stages"]:
                         st_comb = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
@@ -873,20 +847,26 @@ class PDDashboard(QMainWindow):
 
         root = self.tree.invisibleRootItem()
 
-        # Build Main Tree
         for fe_run in fe_runs:
             blk_name = fe_run["block"]
-            
-            base_rtl = re.sub(r'_syn\d+$', '', fe_run["rtl"])
-            if sel_rtl == "[ SHOW ALL ]":
-                display_rtl = base_rtl
-            else:
-                display_rtl = fe_run["rtl"]
-                
+            run_rtl = fe_run["rtl"]
+            base_rtl = re.sub(r'_syn\d+$', '', run_rtl)
+            has_syn = (run_rtl != base_rtl)
+
             block_node = self._get_node(root, blk_name, "BLOCK")
-            rtl_node = self._get_node(block_node, display_rtl, "RTL")
+
+            if sel_rtl == "[ SHOW ALL ]":
+                milestone = get_milestone(base_rtl)
+                m_node = self._get_node(block_node, milestone, "MILESTONE")
+                rtl_node = self._get_node(m_node, base_rtl, "RTL")
+                parent_for_run = rtl_node
+            elif sel_rtl == base_rtl and has_syn:
+                syn_node = self._get_node(block_node, run_rtl, "RTL")
+                parent_for_run = syn_node
+            else:
+                parent_for_run = block_node
             
-            fe_item = self._create_run_item(rtl_node, fe_run)
+            fe_item = self._create_run_item(parent_for_run, fe_run)
             fe_base = fe_run["r_name"].replace("-FE", "")
             
             for be_run in be_runs:
@@ -898,45 +878,64 @@ class PDDashboard(QMainWindow):
         for be_run in be_runs:
             if id(be_run) not in matched_be_ids:
                 blk_name = be_run["block"]
-                
-                base_rtl = re.sub(r'_syn\d+$', '', be_run["rtl"])
-                if sel_rtl == "[ SHOW ALL ]":
-                    display_rtl = base_rtl
-                else:
-                    display_rtl = be_run["rtl"]
-                
+                run_rtl = be_run["rtl"]
+                base_rtl = re.sub(r'_syn\d+$', '', run_rtl)
+                has_syn = (run_rtl != base_rtl)
+
                 block_node = self._get_node(root, blk_name, "BLOCK")
-                rtl_node = self._get_node(block_node, display_rtl, "RTL")
-                other_pnr_node = self._get_node(rtl_node, "Other PNR runs", "OTHER")
+
+                if sel_rtl == "[ SHOW ALL ]":
+                    milestone = get_milestone(base_rtl)
+                    m_node = self._get_node(block_node, milestone, "MILESTONE")
+                    rtl_node = self._get_node(m_node, base_rtl, "RTL")
+                    other_pnr_node = self._get_node(rtl_node, "Other PNR runs", "OTHER")
+                    parent_for_run = other_pnr_node
+                elif sel_rtl == base_rtl and has_syn:
+                    syn_node = self._get_node(block_node, run_rtl, "RTL")
+                    other_pnr_node = self._get_node(syn_node, "Other PNR runs", "OTHER")
+                    parent_for_run = other_pnr_node
+                else:
+                    other_pnr_node = self._get_node(block_node, "Other PNR runs", "OTHER")
+                    parent_for_run = other_pnr_node
                 
-                be_item = self._create_run_item(other_pnr_node, be_run)
+                be_item = self._create_run_item(parent_for_run, be_run)
                 self._add_stages(be_item, be_run)
 
-        # Build Ignored Runs Tree
         if ignored_runs_list:
             ignored_root = self._get_node(root, "🚫 Ignored Runs", "IGNORED_ROOT")
             for run in ignored_runs_list:
                 blk_name = run["block"]
-                
-                base_rtl = re.sub(r'_syn\d+$', '', run["rtl"])
-                if sel_rtl == "[ SHOW ALL ]":
-                    display_rtl = base_rtl
-                else:
-                    display_rtl = run["rtl"]
-                
+                run_rtl = run["rtl"]
+                base_rtl = re.sub(r'_syn\d+$', '', run_rtl)
+                has_syn = (run_rtl != base_rtl)
+
                 block_node = self._get_node(ignored_root, blk_name, "BLOCK")
-                rtl_node = self._get_node(block_node, display_rtl, "RTL")
+
+                if sel_rtl == "[ SHOW ALL ]":
+                    milestone = get_milestone(base_rtl)
+                    m_node = self._get_node(block_node, milestone, "MILESTONE")
+                    rtl_node = self._get_node(m_node, base_rtl, "RTL")
+                    parent_for_run = rtl_node
+                elif sel_rtl == base_rtl and has_syn:
+                    syn_node = self._get_node(block_node, run_rtl, "RTL")
+                    parent_for_run = syn_node
+                else:
+                    parent_for_run = block_node
                 
-                item = self._create_run_item(rtl_node, run)
+                item = self._create_run_item(parent_for_run, run)
                 if run["run_type"] == "BE":
                     self._add_stages(item, run)
 
         self.tree.setSortingEnabled(True)
 
+        # Smart Restore State
         def restore_state(node):
             for i in range(node.childCount()):
                 child = node.child(i)
                 path_key = self._get_item_path_id(child)
+                
+                # Check if it's an actual run item (has a path in column 12)
+                is_run = bool(child.text(12))
                 
                 if path_key in expanded_states:
                     child.setExpanded(expanded_states[path_key])
@@ -945,8 +944,12 @@ class PDDashboard(QMainWindow):
                         child.setExpanded(True) 
                     elif child.text(0).strip() == "Other PNR runs":
                         child.setExpanded(False) 
-                    else:
+                    elif is_run:
+                        # Collapse the runs natively so -BE stages hide
                         child.setExpanded(False) 
+                    else:
+                        # Expand grouping folders (Block, Milestone, RTL)
+                        child.setExpanded(True) 
                         
                 restore_state(child)
 
@@ -988,15 +991,18 @@ class PDDashboard(QMainWindow):
         log_path = item.text(13)
         run_path = item.text(12) 
         
+        ignore_checked_act = m.addAction("Ignore All Checked Runs")
+        m.addSeparator()
+
         ignore_act = None
         restore_act = None
         is_stage = item.data(0, Qt.UserRole) == "STAGE"
         
         if run_path and run_path != "N/A" and not is_stage:
             if run_path in self.ignored_paths:
-                restore_act = m.addAction("Restore Run (Un-ignore)")
+                restore_act = m.addAction("Restore Current Run (Un-ignore)")
             else:
-                ignore_act = m.addAction("Ignore Run (Hide)")
+                ignore_act = m.addAction("Ignore Current Run")
             m.addSeparator()
         
         calc_size_act = None
@@ -1035,7 +1041,17 @@ class PDDashboard(QMainWindow):
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         
         if res:
-            if ignore_act and res == ignore_act:
+            if ignore_checked_act and res == ignore_checked_act:
+                def ignore_checked(node):
+                    for i in range(node.childCount()):
+                        c = node.child(i)
+                        if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
+                            p = c.text(12)
+                            if p and p != "N/A": self.ignored_paths.add(p)
+                        ignore_checked(c)
+                ignore_checked(self.tree.invisibleRootItem())
+                self.refresh_view()
+            elif ignore_act and res == ignore_act:
                 self.ignored_paths.add(run_path)
                 self.refresh_view()
             elif restore_act and res == restore_act:
