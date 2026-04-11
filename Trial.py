@@ -221,7 +221,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Dashboard Settings")
-        self.resize(400, 320)
+        self.resize(400, 350)
         layout = QFormLayout(self)
         layout.setSpacing(12)
 
@@ -243,12 +243,16 @@ class SettingsDialog(QDialog):
         self.rel_time_cb = QCheckBox("Show relative timestamps (e.g. '2h ago')")
         self.rel_time_cb.setChecked(parent.show_relative_time if parent else False)
         layout.addRow("", self.rel_time_cb)
+        
+        self.theme_cb = QCheckBox("Enable Dark Mode (Default Theme)")
+        self.theme_cb.setChecked(parent.is_dark_mode if parent else False)
+        layout.addRow("", self.theme_cb)
 
         # Custom Theming
         sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
         layout.addRow(sep)
         
-        self.use_custom_cb = QCheckBox("Enable Custom Colors")
+        self.use_custom_cb = QCheckBox("Enable Custom Colors (Overrides Default Theme)")
         self.use_custom_cb.setChecked(parent.use_custom_colors if parent else False)
         layout.addRow("Theme:", self.use_custom_cb)
 
@@ -478,7 +482,6 @@ class ScannerWorker(QThread):
         vslp_rpt = os.path.join(evt_base, "vslp", clean_run, "pre", "reports", "report_lp.rpt")
         info     = parse_runtime_rpt(os.path.join(rd, "reports/runtime.V2.rpt"))
 
-        # Determine FE Status exactly based on logs
         is_comp = True if source == "OUTFEED" else cached_exists(os.path.join(rd, "pass/compile_opt.pass"))
         fe_status = "RUNNING"
         
@@ -492,10 +495,13 @@ class ScannerWorker(QThread):
                 else:
                     fe_status = "RUNNING"
                     try:
-                        # Fast check for crashing thread in the log
-                        res = subprocess.run(["grep", "-m", "1", "Stack trace for crashing thread", log_file], stdout=subprocess.DEVNULL)
-                        if res.returncode == 0:
+                        res_fatal = subprocess.run(["grep", "-m", "1", "Stack trace for crashing thread", log_file], stdout=subprocess.DEVNULL)
+                        if res_fatal.returncode == 0:
                             fe_status = "FATAL ERROR"
+                        else:
+                            res_int = subprocess.run(["grep", "-m", "1", "Information: Process terminated by interrupt. (INT-4)", log_file], stdout=subprocess.DEVNULL)
+                            if res_int.returncode == 0:
+                                fe_status = "INTERRUPTED"
                     except: pass
 
         stages = []
@@ -568,13 +574,14 @@ class PDDashboard(QMainWindow):
         self.out_data = {}
         self.ir_data  = {}
         
+        self.is_dark_mode       = False
         self.use_custom_colors  = False
         self.custom_bg_color    = "#2b2d30"
         self.custom_fg_color    = "#dfe1e5"
         self.custom_sel_color   = "#2f65ca"
         
         self.row_spacing        = 2
-        self.show_relative_time = False # Changed default to False
+        self.show_relative_time = False 
         self._columns_fitted_once = False
         self._last_scan_time    = None
 
@@ -692,7 +699,7 @@ class PDDashboard(QMainWindow):
 
         # Left: block filter panel
         left_panel = QWidget()
-        left_panel.setMaximumWidth(280)
+        left_panel.setMaximumWidth(320)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 4, 0)
         left_layout.setSpacing(6)
@@ -719,16 +726,15 @@ class PDDashboard(QMainWindow):
 
         # Right: tree
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(21) # Updated for new User column
+        self.tree.setColumnCount(21) 
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)     
         self.tree.setAnimated(False)             
         self.tree.setExpandsOnDoubleClick(False) 
         self.tree.setSortingEnabled(True)
         self.tree.header().setSectionsMovable(True)
-        self.tree.header().setStretchLastSection(True) # Fill out to right end
+        self.tree.header().setStretchLastSection(True) 
 
-        # Reorder headers to include User before Size
         headers = [
             "Run Name (Select)", "RTL Release Version", "Source", "Status", "Stage", "User", "Size",
             "FM - NONUPF", "FM - UPF", "VSLP Status", "Static IR", "Runtime", "Start", "End",
@@ -743,17 +749,15 @@ class PDDashboard(QMainWindow):
 
         self.tree.setColumnWidth(0, 380); self.tree.setColumnWidth(1, 260)
         self.tree.setColumnWidth(2, 90);  self.tree.setColumnWidth(3, 110)
-        self.tree.setColumnWidth(4, 130); self.tree.setColumnWidth(5, 100) # User
+        self.tree.setColumnWidth(4, 130); self.tree.setColumnWidth(5, 100) 
         self.tree.setColumnWidth(6, 80);  self.tree.setColumnWidth(7, 160)
         self.tree.setColumnWidth(8, 160); self.tree.setColumnWidth(9, 200)
         self.tree.setColumnWidth(10, 100); self.tree.setColumnWidth(11, 110)
         self.tree.setColumnWidth(12, 120); self.tree.setColumnWidth(13, 120)
 
-        # Connect expansion to auto-fit run name column
         self.tree.itemExpanded.connect(lambda: self.tree.resizeColumnToContents(0))
         self.tree.itemCollapsed.connect(lambda: self.tree.resizeColumnToContents(0))
 
-        # Default hidden columns (10 is Static IR, >=14 are paths)
         for i in [10, 14, 15, 16, 17, 18, 19, 20]: 
             self.tree.setColumnHidden(i, True)
 
@@ -763,7 +767,7 @@ class PDDashboard(QMainWindow):
         self.tree.itemChanged.connect(self._on_item_check_changed)
 
         self.splitter.addWidget(self.tree)
-        self.splitter.setSizes([260, 1660])
+        self.splitter.setSizes([320, 1600])
         root_layout.addWidget(self.splitter)
 
         # ---- STATUS BAR ----
@@ -871,6 +875,7 @@ class PDDashboard(QMainWindow):
             font.setPointSize(dlg.size_spin.value())
             QApplication.setFont(font)
             
+            self.is_dark_mode        = dlg.theme_cb.isChecked()
             self.use_custom_colors   = dlg.use_custom_cb.isChecked()
             self.custom_bg_color     = dlg.bg_color
             self.custom_fg_color     = dlg.fg_color
@@ -1096,8 +1101,8 @@ class PDDashboard(QMainWindow):
         def gather(node):
             for i in range(node.childCount()):
                 child = node.child(i)
-                path = child.text(14) # Path is now col 14
-                if path and path != "N/A" and child.text(6) in ["-", "N/A", "Calc..."]: # Size is col 6
+                path = child.text(14) 
+                if path and path != "N/A" and child.text(6) in ["-", "N/A", "Calc..."]: 
                     item_id = str(id(child))
                     self.item_map[item_id] = child
                     size_tasks.append((item_id, path))
@@ -1151,6 +1156,8 @@ class PDDashboard(QMainWindow):
             item.setForeground(col, QColor("#0d47a1" if not self.is_dark_mode else "#64b5f6"))
         elif status == "NOT STARTED":
             item.setForeground(col, QColor("#757575" if not self.is_dark_mode else "#9e9e9e"))
+        elif status == "INTERRUPTED":
+            item.setForeground(col, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
         elif status in ("FAILED", "FATAL ERROR", "ERROR"):
             item.setForeground(col, QColor("#b71c1c" if not self.is_dark_mode else "#e57373"))
 
@@ -1177,7 +1184,7 @@ class PDDashboard(QMainWindow):
         child.setText(0, run["r_name"])
         child.setText(1, run["rtl"])
         child.setText(2, run["source"])
-        child.setText(5, run.get("owner", "Unknown")) # User is col 5
+        child.setText(5, run.get("owner", "Unknown")) 
 
         if run["path"] in self._checked_paths:
             child.setCheckState(0, Qt.Checked)
@@ -1210,11 +1217,11 @@ class PDDashboard(QMainWindow):
             status_str = run["fe_status"]
             child.setText(3, status_str)
             child.setText(4, "COMPLETED" if run["is_comp"] else run["info"]["last_stage"])
-            child.setText(6, "-") # Size
+            child.setText(6, "-") 
             child.setText(7, f"NONUPF - {run['st_n']}")
             child.setText(8, f"UPF - {run['st_u']}")
             child.setText(9, run["vslp_status"])
-            child.setText(10, "-") # Static IR
+            child.setText(10, "-") 
             child.setText(11, run["info"]["runtime"])
 
             start_raw = run["info"]["start"]
@@ -1294,13 +1301,12 @@ class PDDashboard(QMainWindow):
             st_item.setText(0, stage["name"])
             st_item.setText(2, be_run["source"])
             st_item.setText(4, stage_status)
-            st_item.setText(5, owner) # User
-            st_item.setText(6, "-") # Size
+            st_item.setText(5, owner) 
+            st_item.setText(6, "-") 
             st_item.setText(7, f"NONUPF - {stage['st_n']}")
             st_item.setText(8, f"UPF - {stage['st_u']}")
             st_item.setText(9, stage["vslp_status"])
             
-            # Static IR
             st_item.setText(10, ir_info["value"] if is_ir_block else "-")
             
             st_item.setText(11, stage["info"]["runtime"])
@@ -1388,11 +1394,10 @@ class PDDashboard(QMainWindow):
         self.tree.setSortingEnabled(False)
         self.tree.clear()
 
-        # Dynamic Column Visibility logic
         if self.rel_combo.currentText() == "[ SHOW ALL ]":
-            self.tree.setColumnHidden(1, False) # Show RTL Column
+            self.tree.setColumnHidden(1, False) 
         else:
-            self.tree.setColumnHidden(1, True) # Hide RTL Column
+            self.tree.setColumnHidden(1, True) 
 
         src_mode = self.src_combo.currentText()
         sel_rtl  = self.rel_combo.currentText()
@@ -1534,7 +1539,7 @@ class PDDashboard(QMainWindow):
                 child     = node.child(i)
                 path_key  = self._get_item_path_id(child)
                 node_type = child.data(0, Qt.UserRole)
-                is_run    = bool(child.text(14)) # Path is 14 now
+                is_run    = bool(child.text(14)) 
                 if path_key in expanded_states:
                     child.setExpanded(expanded_states[path_key])
                 else:
@@ -1543,7 +1548,7 @@ class PDDashboard(QMainWindow):
                     elif node_type == "MILESTONE":     
                         child.setExpanded(False)
                     elif sel_rtl == "[ SHOW ALL ]" and node_type == "RTL": 
-                        child.setExpanded(False) # Keep runs collapsed under RTL in Show All
+                        child.setExpanded(False) 
                     elif child.text(0).strip() == "Other PNR runs": 
                         child.setExpanded(False)
                     elif is_run:                       
@@ -1553,9 +1558,7 @@ class PDDashboard(QMainWindow):
                 restore_state(child)
         restore_state(root)
 
-        # Trigger autofit for Col 0 now that the tree is populated
         self.tree.resizeColumnToContents(0)
-
         self.tree.setUpdatesEnabled(True)
 
         all_runs = list(runs_to_process)
@@ -1648,7 +1651,7 @@ class PDDashboard(QMainWindow):
         elif copy_cell_act and res == copy_cell_act:
             QApplication.clipboard().setText(cell_text)
         elif calc_size_act and res == calc_size_act:
-            item.setText(6, "Calc...") # Col 6 is Size
+            item.setText(6, "Calc...") 
             worker = SingleSizeWorker(item, run_path)
             worker.result.connect(lambda it, sz: (
                 it.setText(6, sz),
@@ -1704,7 +1707,7 @@ class PDDashboard(QMainWindow):
 # ===========================================================================
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")          # consistent cross-platform look
+    app.setStyle("Fusion")          
     w = PDDashboard()
     w.show()
     sys.exit(app.exec_())
