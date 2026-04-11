@@ -26,6 +26,9 @@ BASE_WS_BE_DIR = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
 
 BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
 
+# IR Configuration
+BASE_IR_DIR = "/user/s5k2p5sx.be1/LAYOUT/IR/"
+
 PNR_TOOL_NAMES = "fc innovus"
 
 SUMMARY_SCRIPT = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
@@ -261,16 +264,16 @@ class ScannerWorker(QThread):
 
     def scan_ir_dir(self):
         ir_data = {}
-        ir_base = "/user/s5k2p5sx.be1/LAYOUT/IR/"
-        if os.path.exists(ir_base):
-            for root_dir, dirs, files in os.walk(ir_base):
+        if os.path.exists(BASE_IR_DIR):
+            target_lef = f"{PROJECT_PREFIX}.lef.list"
+            for root_dir, dirs, files in os.walk(BASE_IR_DIR):
                 if "redhawk.log" in files:
                     log_path = os.path.join(root_dir, "redhawk.log")
                     run_be_name, step_name, inst_line, inst_value = None, None, "", ""
                     try:
                         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
                             for line in f:
-                                if line.startswith("Parsing ") and "S5K2P5SP.lef.list" in line:
+                                if line.startswith("Parsing ") and target_lef in line:
                                     # Matches both outfeed (.../run-BE/stage/outputs/...) and WS (.../run-BE/outputs/stage/...)
                                     m = re.search(r'/fc/([^/]+-BE)/(?:outputs/)?([^/]+)/', line)
                                     if m: 
@@ -1042,6 +1045,8 @@ class PDDashboard(QMainWindow):
                     if child.parent() is None: 
                         child.setExpanded(True) 
                     elif node_type == "MILESTONE":
+                        child.setExpanded(False) 
+                    elif child.text(0).strip() == "Other PNR runs":
                         child.setExpanded(False) 
                     elif is_run:
                         child.setExpanded(False) 
