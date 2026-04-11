@@ -266,20 +266,25 @@ class ScannerWorker(QThread):
             for root_dir, dirs, files in os.walk(ir_base):
                 if "redhawk.log" in files:
                     log_path = os.path.join(root_dir, "redhawk.log")
-                    run_be_name, inst_line, inst_value = None, "", ""
+                    run_be_name, step_name, inst_line, inst_value = None, None, "", ""
                     try:
                         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
                             for line in f:
                                 if line.startswith("Parsing ") and "S5K2P5SP.lef.list" in line:
-                                    m = re.search(r'/fc/([^/]+-BE)/', line)
-                                    if m: run_be_name = m.group(1)
+                                    # Matches both outfeed (.../run-BE/stage/outputs/...) and WS (.../run-BE/outputs/stage/...)
+                                    m = re.search(r'/fc/([^/]+-BE)/(?:outputs/)?([^/]+)/', line)
+                                    if m: 
+                                        run_be_name = m.group(1)
+                                        step_name = m.group(2)
                                 elif line.startswith("INST ") and "mV" in line:
                                     inst_line = line.strip()
                                     m2 = re.search(r'INST\s+(\S+mV)', inst_line)
                                     if m2: inst_value = m2.group(1)
                     except: pass
-                    if run_be_name:
-                        ir_data[run_be_name] = {"log": log_path, "line": inst_line, "value": inst_value}
+                    if run_be_name and step_name:
+                        # Key uniquely by BE Run + PNR Stage
+                        key = f"{run_be_name}/{step_name}"
+                        ir_data[key] = {"log": log_path, "line": inst_line, "value": inst_value}
         return ir_data
 
     def run(self):
@@ -740,15 +745,13 @@ class PDDashboard(QMainWindow):
         child.setText(1, run["rtl"]) 
         child.setText(2, run["source"]) 
         
-        ir_info = self.ir_data.get(run["r_name"], {"log": "", "line": "N/A", "value": "-"})
-        
         tooltip_text = (f"Owner: {run.get('owner', 'Unknown')}\n"
                         f"Size: Pending\n"
                         f"Runtime: {run['info']['runtime']}\n"
                         f"NONUPF: {run['st_n']}\n"
                         f"UPF: {run['st_u']}\n"
                         f"VSLP: {run['vslp_status']}\n"
-                        f"Static IR: {ir_info['line']}")
+                        f"Static IR: Check individual stage levels")
         child.setToolTip(0, tooltip_text)
         
         child.setExpanded(False)
@@ -787,9 +790,9 @@ class PDDashboard(QMainWindow):
             child.setForeground(3, QColor("#81c784" if run["is_comp"] else "#4fc3f7") if self.is_dark_mode else QColor("#2e7d32" if run["is_comp"] else "#0277bd"))
         else:
             child.setText(5, "-") 
-            child.setText(9, ir_info["value"])
+            child.setText(9, "-")
             child.setText(13, run["path"]) 
-            child.setText(19, ir_info["log"]) 
+            child.setText(19, "") 
             
         for i in range(1, 20):
             child.setTextAlignment(i, Qt.AlignCenter)
@@ -799,7 +802,6 @@ class PDDashboard(QMainWindow):
 
     def _add_stages(self, be_item, be_run):
         owner = be_run.get("owner", "Unknown")
-        ir_info = self.ir_data.get(be_run["r_name"], {"log": "", "line": "N/A", "value": "-"})
         
         for stage in be_run["stages"]:
             st_item = CustomTreeItem(be_item)
@@ -809,6 +811,9 @@ class PDDashboard(QMainWindow):
             st_item.setData(0, Qt.UserRole, "STAGE")
             st_item.setData(1, Qt.UserRole, stage["name"])
             st_item.setData(2, Qt.UserRole, stage["qor_path"])
+            
+            ir_key = f"{be_run['r_name']}/{stage['name']}"
+            ir_info = self.ir_data.get(ir_key, {"log": "", "line": "N/A", "value": "-"})
             
             tooltip_text = (f"Owner: {owner}\n"
                             f"Size: Pending\n"
@@ -837,7 +842,7 @@ class PDDashboard(QMainWindow):
             st_item.setText(6, f"NONUPF - {stage['st_n']}") 
             st_item.setText(7, f"UPF - {stage['st_u']}")
             st_item.setText(8, stage["vslp_status"])
-            st_item.setText(9, "-")
+            st_item.setText(9, ir_info["value"])
             st_item.setText(10, stage["info"]["runtime"])
             st_item.setText(11, stage["info"]["start"])
             st_item.setText(12, stage["info"]["end"])
@@ -847,7 +852,7 @@ class PDDashboard(QMainWindow):
             st_item.setText(16, stage["fm_n_path"])
             st_item.setText(17, stage["vslp_rpt_path"])
             st_item.setText(18, stage["sta_rpt_path"]) 
-            st_item.setText(19, "")
+            st_item.setText(19, ir_info["log"])
             
             if "FAILS" in stage["st_n"]: st_item.setForeground(6, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
             elif "PASS" in stage["st_n"]: st_item.setForeground(6, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
@@ -984,12 +989,15 @@ class PDDashboard(QMainWindow):
                     milestone = get_milestone(base_rtl)
                     m_node = self._get_node(block_node, milestone, "MILESTONE")
                     rtl_node = self._get_node(m_node, base_rtl, "RTL")
-                    parent_for_run = rtl_node
+                    other_pnr_node = self._get_node(rtl_node, "Other PNR runs", "OTHER")
+                    parent_for_run = other_pnr_node
                 elif sel_rtl == base_rtl and has_syn:
                     syn_node = self._get_node(block_node, run_rtl, "RTL")
-                    parent_for_run = syn_node
+                    other_pnr_node = self._get_node(syn_node, "Other PNR runs", "OTHER")
+                    parent_for_run = other_pnr_node
                 else:
-                    parent_for_run = block_node
+                    other_pnr_node = self._get_node(block_node, "Other PNR runs", "OTHER")
+                    parent_for_run = other_pnr_node
                 
                 be_item = self._create_run_item(parent_for_run, be_run)
                 self._add_stages(be_item, be_run)
