@@ -100,7 +100,7 @@ class CustomTreeItem(QTreeWidgetItem):
 
 
 # ===========================================================================
-# --- LOGIC HELPERS  (unchanged from original) ---
+# --- LOGIC HELPERS ---
 # ===========================================================================
 def get_owner(path):
     if not path or not cached_exists(path): return "Unknown"
@@ -323,7 +323,6 @@ class ScannerWorker(QThread):
     finished       = pyqtSignal(dict, dict, dict)
     progress_update = pyqtSignal(int, int)
 
-    # ------------------------------------------------------------------ IR
     def scan_ir_dir(self):
         ir_data = {}
         if not os.path.exists(BASE_IR_DIR): return ir_data
@@ -350,7 +349,6 @@ class ScannerWorker(QThread):
                 ir_data[key] = {"log": log_path, "line": inst_line, "value": inst_value}
         return ir_data
 
-    # ------------------------------------------------------------------ main
     def run(self):
         clear_path_cache()
         ws_data  = {"releases": {}, "blocks": set(), "all_runs": []}
@@ -358,7 +356,6 @@ class ScannerWorker(QThread):
         tasks = []
         tools_to_scan = PNR_TOOL_NAMES.split()
 
-        # -- WS scan
         for ws_base in [BASE_WS_FE_DIR, BASE_WS_BE_DIR]:
             if not os.path.exists(ws_base): continue
             for ws_name in os.listdir(ws_base):
@@ -389,7 +386,6 @@ class ScannerWorker(QThread):
                             if os.path.isdir(rd):
                                 tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
-        # -- OUTFEED scan
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
                 ent_path = os.path.join(BASE_OUTFEED_DIR, ent_name)
@@ -544,7 +540,7 @@ class PDDashboard(QMainWindow):
         self.size_workers  = []
         self.item_map      = {}
         self.ignored_paths = set()
-        self._checked_paths = set()   # tracks which run paths are checked (for highlight)
+        self._checked_paths = set()
 
         # timers
         self.search_timer = QTimer(self)
@@ -631,7 +627,6 @@ class PDDashboard(QMainWindow):
         self.tools_menu.addAction("Collapse All [Ctrl+W]",       lambda: self.tree.collapseAll())
         self.tools_menu.addSeparator()
         self.tools_menu.addAction("Calculate All Run Sizes",      self.calculate_all_sizes)
-        self.tools_menu.addAction("Open Run Folder (xdg-open)",   self._open_selected_folder)
         self.tools_btn.setMenu(self.tools_menu)
         top.addWidget(self.tools_btn)
 
@@ -656,20 +651,20 @@ class PDDashboard(QMainWindow):
 
         # Left: block filter panel
         left_panel = QWidget()
-        left_panel.setMaximumWidth(220)
+        left_panel.setMaximumWidth(280)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 4, 0)
-        left_layout.setSpacing(4)
+        left_layout.setSpacing(6)
 
         blk_header = QHBoxLayout()
         blk_header.addWidget(self._label("<b>Blocks</b>"))
         blk_header.addStretch()
-        all_btn  = QPushButton("All")
-        none_btn = QPushButton("None")
-        all_btn.setFixedSize(36, 20)
-        none_btn.setFixedSize(40, 20)
+        
+        all_btn  = QPushButton("Select All")
+        none_btn = QPushButton("Deselect All")
         all_btn.clicked.connect(lambda: self._set_all_blocks(True))
         none_btn.clicked.connect(lambda: self._set_all_blocks(False))
+        
         blk_header.addWidget(all_btn)
         blk_header.addWidget(none_btn)
         left_layout.addLayout(blk_header)
@@ -720,7 +715,7 @@ class PDDashboard(QMainWindow):
         self.tree.itemChanged.connect(self._on_item_check_changed)
 
         self.splitter.addWidget(self.tree)
-        self.splitter.setSizes([210, 1710])
+        self.splitter.setSizes([260, 1660])
         root_layout.addWidget(self.splitter)
 
         # ---- STATUS BAR ----
@@ -783,13 +778,6 @@ class PDDashboard(QMainWindow):
         QShortcut(QKeySequence("Ctrl+W"),       self, lambda: self.tree.collapseAll())
         QShortcut(QKeySequence("Ctrl+Shift+F"), self, self.fit_all_columns)
 
-    def _open_selected_folder(self):
-        item = self.tree.currentItem()
-        if not item: return
-        path = item.text(13)
-        if path and path != "N/A" and os.path.exists(path):
-            subprocess.Popen(["xdg-open", path])
-
     # ------------------------------------------------------------------
     # STATUS-BAR UPDATE
     # ------------------------------------------------------------------
@@ -802,7 +790,6 @@ class PDDashboard(QMainWindow):
             if status == "COMPLETED": completed += 1
             elif status == "RUNNING":
                 running += 1
-                # count failed: VSLP or FM errors
                 if ("FAILS" in r.get("st_n","") or "FAILS" in r.get("st_u","")):
                     failed += 1
 
@@ -819,11 +806,14 @@ class PDDashboard(QMainWindow):
         if col != 0: return
         path = item.text(13)
         if not path or path == "N/A": return
+        
+        # Determine background highlight color safely via current theme
+        hl_color = QColor("#404652" if self.is_dark_mode else "#e3f2fd")
+        
         if item.checkState(0) == Qt.Checked:
             self._checked_paths.add(path)
-            # highlight row
             for c in range(self.tree.columnCount()):
-                item.setBackground(c, QColor("#fff9c4" if not self.is_dark_mode else "#4a4000"))
+                item.setBackground(c, hl_color)
         else:
             self._checked_paths.discard(path)
             for c in range(self.tree.columnCount()):
@@ -849,76 +839,90 @@ class PDDashboard(QMainWindow):
         if self.is_dark_mode:
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{
-                    background-color: #1e1e2e; color: #cdd6f4; }}
+                    background-color: #2b2d30; color: #dfe1e5;
+                }}
                 QTreeWidget, QListWidget {{
-                    background-color: #252536; color: #cdd6f4;
-                    alternate-background-color: #2a2a3e;
-                    gridline-color: #3c3c5a; }}
+                    background-color: #1e1f22; color: #dfe1e5;
+                    alternate-background-color: #26282b;
+                    gridline-color: #393b40; border: 1px solid #393b40;
+                }}
                 QHeaderView::section {{
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                        stop:0 #3c3c5a, stop:1 #2e2e48);
-                    color: #89b4fa; border: 1px solid #1e1e2e;
-                    padding: 5px; font-weight: bold; }}
-                QLineEdit, QComboBox, QSpinBox {{
-                    background-color: #313244; color: #cdd6f4;
-                    border: 1px solid #585b70; padding: 3px;
-                    border-radius: 3px; }}
-                QComboBox::drop-down {{ border: none; }}
+                    background-color: #2b2d30; color: #a9b7c6;
+                    border: 1px solid #1e1f22; padding: 5px; font-weight: bold;
+                }}
+                QLineEdit, QSpinBox {{
+                    background-color: #1e1f22; color: #dfe1e5;
+                    border: 1px solid #43454a; padding: 4px; border-radius: 4px;
+                }}
+                QComboBox {{
+                    background-color: #2b2d30; color: #dfe1e5;
+                    border: 1px solid #43454a; padding: 4px; border-radius: 4px;
+                }}
+                QComboBox QAbstractItemView {{
+                    background-color: #2b2d30; color: #dfe1e5;
+                    selection-background-color: #2f65ca; selection-color: #ffffff;
+                }}
                 QPushButton {{
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                        stop:0 #45475a, stop:1 #313244);
-                    color: #cdd6f4; border: 1px solid #585b70;
-                    padding: 4px 10px; border-radius: 4px; }}
-                QPushButton:hover {{
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                        stop:0 #585b70, stop:1 #45475a); }}
-                QPushButton:pressed {{ background: #1e1e2e; }}
-                QSplitter::handle {{ background-color: #45475a; }}
-                QMenu {{ border: 1px solid #585b70;
-                    background-color: #252536; color: #cdd6f4; }}
-                QMenu::item:selected {{ background-color: #45475a; }}
-                QStatusBar {{ background: #1e1e2e; color: #a6adc8;
-                    border-top: 1px solid #313244; }}
-                QScrollBar:vertical {{
-                    background: #252536; width: 10px; border-radius: 5px; }}
-                QScrollBar::handle:vertical {{
-                    background: #585b70; border-radius: 5px; min-height: 20px; }}
+                    background-color: #393b40; color: #dfe1e5;
+                    border: 1px solid #43454a; padding: 5px 12px; border-radius: 4px;
+                }}
+                QPushButton:hover {{ background-color: #43454a; }}
+                QPushButton:pressed {{ background-color: #2f65ca; color: #ffffff; border-color: #2f65ca; }}
+                QSplitter::handle {{ background-color: #393b40; }}
+                QMenu {{
+                    border: 1px solid #43454a; background-color: #2b2d30; color: #dfe1e5;
+                }}
+                QMenu::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
+                QStatusBar {{ background: #2b2d30; color: #808080; border-top: 1px solid #393b40; }}
                 QTreeView::item {{ padding: {pad}px; }}
                 QListWidget::item {{ padding: {pad}px; }}
+                QTreeView::item:selected, QListWidget::item:selected {{
+                    background-color: #2f65ca; color: #ffffff;
+                }}
             """
         else:
             stylesheet = f"""
-                QMainWindow, QWidget {{ background-color: #f5f5f5; }}
+                QMainWindow, QWidget, QDialog {{
+                    background-color: #f5f7fa; color: #333333;
+                }}
                 QHeaderView::section {{
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                        stop:0 #e8eaf6, stop:1 #c5cae9);
-                    color: #283593; border: 1px solid #9fa8da;
-                    padding: 5px; font-weight: bold; }}
+                    background-color: #e4e7eb; color: #4a5568;
+                    border: 1px solid #cbd5e0; padding: 5px; font-weight: bold;
+                }}
                 QTreeWidget, QListWidget {{
-                    background-color: #ffffff;
-                    alternate-background-color: #f3f4fb;
-                    gridline-color: #e0e0e0; }}
-                QLineEdit, QComboBox, QSpinBox {{
-                    border: 1px solid #bdbdbd; padding: 3px;
-                    border-radius: 3px; background: white; }}
-                QComboBox::drop-down {{ border: none; }}
+                    background-color: #ffffff; color: #333333;
+                    alternate-background-color: #f8fafc;
+                    gridline-color: #e2e8f0; border: 1px solid #cbd5e0;
+                }}
+                QLineEdit, QSpinBox {{
+                    background-color: #ffffff; color: #333333;
+                    border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px;
+                }}
+                QComboBox {{
+                    background-color: #ffffff; color: #333333;
+                    border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px;
+                }}
+                QComboBox QAbstractItemView {{
+                    background-color: #ffffff; color: #333333;
+                    selection-background-color: #3182ce; selection-color: #ffffff;
+                }}
                 QPushButton {{
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                        stop:0 #e8eaf6, stop:1 #c5cae9);
-                    color: #283593; border: 1px solid #9fa8da;
-                    padding: 4px 10px; border-radius: 4px; font-weight: bold; }}
-                QPushButton:hover {{
-                    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
-                        stop:0 #c5cae9, stop:1 #9fa8da); }}
-                QPushButton:pressed {{ background: #9fa8da; }}
-                QStatusBar {{ background: #e8eaf6; color: #37474f;
-                    border-top: 1px solid #c5cae9; }}
-                QScrollBar:vertical {{
-                    background: #f5f5f5; width: 10px; border-radius: 5px; }}
-                QScrollBar::handle:vertical {{
-                    background: #bdbdbd; border-radius: 5px; min-height: 20px; }}
+                    background-color: #ffffff; color: #4a5568;
+                    border: 1px solid #cbd5e0; padding: 5px 12px; border-radius: 4px; font-weight: bold;
+                }}
+                QPushButton:hover {{ background-color: #edf2f7; border-color: #a0aec0; }}
+                QPushButton:pressed {{ background-color: #e2e8f0; }}
+                QSplitter::handle {{ background-color: #cbd5e0; }}
+                QMenu {{
+                    border: 1px solid #cbd5e0; background-color: #ffffff; color: #333333;
+                }}
+                QMenu::item:selected {{ background-color: #3182ce; color: #ffffff; }}
+                QStatusBar {{ background: #e4e7eb; color: #4a5568; border-top: 1px solid #cbd5e0; }}
                 QTreeView::item {{ padding: {pad}px; }}
                 QListWidget::item {{ padding: {pad}px; }}
+                QTreeView::item:selected, QListWidget::item:selected {{
+                    background-color: #3182ce; color: #ffffff;
+                }}
             """
         self.setStyleSheet(stylesheet)
         self.refresh_view()
@@ -955,7 +959,6 @@ class PDDashboard(QMainWindow):
         self.refresh_btn.setText("Refresh  [Ctrl+R]")
         self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
         self.on_source_changed()
-        # auto-fit columns once after the first scan
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
             self.fit_all_columns()
@@ -1038,7 +1041,7 @@ class PDDashboard(QMainWindow):
         p.setData(0, Qt.UserRole, node_type)
         p.setExpanded(True)
         if node_type == "MILESTONE":
-            p.setForeground(0, QColor("#1565C0" if not self.is_dark_mode else "#89b4fa"))
+            p.setForeground(0, QColor("#1e88e5" if not self.is_dark_mode else "#64b5f6"))
             f = p.font(0); f.setBold(True); p.setFont(0, f)
         elif node_type == "RTL":
             f = p.font(0); f.setItalic(True); p.setFont(0, f)
@@ -1059,23 +1062,23 @@ class PDDashboard(QMainWindow):
 
     def _apply_status_color(self, item, col, status):
         if status == "COMPLETED":
-            item.setForeground(col, QColor("#1b5e20" if not self.is_dark_mode else "#a6e3a1"))
+            item.setForeground(col, QColor("#1b5e20" if not self.is_dark_mode else "#81c784"))
         elif status == "RUNNING":
-            item.setForeground(col, QColor("#0d47a1" if not self.is_dark_mode else "#89b4fa"))
+            item.setForeground(col, QColor("#0d47a1" if not self.is_dark_mode else "#64b5f6"))
         elif status in ("FAILED", "ERROR"):
-            item.setForeground(col, QColor("#b71c1c" if not self.is_dark_mode else "#f38ba8"))
+            item.setForeground(col, QColor("#b71c1c" if not self.is_dark_mode else "#e57373"))
 
     def _apply_fm_color(self, item, col, val):
         if "FAILS" in val:
-            item.setForeground(col, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
         elif "PASS" in val:
-            item.setForeground(col, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
 
     def _apply_vslp_color(self, item, col, val):
         if "Error" in val and "Error: 0" not in val:
-            item.setForeground(col, QColor("#ef5350" if self.is_dark_mode else "#d32f2f"))
+            item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
         elif "Error: 0" in val:
-            item.setForeground(col, QColor("#66bb6a" if self.is_dark_mode else "#388e3c"))
+            item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -1089,11 +1092,11 @@ class PDDashboard(QMainWindow):
         child.setText(1, run["rtl"])
         child.setText(2, run["source"])
 
-        # restore checked highlight if previously checked
         if run["path"] in self._checked_paths:
             child.setCheckState(0, Qt.Checked)
+            hl_color = QColor("#404652" if self.is_dark_mode else "#e3f2fd")
             for c in range(self.tree.columnCount()):
-                child.setBackground(c, QColor("#fff9c4" if not self.is_dark_mode else "#4a4000"))
+                child.setBackground(c, hl_color)
 
         tooltip_text = (
             f"Owner: {run.get('owner','Unknown')}\n"
@@ -1107,11 +1110,10 @@ class PDDashboard(QMainWindow):
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
 
-        # source color
         if run["source"] == "OUTFEED":
-            child.setForeground(2, QColor("#7c4dff" if self.is_dark_mode else "#5e35b1"))
+            child.setForeground(2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
         else:
-            child.setForeground(2, QColor("#ffb74d" if self.is_dark_mode else "#e65100"))
+            child.setForeground(2, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
 
         if run["run_type"] == "FE":
             status_str = self._status_text(run["is_comp"])
@@ -1124,7 +1126,6 @@ class PDDashboard(QMainWindow):
             child.setText(9, "-")
             child.setText(10, run["info"]["runtime"])
 
-            # relative timestamps
             start_raw = run["info"]["start"]
             end_raw   = run["info"]["end"]
             if self.show_relative_time:
@@ -1250,9 +1251,9 @@ class PDDashboard(QMainWindow):
             blk = it.text()
             status = self._block_aggregate_status(blk, runs)
             if status == "running":
-                it.setForeground(QColor("#0277bd" if not self.is_dark_mode else "#89b4fa"))
+                it.setForeground(QColor("#0277bd" if not self.is_dark_mode else "#64b5f6"))
             else:
-                it.setForeground(QColor("#2e7d32" if not self.is_dark_mode else "#a6e3a1"))
+                it.setForeground(QColor("#2e7d32" if not self.is_dark_mode else "#81c784"))
 
     # ------------------------------------------------------------------
     # VIEW PRESET FILTER
@@ -1278,7 +1279,6 @@ class PDDashboard(QMainWindow):
             if hasattr(w, 'cancel'): w.cancel()
         self.item_map.clear()
 
-        # save expand states
         expanded_states = {}
         def save_state(node):
             for i in range(node.childCount()):
@@ -1426,7 +1426,6 @@ class PDDashboard(QMainWindow):
 
         self.tree.setSortingEnabled(True)
 
-        # restore expand state
         def restore_state(node):
             for i in range(node.childCount()):
                 child     = node.child(i)
@@ -1446,7 +1445,6 @@ class PDDashboard(QMainWindow):
 
         self.tree.setUpdatesEnabled(True)
 
-        # update block sidebar colors and status bar
         all_runs = list(runs_to_process)
         self._refresh_block_colors(all_runs)
         self._update_status_bar(normal_runs_list)
@@ -1501,11 +1499,7 @@ class PDDashboard(QMainWindow):
         calc_size_act = None
         if run_path and run_path != "N/A" and cached_exists(run_path):
             calc_size_act = m.addAction("Calculate Folder Size")
-
-        open_folder_act = None
-        if run_path and run_path != "N/A" and cached_exists(run_path):
-            open_folder_act = m.addAction("Open Folder (xdg-open)")
-        m.addSeparator()
+            m.addSeparator()
 
         fm_n_act = m.addAction("Open NONUPF Formality Report") if fm_n_path and fm_n_path != "N/A" and cached_exists(fm_n_path) else None
         fm_u_act = m.addAction("Open UPF Formality Report")   if fm_u_path and fm_u_path != "N/A" and cached_exists(fm_u_path) else None
@@ -1551,8 +1545,6 @@ class PDDashboard(QMainWindow):
             self.size_workers.append(worker)
             worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
             worker.start()
-        elif open_folder_act and res == open_folder_act:
-            subprocess.Popen(["xdg-open", run_path])
         elif fm_n_act and res == fm_n_act: subprocess.Popen(['gvim', fm_n_path])
         elif fm_u_act and res == fm_u_act: subprocess.Popen(['gvim', fm_u_path])
         elif v_act    and res == v_act:    subprocess.Popen(['gvim', vslp_path])
