@@ -10,6 +10,7 @@ import time
 import datetime
 import getpass
 import shutil
+import math
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -337,7 +338,7 @@ class MailDialog(QDialog):
 class PieChartWidget(QWidget):
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(300, 300)
+        self.setMinimumSize(450, 450)
         self.data = {} 
         self.colors = [
             QColor("#ef5350"), QColor("#42a5f5"), QColor("#66bb6a"), QColor("#ffa726"),
@@ -356,8 +357,14 @@ class PieChartWidget(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         
         rect = self.rect()
-        margin = 15
-        pie_rect = QRectF(rect.adjusted(margin, margin, -margin, -margin))
+        margin = 30
+        
+        # Enforce perfect circle sizing
+        min_dim = min(rect.width(), rect.height()) - 2 * margin
+        if min_dim <= 0: return
+        
+        center = rect.center()
+        pie_rect = QRectF(center.x() - min_dim/2, center.y() - min_dim/2, min_dim, min_dim)
         
         total = sum(self.data.values())
         if total == 0:
@@ -371,13 +378,45 @@ class PieChartWidget(QWidget):
             painter.setBrush(QBrush(self.colors[i % len(self.colors)]))
             painter.setPen(QPen(QColor(self.bg_col), 2)) 
             painter.drawPie(pie_rect, int(start_angle), int(span_angle))
+            
+            # Draw Labels inside slices if they are large enough (>3% of total)
+            if (val / total) > 0.03:
+                mid_angle_deg = (start_angle + span_angle / 2) / 16.0
+                mid_angle_rad = math.radians(mid_angle_deg)
+                
+                # Position text ~65% of the way from center to edge
+                text_x = center.x() + (min_dim / 2 * 0.65) * math.cos(mid_angle_rad)
+                # Qt Y-axis is inverted
+                text_y = center.y() - (min_dim / 2 * 0.65) * math.sin(mid_angle_rad)
+                
+                perc = (val / total) * 100
+                text = f"{name}\n{perc:.1f}%"
+                
+                font = painter.font()
+                font.setBold(True)
+                font.setPointSize(9)
+                painter.setFont(font)
+                fm = painter.fontMetrics()
+                lines = text.split('\n')
+                th = fm.height()
+                y_offset = text_y - (th * len(lines)) / 2
+                
+                for line in lines:
+                    tw = fm.horizontalAdvance(line)
+                    # Draw subtle black shadow for contrast against bright pie slices
+                    painter.setPen(QPen(QColor(0, 0, 0, 180)))
+                    painter.drawText(int(text_x - tw/2 + 1), int(y_offset + th + 1), line)
+                    painter.setPen(QPen(Qt.white))
+                    painter.drawText(int(text_x - tw/2), int(y_offset + th), line)
+                    y_offset += th
+            
             start_angle += span_angle
 
 class DiskUsageDialog(QDialog):
     def __init__(self, disk_data, is_dark, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Disk Space Usage (Advanced Drill-Down)")
-        self.resize(1000, 600)
+        self.resize(1200, 700)
         self.disk_data = disk_data
         self.is_dark = is_dark
         self.parent_window = parent
@@ -403,7 +442,6 @@ class DiskUsageDialog(QDialog):
         # --- Main Body (Pie Chart + Tree Widget) ---
         main_body = QHBoxLayout()
         self.pie = PieChartWidget()
-        self.pie.setMinimumWidth(350)
         main_body.addWidget(self.pie, 1)
 
         self.tree = QTreeWidget()
@@ -466,9 +504,14 @@ class DiskUsageDialog(QDialog):
                 dir_item = QTreeWidgetItem(user_item)
                 dir_item.setFlags(dir_item.flags() | Qt.ItemIsUserCheckable)
                 dir_item.setCheckState(0, Qt.Unchecked)
-                dir_item.setText(0, dir_path)
+                # Show only base folder name instead of full massive path
+                dir_item.setText(0, os.path.basename(dir_path))
+                dir_item.setToolTip(0, dir_path) # Hover shows full path
                 dir_item.setText(1, f"{dir_sz:.2f} GB")
+                
+                # Store data needed for mailing routing silently
                 dir_item.setData(0, Qt.UserRole, user) 
+                dir_item.setData(0, Qt.UserRole + 1, dir_path) 
 
         self.tree.blockSignals(False)
 
@@ -489,7 +532,7 @@ class DiskUsageDialog(QDialog):
                 dir_item = user_item.child(j)
                 if dir_item.checkState(0) == Qt.Checked:
                     owner = dir_item.data(0, Qt.UserRole)
-                    path = dir_item.text(0)
+                    path = dir_item.data(0, Qt.UserRole + 1) # Extract full saved path
                     if owner not in user_runs:
                         user_runs[owner] = []
                     user_runs[owner].append(path)
@@ -873,6 +916,13 @@ class PDDashboard(QMainWindow):
         self.start_fs_scan()
 
     # ------------------------------------------------------------------
+    # EVENT OVERRIDES (Ensures safe background closure)
+    # ------------------------------------------------------------------
+    def closeEvent(self, event):
+        """Immediately terminates all background concurrent workers to avoid hanging terminal instances on exit."""
+        os._exit(0)
+
+    # ------------------------------------------------------------------
     # UI BUILD
     # ------------------------------------------------------------------
     def init_ui(self):
@@ -1229,9 +1279,9 @@ class PDDashboard(QMainWindow):
     def apply_theme_and_spacing(self):
         pad = self.row_spacing
         
-        # Ensures checkmark stays visible even when cell is highlighted
+        # Ensures checkmark stays completely visible and distinct even when cell is highlighted
         cb_style = """
-            QTreeView::indicator:checked { background-color: #4CAF50; border: 1px solid #388E3C; }
+            QTreeView::indicator:checked { background-color: #4CAF50; border: 1px solid #388E3C; image: none; }
             QTreeView::indicator:unchecked { background-color: white; border: 1px solid gray; }
         """
         
@@ -1351,11 +1401,19 @@ class PDDashboard(QMainWindow):
     def on_source_changed(self):
         src_mode = self.src_combo.currentText()
         
-        # Dynamically hide/show the "Source" column based on selection
-        if src_mode in ["WS", "OUTFEED"]:
-            self.tree.setColumnHidden(2, True)
-        else:
-            self.tree.setColumnHidden(2, False)
+        # Dynamically hide/show columns based on OUTFEED vs WS logic
+        if src_mode == "WS":
+            self.tree.setColumnHidden(2, True)  # Source
+            self.tree.setColumnHidden(3, False) # Status
+            self.tree.setColumnHidden(4, False) # Stage
+        elif src_mode == "OUTFEED":
+            self.tree.setColumnHidden(2, True)  # Source
+            self.tree.setColumnHidden(3, True)  # Status (Hide in OUTFEED)
+            self.tree.setColumnHidden(4, True)  # Stage (Hide in OUTFEED)
+        else: # ALL
+            self.tree.setColumnHidden(2, False) # Source
+            self.tree.setColumnHidden(3, False) # Status
+            self.tree.setColumnHidden(4, False) # Stage
             
         releases, blocks = set(), set()
         if src_mode in ["WS",  "ALL"] and self.ws_data:
@@ -1622,22 +1680,6 @@ class PDDashboard(QMainWindow):
             else: it.setForeground(QColor("#2e7d32" if not self.is_dark_mode else "#81c784"))
 
     # ------------------------------------------------------------------
-    # VIEW PRESET FILTER
-    # ------------------------------------------------------------------
-    def _apply_view_preset(self, run):
-        preset = self.view_combo.currentText()
-        if preset == "All Runs":       return True
-        if preset == "FE Only":        return run["run_type"] == "FE"
-        if preset == "BE Only":        return run["run_type"] == "BE"
-        if preset == "Running Only":   return run["run_type"] == "FE" and not run["is_comp"]
-        if preset == "Failed Only":
-            return ("FAILS" in run.get("st_n","") or "FAILS" in run.get("st_u","") or run.get("fe_status") == "FATAL ERROR")
-        if preset == "Today's Runs":
-            start = run["info"].get("start","")
-            return relative_time(start).endswith("ago") and ("h ago" in relative_time(start) or "m ago" in relative_time(start))
-        return True
-
-    # ------------------------------------------------------------------
     # MAIN REFRESH
     # ------------------------------------------------------------------
     def refresh_view(self):
@@ -1683,7 +1725,22 @@ class PDDashboard(QMainWindow):
             if get_milestone(base_rtl_filter) is None: continue
             if sel_rtl != "[ SHOW ALL ]":
                 if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): continue
-            if not self._apply_view_preset(run): continue
+            
+            # Preset filter evaluation
+            preset = self.view_combo.currentText()
+            valid_run = True
+            if preset == "FE Only":        valid_run = (run["run_type"] == "FE")
+            elif preset == "BE Only":      valid_run = (run["run_type"] == "BE")
+            elif preset == "Running Only": valid_run = (run["run_type"] == "FE" and not run["is_comp"])
+            elif preset == "Failed Only":
+                valid_run = ("FAILS" in run.get("st_n","") or "FAILS" in run.get("st_u","") or run.get("fe_status") == "FATAL ERROR")
+            elif preset == "Today's Runs":
+                start = run["info"].get("start","")
+                valid_run = relative_time(start).endswith("ago") and ("h ago" in relative_time(start) or "m ago" in relative_time(start))
+            
+            if not valid_run: continue
+            
+            # Search query evaluation
             if search_pattern != "*":
                 combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} {run['st_n']} {run['st_u']} {run['vslp_status']} {run['info']['runtime']} {run['info']['start']} {run['info']['end']}").lower()
                 matches = fnmatch.fnmatch(combined, search_pattern)
@@ -1692,6 +1749,7 @@ class PDDashboard(QMainWindow):
                         sc = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
                         if fnmatch.fnmatch(sc, search_pattern): matches = True; break
                 if not matches: continue
+                
             normal_runs_list.append(run)
 
         fe_runs = [r for r in normal_runs_list if r["run_type"] == "FE"]
@@ -1774,25 +1832,27 @@ class PDDashboard(QMainWindow):
                 path_key  = self._get_item_path_id(child)
                 node_type = child.data(0, Qt.UserRole)
                 is_run    = bool(child.text(15)) 
-                if path_key in expanded_states: 
+                
+                # If filtering is active, bypass cached states to force expand visibility
+                if is_filtered and node_type in ["BLOCK", "MILESTONE", "RTL"]: 
+                    child.setExpanded(True)
+                elif path_key in expanded_states: 
                     child.setExpanded(expanded_states[path_key])
                 else:
                     if child.parent() is None: child.setExpanded(True)
-                    elif is_filtered and node_type in ["BLOCK", "MILESTONE", "RTL"]: child.setExpanded(True)
                     elif node_type == "MILESTONE": child.setExpanded(False)
                     elif sel_rtl == "[ SHOW ALL ]" and node_type == "RTL": child.setExpanded(False) 
                     elif is_run: child.setExpanded(False)
                     else: child.setExpanded(True)
                 restore_state(child)
+                
         restore_state(root)
-
         self.tree.resizeColumnToContents(0)
         self.tree.setUpdatesEnabled(True)
 
         all_runs = list(runs_to_process)
         self._refresh_block_colors(all_runs)
         self._update_status_bar(normal_runs_list)
-        
         self.on_tree_selection_changed()
 
     # ------------------------------------------------------------------
@@ -1851,8 +1911,12 @@ class PDDashboard(QMainWindow):
         fm_u_act = m.addAction("Open UPF Formality Report")   if fm_u_path and fm_u_path != "N/A" and cached_exists(fm_u_path) else None
         v_act    = m.addAction("Open VSLP Report")            if vslp_path and vslp_path != "N/A" and cached_exists(vslp_path) else None
         sta_act  = m.addAction("Open PT STA Summary")         if sta_path  and sta_path  != "N/A" and cached_exists(sta_path)  else None
-        ir_act   = m.addAction("Open Static IR Log")          if ir_path   and ir_path   != "N/A" and cached_exists(ir_path)   else None
-        log_act  = m.addAction("Open Log File")               if log_path  and log_path  != "N/A" and cached_exists(log_path)  else None
+        
+        ir_stat_act = m.addAction("Open Static IR Log")  if ir_path and ir_path != "N/A" and cached_exists(ir_path) else None
+        ir_dyn_act  = m.addAction("Open Dynamic IR Log") if is_stage and ir_path and ir_path != "N/A" and cached_exists(ir_path) else None
+        
+        log_act  = m.addAction("Open Log File") if log_path and log_path != "N/A" and cached_exists(log_path) else None
+        
         m.addSeparator()
         c_act = m.addAction("Copy Path")
         qor_act = None
@@ -1885,11 +1949,13 @@ class PDDashboard(QMainWindow):
             self.size_workers.append(worker)
             worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
             worker.start()
+            
         elif fm_n_act and res == fm_n_act: subprocess.Popen(['gvim', fm_n_path])
         elif fm_u_act and res == fm_u_act: subprocess.Popen(['gvim', fm_u_path])
         elif v_act    and res == v_act:    subprocess.Popen(['gvim', vslp_path])
         elif sta_act  and res == sta_act:  subprocess.Popen(['gvim', sta_path])
-        elif ir_act   and res == ir_act:   subprocess.Popen(['gvim', ir_path])
+        elif ir_stat_act and res == ir_stat_act: subprocess.Popen(['gvim', ir_path])
+        elif ir_dyn_act and res == ir_dyn_act: subprocess.Popen(['gvim', ir_path])
         elif log_act  and res == log_act:  subprocess.Popen(['gvim', log_path])
         elif res == c_act: QApplication.clipboard().setText(run_path)
         elif qor_act and res == qor_act:
