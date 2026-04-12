@@ -345,8 +345,8 @@ class PieChartWidget(QWidget):
 class DiskUsageDialog(QDialog):
     def __init__(self, disk_data, is_dark, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Disk Space Usage (User-Wise)")
-        self.resize(800, 500)
+        self.setWindowTitle("Disk Space Usage (User-Wise Breakdown)")
+        self.resize(850, 500)
         self.disk_data = disk_data
         self.is_dark = is_dark
         
@@ -366,15 +366,16 @@ class DiskUsageDialog(QDialog):
         main_body.addWidget(self.pie, 1)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["", "User", "Size (GB)"])
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["", "User", "Total (GB)", "Largest Directory Info"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.verticalHeader().setVisible(False)
-        main_body.addWidget(self.table, 1)
+        main_body.addWidget(self.table, 2)
 
         layout.addLayout(main_body, 1)
         self.update_view()
@@ -382,11 +383,13 @@ class DiskUsageDialog(QDialog):
     def update_view(self):
         cat = self.combo.currentText()
         data = self.disk_data.get(cat, {})
-        self.pie.set_data(data, self.is_dark)
+        
+        pie_data = {user: info["total"] for user, info in data.items()}
+        self.pie.set_data(pie_data, self.is_dark)
         
         self.table.setRowCount(0)
-        sorted_data = sorted(data.items(), key=lambda item: item[1], reverse=True)
-        for i, (user, sz) in enumerate(sorted_data):
+        sorted_data = sorted(data.items(), key=lambda item: item[1]["total"], reverse=True)
+        for i, (user, info) in enumerate(sorted_data):
             self.table.insertRow(i)
             
             color_item = QTableWidgetItem("")
@@ -395,11 +398,13 @@ class DiskUsageDialog(QDialog):
             it_u = QTableWidgetItem(user)
             it_u.setForeground(QColor(self.pie.colors[i % len(self.pie.colors)]))
             
-            it_s = QTableWidgetItem(f"{sz:.2f} GB")
+            it_s = QTableWidgetItem(f"{info['total']:.2f} GB")
+            it_dir = QTableWidgetItem(f"{info['max_dir']} ({info['max_sz']:.2f} GB)")
             
             self.table.setItem(i, 0, color_item)
             self.table.setItem(i, 1, it_u)
             self.table.setItem(i, 2, it_s)
+            self.table.setItem(i, 3, it_dir)
 
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
@@ -408,8 +413,8 @@ class DiskScannerWorker(QThread):
         try:
             owner = pwd.getpwuid(os.stat(path).st_uid).pw_name
             sz = int(subprocess.check_output(['du', '-sk', path], stderr=subprocess.DEVNULL).decode().split()[0])
-            return owner, sz
-        except: return "Unknown", 0
+            return owner, sz, path
+        except: return "Unknown", 0, path
 
     def run(self):
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
@@ -430,11 +435,18 @@ class DiskScannerWorker(QThread):
             for future in concurrent.futures.as_completed(future_to_task):
                 cat = future_to_task[future]
                 try:
-                    owner, sz_kb = future.result()
+                    owner, sz_kb, full_path = future.result()
                     if sz_kb > 0:
                         gb_sz = sz_kb / (1024**2) 
                         if gb_sz > 0.01: 
-                            results[cat][owner] = results[cat].get(owner, 0) + gb_sz
+                            if owner not in results[cat]:
+                                results[cat][owner] = {"total": 0, "max_dir": "", "max_sz": 0}
+                            
+                            results[cat][owner]["total"] += gb_sz
+                            
+                            if gb_sz > results[cat][owner]["max_sz"]:
+                                results[cat][owner]["max_sz"] = gb_sz
+                                results[cat][owner]["max_dir"] = os.path.basename(full_path)
                 except: pass
                 
         self.finished_scan.emit(results)
@@ -486,25 +498,49 @@ class ScannerWorker(QThread):
         ir_data = {}
         if not os.path.exists(BASE_IR_DIR): return ir_data
         target_lef = f"{PROJECT_PREFIX}.lef.list"
+        
         for root_dir, dirs, files in os.walk(BASE_IR_DIR):
-            if "redhawk.log" not in files: continue
-            log_path = os.path.join(root_dir, "redhawk.log")
-            run_be_name = step_name = None
-            inst_line = inst_value = ""
-            try:
-                with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    for line in f:
-                        if line.startswith("Parsing ") and target_lef in line:
-                            m = re.search(r'/fc/([^/]+-BE)/(?:outputs/)?([^/]+)/', line)
-                            if m: run_be_name = m.group(1); step_name = m.group(2)
-                        elif line.startswith("INST ") and "mV" in line:
-                            inst_line = line.strip()
-                            m2 = re.search(r'INST\s+(\S+mV)', inst_line)
-                            if m2: inst_value = m2.group(1)
-            except: pass
-            if run_be_name and step_name:
-                key = f"{run_be_name}/{step_name}"
-                ir_data[key] = {"log": log_path, "line": inst_line, "value": inst_value}
+            for f_name in files:
+                if not f_name.startswith("redhawk.log"): continue
+                log_path = os.path.join(root_dir, f_name)
+                
+                run_be_name = step_name = None
+                static_val = "-"
+                dynamic_val = "-"
+                in_static = False
+                in_dynamic = False
+
+                try:
+                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        for line in f:
+                            if line.startswith("Parsing ") and target_lef in line:
+                                m = re.search(r'/fc/([^/]+-BE)/(?:outputs/)?([^/]+)/', line)
+                                if m: run_be_name = m.group(1); step_name = m.group(2)
+                            
+                            if "Worst Static IR Drop:" in line:
+                                in_static = True; in_dynamic = False; continue
+                            if "Worst Dynamic Voltage Drop:" in line:
+                                in_dynamic = True; in_static = False; continue
+
+                            if in_static and line.strip() and not line.startswith("-") and not line.startswith("Type"):
+                                parts = line.split()
+                                if len(parts) >= 2 and parts[0] != "WIRE" and static_val == "-":
+                                    static_val = parts[1]
+                                    in_static = False
+
+                            if in_dynamic and line.strip() and not line.startswith("-") and not line.startswith("Type"):
+                                parts = line.split()
+                                if len(parts) >= 2 and parts[0] != "WIRE" and dynamic_val == "-":
+                                    dynamic_val = parts[1]
+                                    in_dynamic = False
+
+                    if run_be_name and step_name:
+                        key = f"{run_be_name}/{step_name}"
+                        if key not in ir_data:
+                            ir_data[key] = {"static": "-", "dynamic": "-", "log": log_path}
+                        if static_val != "-": ir_data[key]["static"] = static_val
+                        if dynamic_val != "-": ir_data[key]["dynamic"] = dynamic_val
+                except: pass
         return ir_data
 
     def run(self):
@@ -873,7 +909,7 @@ class PDDashboard(QMainWindow):
 
         # Right: tree
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(21) 
+        self.tree.setColumnCount(22) 
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)     
         self.tree.setAnimated(False)             
@@ -884,7 +920,7 @@ class PDDashboard(QMainWindow):
 
         headers = [
             "Run Name (Select)", "RTL Release Version", "Source", "Status", "Stage", "User", "Size",
-            "FM - NONUPF", "FM - UPF", "VSLP Status", "Static IR", "Runtime", "Start", "End",
+            "FM - NONUPF", "FM - UPF", "VSLP Status", "Static IR", "Dynamic IR", "Runtime", "Start", "End",
             "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT", "STA_RPT", "IR_LOG"
         ]
         self.tree.setHeaderLabels(headers)
@@ -899,14 +935,16 @@ class PDDashboard(QMainWindow):
         self.tree.setColumnWidth(4, 130); self.tree.setColumnWidth(5, 100) 
         self.tree.setColumnWidth(6, 80);  self.tree.setColumnWidth(7, 160)
         self.tree.setColumnWidth(8, 160); self.tree.setColumnWidth(9, 200)
-        self.tree.setColumnWidth(10, 100); self.tree.setColumnWidth(11, 110)
-        self.tree.setColumnWidth(12, 120); self.tree.setColumnWidth(13, 120)
+        self.tree.setColumnWidth(10, 100); self.tree.setColumnWidth(11, 100)
+        self.tree.setColumnWidth(12, 110); self.tree.setColumnWidth(13, 120)
+        self.tree.setColumnWidth(14, 120)
 
         self.tree.itemExpanded.connect(lambda: self.tree.resizeColumnToContents(0))
         self.tree.itemCollapsed.connect(lambda: self.tree.resizeColumnToContents(0))
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
 
-        for i in [10, 14, 15, 16, 17, 18, 19, 20]: self.tree.setColumnHidden(i, True)
+        # Hide core developer internal paths
+        for i in [15, 16, 17, 18, 19, 20, 21]: self.tree.setColumnHidden(i, True)
 
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.on_context_menu)
@@ -1003,7 +1041,7 @@ class PDDashboard(QMainWindow):
 
     def _on_item_check_changed(self, item, col=0):
         if col != 0: return
-        path = item.text(14)
+        path = item.text(15)
         if not path or path == "N/A": return
         hl_color = QColor(self.custom_sel_color if self.use_custom_colors else ("#404652" if self.is_dark_mode else "#e3f2fd"))
         
@@ -1024,7 +1062,7 @@ class PDDashboard(QMainWindow):
             item = sel[0]
             is_stage = item.data(0, Qt.UserRole) == "STAGE"
             if not is_stage:
-                run_path = item.text(14)
+                run_path = item.text(15)
                 if run_path and run_path != "N/A":
                     err_file = os.path.join(run_path, "logs", "compile_opt.error.log")
                     if os.path.exists(err_file):
@@ -1221,7 +1259,7 @@ class PDDashboard(QMainWindow):
         def gather(node):
             for i in range(node.childCount()):
                 child = node.child(i)
-                path = child.text(14) 
+                path = child.text(15) 
                 if path and path != "N/A" and child.text(6) in ["-", "N/A", "Calc..."]: 
                     item_id = str(id(child))
                     self.item_map[item_id] = child
@@ -1320,35 +1358,36 @@ class PDDashboard(QMainWindow):
             child.setText(8, f"UPF - {run['st_u']}")
             child.setText(9, run["vslp_status"])
             child.setText(10, "-") 
-            child.setText(11, run["info"]["runtime"])
+            child.setText(11, "-") 
+            child.setText(12, run["info"]["runtime"])
 
             start_raw = run["info"]["start"]
             end_raw   = run["info"]["end"]
             if self.show_relative_time:
-                child.setText(12, relative_time(start_raw))
-                child.setText(13, relative_time(end_raw) if run["is_comp"] else "-")
+                child.setText(13, relative_time(start_raw))
+                child.setText(14, relative_time(end_raw) if run["is_comp"] else "-")
             else:
-                child.setText(12, start_raw)
-                child.setText(13, end_raw)
-            child.setToolTip(12, start_raw); child.setToolTip(13, end_raw)
+                child.setText(13, start_raw)
+                child.setText(14, end_raw)
+            child.setToolTip(13, start_raw); child.setToolTip(14, end_raw)
 
-            child.setText(14, run["path"])
-            child.setText(15, os.path.join(run["path"], "logs/compile_opt.log"))
-            child.setText(16, run["fm_u_path"])
-            child.setText(17, run["fm_n_path"])
-            child.setText(18, run["vslp_rpt_path"])
-            child.setText(19, "")
+            child.setText(15, run["path"])
+            child.setText(16, os.path.join(run["path"], "logs/compile_opt.log"))
+            child.setText(17, run["fm_u_path"])
+            child.setText(18, run["fm_n_path"])
+            child.setText(19, run["vslp_rpt_path"])
             child.setText(20, "")
+            child.setText(21, "")
 
             self._apply_status_color(child, 3, status_str)
             self._apply_fm_color(child, 7, run["st_n"])
             self._apply_fm_color(child, 8, run["st_u"])
             self._apply_vslp_color(child, 9, run["vslp_status"])
         else:
-            child.setText(6, "-"); child.setText(10, "-")
-            child.setText(14, run["path"]); child.setText(20, "")
+            child.setText(6, "-"); child.setText(10, "-"); child.setText(11, "-")
+            child.setText(15, run["path"]); child.setText(21, "")
 
-        for i in range(1, 21): child.setTextAlignment(i, Qt.AlignCenter)
+        for i in range(1, 22): child.setTextAlignment(i, Qt.AlignCenter)
         child.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
         return child
 
@@ -1368,10 +1407,10 @@ class PDDashboard(QMainWindow):
             st_item.setData(2, Qt.UserRole, stage["qor_path"])
 
             ir_key  = f"{be_run['r_name']}/{stage['name']}"
-            ir_info = self.ir_data.get(ir_key, {"log": "", "line": "N/A", "value": "-"})
+            ir_info = self.ir_data.get(ir_key, {"static": "-", "dynamic": "-", "log": ""})
 
             tooltip_text = (f"Owner: {owner}\nSize: Pending\nRuntime: {stage['info']['runtime']}\nNONUPF: {stage['st_n']}\nUPF: {stage['st_u']}\nVSLP: {stage['vslp_status']}\n")
-            if is_ir_block: tooltip_text += f"Static IR: {ir_info['line']}"
+            if is_ir_block: tooltip_text += f"Static IR: {ir_info['static']}\nDynamic IR: {ir_info['dynamic']}"
             st_item.setToolTip(0, tooltip_text)
 
             stage_status = "COMPLETED"
@@ -1392,33 +1431,34 @@ class PDDashboard(QMainWindow):
             st_item.setText(7, f"NONUPF - {stage['st_n']}")
             st_item.setText(8, f"UPF - {stage['st_u']}")
             st_item.setText(9, stage["vslp_status"])
-            st_item.setText(10, ir_info["value"] if is_ir_block else "-")
-            st_item.setText(11, stage["info"]["runtime"])
+            st_item.setText(10, ir_info["static"] if is_ir_block else "-")
+            st_item.setText(11, ir_info["dynamic"] if is_ir_block else "-")
+            st_item.setText(12, stage["info"]["runtime"])
 
             s_start = stage["info"]["start"]
             s_end   = stage["info"]["end"]
             if self.show_relative_time:
-                st_item.setText(12, relative_time(s_start))
-                st_item.setText(13, relative_time(s_end))
+                st_item.setText(13, relative_time(s_start))
+                st_item.setText(14, relative_time(s_end))
             else:
-                st_item.setText(12, s_start)
-                st_item.setText(13, s_end)
-            st_item.setToolTip(12, s_start); st_item.setToolTip(13, s_end)
+                st_item.setText(13, s_start)
+                st_item.setText(14, s_end)
+            st_item.setToolTip(13, s_start); st_item.setToolTip(14, s_end)
 
-            st_item.setText(14, stage["stage_path"])
-            st_item.setText(15, stage["log"])
-            st_item.setText(16, stage["fm_u_path"])
-            st_item.setText(17, stage["fm_n_path"])
-            st_item.setText(18, stage["vslp_rpt_path"])
-            st_item.setText(19, stage["sta_rpt_path"])
-            st_item.setText(20, ir_info["log"])
+            st_item.setText(15, stage["stage_path"])
+            st_item.setText(16, stage["log"])
+            st_item.setText(17, stage["fm_u_path"])
+            st_item.setText(18, stage["fm_n_path"])
+            st_item.setText(19, stage["vslp_rpt_path"])
+            st_item.setText(20, stage["sta_rpt_path"])
+            st_item.setText(21, ir_info["log"])
 
             self._apply_fm_color(st_item, 7, stage["st_n"])
             self._apply_fm_color(st_item, 8, stage["st_u"])
             self._apply_vslp_color(st_item, 9, stage["vslp_status"])
             self._apply_status_color(st_item, 4, stage_status if stage_status in ("COMPLETED","RUNNING","FAILED") else "RUNNING")
 
-            for i in range(1, 21): st_item.setTextAlignment(i, Qt.AlignCenter)
+            for i in range(1, 22): st_item.setTextAlignment(i, Qt.AlignCenter)
             st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
 
     # ------------------------------------------------------------------
@@ -1586,7 +1626,7 @@ class PDDashboard(QMainWindow):
                 child     = node.child(i)
                 path_key  = self._get_item_path_id(child)
                 node_type = child.data(0, Qt.UserRole)
-                is_run    = bool(child.text(14)) 
+                is_run    = bool(child.text(15)) 
                 if path_key in expanded_states: child.setExpanded(expanded_states[path_key])
                 else:
                     if child.parent() is None: child.setExpanded(True)
@@ -1611,7 +1651,7 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def on_header_context_menu(self, pos):
         menu = QMenu(self)
-        for i in range(1, 21):
+        for i in range(1, 22):
             action = QWidgetAction(menu)
             cb = QCheckBox(self.tree.headerItem().text(i))
             cb.setChecked(not self.tree.isColumnHidden(i))
@@ -1632,9 +1672,9 @@ class PDDashboard(QMainWindow):
             copy_cell_act = m.addAction("Copy Cell Text")
             m.addSeparator()
 
-        run_path, log_path = item.text(14), item.text(15)
-        fm_u_path, fm_n_path = item.text(16), item.text(17)
-        vslp_path, sta_path, ir_path = item.text(18), item.text(19), item.text(20)
+        run_path, log_path = item.text(15), item.text(16)
+        fm_u_path, fm_n_path = item.text(17), item.text(18)
+        vslp_path, sta_path, ir_path = item.text(19), item.text(20), item.text(21)
         is_stage = item.data(0, Qt.UserRole) == "STAGE"
 
         ignore_checked_act = m.addAction("Ignore All Checked Runs")
@@ -1671,7 +1711,7 @@ class PDDashboard(QMainWindow):
                 for i in range(node.childCount()):
                     c = node.child(i)
                     if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
-                        p = c.text(14)
+                        p = c.text(15)
                         if p and p != "N/A": self.ignored_paths.add(p)
                     ig(c)
             ig(self.tree.invisibleRootItem()); self.refresh_view()
@@ -1702,7 +1742,7 @@ class PDDashboard(QMainWindow):
 
     def on_item_double_clicked(self, item, col):
         if item.parent():
-            log = item.text(15)
+            log = item.text(16)
             if log and cached_exists(log): subprocess.Popen(['gvim', log])
 
     # ------------------------------------------------------------------
@@ -1721,7 +1761,7 @@ class PDDashboard(QMainWindow):
             for i in range(node.childCount()):
                 c = node.child(i)
                 if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
-                    path = c.text(14)
+                    path = c.text(15)
                     owner = c.text(5)
                     run_name = c.text(0)
                     
@@ -1804,7 +1844,7 @@ class PDDashboard(QMainWindow):
             for i in range(node.childCount()):
                 c = node.child(i)
                 if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
-                    qp  = c.text(14)
+                    qp  = c.text(15)
                     src = c.text(2)
                     if src == "OUTFEED" and qp: qp = os.path.dirname(qp)
                     if qp and not qp.endswith("/"): qp += "/"
