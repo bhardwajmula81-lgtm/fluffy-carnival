@@ -16,8 +16,8 @@ from PyQt5.QtWidgets import (
     QPushButton, QMessageBox, QListWidget, QListWidgetItem,
     QProgressBar, QMenu, QSplitter, QFontComboBox, QSpinBox,
     QWidgetAction, QCheckBox, QDialog, QFormLayout, QDialogButtonBox,
-    QStatusBar, QFrame, QShortcut, QAction, QToolBar, QColorDialog,
-    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QProgressDialog
+    QStatusBar, QFrame, QShortcut, QAction, QToolButton, QStyle, QColorDialog,
+    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QRectF
 from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush, QPainter, QPen
@@ -278,14 +278,14 @@ class SettingsDialog(QDialog):
         if c.isValid(): self.sel_color = c.name()
 
 class MailDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, default_subject, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Group Mail Configuration")
         self.resize(600, 250)
         layout = QVBoxLayout(self)
 
         form = QFormLayout()
-        self.subject_input = QLineEdit("Please remove your old PD runs")
+        self.subject_input = QLineEdit(default_subject)
         form.addRow("Subject:", self.subject_input)
         layout.addLayout(form)
 
@@ -366,12 +366,14 @@ class DiskUsageDialog(QDialog):
         main_body.addWidget(self.pie, 1)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(2)
-        self.table.setHorizontalHeaderLabels(["User", "Size (GB)"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.setColumnCount(3)
+        self.table.setHorizontalHeaderLabels(["", "User", "Size (GB)"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.verticalHeader().setVisible(False)
         main_body.addWidget(self.table, 1)
 
         layout.addLayout(main_body, 1)
@@ -380,26 +382,26 @@ class DiskUsageDialog(QDialog):
     def update_view(self):
         cat = self.combo.currentText()
         data = self.disk_data.get(cat, {})
-        
         self.pie.set_data(data, self.is_dark)
         
         self.table.setRowCount(0)
         sorted_data = sorted(data.items(), key=lambda item: item[1], reverse=True)
         for i, (user, sz) in enumerate(sorted_data):
             self.table.insertRow(i)
-            it_u = QTableWidgetItem(user)
-            it_s = QTableWidgetItem(f"{sz:.2f} GB")
             
-            dot = QTableWidgetItem("  ■  ")
-            dot.setForeground(QColor(self.pie.colors[i % len(self.pie.colors)]))
-            it_u.setIcon(dot.icon()) 
+            color_item = QTableWidgetItem("")
+            color_item.setBackground(QColor(self.pie.colors[i % len(self.pie.colors)]))
+            
+            it_u = QTableWidgetItem(user)
             it_u.setForeground(QColor(self.pie.colors[i % len(self.pie.colors)]))
             
-            self.table.setItem(i, 0, it_u)
-            self.table.setItem(i, 1, it_s)
+            it_s = QTableWidgetItem(f"{sz:.2f} GB")
+            
+            self.table.setItem(i, 0, color_item)
+            self.table.setItem(i, 1, it_u)
+            self.table.setItem(i, 2, it_s)
 
 class DiskScannerWorker(QThread):
-    progress = pyqtSignal(str)
     finished_scan = pyqtSignal(dict)
 
     def _get_dir_info(self, path):
@@ -423,17 +425,10 @@ class DiskScannerWorker(QThread):
             for p in paths:
                 if os.path.isdir(p): tasks.append((cat, p))
         
-        total_tasks = len(tasks)
-        completed = 0
-        
         with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
             future_to_task = {executor.submit(self._get_dir_info, t[1]): t[0] for t in tasks}
             for future in concurrent.futures.as_completed(future_to_task):
                 cat = future_to_task[future]
-                completed += 1
-                if completed % 10 == 0 or completed == total_tasks:
-                    self.progress.emit(f"Scanning directories... ({completed}/{total_tasks})")
-                
                 try:
                     owner, sz_kb = future.result()
                     if sz_kb > 0:
@@ -731,67 +726,60 @@ class PDDashboard(QMainWindow):
         root_layout.setContentsMargins(6, 6, 6, 4)
         root_layout.setSpacing(4)
 
-        # ---- TOP TOOLBAR (ROW 1: Search & Core Filters) ----
-        top_row1 = QHBoxLayout()
-        top_row1.setSpacing(6)
+        # ---- TOP TOOLBAR (Sleek Single Row) ----
+        top_layout = QHBoxLayout()
+        top_layout.setSpacing(6)
 
-        top_row1.addWidget(self._label("Source:"))
+        # Source
+        top_layout.addWidget(self._label("Source:"))
         self.src_combo = QComboBox()
         self.src_combo.addItems(["ALL", "WS", "OUTFEED"])
-        self.src_combo.setFixedWidth(120) 
+        self.src_combo.setFixedWidth(100)
         self.src_combo.currentIndexChanged.connect(self.on_source_changed)
-        top_row1.addWidget(self.src_combo)
+        top_layout.addWidget(self.src_combo)
 
-        self._add_separator(top_row1)
-
-        top_row1.addWidget(self._label("RTL Release:"))
+        # RTL Release
+        self._add_separator(top_layout)
+        top_layout.addWidget(self._label("RTL Release:"))
         self.rel_combo = QComboBox()
         self.rel_combo.setMinimumWidth(220) 
         self.rel_combo.currentIndexChanged.connect(self.refresh_view)
-        top_row1.addWidget(self.rel_combo)
+        top_layout.addWidget(self.rel_combo)
 
-        self._add_separator(top_row1)
-
-        top_row1.addWidget(self._label("View:"))
+        # View
+        self._add_separator(top_layout)
+        top_layout.addWidget(self._label("View:"))
         self.view_combo = QComboBox()
         self.view_combo.addItems(["All Runs", "FE Only", "BE Only", "Running Only", "Failed Only", "Today's Runs"])
-        self.view_combo.setFixedWidth(130)
+        self.view_combo.setFixedWidth(120)
         self.view_combo.currentIndexChanged.connect(self.refresh_view)
-        top_row1.addWidget(self.view_combo)
+        top_layout.addWidget(self.view_combo)
 
-        self._add_separator(top_row1)
-
+        # Search
+        self._add_separator(top_layout)
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search runs, blocks, status, runtime...   [Ctrl+F]")
-        self.search.setMinimumWidth(280)
+        self.search.setMinimumWidth(260)
         self.search.textChanged.connect(lambda: self.search_timer.start(500))
-        top_row1.addWidget(self.search)
+        top_layout.addWidget(self.search)
 
-        top_row1.addStretch()
+        top_layout.addStretch()
 
-        self.refresh_btn = self._btn("Refresh  [Ctrl+R]", self.start_fs_scan)
-        top_row1.addWidget(self.refresh_btn)
+        # Action Buttons
+        self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setToolTip("Refresh [Ctrl+R]")
+        self.refresh_btn.clicked.connect(self.start_fs_scan)
+        top_layout.addWidget(self.refresh_btn)
 
-        top_row1.addWidget(self._label("Auto:"))
         self.auto_combo = QComboBox()
         self.auto_combo.addItems(["Off", "1 Min", "5 Min", "10 Min"])
         self.auto_combo.setFixedWidth(75)
+        self.auto_combo.setToolTip("Auto-refresh interval")
         self.auto_combo.currentIndexChanged.connect(self.on_auto_refresh_changed)
-        top_row1.addWidget(self.auto_combo)
+        top_layout.addWidget(self.auto_combo)
 
-        self._add_separator(top_row1)
-        self.size_toggle_btn = self._btn("Compact Window", self.toggle_window_size)
-        top_row1.addWidget(self.size_toggle_btn)
-        top_row1.addWidget(self._btn("Settings", self.open_settings))
-        
-        root_layout.addLayout(top_row1)
+        self._add_separator(top_layout)
 
-        # ---- TOP TOOLBAR (ROW 2: Actions & Tools) ----
-        top_row2 = QHBoxLayout()
-        top_row2.setSpacing(6)
-        
-        top_row2.addSpacing(330) 
-        
         self.tools_btn = QPushButton("Tools")
         self.tools_menu = QMenu(self)
         self.tools_menu.addAction("Fit Columns  [Ctrl+Shift+F]", self.fit_all_columns)
@@ -800,19 +788,29 @@ class PDDashboard(QMainWindow):
         self.tools_menu.addSeparator()
         self.tools_menu.addAction("Calculate All Run Sizes",      self.calculate_all_sizes)
         self.tools_btn.setMenu(self.tools_menu)
-        top_row2.addWidget(self.tools_btn)
+        top_layout.addWidget(self.tools_btn)
 
         self.qor_btn = self._btn("Compare QoR", self.run_qor_comparison)
-        top_row2.addWidget(self.qor_btn)
+        top_layout.addWidget(self.qor_btn)
         
         self.mail_btn = self._btn("Send Mail", self.send_mail_action)
-        top_row2.addWidget(self.mail_btn)
+        top_layout.addWidget(self.mail_btn)
         
         self.disk_btn = self._btn("Disk Space", self.open_disk_usage)
-        top_row2.addWidget(self.disk_btn)
+        top_layout.addWidget(self.disk_btn)
         
-        top_row2.addStretch()
-        root_layout.addLayout(top_row2)
+        self.settings_btn = self._btn("Settings", self.open_settings)
+        top_layout.addWidget(self.settings_btn)
+
+        # Window Size Toggle Icon Button (placed gracefully at the end)
+        self.size_toggle_btn = QToolButton()
+        self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
+        self.size_toggle_btn.setToolTip("Toggle Compact Window Mode")
+        self.size_toggle_btn.clicked.connect(self.toggle_window_size)
+        self.size_toggle_btn.setFixedSize(28, 28)
+        top_layout.addWidget(self.size_toggle_btn)
+
+        root_layout.addLayout(top_layout)
 
         # ---- SCAN PROGRESS ----
         self.prog = QProgressBar()
@@ -971,13 +969,13 @@ class PDDashboard(QMainWindow):
         if not self.is_compact:
             self.showNormal() 
             self.resize(1280, 720)
-            self.size_toggle_btn.setText("Expand Window")
             self.is_compact = True
+            self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
         else:
             self.showNormal()
             self.resize(1920, 1000)
-            self.size_toggle_btn.setText("Compact Window")
             self.is_compact = False
+            self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+R"),       self, self.start_fs_scan)
@@ -1042,7 +1040,7 @@ class PDDashboard(QMainWindow):
                         if count == 0: color = "#81c784" if self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888") else "#388e3c"
                         
                         self.fe_error_btn.setStyleSheet(f"QPushButton#errorLinkBtn {{ border: none; background: transparent; color: {color}; font-weight: bold; text-align: left; padding: 6px 0px; }} QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
-                        self.fe_error_btn.setText(f"📝 compile_opt errors: {count}")
+                        self.fe_error_btn.setText(f"compile_opt errors: {count}")
                         self.fe_error_btn.setVisible(True)
 
     def open_error_log(self):
@@ -1082,9 +1080,9 @@ class PDDashboard(QMainWindow):
                 QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; font-weight: bold; }}
                 QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 4px; border-radius: 4px; }}
                 QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #ffffff; }}
-                QPushButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
-                QPushButton:hover {{ border-color: {sel}; }}
-                QPushButton:pressed {{ background-color: {sel}; color: #ffffff; }}
+                QPushButton, QToolButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
+                QPushButton:hover, QToolButton:hover {{ border-color: {sel}; }}
+                QPushButton:pressed, QToolButton:pressed {{ background-color: {sel}; color: #ffffff; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: {sel}; padding: 0px 4px; min-width: 0px; }}
                 QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: {sel}; }}
@@ -1104,9 +1102,9 @@ class PDDashboard(QMainWindow):
                 QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
                 QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
                 QComboBox QAbstractItemView {{ background-color: #2b2d30; color: #dfe1e5; selection-background-color: #2f65ca; selection-color: #ffffff; }}
-                QPushButton {{ background-color: #393b40; color: #dfe1e5; border: 1px solid #43454a; padding: 5px 12px; border-radius: 4px; }}
-                QPushButton:hover {{ background-color: #43454a; }}
-                QPushButton:pressed {{ background-color: #2f65ca; color: #ffffff; border-color: #2f65ca; }}
+                QPushButton, QToolButton {{ background-color: #393b40; color: #dfe1e5; border: 1px solid #43454a; padding: 5px 12px; border-radius: 4px; }}
+                QPushButton:hover, QToolButton:hover {{ background-color: #43454a; }}
+                QPushButton:pressed, QToolButton:pressed {{ background-color: #2f65ca; color: #ffffff; border-color: #2f65ca; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: #64b5f6; padding: 0px 4px; min-width: 0px; }}
                 QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: #393b40; }}
@@ -1127,9 +1125,9 @@ class PDDashboard(QMainWindow):
                 QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
                 QComboBox {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
                 QComboBox QAbstractItemView {{ background-color: #ffffff; color: #333333; selection-background-color: #3182ce; selection-color: #ffffff; }}
-                QPushButton {{ background-color: #ffffff; color: #4a5568; border: 1px solid #cbd5e0; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
-                QPushButton:hover {{ background-color: #edf2f7; border-color: #a0aec0; }}
-                QPushButton:pressed {{ background-color: #e2e8f0; }}
+                QPushButton, QToolButton {{ background-color: #ffffff; color: #4a5568; border: 1px solid #cbd5e0; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
+                QPushButton:hover, QToolButton:hover {{ background-color: #edf2f7; border-color: #a0aec0; }}
+                QPushButton:pressed, QToolButton:pressed {{ background-color: #e2e8f0; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: #3182ce; padding: 0px 4px; min-width: 0px; }}
                 QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: #cbd5e0; }}
@@ -1173,7 +1171,7 @@ class PDDashboard(QMainWindow):
         self.ws_data, self.out_data, self.ir_data = ws, out, ir
         self.prog.setVisible(False)
         self.refresh_btn.setEnabled(True)
-        self.refresh_btn.setText("Refresh  [Ctrl+R]")
+        self.refresh_btn.setText("Refresh")
         self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
         self.on_source_changed()
         if not self._columns_fitted_once:
@@ -1716,23 +1714,34 @@ class PDDashboard(QMainWindow):
             return
 
         user_runs = {} 
+        is_fe_selected = False
+        
         def find_owners(node):
+            nonlocal is_fe_selected
             for i in range(node.childCount()):
                 c = node.child(i)
                 if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
                     path = c.text(14)
                     owner = c.text(5)
+                    run_name = c.text(0)
+                    
+                    if "FE" in run_name: 
+                        is_fe_selected = True
+
                     if path and path != "N/A" and owner and owner != "Unknown":
                         if owner not in user_runs: user_runs[owner] = []
                         user_runs[owner].append(path)
                 find_owners(c)
+                
         find_owners(self.tree.invisibleRootItem())
 
         if not user_runs:
             QMessageBox.warning(self, "Unknown Users", "Could not determine the owners for the selected runs.")
             return
 
-        dlg = MailDialog(self)
+        default_subject = "Please remove your old PI runs" if is_fe_selected else "Please remove your old PD runs"
+
+        dlg = MailDialog(default_subject, self)
         if dlg.exec_():
             subject = dlg.subject_input.text().strip()
             body_template = dlg.body_input.toPlainText()
@@ -1768,19 +1777,20 @@ class PDDashboard(QMainWindow):
     # DISK USAGE FEATURE
     # ------------------------------------------------------------------
     def open_disk_usage(self):
-        self.prog_dialog = QProgressDialog("Calculating User Storage Distribution... (Fast Scan)", "Cancel", 0, 0, self)
-        self.prog_dialog.setWindowTitle("Disk Scan")
-        self.prog_dialog.setModal(True)
-        self.prog_dialog.setCancelButton(None) 
-        self.prog_dialog.show()
-
+        if hasattr(self, 'disk_worker') and self.disk_worker.isRunning():
+            return
+            
+        self.disk_btn.setEnabled(False)
+        self.disk_btn.setText("Scanning...")
+        
         self.disk_worker = DiskScannerWorker()
-        self.disk_worker.progress.connect(lambda msg: self.prog_dialog.setLabelText(msg))
         self.disk_worker.finished_scan.connect(self._on_disk_scan_finished)
         self.disk_worker.start()
 
     def _on_disk_scan_finished(self, results):
-        self.prog_dialog.close()
+        self.disk_btn.setEnabled(True)
+        self.disk_btn.setText("Disk Space")
+        
         dlg = DiskUsageDialog(results, self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"), self)
         dlg.exec_()
 
