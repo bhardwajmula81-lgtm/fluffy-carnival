@@ -17,10 +17,10 @@ from PyQt5.QtWidgets import (
     QProgressBar, QMenu, QSplitter, QFontComboBox, QSpinBox,
     QWidgetAction, QCheckBox, QDialog, QFormLayout, QDialogButtonBox,
     QStatusBar, QFrame, QShortcut, QAction, QToolBar, QColorDialog,
-    QTextEdit
+    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QProgressDialog
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
-from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QRectF
+from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush, QPainter, QPen
 
 # ===========================================================================
 # --- CONFIGURATION BLOCK (Project Dependent) ---
@@ -39,29 +39,22 @@ USER_INFO_UTIL   = "/usr/local/bin/user_info"
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# Performance: module-level path-existence cache (cleared each scan cycle)
+# Performance Cache & Helpers
 # ---------------------------------------------------------------------------
 _path_cache = {}
 
 def cached_exists(path):
-    if path not in _path_cache:
-        _path_cache[path] = os.path.exists(path)
+    if path not in _path_cache: _path_cache[path] = os.path.exists(path)
     return _path_cache[path]
 
-def clear_path_cache():
-    _path_cache.clear()
+def clear_path_cache(): _path_cache.clear()
 
-# ---------------------------------------------------------------------------
-# Relative-time helper
-# ---------------------------------------------------------------------------
 def relative_time(date_str):
-    if not date_str or date_str == "N/A":
-        return date_str
+    if not date_str or date_str == "N/A": return date_str
     try:
         m = re.search(r'(\w{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{2}):(\d{2})', str(date_str))
         if not m: return date_str
-        month_map = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
-                     "Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+        month_map = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
         mon, day, year, hour, minute = m.groups()
         dt = datetime.datetime(int(year), month_map.get(mon, 1), int(day), int(hour), int(minute))
         delta = datetime.datetime.now() - dt
@@ -71,19 +64,16 @@ def relative_time(date_str):
         if total_seconds < 86400: return f"{total_seconds // 3600}h {(total_seconds % 3600) // 60}m ago"
         days = total_seconds // 86400
         return f"{days}d ago"
-    except Exception:
-        return date_str
+    except: return date_str
 
 def get_user_email(username):
-    if not username or username == "Unknown":
-        return ""
+    if not username or username == "Unknown": return ""
     try:
         res = subprocess.check_output([USER_INFO_UTIL, '-a', username], stderr=subprocess.DEVNULL).decode('utf-8')
         match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', res)
-        if match:
-            return match.group(0)
+        if match: return match.group(0)
     except: pass
-    return f"{username}@samsung.com" # Fallback if utility fails
+    return f"{username}@samsung.com" 
 
 # ===========================================================================
 # --- CUSTOM SORTING UI CLASS ---
@@ -93,12 +83,9 @@ class CustomTreeItem(QTreeWidgetItem):
         col = self.treeWidget().sortColumn()
         t1 = self.text(col).strip() if self.text(col) else ""
         t2 = other.text(col).strip() if other.text(col) else ""
-
         if col == 0:
             if t1 == "[ Ignored Runs ]": return False
             if t2 == "[ Ignored Runs ]": return True
-            if t1 == "Other PNR runs": return False
-            if t2 == "Other PNR runs": return True
             m_order = {"INITIAL RELEASE": 1, "PRE-SVP": 2, "SVP": 3, "FFN": 4}
             if t1 in m_order and t2 in m_order:
                 asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
@@ -110,14 +97,11 @@ class CustomTreeItem(QTreeWidgetItem):
 # ===========================================================================
 def get_owner(path):
     if not path or not cached_exists(path): return "Unknown"
-    try:
-        return pwd.getpwuid(os.stat(path).st_uid).pw_name
-    except Exception:
-        return "Unknown"
+    try: return pwd.getpwuid(os.stat(path).st_uid).pw_name
+    except: return "Unknown"
 
 def normalize_rtl(rtl_str):
-    if rtl_str and rtl_str.startswith("EVT"):
-        return f"{PROJECT_PREFIX}_{rtl_str}"
+    if rtl_str and rtl_str.startswith("EVT"): return f"{PROJECT_PREFIX}_{rtl_str}"
     return rtl_str
 
 def get_milestone(rtl_str):
@@ -156,12 +140,10 @@ def get_vslp_info(report_path):
         with open(report_path, 'r') as f:
             in_summary = False
             for line in f:
-                if "Management Summary" in line:
-                    in_summary = True; continue
+                if "Management Summary" in line: in_summary = True; continue
                 if in_summary and line.strip().startswith("Total"):
                     parts = line.strip().split()
-                    if len(parts) >= 3:
-                        return f"Error: {parts[1]}, Warning: {parts[2]}"
+                    if len(parts) >= 3: return f"Error: {parts[1]}, Warning: {parts[2]}"
                     break
     except: pass
     return "Not Found"
@@ -175,15 +157,12 @@ def parse_runtime_rpt(file_path):
                 if "TOTAL_START" in line and "Load :" in line:
                     d["start"] = format_log_date(line.split("Load :")[-1].strip())
                 m = re.search(r'TimeStamp\s*:\s*(\S+)', line)
-                if m and m.group(1) not in ["TOTAL", "TOTAL_START"]:
-                    d["last_stage"] = m.group(1)
+                if m and m.group(1) not in ["TOTAL", "TOTAL_START"]: d["last_stage"] = m.group(1)
                 if "TimeStamp : TOTAL" in line and "TOTAL_START" not in line:
                     rt = re.search(r'Total\s*:\s*(\d+)h:(\d+)m:(\d+)s', line)
-                    if rt:
-                        d["runtime"] = f"{int(rt.group(1)):02}h:{int(rt.group(2)):02}m:{int(rt.group(3)):02}s"
-                    if "Load :" in line:
-                        d["end"] = format_log_date(line.split("Load :")[-1].strip())
-    except Exception: pass
+                    if rt: d["runtime"] = f"{int(rt.group(1)):02}h:{int(rt.group(2)):02}m:{int(rt.group(3)):02}s"
+                    if "Load :" in line: d["end"] = format_log_date(line.split("Load :")[-1].strip())
+    except: pass
     return d
 
 def parse_pnr_runtime_rpt(file_path):
@@ -205,17 +184,15 @@ def parse_pnr_runtime_rpt(file_path):
                         days, hours, mins, secs = map(int, target_match)
                         total_hours = days * 24 + hours
                         final_time_str = f"{total_hours:02}h:{mins:02}m:{secs:02}s"
-                        if len(parts) > 1 and not parts[1].isdigit():
-                            d["last_stage"] = parts[1]
+                        if len(parts) > 1 and not parts[1].isdigit(): d["last_stage"] = parts[1]
         if first_ts:
             y, mo, day, H, M = first_ts.groups()
             d["start"] = f"{months[int(mo)-1]} {int(day):02d}, {y} - {H}:{M}"
         if last_ts:
             y, mo, day, H, M = last_ts.groups()
             d["end"] = f"{months[int(mo)-1]} {int(day):02d}, {y} - {H}:{M}"
-        if final_time_str:
-            d["runtime"] = final_time_str
-    except Exception: pass
+        if final_time_str: d["runtime"] = final_time_str
+    except: pass
     return d
 
 def extract_rtl(run_dir):
@@ -263,11 +240,10 @@ class SettingsDialog(QDialog):
         self.theme_cb.setChecked(parent.is_dark_mode if parent else False)
         layout.addRow("", self.theme_cb)
 
-        # Custom Theming
         sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
         layout.addRow(sep)
         
-        self.use_custom_cb = QCheckBox("Enable Custom Colors (Overrides Default Theme)")
+        self.use_custom_cb = QCheckBox("Enable Custom Colors")
         self.use_custom_cb.setChecked(parent.use_custom_colors if parent else False)
         layout.addRow("Theme:", self.use_custom_cb)
 
@@ -302,43 +278,170 @@ class SettingsDialog(QDialog):
         if c.isValid(): self.sel_color = c.name()
 
 class MailDialog(QDialog):
-    def __init__(self, to_emails, run_paths, parent=None):
+    def __init__(self, user_count, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Send Mail to Run Owners")
-        self.resize(600, 450)
+        self.setWindowTitle("Group Mail Configuration")
+        self.resize(600, 350)
         layout = QVBoxLayout(self)
 
-        form = QFormLayout()
-        self.to_input = QLineEdit(", ".join(to_emails))
-        form.addRow("To:", self.to_input)
+        info = QLabel(f"<b>Batch Setup:</b> Emails will be individually sent to <b>{user_count} unique users.</b><br>Each user will automatically receive a list of ONLY their own runs.")
+        layout.addWidget(info)
 
+        form = QFormLayout()
         self.subject_input = QLineEdit("Please remove your old PD runs")
         form.addRow("Subject:", self.subject_input)
         layout.addLayout(form)
 
-        layout.addWidget(QLabel("Message:"))
+        layout.addWidget(QLabel("Message Header (The runs will be appended below this):"))
         self.body_input = QTextEdit()
-        default_text = "Hi,\n\nPlease remove these runs as they are no longer needed:\n\n" + "\n".join(run_paths)
-        self.body_input.setPlainText(default_text)
+        self.body_input.setPlainText("Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:")
         layout.addWidget(self.body_input)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.button(QDialogButtonBox.Ok).setText("Send Mail")
+        self.buttons.button(QDialogButtonBox.Ok).setText("Send All Emails")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
 
 # ===========================================================================
-# --- BACKGROUND WORKER THREADS ---
+# --- PIE CHART & DISK USAGE UI ---
+# ===========================================================================
+class PieChartWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(300, 300)
+        self.data = {} # user -> size
+        self.colors = [
+            QColor("#ef5350"), QColor("#42a5f5"), QColor("#66bb6a"), QColor("#ffa726"),
+            QColor("#ab47bc"), QColor("#26c6da"), QColor("#8d6e63"), QColor("#78909c"),
+            QColor("#d4e157"), QColor("#ec407a")
+        ]
+        self.bg_col = "#ffffff"
+
+    def set_data(self, data, is_dark):
+        self.data = dict(sorted(data.items(), key=lambda item: item[1], reverse=True))
+        self.bg_col = "#2b2d30" if is_dark else "#ffffff"
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        
+        rect = self.rect()
+        margin = 15
+        pie_rect = QRectF(rect.adjusted(margin, margin, -margin, -margin))
+        
+        total = sum(self.data.values())
+        if total == 0:
+            painter.setPen(QColor("#888888"))
+            painter.drawText(rect, Qt.AlignCenter, "No Data Available")
+            return
+
+        start_angle = 0
+        for i, (name, val) in enumerate(self.data.items()):
+            span_angle = (val / total) * 360 * 16
+            painter.setBrush(QBrush(self.colors[i % len(self.colors)]))
+            painter.setPen(QPen(QColor(self.bg_col), 2)) # Stroke matches background
+            painter.drawPie(pie_rect, int(start_angle), int(span_angle))
+            start_angle += span_angle
+
+class DiskUsageDialog(QDialog):
+    def __init__(self, disk_data, is_dark, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Disk Space Usage (User-Wise)")
+        self.resize(800, 500)
+        self.disk_data = disk_data
+        self.is_dark = is_dark
+        
+        layout = QVBoxLayout(self)
+        
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("<b>Select Directory Scope:</b>"))
+        self.combo = QComboBox()
+        self.combo.addItems(["WS (FE)", "WS (BE)", "OUTFEED"])
+        self.combo.currentIndexChanged.connect(self.update_view)
+        top_row.addWidget(self.combo)
+        top_row.addStretch()
+        layout.addLayout(top_row)
+
+        main_body = QHBoxLayout()
+        self.pie = PieChartWidget()
+        main_body.addWidget(self.pie, 1)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(2)
+        self.table.setHorizontalHeaderLabels(["User", "Size (GB)"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        main_body.addWidget(self.table, 1)
+
+        layout.addLayout(main_body, 1)
+        self.update_view()
+
+    def update_view(self):
+        cat = self.combo.currentText()
+        data = self.disk_data.get(cat, {})
+        
+        self.pie.set_data(data, self.is_dark)
+        
+        self.table.setRowCount(0)
+        sorted_data = sorted(data.items(), key=lambda item: item[1], reverse=True)
+        for i, (user, sz) in enumerate(sorted_data):
+            self.table.insertRow(i)
+            it_u = QTableWidgetItem(user)
+            it_s = QTableWidgetItem(f"{sz:.2f} GB")
+            
+            # Color code dot in table
+            dot = QTableWidgetItem("  ■  ")
+            dot.setForeground(QColor(self.pie.colors[i % len(self.pie.colors)]))
+            it_u.setIcon(dot.icon()) 
+            it_u.setForeground(QColor(self.pie.colors[i % len(self.pie.colors)]))
+            
+            self.table.setItem(i, 0, it_u)
+            self.table.setItem(i, 1, it_s)
+
+class DiskScannerWorker(QThread):
+    progress = pyqtSignal(str)
+    finished_scan = pyqtSignal(dict)
+
+    def run(self):
+        targets = {
+            "WS (FE)": BASE_WS_FE_DIR,
+            "WS (BE)": BASE_WS_BE_DIR,
+            "OUTFEED": BASE_OUTFEED_DIR
+        }
+        results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
+
+        for category, path in targets.items():
+            if not os.path.exists(path): continue
+            self.progress.emit(f"Analyzing {category} space distribution... This may take a minute.")
+            # Fast highly accurate block size count mapped strictly to owners.
+            cmd = f"find {path} -type f -printf '%u %s\\n' 2>/dev/null | awk '{{user[$1]+=$2}} END {{for (u in user) print u, user[u]}}'"
+            try:
+                out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
+                for line in out.strip().split('\n'):
+                    if not line.strip(): continue
+                    parts = line.strip().split()
+                    if len(parts) == 2:
+                        user, bytes_sz = parts[0], int(parts[1])
+                        gb_sz = bytes_sz / (1024**3)
+                        if gb_sz > 0.01: # Filter tiny residual files
+                            results[category][user] = gb_sz
+            except: pass
+            
+        self.finished_scan.emit(results)
+
+# ===========================================================================
+# --- BACKGROUND WORKER THREADS (Sizes & Scan) ---
 # ===========================================================================
 class BatchSizeWorker(QThread):
     size_calculated = pyqtSignal(str, str)
-
     def __init__(self, tasks):
         super().__init__()
         self.tasks = tasks
         self._is_cancelled = False
-
     def run(self):
         max_w = min(20, (os.cpu_count() or 4) * 4)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
@@ -346,41 +449,28 @@ class BatchSizeWorker(QThread):
             for future in concurrent.futures.as_completed(futures):
                 if self._is_cancelled: break
                 item_id = futures[future]
-                try:
-                    self.size_calculated.emit(item_id, future.result())
-                except:
-                    self.size_calculated.emit(item_id, "N/A")
-
+                try: self.size_calculated.emit(item_id, future.result())
+                except: self.size_calculated.emit(item_id, "N/A")
     def get_size(self, path):
         if not path or not os.path.exists(path): return "N/A"
-        try:
-            return subprocess.check_output(
-                ['du', '-sh', path], stderr=subprocess.DEVNULL
-            ).decode('utf-8').split()[0]
+        try: return subprocess.check_output(['du', '-sh', path], stderr=subprocess.DEVNULL).decode('utf-8').split()[0]
         except: return "N/A"
-
     def cancel(self): self._is_cancelled = True
 
 class SingleSizeWorker(QThread):
     result = pyqtSignal(object, str)
-
     def __init__(self, item, path):
         super().__init__()
         self.item = item; self.path = path; self._is_cancelled = False
-
     def run(self):
         if self._is_cancelled or not self.path or not os.path.exists(self.path):
             self.result.emit(self.item, "N/A"); return
         try:
-            sz = subprocess.check_output(
-                ['du', '-sh', self.path], stderr=subprocess.DEVNULL
-            ).decode('utf-8').split()[0]
+            sz = subprocess.check_output(['du', '-sh', self.path], stderr=subprocess.DEVNULL).decode('utf-8').split()[0]
             if not self._is_cancelled: self.result.emit(self.item, sz)
         except:
             if not self._is_cancelled: self.result.emit(self.item, "N/A")
-
     def cancel(self): self._is_cancelled = True
-
 
 class ScannerWorker(QThread):
     finished       = pyqtSignal(dict, dict, dict)
@@ -400,8 +490,7 @@ class ScannerWorker(QThread):
                     for line in f:
                         if line.startswith("Parsing ") and target_lef in line:
                             m = re.search(r'/fc/([^/]+-BE)/(?:outputs/)?([^/]+)/', line)
-                            if m:
-                                run_be_name = m.group(1); step_name = m.group(2)
+                            if m: run_be_name = m.group(1); step_name = m.group(2)
                         elif line.startswith("INST ") and "mV" in line:
                             inst_line = line.strip()
                             m2 = re.search(r'INST\s+(\S+mV)', inst_line)
@@ -446,8 +535,7 @@ class ScannerWorker(QThread):
                                 tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
                     if "innovus" in tools_to_scan:
                         for rd in glob.glob(os.path.join(ent_path, "innovus", "EVT*_ML*_DEV*_*")):
-                            if os.path.isdir(rd):
-                                tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                            if os.path.isdir(rd): tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
@@ -458,14 +546,11 @@ class ScannerWorker(QThread):
                     for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
                         tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
                     if "fc" in tools_to_scan:
-                        be_runs = (glob.glob(os.path.join(evt_dir, "fc", "*-BE")) +
-                                   glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE")))
-                        for rd in be_runs:
-                            tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                        be_runs = (glob.glob(os.path.join(evt_dir, "fc", "*-BE")) + glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE")))
+                        for rd in be_runs: tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
                     if "innovus" in tools_to_scan:
                         for rd in glob.glob(os.path.join(evt_dir, "innovus", "*")):
-                            if os.path.isdir(rd):
-                                tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                            if os.path.isdir(rd): tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
         total_tasks = len(tasks)
         completed_tasks = 0
@@ -481,8 +566,7 @@ class ScannerWorker(QThread):
                         if result["source"] == "WS":
                             ws_data["blocks"].add(result["block"])
                             ws_data["all_runs"].append(result)
-                            if result["run_type"] == "BE":
-                                self._map_release(ws_data, result["rtl"], result["parent"])
+                            if result["run_type"] == "BE": self._map_release(ws_data, result["rtl"], result["parent"])
                         else:
                             out_data["blocks"].add(result["block"])
                             out_data["all_runs"].append(result)
@@ -497,8 +581,7 @@ class ScannerWorker(QThread):
 
     def _thread_process_run(self, task_tuple):
         b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
-        if source == "OUTFEED":
-            rtl = self._resolve_outfeed_rtl(rd, phys_evt)
+        if source == "OUTFEED": rtl = self._resolve_outfeed_rtl(rd, phys_evt)
         else:
             rtl = extract_rtl(rd) if run_type == "BE" else base_rtl
             if rtl == "Unknown": rtl = base_rtl
@@ -506,10 +589,8 @@ class ScannerWorker(QThread):
 
     def _resolve_outfeed_rtl(self, rd, phys_evt):
         rtl = extract_rtl(rd)
-        if re.search(r'EVT\d+_ML\d+_DEV\d+', rtl):
-            rtl = re.sub(r'EVT\d+_ML\d+_DEV\d+', phys_evt, rtl)
-        elif rtl == "Unknown":
-            rtl = normalize_rtl(phys_evt)
+        if re.search(r'EVT\d+_ML\d+_DEV\d+', rtl): rtl = re.sub(r'EVT\d+_ML\d+_DEV\d+', phys_evt, rtl)
+        elif rtl == "Unknown": rtl = normalize_rtl(phys_evt)
         return normalize_rtl(rtl)
 
     def _process_run(self, b_name, rd, parent_path, rtl, source, run_type):
@@ -528,22 +609,15 @@ class ScannerWorker(QThread):
         fe_status = "RUNNING"
         
         if run_type == "FE":
-            if is_comp:
-                fe_status = "COMPLETED"
+            if is_comp: fe_status = "COMPLETED"
             else:
                 log_file = os.path.join(rd, "logs/compile_opt.log")
-                if not cached_exists(log_file):
-                    fe_status = "NOT STARTED"
+                if not cached_exists(log_file): fe_status = "NOT STARTED"
                 else:
                     fe_status = "RUNNING"
                     try:
-                        res_fatal = subprocess.run(["grep", "-m", "1", "Stack trace for crashing thread", log_file], stdout=subprocess.DEVNULL)
-                        if res_fatal.returncode == 0:
-                            fe_status = "FATAL ERROR"
-                        else:
-                            res_int = subprocess.run(["grep", "-m", "1", "Information: Process terminated by interrupt. (INT-4)", log_file], stdout=subprocess.DEVNULL)
-                            if res_int.returncode == 0:
-                                fe_status = "INTERRUPTED"
+                        if subprocess.run(["grep", "-m", "1", "Stack trace for crashing thread", log_file], stdout=subprocess.DEVNULL).returncode == 0: fe_status = "FATAL ERROR"
+                        elif subprocess.run(["grep", "-m", "1", "Information: Process terminated by interrupt. (INT-4)", log_file], stdout=subprocess.DEVNULL).returncode == 0: fe_status = "INTERRUPTED"
                     except: pass
 
         stages = []
@@ -552,16 +626,13 @@ class ScannerWorker(QThread):
             for s_dir in glob.glob(search_glob):
                 if not os.path.isdir(s_dir): continue
                 step_name = os.path.basename(s_dir)
-                if source == "OUTFEED" and step_name in ["reports", "logs", "pass", "fail", "outputs"]:
-                    continue
+                if source == "OUTFEED" and step_name in ["reports", "logs", "pass", "fail", "outputs"]: continue
 
                 if source == "WS":
-                    rpt        = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
-                    log        = os.path.join(rd, "logs",    f"{step_name}.log")
+                    rpt, log = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt"), os.path.join(rd, "logs", f"{step_name}.log")
                     stage_path = os.path.join(rd, "outputs", step_name)
                 else:
-                    rpt        = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
-                    log        = os.path.join(s_dir, "logs",    f"{step_name}.log")
+                    rpt, log = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt"), os.path.join(s_dir, "logs", f"{step_name}.log")
                     stage_path = os.path.join(rd, step_name)
 
                 fm_u_glob   = glob.glob(os.path.join(evt_base, "fm", clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
@@ -573,34 +644,27 @@ class ScannerWorker(QThread):
                 qor_path     = rd if rd.endswith("/") else rd + "/"
 
                 stages.append({
-                    "name": step_name, "rpt": rpt, "log": log,
-                    "info": parse_pnr_runtime_rpt(rpt),
-                    "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path),
-                    "vslp_status": get_vslp_info(st_vslp_rpt),
-                    "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path,
-                    "vslp_rpt_path": st_vslp_rpt, "sta_rpt_path": sta_rpt,
+                    "name": step_name, "rpt": rpt, "log": log, "info": parse_pnr_runtime_rpt(rpt),
+                    "st_n": get_fm_info(st_fm_n_path), "st_u": get_fm_info(st_fm_u_path), "vslp_status": get_vslp_info(st_vslp_rpt),
+                    "fm_u_path": st_fm_u_path, "fm_n_path": st_fm_n_path, "vslp_rpt_path": st_vslp_rpt, "sta_rpt_path": sta_rpt,
                     "qor_path": qor_path, "stage_path": stage_path
                 })
 
         return {
-            "block": b_name, "path": rd, "parent": parent_path,
-            "rtl": rtl, "r_name": r_name, "run_type": run_type,
-            "stages": stages, "source": source, "owner": owner,
-            "is_comp": is_comp, "fe_status": fe_status,
-            "st_n": get_fm_info(fm_n), "st_u": get_fm_info(fm_u),
-            "vslp_status": get_vslp_info(vslp_rpt),
+            "block": b_name, "path": rd, "parent": parent_path, "rtl": rtl, "r_name": r_name, "run_type": run_type,
+            "stages": stages, "source": source, "owner": owner, "is_comp": is_comp, "fe_status": fe_status,
+            "st_n": get_fm_info(fm_n), "st_u": get_fm_info(fm_u), "vslp_status": get_vslp_info(vslp_rpt),
             "info": info, "fm_n_path": fm_n, "fm_u_path": fm_u, "vslp_rpt_path": vslp_rpt
         }
 
     def _map_release(self, data_obj, rtl_str, path):
-        if rtl_str not in data_obj["releases"]:
-            data_obj["releases"][rtl_str] = []
-        if path not in data_obj["releases"][rtl_str]:
-            data_obj["releases"][rtl_str].append(path)
+        if rtl_str not in data_obj["releases"]: data_obj["releases"][rtl_str] = []
+        if path not in data_obj["releases"][rtl_str]: data_obj["releases"][rtl_str].append(path)
         base = re.sub(r'_syn\d+$', '', rtl_str)
         if base != rtl_str:
             if base not in data_obj["releases"]: data_obj["releases"][base] = []
             if path not in data_obj["releases"][base]: data_obj["releases"][base].append(path)
+
 
 # ===========================================================================
 # --- MAIN DASHBOARD WINDOW ---
@@ -659,7 +723,6 @@ class PDDashboard(QMainWindow):
         top = QHBoxLayout()
         top.setSpacing(6)
 
-        # Source
         top.addWidget(self._label("Source:"))
         self.src_combo = QComboBox()
         self.src_combo.addItems(["ALL", "WS", "OUTFEED"])
@@ -669,7 +732,6 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top)
 
-        # RTL release
         top.addWidget(self._label("RTL Release:"))
         self.rel_combo = QComboBox()
         self.rel_combo.setMinimumWidth(340)
@@ -678,7 +740,6 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top)
 
-        # View preset
         top.addWidget(self._label("View:"))
         self.view_combo = QComboBox()
         self.view_combo.addItems(["All Runs", "FE Only", "BE Only", "Running Only", "Failed Only", "Today's Runs"])
@@ -688,7 +749,6 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top)
 
-        # Search
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search runs, blocks, status, runtime...   [Ctrl+F]")
         self.search.setMinimumWidth(280)
@@ -697,7 +757,6 @@ class PDDashboard(QMainWindow):
 
         top.addStretch()
 
-        # Buttons
         self.refresh_btn = self._btn("Refresh  [Ctrl+R]", self.start_fs_scan)
         top.addWidget(self.refresh_btn)
 
@@ -710,7 +769,6 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top)
 
-        # Tools menu button
         self.tools_btn = QPushButton("Tools")
         self.tools_menu = QMenu(self)
         self.tools_menu.addAction("Fit Columns  [Ctrl+Shift+F]", self.fit_all_columns)
@@ -726,6 +784,9 @@ class PDDashboard(QMainWindow):
         
         self.mail_btn = self._btn("Send Mail", self.send_mail_action)
         top.addWidget(self.mail_btn)
+        
+        self.disk_btn = self._btn("Disk Space", self.open_disk_usage)
+        top.addWidget(self.disk_btn)
 
         top.addWidget(self._btn("Settings", self.open_settings))
 
@@ -820,8 +881,7 @@ class PDDashboard(QMainWindow):
         self.tree.itemCollapsed.connect(lambda: self.tree.resizeColumnToContents(0))
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
 
-        for i in [10, 14, 15, 16, 17, 18, 19, 20]: 
-            self.tree.setColumnHidden(i, True)
+        for i in [10, 14, 15, 16, 17, 18, 19, 20]: self.tree.setColumnHidden(i, True)
 
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.on_context_menu)
@@ -843,8 +903,7 @@ class PDDashboard(QMainWindow):
         self.sb_selected = QLabel("Selected: 0")
         self.sb_scan_time = QLabel("")
 
-        for lbl in [self.sb_total, self.sb_complete, self.sb_running,
-                    self.sb_selected, self.sb_scan_time]:
+        for lbl in [self.sb_total, self.sb_complete, self.sb_running, self.sb_selected, self.sb_scan_time]:
             lbl.setContentsMargins(8, 0, 8, 0)
             self.status_bar.addPermanentWidget(lbl)
             self.status_bar.addPermanentWidget(self._vsep())
@@ -854,10 +913,8 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # HELPERS
     # ------------------------------------------------------------------
-    def _label(self, text):
-        l = QLabel(text)
-        return l
-
+    def _label(self, text): return QLabel(text)
+    
     def _btn(self, text, slot):
         b = QPushButton(text)
         b.clicked.connect(slot)
@@ -879,8 +936,7 @@ class PDDashboard(QMainWindow):
     def _set_all_blocks(self, checked):
         state = Qt.Checked if checked else Qt.Unchecked
         self.blk_list.blockSignals(True)
-        for i in range(self.blk_list.count()):
-            self.blk_list.item(i).setCheckState(state)
+        for i in range(self.blk_list.count()): self.blk_list.item(i).setCheckState(state)
         self.blk_list.blockSignals(False)
         self.refresh_view()
 
@@ -905,26 +961,21 @@ class PDDashboard(QMainWindow):
         self.sb_total.setText(f"  Total: {total}")
         self.sb_complete.setText(f"  Completed: {completed}")
         self.sb_running.setText(f"  Running: {running}")
-        sel = len(self._checked_paths)
-        self.sb_selected.setText(f"  Selected: {sel}")
-        if self._last_scan_time:
-            self.sb_scan_time.setText(f"  Last scan: {self._last_scan_time}  ")
+        self.sb_selected.setText(f"  Selected: {len(self._checked_paths)}")
+        if self._last_scan_time: self.sb_scan_time.setText(f"  Last scan: {self._last_scan_time}  ")
 
     def _on_item_check_changed(self, item, col=0):
         if col != 0: return
         path = item.text(14)
         if not path or path == "N/A": return
-        
         hl_color = QColor(self.custom_sel_color if self.use_custom_colors else ("#404652" if self.is_dark_mode else "#e3f2fd"))
         
         if item.checkState(0) == Qt.Checked:
             self._checked_paths.add(path)
-            for c in range(self.tree.columnCount()):
-                item.setBackground(c, hl_color)
+            for c in range(self.tree.columnCount()): item.setBackground(c, hl_color)
         else:
             self._checked_paths.discard(path)
-            for c in range(self.tree.columnCount()):
-                item.setBackground(c, QColor(0, 0, 0, 0))
+            for c in range(self.tree.columnCount()): item.setBackground(c, QColor(0, 0, 0, 0))
         self.sb_selected.setText(f"  Selected: {len(self._checked_paths)}")
 
     def on_tree_selection_changed(self):
@@ -935,7 +986,6 @@ class PDDashboard(QMainWindow):
         if len(sel) == 1:
             item = sel[0]
             is_stage = item.data(0, Qt.UserRole) == "STAGE"
-            
             if not is_stage:
                 run_path = item.text(14)
                 if run_path and run_path != "N/A":
@@ -950,8 +1000,7 @@ class PDDashboard(QMainWindow):
                         self.current_error_log_path = err_file
                         
                         color = "#e57373" if self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888") else "#d32f2f"
-                        if count == 0:
-                            color = "#81c784" if self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888") else "#388e3c"
+                        if count == 0: color = "#81c784" if self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888") else "#388e3c"
                         
                         self.fe_error_btn.setStyleSheet(f"QPushButton#errorLinkBtn {{ border: none; background: transparent; color: {color}; font-weight: bold; text-align: left; padding: 6px 0px; }} QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
                         self.fe_error_btn.setText(f"📝 compile_opt errors: {count}")
@@ -986,33 +1035,15 @@ class PDDashboard(QMainWindow):
         pad = self.row_spacing
         
         if self.use_custom_colors:
-            bg = self.custom_bg_color
-            fg = self.custom_fg_color
-            sel = self.custom_sel_color
-            
+            bg, fg, sel = self.custom_bg_color, self.custom_fg_color, self.custom_sel_color
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{ background-color: {bg}; color: {fg}; }}
-                QHeaderView::section {{
-                    background-color: {bg}; color: {fg};
-                    border: 1px solid {fg}; padding: 5px; font-weight: bold;
-                }}
-                QTreeWidget, QListWidget {{
-                    background-color: {bg}; color: {fg};
-                    alternate-background-color: transparent;
-                    gridline-color: {fg}; border: 1px solid {fg};
-                }}
-                QLineEdit, QSpinBox, QComboBox, QTextEdit {{
-                    background-color: {bg}; color: {fg};
-                    border: 1px solid {fg}; padding: 4px; border-radius: 4px;
-                }}
-                QComboBox QAbstractItemView {{
-                    background-color: {bg}; color: {fg};
-                    selection-background-color: {sel}; selection-color: #ffffff;
-                }}
-                QPushButton {{
-                    background-color: {bg}; color: {fg};
-                    border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; font-weight: bold;
-                }}
+                QHeaderView::section {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px; font-weight: bold; }}
+                QTreeWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; }}
+                QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; font-weight: bold; font-size: 14px; }}
+                QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 4px; border-radius: 4px; }}
+                QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #ffffff; }}
+                QPushButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
                 QPushButton:hover {{ border-color: {sel}; }}
                 QPushButton:pressed {{ background-color: {sel}; color: #ffffff; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: {sel}; padding: 0px 4px; min-width: 0px; }}
@@ -1023,101 +1054,53 @@ class PDDashboard(QMainWindow):
                 QStatusBar {{ background: {bg}; color: {fg}; border-top: 1px solid {fg}; }}
                 QTreeView::item {{ padding: {pad}px; }}
                 QListWidget::item {{ padding: {pad}px; }}
-                QTreeView::item:selected, QListWidget::item:selected {{
-                    background-color: {sel}; color: #ffffff;
-                }}
+                QTreeView::item:selected, QListWidget::item:selected {{ background-color: {sel}; color: #ffffff; }}
             """
         elif self.is_dark_mode:
             stylesheet = f"""
-                QMainWindow, QWidget, QDialog {{
-                    background-color: #2b2d30; color: #dfe1e5;
-                }}
-                QTreeWidget, QListWidget {{
-                    background-color: #1e1f22; color: #dfe1e5;
-                    alternate-background-color: #26282b;
-                    gridline-color: #393b40; border: 1px solid #393b40;
-                }}
-                QHeaderView::section {{
-                    background-color: #2b2d30; color: #a9b7c6;
-                    border: 1px solid #1e1f22; padding: 5px; font-weight: bold;
-                }}
-                QLineEdit, QSpinBox, QTextEdit {{
-                    background-color: #1e1f22; color: #dfe1e5;
-                    border: 1px solid #43454a; padding: 4px; border-radius: 4px;
-                }}
-                QComboBox {{
-                    background-color: #2b2d30; color: #dfe1e5;
-                    border: 1px solid #43454a; padding: 4px; border-radius: 4px;
-                }}
-                QComboBox QAbstractItemView {{
-                    background-color: #2b2d30; color: #dfe1e5;
-                    selection-background-color: #2f65ca; selection-color: #ffffff;
-                }}
-                QPushButton {{
-                    background-color: #393b40; color: #dfe1e5;
-                    border: 1px solid #43454a; padding: 5px 12px; border-radius: 4px;
-                }}
+                QMainWindow, QWidget, QDialog {{ background-color: #2b2d30; color: #dfe1e5; }}
+                QTreeWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; }}
+                QListWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; font-weight: bold; font-size: 14px; }}
+                QHeaderView::section {{ background-color: #2b2d30; color: #a9b7c6; border: 1px solid #1e1f22; padding: 5px; font-weight: bold; }}
+                QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
+                QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
+                QComboBox QAbstractItemView {{ background-color: #2b2d30; color: #dfe1e5; selection-background-color: #2f65ca; selection-color: #ffffff; }}
+                QPushButton {{ background-color: #393b40; color: #dfe1e5; border: 1px solid #43454a; padding: 5px 12px; border-radius: 4px; }}
                 QPushButton:hover {{ background-color: #43454a; }}
                 QPushButton:pressed {{ background-color: #2f65ca; color: #ffffff; border-color: #2f65ca; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: #64b5f6; padding: 0px 4px; min-width: 0px; }}
                 QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: #393b40; }}
-                QMenu {{
-                    border: 1px solid #43454a; background-color: #2b2d30; color: #dfe1e5;
-                }}
+                QMenu {{ border: 1px solid #43454a; background-color: #2b2d30; color: #dfe1e5; }}
                 QMenu::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
                 QStatusBar {{ background: #2b2d30; color: #808080; border-top: 1px solid #393b40; }}
                 QTreeView::item {{ padding: {pad}px; }}
                 QListWidget::item {{ padding: {pad}px; }}
-                QTreeView::item:selected, QListWidget::item:selected {{
-                    background-color: #2f65ca; color: #ffffff;
-                }}
+                QTreeView::item:selected, QListWidget::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
+                QTableWidget {{ background-color: #1e1f22; alternate-background-color: #26282b; gridline-color: #393b40; }}
             """
         else:
             stylesheet = f"""
-                QMainWindow, QWidget, QDialog {{
-                    background-color: #f5f7fa; color: #333333;
-                }}
-                QHeaderView::section {{
-                    background-color: #e4e7eb; color: #4a5568;
-                    border: 1px solid #cbd5e0; padding: 5px; font-weight: bold;
-                }}
-                QTreeWidget, QListWidget {{
-                    background-color: #ffffff; color: #333333;
-                    alternate-background-color: #f8fafc;
-                    gridline-color: #e2e8f0; border: 1px solid #cbd5e0;
-                }}
-                QLineEdit, QSpinBox, QTextEdit {{
-                    background-color: #ffffff; color: #333333;
-                    border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px;
-                }}
-                QComboBox {{
-                    background-color: #ffffff; color: #333333;
-                    border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px;
-                }}
-                QComboBox QAbstractItemView {{
-                    background-color: #ffffff; color: #333333;
-                    selection-background-color: #3182ce; selection-color: #ffffff;
-                }}
-                QPushButton {{
-                    background-color: #ffffff; color: #4a5568;
-                    border: 1px solid #cbd5e0; padding: 5px 12px; border-radius: 4px; font-weight: bold;
-                }}
+                QMainWindow, QWidget, QDialog {{ background-color: #f5f7fa; color: #333333; }}
+                QHeaderView::section {{ background-color: #e4e7eb; color: #4a5568; border: 1px solid #cbd5e0; padding: 5px; font-weight: bold; }}
+                QTreeWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; }}
+                QListWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; font-weight: bold; font-size: 14px; }}
+                QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
+                QComboBox {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
+                QComboBox QAbstractItemView {{ background-color: #ffffff; color: #333333; selection-background-color: #3182ce; selection-color: #ffffff; }}
+                QPushButton {{ background-color: #ffffff; color: #4a5568; border: 1px solid #cbd5e0; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
                 QPushButton:hover {{ background-color: #edf2f7; border-color: #a0aec0; }}
                 QPushButton:pressed {{ background-color: #e2e8f0; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: #3182ce; padding: 0px 4px; min-width: 0px; }}
                 QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: #cbd5e0; }}
-                QMenu {{
-                    border: 1px solid #cbd5e0; background-color: #ffffff; color: #333333;
-                }}
+                QMenu {{ border: 1px solid #cbd5e0; background-color: #ffffff; color: #333333; }}
                 QMenu::item:selected {{ background-color: #3182ce; color: #ffffff; }}
                 QStatusBar {{ background: #e4e7eb; color: #4a5568; border-top: 1px solid #cbd5e0; }}
                 QTreeView::item {{ padding: {pad}px; }}
                 QListWidget::item {{ padding: {pad}px; }}
-                QTreeView::item:selected, QListWidget::item:selected {{
-                    background-color: #3182ce; color: #ffffff;
-                }}
+                QTreeView::item:selected, QListWidget::item:selected {{ background-color: #3182ce; color: #ffffff; }}
+                QTableWidget {{ background-color: #ffffff; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; }}
             """
         self.setStyleSheet(stylesheet)
         self.refresh_view()
@@ -1161,7 +1144,6 @@ class PDDashboard(QMainWindow):
     def on_source_changed(self):
         src_mode = self.src_combo.currentText()
         releases, blocks = set(), set()
-
         if src_mode in ["WS",  "ALL"] and self.ws_data:
             releases.update(self.ws_data.get("releases", {}).keys())
             blocks.update(self.ws_data.get("blocks", set()))
@@ -1170,8 +1152,7 @@ class PDDashboard(QMainWindow):
             blocks.update(self.out_data.get("blocks", set()))
 
         current_rtl = self.rel_combo.currentText()
-        saved_states = {self.blk_list.item(i).text(): self.blk_list.item(i).checkState()
-                        for i in range(self.blk_list.count())}
+        saved_states = {self.blk_list.item(i).text(): self.blk_list.item(i).checkState() for i in range(self.blk_list.count())}
 
         self.rel_combo.blockSignals(True); self.rel_combo.clear()
         valid = [r for r in releases if "Unknown" not in r and get_milestone(r) is not None]
@@ -1195,8 +1176,7 @@ class PDDashboard(QMainWindow):
     def fit_all_columns(self):
         self.tree.setUpdatesEnabled(False)
         for i in range(self.tree.columnCount()):
-            if not self.tree.isColumnHidden(i):
-                self.tree.resizeColumnToContents(i)
+            if not self.tree.isColumnHidden(i): self.tree.resizeColumnToContents(i)
         self.tree.setUpdatesEnabled(True)
 
     def calculate_all_sizes(self):
@@ -1224,13 +1204,11 @@ class PDDashboard(QMainWindow):
         if item:
             item.setText(6, size_str)
             old = item.toolTip(0)
-            if old:
-                item.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {size_str}\n', old))
+            if old: item.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {size_str}\n', old))
 
     def _get_node(self, parent, text, node_type="DEFAULT"):
         for i in range(parent.childCount()):
-            if parent.child(i).text(0) == text:
-                return parent.child(i)
+            if parent.child(i).text(0) == text: return parent.child(i)
         p = CustomTreeItem(parent)
         p.setText(0, text)
         p.setData(0, Qt.UserRole, node_type)
@@ -1253,28 +1231,19 @@ class PDDashboard(QMainWindow):
     # STATUS BADGE TEXT
     # ------------------------------------------------------------------
     def _apply_status_color(self, item, col, status):
-        if status == "COMPLETED":
-            item.setForeground(col, QColor("#1b5e20" if not self.is_dark_mode else "#81c784"))
-        elif status == "RUNNING":
-            item.setForeground(col, QColor("#0d47a1" if not self.is_dark_mode else "#64b5f6"))
-        elif status == "NOT STARTED":
-            item.setForeground(col, QColor("#757575" if not self.is_dark_mode else "#9e9e9e"))
-        elif status == "INTERRUPTED":
-            item.setForeground(col, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
-        elif status in ("FAILED", "FATAL ERROR", "ERROR"):
-            item.setForeground(col, QColor("#b71c1c" if not self.is_dark_mode else "#e57373"))
+        if status == "COMPLETED": item.setForeground(col, QColor("#1b5e20" if not self.is_dark_mode else "#81c784"))
+        elif status == "RUNNING": item.setForeground(col, QColor("#0d47a1" if not self.is_dark_mode else "#64b5f6"))
+        elif status == "NOT STARTED": item.setForeground(col, QColor("#757575" if not self.is_dark_mode else "#9e9e9e"))
+        elif status == "INTERRUPTED": item.setForeground(col, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
+        elif status in ("FAILED", "FATAL ERROR", "ERROR"): item.setForeground(col, QColor("#b71c1c" if not self.is_dark_mode else "#e57373"))
 
     def _apply_fm_color(self, item, col, val):
-        if "FAILS" in val:
-            item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
-        elif "PASS" in val:
-            item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
+        if "FAILS" in val: item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
+        elif "PASS" in val: item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
 
     def _apply_vslp_color(self, item, col, val):
-        if "Error" in val and "Error: 0" not in val:
-            item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
-        elif "Error: 0" in val:
-            item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
+        if "Error" in val and "Error: 0" not in val: item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
+        elif "Error: 0" in val: item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -1292,29 +1261,18 @@ class PDDashboard(QMainWindow):
         if run["path"] in self._checked_paths:
             child.setCheckState(0, Qt.Checked)
             hl_color = QColor(self.custom_sel_color if self.use_custom_colors else ("#404652" if self.is_dark_mode else "#e3f2fd"))
-            for c in range(self.tree.columnCount()):
-                child.setBackground(c, hl_color)
+            for c in range(self.tree.columnCount()): child.setBackground(c, hl_color)
 
         is_ir_block = (run["block"].upper() == PROJECT_PREFIX.upper())
-        
         ir_text = "Check individual stage levels" if is_ir_block else "N/A"
-        tooltip_text = (
-            f"Owner: {run.get('owner','Unknown')}\n"
-            f"Size: Pending\n"
-            f"Runtime: {run['info']['runtime']}\n"
-            f"NONUPF: {run['st_n']}\n"
-            f"UPF: {run['st_u']}\n"
-            f"VSLP: {run['vslp_status']}\n"
-        )
+        tooltip_text = (f"Owner: {run.get('owner','Unknown')}\nSize: Pending\nRuntime: {run['info']['runtime']}\nNONUPF: {run['st_n']}\nUPF: {run['st_u']}\nVSLP: {run['vslp_status']}\n")
         if is_ir_block: tooltip_text += f"Static IR: {ir_text}"
         
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
 
-        if run["source"] == "OUTFEED":
-            child.setForeground(2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
-        else:
-            child.setForeground(2, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
+        if run["source"] == "OUTFEED": child.setForeground(2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
+        else: child.setForeground(2, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
 
         if run["run_type"] == "FE":
             status_str = run["fe_status"]
@@ -1335,8 +1293,7 @@ class PDDashboard(QMainWindow):
             else:
                 child.setText(12, start_raw)
                 child.setText(13, end_raw)
-            child.setToolTip(12, start_raw)
-            child.setToolTip(13, end_raw)
+            child.setToolTip(12, start_raw); child.setToolTip(13, end_raw)
 
             child.setText(14, run["path"])
             child.setText(15, os.path.join(run["path"], "logs/compile_opt.log"))
@@ -1351,13 +1308,10 @@ class PDDashboard(QMainWindow):
             self._apply_fm_color(child, 8, run["st_u"])
             self._apply_vslp_color(child, 9, run["vslp_status"])
         else:
-            child.setText(6, "-")
-            child.setText(10, "-")
-            child.setText(14, run["path"])
-            child.setText(20, "")
+            child.setText(6, "-"); child.setText(10, "-")
+            child.setText(14, run["path"]); child.setText(20, "")
 
-        for i in range(1, 21):
-            child.setTextAlignment(i, Qt.AlignCenter)
+        for i in range(1, 21): child.setTextAlignment(i, Qt.AlignCenter)
         child.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
         return child
 
@@ -1379,14 +1333,7 @@ class PDDashboard(QMainWindow):
             ir_key  = f"{be_run['r_name']}/{stage['name']}"
             ir_info = self.ir_data.get(ir_key, {"log": "", "line": "N/A", "value": "-"})
 
-            tooltip_text = (
-                f"Owner: {owner}\n"
-                f"Size: Pending\n"
-                f"Runtime: {stage['info']['runtime']}\n"
-                f"NONUPF: {stage['st_n']}\n"
-                f"UPF: {stage['st_u']}\n"
-                f"VSLP: {stage['vslp_status']}\n"
-            )
+            tooltip_text = (f"Owner: {owner}\nSize: Pending\nRuntime: {stage['info']['runtime']}\nNONUPF: {stage['st_n']}\nUPF: {stage['st_u']}\nVSLP: {stage['vslp_status']}\n")
             if is_ir_block: tooltip_text += f"Static IR: {ir_info['line']}"
             st_item.setToolTip(0, tooltip_text)
 
@@ -1397,8 +1344,7 @@ class PDDashboard(QMainWindow):
                     try:
                         with open(stage["log"], 'r', encoding='utf-8', errors='ignore') as f:
                             for line in f:
-                                if "START_CMD:" in line:
-                                    stage_status = line.strip(); break
+                                if "START_CMD:" in line: stage_status = line.strip(); break
                     except: pass
 
             st_item.setText(0, stage["name"])
@@ -1409,9 +1355,7 @@ class PDDashboard(QMainWindow):
             st_item.setText(7, f"NONUPF - {stage['st_n']}")
             st_item.setText(8, f"UPF - {stage['st_u']}")
             st_item.setText(9, stage["vslp_status"])
-            
             st_item.setText(10, ir_info["value"] if is_ir_block else "-")
-            
             st_item.setText(11, stage["info"]["runtime"])
 
             s_start = stage["info"]["start"]
@@ -1422,8 +1366,7 @@ class PDDashboard(QMainWindow):
             else:
                 st_item.setText(12, s_start)
                 st_item.setText(13, s_end)
-            st_item.setToolTip(12, s_start)
-            st_item.setToolTip(13, s_end)
+            st_item.setToolTip(12, s_start); st_item.setToolTip(13, s_end)
 
             st_item.setText(14, stage["stage_path"])
             st_item.setText(15, stage["log"])
@@ -1438,8 +1381,7 @@ class PDDashboard(QMainWindow):
             self._apply_vslp_color(st_item, 9, stage["vslp_status"])
             self._apply_status_color(st_item, 4, stage_status if stage_status in ("COMPLETED","RUNNING","FAILED") else "RUNNING")
 
-            for i in range(1, 21):
-                st_item.setTextAlignment(i, Qt.AlignCenter)
+            for i in range(1, 21): st_item.setTextAlignment(i, Qt.AlignCenter)
             st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
 
     # ------------------------------------------------------------------
@@ -1456,10 +1398,8 @@ class PDDashboard(QMainWindow):
             it = self.blk_list.item(i)
             blk = it.text()
             status = self._block_aggregate_status(blk, runs)
-            if status == "running":
-                it.setForeground(QColor("#0277bd" if not self.is_dark_mode else "#64b5f6"))
-            else:
-                it.setForeground(QColor("#2e7d32" if not self.is_dark_mode else "#81c784"))
+            if status == "running": it.setForeground(QColor("#0277bd" if not self.is_dark_mode else "#64b5f6"))
+            else: it.setForeground(QColor("#2e7d32" if not self.is_dark_mode else "#81c784"))
 
     # ------------------------------------------------------------------
     # VIEW PRESET FILTER
@@ -1497,36 +1437,22 @@ class PDDashboard(QMainWindow):
         self.tree.setSortingEnabled(False)
         self.tree.clear()
 
-        if self.rel_combo.currentText() == "[ SHOW ALL ]":
-            self.tree.setColumnHidden(1, False) 
-        else:
-            self.tree.setColumnHidden(1, True) 
+        if self.rel_combo.currentText() == "[ SHOW ALL ]": self.tree.setColumnHidden(1, False) 
+        else: self.tree.setColumnHidden(1, True) 
 
         src_mode = self.src_combo.currentText()
         sel_rtl  = self.rel_combo.currentText()
 
         raw_query = self.search.text().lower().strip()
-        if not raw_query:
-            search_pattern = "*"
-        elif '*' not in raw_query:
-            search_pattern = f"*{raw_query}*"
-        else:
-            search_pattern = raw_query
+        search_pattern = "*" if not raw_query else (f"*{raw_query}*" if '*' not in raw_query else raw_query)
 
-        checked_blks = [
-            self.blk_list.item(i).text()
-            for i in range(self.blk_list.count())
-            if self.blk_list.item(i).checkState() == Qt.Checked
-        ]
+        checked_blks = [self.blk_list.item(i).text() for i in range(self.blk_list.count()) if self.blk_list.item(i).checkState() == Qt.Checked]
 
         runs_to_process = []
-        if src_mode in ["WS",  "ALL"] and self.ws_data:
-            runs_to_process.extend(self.ws_data.get("all_runs", []))
-        if src_mode in ["OUTFEED","ALL"] and self.out_data:
-            runs_to_process.extend(self.out_data.get("all_runs", []))
+        if src_mode in ["WS",  "ALL"] and self.ws_data: runs_to_process.extend(self.ws_data.get("all_runs", []))
+        if src_mode in ["OUTFEED","ALL"] and self.out_data: runs_to_process.extend(self.out_data.get("all_runs", []))
 
-        ignored_runs_list = []
-        normal_runs_list  = []
+        ignored_runs_list, normal_runs_list = [], []
 
         for run in runs_to_process:
             if run["path"] in self.ignored_paths:
@@ -1535,29 +1461,24 @@ class PDDashboard(QMainWindow):
             base_rtl_filter = re.sub(r'_syn\d+$', '', run["rtl"])
             if get_milestone(base_rtl_filter) is None: continue
             if sel_rtl != "[ SHOW ALL ]":
-                if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")):
-                    continue
+                if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): continue
             if not self._apply_view_preset(run): continue
             if search_pattern != "*":
-                combined = (
-                    f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
-                    f"{run['st_n']} {run['st_u']} {run['vslp_status']} "
-                    f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']}"
-                ).lower()
+                combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} {run['st_n']} {run['st_u']} {run['vslp_status']} {run['info']['runtime']} {run['info']['start']} {run['info']['end']}").lower()
                 matches = fnmatch.fnmatch(combined, search_pattern)
                 if not matches and run["run_type"] == "BE":
                     for stage in run["stages"]:
                         sc = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
-                        if fnmatch.fnmatch(sc, search_pattern):
-                            matches = True; break
+                        if fnmatch.fnmatch(sc, search_pattern): matches = True; break
                 if not matches: continue
             normal_runs_list.append(run)
 
         fe_runs = [r for r in normal_runs_list if r["run_type"] == "FE"]
         be_runs = [r for r in normal_runs_list if r["run_type"] == "BE"]
-        matched_be_ids = set()
+        
         root = self.tree.invisibleRootItem()
 
+        # Place FE runs
         for fe_run in fe_runs:
             blk_name = fe_run["block"]
             run_rtl  = fe_run["rtl"]
@@ -1568,28 +1489,15 @@ class PDDashboard(QMainWindow):
             if sel_rtl == "[ SHOW ALL ]":
                 milestone  = get_milestone(base_rtl)
                 m_node     = self._get_node(block_node, milestone, "MILESTONE")
-                rtl_node   = self._get_node(m_node,    base_rtl,  "RTL")
+                rtl_node   = self._get_node(m_node, base_rtl,  "RTL")
                 parent_for_run = rtl_node
-            elif sel_rtl == base_rtl and has_syn:
-                syn_node   = self._get_node(block_node, run_rtl, "RTL")
-                parent_for_run = syn_node
-            else:
-                parent_for_run = block_node
+            elif sel_rtl == base_rtl and has_syn: parent_for_run = self._get_node(block_node, run_rtl, "RTL")
+            else: parent_for_run = block_node
 
-            fe_item  = self._create_run_item(parent_for_run, fe_run)
-            fe_base  = fe_run["r_name"].replace("-FE", "")
+            self._create_run_item(parent_for_run, fe_run)
 
-            for be_run in be_runs:
-                if be_run["block"] == fe_run["block"] and (
-                    f"_{fe_base}_" in be_run["r_name"] or
-                    be_run["r_name"].startswith(f"{fe_base}_")
-                ):
-                    be_item = self._create_run_item(fe_item, be_run)
-                    self._add_stages(be_item, be_run)
-                    matched_be_ids.add(id(be_run))
-
+        # Place BE runs (No more "Other PNR runs" fallback)
         for be_run in be_runs:
-            if id(be_run) in matched_be_ids: continue
             blk_name = be_run["block"]
             run_rtl  = be_run["rtl"]
             base_rtl = re.sub(r'_syn\d+$', '', run_rtl)
@@ -1599,18 +1507,21 @@ class PDDashboard(QMainWindow):
             if sel_rtl == "[ SHOW ALL ]":
                 milestone  = get_milestone(base_rtl)
                 m_node     = self._get_node(block_node, milestone, "MILESTONE")
-                rtl_node   = self._get_node(m_node,    base_rtl,  "RTL")
-                other_node = self._get_node(rtl_node,  "Other PNR runs", "OTHER")
-                parent_for_run = other_node
-            elif sel_rtl == base_rtl and has_syn:
-                syn_node   = self._get_node(block_node, run_rtl, "RTL")
-                other_node = self._get_node(syn_node,  "Other PNR runs", "OTHER")
-                parent_for_run = other_node
-            else:
-                other_node = self._get_node(block_node, "Other PNR runs", "OTHER")
-                parent_for_run = other_node
+                parent_for_run   = self._get_node(m_node, base_rtl,  "RTL")
+            elif sel_rtl == base_rtl and has_syn: parent_for_run = self._get_node(block_node, run_rtl, "RTL")
+            else: parent_for_run = block_node
 
-            be_item = self._create_run_item(parent_for_run, be_run)
+            # Attempt to nest inside matching FE run
+            fe_parent = None
+            for i in range(parent_for_run.childCount()):
+                c = parent_for_run.child(i)
+                fe_base = c.text(0).replace("-FE", "")
+                if c.data(0, Qt.UserRole) != "STAGE" and (f"_{fe_base}_" in be_run["r_name"] or be_run["r_name"].startswith(f"{fe_base}_")):
+                    fe_parent = c
+                    break
+
+            actual_parent = fe_parent if fe_parent else parent_for_run
+            be_item = self._create_run_item(actual_parent, be_run)
             self._add_stages(be_item, be_run)
 
         if ignored_runs_list:
@@ -1624,16 +1535,12 @@ class PDDashboard(QMainWindow):
                 if sel_rtl == "[ SHOW ALL ]":
                     milestone  = get_milestone(base_rtl)
                     m_node     = self._get_node(block_node, milestone, "MILESTONE")
-                    rtl_node   = self._get_node(m_node, base_rtl, "RTL")
-                    parent_for_run = rtl_node
-                elif sel_rtl == base_rtl and has_syn:
-                    syn_node   = self._get_node(block_node, run_rtl, "RTL")
-                    parent_for_run = syn_node
-                else:
-                    parent_for_run = block_node
+                    parent_for_run = self._get_node(m_node, base_rtl, "RTL")
+                elif sel_rtl == base_rtl and has_syn: parent_for_run = self._get_node(block_node, run_rtl, "RTL")
+                else: parent_for_run = block_node
+                
                 item = self._create_run_item(parent_for_run, run)
-                if run["run_type"] == "BE":
-                    self._add_stages(item, run)
+                if run["run_type"] == "BE": self._add_stages(item, run)
 
         self.tree.setSortingEnabled(True)
 
@@ -1643,21 +1550,13 @@ class PDDashboard(QMainWindow):
                 path_key  = self._get_item_path_id(child)
                 node_type = child.data(0, Qt.UserRole)
                 is_run    = bool(child.text(14)) 
-                if path_key in expanded_states:
-                    child.setExpanded(expanded_states[path_key])
+                if path_key in expanded_states: child.setExpanded(expanded_states[path_key])
                 else:
-                    if child.parent() is None:         
-                        child.setExpanded(True)
-                    elif node_type == "MILESTONE":     
-                        child.setExpanded(False)
-                    elif sel_rtl == "[ SHOW ALL ]" and node_type == "RTL": 
-                        child.setExpanded(False) 
-                    elif child.text(0).strip() == "Other PNR runs": 
-                        child.setExpanded(False)
-                    elif is_run:                       
-                        child.setExpanded(False)
-                    else:                              
-                        child.setExpanded(True)
+                    if child.parent() is None: child.setExpanded(True)
+                    elif node_type == "MILESTONE": child.setExpanded(False)
+                    elif sel_rtl == "[ SHOW ALL ]" and node_type == "RTL": child.setExpanded(False) 
+                    elif is_run: child.setExpanded(False)
+                    else: child.setExpanded(True)
                 restore_state(child)
         restore_state(root)
 
@@ -1688,33 +1587,25 @@ class PDDashboard(QMainWindow):
     def on_context_menu(self, pos):
         item = self.tree.itemAt(pos)
         if not item or not item.parent(): return
-
-        col        = self.tree.columnAt(pos.x())
-        m          = QMenu()
-        cell_text  = item.text(col).strip()
+        col = self.tree.columnAt(pos.x())
+        m = QMenu()
+        cell_text = item.text(col).strip()
         copy_cell_act = None
         if cell_text:
             copy_cell_act = m.addAction("Copy Cell Text")
             m.addSeparator()
 
-        run_path  = item.text(14)
-        log_path  = item.text(15)
-        fm_u_path = item.text(16)
-        fm_n_path = item.text(17)
-        vslp_path = item.text(18)
-        sta_path  = item.text(19)
-        ir_path   = item.text(20)
-        is_stage  = item.data(0, Qt.UserRole) == "STAGE"
+        run_path, log_path = item.text(14), item.text(15)
+        fm_u_path, fm_n_path = item.text(16), item.text(17)
+        vslp_path, sta_path, ir_path = item.text(18), item.text(19), item.text(20)
+        is_stage = item.data(0, Qt.UserRole) == "STAGE"
 
         ignore_checked_act = m.addAction("Ignore All Checked Runs")
         m.addSeparator()
-
         ignore_act = restore_act = None
         if run_path and run_path != "N/A" and not is_stage:
-            if run_path in self.ignored_paths:
-                restore_act = m.addAction("Restore Current Run (Un-ignore)")
-            else:
-                ignore_act = m.addAction("Ignore Current Run")
+            if run_path in self.ignored_paths: restore_act = m.addAction("Restore Current Run (Un-ignore)")
+            else: ignore_act = m.addAction("Ignore Current Run")
             m.addSeparator()
 
         calc_size_act = None
@@ -1728,10 +1619,8 @@ class PDDashboard(QMainWindow):
         sta_act  = m.addAction("Open PT STA Summary")         if sta_path  and sta_path  != "N/A" and cached_exists(sta_path)  else None
         ir_act   = m.addAction("Open Static IR Log")          if ir_path   and ir_path   != "N/A" and cached_exists(ir_path)   else None
         log_act  = m.addAction("Open Log File")               if log_path  and log_path  != "N/A" and cached_exists(log_path)  else None
-
         m.addSeparator()
         c_act = m.addAction("Copy Path")
-
         qor_act = None
         if is_stage:
             m.addSeparator()
@@ -1749,19 +1638,13 @@ class PDDashboard(QMainWindow):
                         if p and p != "N/A": self.ignored_paths.add(p)
                     ig(c)
             ig(self.tree.invisibleRootItem()); self.refresh_view()
-        elif res == ignore_act:
-            self.ignored_paths.add(run_path); self.refresh_view()
-        elif res == restore_act:
-            self.ignored_paths.discard(run_path); self.refresh_view()
-        elif copy_cell_act and res == copy_cell_act:
-            QApplication.clipboard().setText(cell_text)
+        elif res == ignore_act: self.ignored_paths.add(run_path); self.refresh_view()
+        elif res == restore_act: self.ignored_paths.discard(run_path); self.refresh_view()
+        elif copy_cell_act and res == copy_cell_act: QApplication.clipboard().setText(cell_text)
         elif calc_size_act and res == calc_size_act:
             item.setText(6, "Calc...") 
             worker = SingleSizeWorker(item, run_path)
-            worker.result.connect(lambda it, sz: (
-                it.setText(6, sz),
-                it.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {sz}\n', it.toolTip(0) if it.toolTip(0) else ""))
-            ))
+            worker.result.connect(lambda it, sz: (it.setText(6, sz), it.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {sz}\n', it.toolTip(0) if it.toolTip(0) else ""))))
             if not hasattr(self, 'size_workers'): self.size_workers = []
             self.size_workers.append(worker)
             worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
@@ -1772,8 +1655,7 @@ class PDDashboard(QMainWindow):
         elif sta_act  and res == sta_act:  subprocess.Popen(['gvim', sta_path])
         elif ir_act   and res == ir_act:   subprocess.Popen(['gvim', ir_path])
         elif log_act  and res == log_act:  subprocess.Popen(['gvim', log_path])
-        elif res == c_act:
-            QApplication.clipboard().setText(run_path)
+        elif res == c_act: QApplication.clipboard().setText(run_path)
         elif qor_act and res == qor_act:
             step_name = item.data(1, Qt.UserRole)
             qor_path  = item.data(2, Qt.UserRole)
@@ -1784,8 +1666,7 @@ class PDDashboard(QMainWindow):
     def on_item_double_clicked(self, item, col):
         if item.parent():
             log = item.text(15)
-            if log and cached_exists(log):
-                subprocess.Popen(['gvim', log])
+            if log and cached_exists(log): subprocess.Popen(['gvim', log])
 
     # ------------------------------------------------------------------
     # MAIL FEATURE
@@ -1795,58 +1676,74 @@ class PDDashboard(QMainWindow):
             QMessageBox.warning(self, "No Runs Selected", "Please select at least one run using the checkboxes before sending mail.")
             return
 
-        owners = set()
-        run_details = []
-
+        user_runs = {} 
         def find_owners(node):
             for i in range(node.childCount()):
                 c = node.child(i)
                 if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
                     path = c.text(14)
                     owner = c.text(5)
-                    if path and path != "N/A":
-                        if owner and owner != "Unknown":
-                            owners.add(owner)
-                        run_details.append(path)
+                    if path and path != "N/A" and owner and owner != "Unknown":
+                        if owner not in user_runs: user_runs[owner] = []
+                        user_runs[owner].append(path)
                 find_owners(c)
-
         find_owners(self.tree.invisibleRootItem())
 
-        emails = set()
-        for owner in owners:
-            email = get_user_email(owner)
-            if email:
-                emails.add(email)
+        if not user_runs:
+            QMessageBox.warning(self, "Unknown Users", "Could not determine the owners for the selected runs.")
+            return
 
-        dlg = MailDialog(list(emails), run_details, self)
+        dlg = MailDialog(len(user_runs), self)
         if dlg.exec_():
-            to_list = dlg.to_input.text().strip()
             subject = dlg.subject_input.text().strip()
-            body = dlg.body_input.toPlainText()
-
-            if not to_list:
-                QMessageBox.warning(self, "Error", "Recipient list is empty. Please specify at least one recipient.")
-                return
+            body_template = dlg.body_input.toPlainText()
 
             current_user = getpass.getuser()
             sender_email = get_user_email(current_user)
-            if not sender_email:
-                sender_email = f"{current_user}@samsung.com"
+            if not sender_email: sender_email = f"{current_user}@samsung.com"
 
-            cmd = [
-                MAIL_UTIL,
-                "-to", to_list,
-                "-sd", sender_email,
-                "-s", subject,
-                "-c", body,
-                "-fm", "text" 
-            ]
+            success_count = 0
+            for owner, paths in user_runs.items():
+                owner_email = get_user_email(owner)
+                if not owner_email: continue
+                
+                final_body = body_template + "\n\n" + "\n".join(paths)
+                
+                cmd = [
+                    MAIL_UTIL,
+                    "-to", owner_email,
+                    "-sd", sender_email,
+                    "-s", subject,
+                    "-c", final_body,
+                    "-fm", "text" 
+                ]
+                try:
+                    subprocess.Popen(cmd)
+                    success_count += 1
+                except Exception as e:
+                    print(f"Failed to send mail to {owner_email}: {e}")
 
-            try:
-                subprocess.Popen(cmd)
-                QMessageBox.information(self, "Mail Triggered", f"Mail command sent successfully as {sender_email}.")
-            except Exception as e:
-                QMessageBox.critical(self, "Mail Error", f"Failed to execute mail utility:\n{e}")
+            QMessageBox.information(self, "Mail Operation Complete", f"Successfully triggered {success_count} emails to individual owners.")
+
+    # ------------------------------------------------------------------
+    # DISK USAGE FEATURE
+    # ------------------------------------------------------------------
+    def open_disk_usage(self):
+        self.prog_dialog = QProgressDialog("Scanning file systems... This might take a minute.", "Cancel", 0, 0, self)
+        self.prog_dialog.setWindowTitle("Disk Scan")
+        self.prog_dialog.setModal(True)
+        self.prog_dialog.setCancelButton(None) 
+        self.prog_dialog.show()
+
+        self.disk_worker = DiskScannerWorker()
+        self.disk_worker.progress.connect(lambda msg: self.prog_dialog.setLabelText(msg))
+        self.disk_worker.finished_scan.connect(self._on_disk_scan_finished)
+        self.disk_worker.start()
+
+    def _on_disk_scan_finished(self, results):
+        self.prog_dialog.close()
+        dlg = DiskUsageDialog(results, self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"), self)
+        dlg.exec_()
 
     # ------------------------------------------------------------------
     # QoR COMPARISON
