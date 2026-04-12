@@ -8,6 +8,7 @@ import concurrent.futures
 import pwd
 import time
 import datetime
+import getpass
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -15,7 +16,8 @@ from PyQt5.QtWidgets import (
     QPushButton, QMessageBox, QListWidget, QListWidgetItem,
     QProgressBar, QMenu, QSplitter, QFontComboBox, QSpinBox,
     QWidgetAction, QCheckBox, QDialog, QFormLayout, QDialogButtonBox,
-    QStatusBar, QFrame, QShortcut, QAction, QToolBar, QColorDialog
+    QStatusBar, QFrame, QShortcut, QAction, QToolBar, QColorDialog,
+    QTextEdit
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime
 from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush
@@ -32,6 +34,8 @@ BASE_IR_DIR      = "/user/s5k2p5sx.be1/LAYOUT/IR/"
 PNR_TOOL_NAMES   = "fc innovus"
 SUMMARY_SCRIPT   = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
 FIREFOX_PATH     = "/usr/bin/firefox"
+MAIL_UTIL        = "/user/vwpmailsystem/MAIL/send_mail_for_rhel7"
+USER_INFO_UTIL   = "/usr/local/bin/user_info"
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -69,6 +73,17 @@ def relative_time(date_str):
         return f"{days}d ago"
     except Exception:
         return date_str
+
+def get_user_email(username):
+    if not username or username == "Unknown":
+        return ""
+    try:
+        res = subprocess.check_output([USER_INFO_UTIL, '-a', username], stderr=subprocess.DEVNULL).decode('utf-8')
+        match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', res)
+        if match:
+            return match.group(0)
+    except: pass
+    return f"{username}@samsung.com" # Fallback if utility fails
 
 # ===========================================================================
 # --- CUSTOM SORTING UI CLASS ---
@@ -285,6 +300,33 @@ class SettingsDialog(QDialog):
     def pick_sel(self):
         c = QColorDialog.getColor(QColor(self.sel_color), self)
         if c.isValid(): self.sel_color = c.name()
+
+class MailDialog(QDialog):
+    def __init__(self, to_emails, run_paths, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Send Mail to Run Owners")
+        self.resize(600, 450)
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.to_input = QLineEdit(", ".join(to_emails))
+        form.addRow("To:", self.to_input)
+
+        self.subject_input = QLineEdit("Please remove your old PD runs")
+        form.addRow("Subject:", self.subject_input)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("Message:"))
+        self.body_input = QTextEdit()
+        default_text = "Hi,\n\nPlease remove these runs as they are no longer needed:\n\n" + "\n".join(run_paths)
+        self.body_input.setPlainText(default_text)
+        layout.addWidget(self.body_input)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Send Mail")
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
 
 # ===========================================================================
 # --- BACKGROUND WORKER THREADS ---
@@ -589,6 +631,7 @@ class PDDashboard(QMainWindow):
         self.item_map      = {}
         self.ignored_paths = set()
         self._checked_paths = set()
+        self.current_error_log_path = None
 
         # timers
         self.search_timer = QTimer(self)
@@ -680,6 +723,9 @@ class PDDashboard(QMainWindow):
 
         self.qor_btn = self._btn("Compare QoR", self.run_qor_comparison)
         top.addWidget(self.qor_btn)
+        
+        self.mail_btn = self._btn("Send Mail", self.send_mail_action)
+        top.addWidget(self.mail_btn)
 
         top.addWidget(self._btn("Settings", self.open_settings))
 
@@ -708,12 +754,20 @@ class PDDashboard(QMainWindow):
         blk_header.addWidget(self._label("<b>Blocks</b>"))
         blk_header.addStretch()
         
-        all_btn  = QPushButton("Select All")
-        none_btn = QPushButton("Deselect All")
+        all_btn  = QPushButton("All")
+        none_btn = QPushButton("None")
+        
+        for btn in (all_btn, none_btn):
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setObjectName("linkBtn")
+            
         all_btn.clicked.connect(lambda: self._set_all_blocks(True))
         none_btn.clicked.connect(lambda: self._set_all_blocks(False))
         
         blk_header.addWidget(all_btn)
+        sep_label = self._label("|")
+        sep_label.setStyleSheet("color: gray;")
+        blk_header.addWidget(sep_label)
         blk_header.addWidget(none_btn)
         left_layout.addLayout(blk_header)
 
@@ -721,6 +775,13 @@ class PDDashboard(QMainWindow):
         self.blk_list.setAlternatingRowColors(True)
         self.blk_list.itemChanged.connect(lambda: self.search_timer.start(100))
         left_layout.addWidget(self.blk_list)
+        
+        self.fe_error_btn = QPushButton("")
+        self.fe_error_btn.setCursor(Qt.PointingHandCursor)
+        self.fe_error_btn.setObjectName("errorLinkBtn")
+        self.fe_error_btn.setVisible(False)
+        self.fe_error_btn.clicked.connect(self.open_error_log)
+        left_layout.addWidget(self.fe_error_btn)
 
         self.splitter.addWidget(left_panel)
 
@@ -757,6 +818,7 @@ class PDDashboard(QMainWindow):
 
         self.tree.itemExpanded.connect(lambda: self.tree.resizeColumnToContents(0))
         self.tree.itemCollapsed.connect(lambda: self.tree.resizeColumnToContents(0))
+        self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
 
         for i in [10, 14, 15, 16, 17, 18, 19, 20]: 
             self.tree.setColumnHidden(i, True)
@@ -767,7 +829,7 @@ class PDDashboard(QMainWindow):
         self.tree.itemChanged.connect(self._on_item_check_changed)
 
         self.splitter.addWidget(self.tree)
-        self.splitter.setSizes([320, 1600])
+        self.splitter.setSizes([260, 1660]) 
         root_layout.addWidget(self.splitter)
 
         # ---- STATUS BAR ----
@@ -830,7 +892,7 @@ class PDDashboard(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+F"), self, self.fit_all_columns)
 
     # ------------------------------------------------------------------
-    # STATUS-BAR UPDATE
+    # STATUS-BAR & ERROR UI UPDATE
     # ------------------------------------------------------------------
     def _update_status_bar(self, runs):
         total = completed = running = 0
@@ -865,6 +927,40 @@ class PDDashboard(QMainWindow):
                 item.setBackground(c, QColor(0, 0, 0, 0))
         self.sb_selected.setText(f"  Selected: {len(self._checked_paths)}")
 
+    def on_tree_selection_changed(self):
+        sel = self.tree.selectedItems()
+        self.fe_error_btn.setVisible(False)
+        self.current_error_log_path = None
+        
+        if len(sel) == 1:
+            item = sel[0]
+            is_stage = item.data(0, Qt.UserRole) == "STAGE"
+            
+            if not is_stage:
+                run_path = item.text(14)
+                if run_path and run_path != "N/A":
+                    err_file = os.path.join(run_path, "logs", "compile_opt.error.log")
+                    if os.path.exists(err_file):
+                        count = 0
+                        try:
+                            with open(err_file, 'r', encoding='utf-8', errors='ignore') as f:
+                                for line in f:
+                                    if line.strip(): count += 1
+                        except: pass
+                        self.current_error_log_path = err_file
+                        
+                        color = "#e57373" if self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888") else "#d32f2f"
+                        if count == 0:
+                            color = "#81c784" if self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888") else "#388e3c"
+                        
+                        self.fe_error_btn.setStyleSheet(f"QPushButton#errorLinkBtn {{ border: none; background: transparent; color: {color}; font-weight: bold; text-align: left; padding: 6px 0px; }} QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
+                        self.fe_error_btn.setText(f"📝 compile_opt errors: {count}")
+                        self.fe_error_btn.setVisible(True)
+
+    def open_error_log(self):
+        if self.current_error_log_path and os.path.exists(self.current_error_log_path):
+            subprocess.Popen(['gvim', self.current_error_log_path])
+
     # ------------------------------------------------------------------
     # SETTINGS / THEME
     # ------------------------------------------------------------------
@@ -884,6 +980,7 @@ class PDDashboard(QMainWindow):
             self.row_spacing         = dlg.space_spin.value()
             self.show_relative_time  = dlg.rel_time_cb.isChecked()
             self.apply_theme_and_spacing()
+            self.on_tree_selection_changed() 
 
     def apply_theme_and_spacing(self):
         pad = self.row_spacing
@@ -904,7 +1001,7 @@ class PDDashboard(QMainWindow):
                     alternate-background-color: transparent;
                     gridline-color: {fg}; border: 1px solid {fg};
                 }}
-                QLineEdit, QSpinBox, QComboBox {{
+                QLineEdit, QSpinBox, QComboBox, QTextEdit {{
                     background-color: {bg}; color: {fg};
                     border: 1px solid {fg}; padding: 4px; border-radius: 4px;
                 }}
@@ -918,6 +1015,8 @@ class PDDashboard(QMainWindow):
                 }}
                 QPushButton:hover {{ border-color: {sel}; }}
                 QPushButton:pressed {{ background-color: {sel}; color: #ffffff; }}
+                QPushButton#linkBtn {{ border: none; background: transparent; color: {sel}; padding: 0px 4px; min-width: 0px; }}
+                QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: {sel}; }}
                 QMenu {{ border: 1px solid {fg}; background-color: {bg}; color: {fg}; }}
                 QMenu::item:selected {{ background-color: {sel}; color: #ffffff; }}
@@ -942,7 +1041,7 @@ class PDDashboard(QMainWindow):
                     background-color: #2b2d30; color: #a9b7c6;
                     border: 1px solid #1e1f22; padding: 5px; font-weight: bold;
                 }}
-                QLineEdit, QSpinBox {{
+                QLineEdit, QSpinBox, QTextEdit {{
                     background-color: #1e1f22; color: #dfe1e5;
                     border: 1px solid #43454a; padding: 4px; border-radius: 4px;
                 }}
@@ -960,6 +1059,8 @@ class PDDashboard(QMainWindow):
                 }}
                 QPushButton:hover {{ background-color: #43454a; }}
                 QPushButton:pressed {{ background-color: #2f65ca; color: #ffffff; border-color: #2f65ca; }}
+                QPushButton#linkBtn {{ border: none; background: transparent; color: #64b5f6; padding: 0px 4px; min-width: 0px; }}
+                QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: #393b40; }}
                 QMenu {{
                     border: 1px solid #43454a; background-color: #2b2d30; color: #dfe1e5;
@@ -986,7 +1087,7 @@ class PDDashboard(QMainWindow):
                     alternate-background-color: #f8fafc;
                     gridline-color: #e2e8f0; border: 1px solid #cbd5e0;
                 }}
-                QLineEdit, QSpinBox {{
+                QLineEdit, QSpinBox, QTextEdit {{
                     background-color: #ffffff; color: #333333;
                     border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px;
                 }}
@@ -1004,6 +1105,8 @@ class PDDashboard(QMainWindow):
                 }}
                 QPushButton:hover {{ background-color: #edf2f7; border-color: #a0aec0; }}
                 QPushButton:pressed {{ background-color: #e2e8f0; }}
+                QPushButton#linkBtn {{ border: none; background: transparent; color: #3182ce; padding: 0px 4px; min-width: 0px; }}
+                QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: #cbd5e0; }}
                 QMenu {{
                     border: 1px solid #cbd5e0; background-color: #ffffff; color: #333333;
@@ -1564,6 +1667,8 @@ class PDDashboard(QMainWindow):
         all_runs = list(runs_to_process)
         self._refresh_block_colors(all_runs)
         self._update_status_bar(normal_runs_list)
+        
+        self.on_tree_selection_changed()
 
     # ------------------------------------------------------------------
     # CONTEXT MENUS
@@ -1681,6 +1786,67 @@ class PDDashboard(QMainWindow):
             log = item.text(15)
             if log and cached_exists(log):
                 subprocess.Popen(['gvim', log])
+
+    # ------------------------------------------------------------------
+    # MAIL FEATURE
+    # ------------------------------------------------------------------
+    def send_mail_action(self):
+        if not self._checked_paths:
+            QMessageBox.warning(self, "No Runs Selected", "Please select at least one run using the checkboxes before sending mail.")
+            return
+
+        owners = set()
+        run_details = []
+
+        def find_owners(node):
+            for i in range(node.childCount()):
+                c = node.child(i)
+                if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
+                    path = c.text(14)
+                    owner = c.text(5)
+                    if path and path != "N/A":
+                        if owner and owner != "Unknown":
+                            owners.add(owner)
+                        run_details.append(path)
+                find_owners(c)
+
+        find_owners(self.tree.invisibleRootItem())
+
+        emails = set()
+        for owner in owners:
+            email = get_user_email(owner)
+            if email:
+                emails.add(email)
+
+        dlg = MailDialog(list(emails), run_details, self)
+        if dlg.exec_():
+            to_list = dlg.to_input.text().strip()
+            subject = dlg.subject_input.text().strip()
+            body = dlg.body_input.toPlainText()
+
+            if not to_list:
+                QMessageBox.warning(self, "Error", "Recipient list is empty. Please specify at least one recipient.")
+                return
+
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user)
+            if not sender_email:
+                sender_email = f"{current_user}@samsung.com"
+
+            cmd = [
+                MAIL_UTIL,
+                "-to", to_list,
+                "-sd", sender_email,
+                "-s", subject,
+                "-c", body,
+                "-fm", "text" 
+            ]
+
+            try:
+                subprocess.Popen(cmd)
+                QMessageBox.information(self, "Mail Triggered", f"Mail command sent successfully as {sender_email}.")
+            except Exception as e:
+                QMessageBox.critical(self, "Mail Error", f"Failed to execute mail utility:\n{e}")
 
     # ------------------------------------------------------------------
     # QoR COMPARISON
