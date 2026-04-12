@@ -35,7 +35,6 @@ BASE_WS_FE_DIR   = "/user/s5k2p5sx.fe1/s5k2p5sp/WS"
 BASE_WS_BE_DIR   = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
 BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
 
-# Supports multiple directories separated by spaces
 BASE_IR_DIR      = "/user/s5k2p5sx.be1/LAYOUT/IR/ /user/s5k2p5sx.be1/LAYOUT/IR2/"
 
 PNR_TOOL_NAMES   = "fc innovus"
@@ -43,11 +42,10 @@ SUMMARY_SCRIPT   = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
 FIREFOX_PATH     = "/usr/bin/firefox"
 MAIL_UTIL        = "/user/vwpmailsystem/MAIL/send_mail_for_rhel7"
 USER_INFO_UTIL   = "/usr/local/bin/user_info"
-# ===========================================================================
 
-# ---------------------------------------------------------------------------
-# Thread-safe path cache with a lock
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# --- THREAD-SAFE CACHE ---
+# ===========================================================================
 _path_cache = {}
 _path_cache_lock = threading.Lock()
 
@@ -75,9 +73,9 @@ def prefetch_path_cache(paths):
         for path, exists in zip(unique_paths, results):
             _path_cache[path] = exists
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# --- HELPERS ---
+# ===========================================================================
 def relative_time(date_str):
     if not date_str or date_str == "N/A": return date_str
     try:
@@ -115,40 +113,6 @@ def get_partition_space(path_str):
     except:
         return "Partition Space Information Unavailable"
 
-# ===========================================================================
-# --- CUSTOM SORTING UI CLASS ---
-# ===========================================================================
-class CustomTreeItem(QTreeWidgetItem):
-    def __lt__(self, other):
-        col = self.treeWidget().sortColumn()
-        t1 = self.text(col).strip() if self.text(col) else ""
-        t2 = other.text(col).strip() if other.text(col) else ""
-
-        if col in [3, 7, 8, 9]:
-            def score(val):
-                v_up = val.upper()
-                if "PASS" in v_up or "ERROR: 0" in v_up or "COMPLETED" in v_up: return 4
-                if "RUNNING" in v_up: return 3
-                if "FAILS" in v_up or "ERROR:" in v_up or "FATAL" in v_up: return 2
-                if "INTERRUPTED" in v_up or "NOT STARTED" in v_up: return 1
-                return 0
-            s1, s2 = score(t1), score(t2)
-            if s1 != s2:
-                asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
-                return s1 < s2 if asc else s1 > s2
-
-        if col == 0:
-            if t1 == "[ Ignored Runs ]": return False
-            if t2 == "[ Ignored Runs ]": return True
-            m_order = {"INITIAL RELEASE": 1, "PRE-SVP": 2, "SVP": 3, "FFN": 4}
-            if t1 in m_order and t2 in m_order:
-                asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
-                return m_order[t1] < m_order[t2] if asc else m_order[t1] > m_order[t2]
-        return t1 < t2
-
-# ===========================================================================
-# --- LOGIC HELPERS ---
-# ===========================================================================
 def get_owner(path):
     if not path or not cached_exists(path): return "Unknown"
     try: return pwd.getpwuid(os.stat(path).st_uid).pw_name
@@ -259,6 +223,37 @@ def extract_rtl(run_dir):
                 if m: return normalize_rtl(m.group(1))
     except: pass
     return "Unknown"
+
+# ===========================================================================
+# --- CUSTOM SORTING UI CLASS ---
+# ===========================================================================
+class CustomTreeItem(QTreeWidgetItem):
+    def __lt__(self, other):
+        col = self.treeWidget().sortColumn()
+        t1 = self.text(col).strip() if self.text(col) else ""
+        t2 = other.text(col).strip() if other.text(col) else ""
+
+        if col in [3, 7, 8, 9]:
+            def score(val):
+                v_up = val.upper()
+                if "PASS" in v_up or "ERROR: 0" in v_up or "COMPLETED" in v_up: return 4
+                if "RUNNING" in v_up: return 3
+                if "FAILS" in v_up or "ERROR:" in v_up or "FATAL" in v_up: return 2
+                if "INTERRUPTED" in v_up or "NOT STARTED" in v_up: return 1
+                return 0
+            s1, s2 = score(t1), score(t2)
+            if s1 != s2:
+                asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
+                return s1 < s2 if asc else s1 > s2
+
+        if col == 0:
+            if t1 == "[ Ignored Runs ]": return False
+            if t2 == "[ Ignored Runs ]": return True
+            m_order = {"INITIAL RELEASE": 1, "PRE-SVP": 2, "SVP": 3, "FFN": 4}
+            if t1 in m_order and t2 in m_order:
+                asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
+                return m_order[t1] < m_order[t2] if asc else m_order[t1] > m_order[t2]
+        return t1 < t2
 
 # ===========================================================================
 # --- UI DIALOGS ---
@@ -656,9 +651,14 @@ class ScannerWorker(QThread):
                 for f_name in files:
                     if not f_name.startswith("redhawk.log"): continue
                     log_path = os.path.join(root_dir, f_name)
+                    
                     run_be_name = step_name = None
                     static_val = dynamic_val = "-"
                     in_static = in_dynamic = False
+                    
+                    static_lines = []
+                    dynamic_lines = []
+                    
                     try:
                         with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
                             for line in f:
@@ -667,29 +667,45 @@ class ScannerWorker(QThread):
                                     if m: run_be_name = m.group(1); step_name = m.group(2)
 
                                 if "Worst Static IR Drop:" in line:
-                                    in_static = True; in_dynamic = False; continue
+                                    in_static = True; in_dynamic = False
+                                    static_lines.append(line.rstrip())
+                                    continue
                                 if "Worst Dynamic Voltage Drop:" in line:
-                                    in_dynamic = True; in_static = False; continue
+                                    in_dynamic = True; in_static = False
+                                    dynamic_lines.append(line.rstrip())
+                                    continue
 
-                                if in_static and line.strip() and not line.startswith("-") and not line.startswith("Type"):
-                                    parts = line.split()
-                                    if len(parts) >= 2 and parts[0] != "WIRE" and static_val == "-":
-                                        static_val = parts[1]; in_static = False
+                                if in_static:
+                                    if line.startswith("****") or line.startswith("Finish"):
+                                        in_static = False
+                                    elif line.strip():
+                                        static_lines.append(line.rstrip())
+                                        if not line.startswith("-") and not line.startswith("Type"):
+                                            parts = line.split()
+                                            if len(parts) >= 2 and parts[0] != "WIRE" and static_val == "-":
+                                                static_val = parts[1]
 
-                                if in_dynamic and line.strip() and not line.startswith("-") and not line.startswith("Type"):
-                                    parts = line.split()
-                                    if len(parts) >= 2 and parts[0] != "WIRE" and dynamic_val == "-":
-                                        dynamic_val = parts[1]; in_dynamic = False
-
-                                if static_val != "-" and dynamic_val != "-" and run_be_name:
-                                    break
+                                if in_dynamic:
+                                    if line.startswith("****") or line.startswith("Finish"):
+                                        in_dynamic = False
+                                    elif line.strip():
+                                        dynamic_lines.append(line.rstrip())
+                                        if not line.startswith("-") and not line.startswith("Type"):
+                                            parts = line.split()
+                                            if len(parts) >= 2 and parts[0] != "WIRE" and dynamic_val == "-":
+                                                dynamic_val = parts[1]
 
                         if run_be_name and step_name:
                             key = f"{run_be_name}/{step_name}"
                             if key not in ir_data:
-                                ir_data[key] = {"static": "-", "dynamic": "-", "log": log_path}
+                                ir_data[key] = {
+                                    "static": "-", "dynamic": "-", "log": log_path,
+                                    "static_table": "", "dynamic_table": ""
+                                }
                             if static_val != "-": ir_data[key]["static"] = static_val
                             if dynamic_val != "-": ir_data[key]["dynamic"] = dynamic_val
+                            if static_lines: ir_data[key]["static_table"] = "\n".join(static_lines)
+                            if dynamic_lines: ir_data[key]["dynamic_table"] = "\n".join(dynamic_lines)
                     except: pass
         return ir_data
 
@@ -906,14 +922,13 @@ class ScannerWorker(QThread):
             if base not in data_obj["releases"]: data_obj["releases"][base] = []
             if path not in data_obj["releases"][base]: data_obj["releases"][base].append(path)
 
-
 # ===========================================================================
 # --- MAIN DASHBOARD WINDOW ---
 # ===========================================================================
 class PDDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unified PD Dashboard  |  Pro Edition")
+        self.setWindowTitle("Unified PD Dashboard | Pro Edition")
         self.resize(1920, 1000)
 
         self.ws_data  = {}
@@ -939,6 +954,7 @@ class PDDashboard(QMainWindow):
         self.current_error_log_path = None
         
         self.run_filter_config = None
+        self.current_config_path = None
 
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -1195,6 +1211,7 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
                         parsed_config[rtl][blk] = runs
             
             self.run_filter_config = parsed_config
+            self.current_config_path = path
             self.sb_config.setText(f"Config: Active ({os.path.basename(path)})")
             self.sb_config.setStyleSheet("color: #d32f2f; font-weight: bold;" if not self.is_dark_mode else "color: #ffb74d; font-weight: bold;")
             self.refresh_view()
@@ -1205,9 +1222,23 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
     def clear_filter_config(self):
         if self.run_filter_config is not None:
             self.run_filter_config = None
+            self.current_config_path = None
             self.sb_config.setText("Config: None")
             self.sb_config.setStyleSheet("")
             self.refresh_view()
+
+    def _save_current_config(self):
+        if not self.current_config_path or self.run_filter_config is None: return
+        try:
+            with open(self.current_config_path, 'w') as f:
+                f.write("# PD Dashboard Run Filter Configuration\n")
+                f.write("# Format: RTL_NAME : BLOCK_NAME : run1 run2 run3 ...\n\n")
+                for rtl, blocks in self.run_filter_config.items():
+                    for blk, runs in blocks.items():
+                        if runs:
+                            f.write(f"{rtl} : {blk} : {' '.join(sorted(list(runs)))}\n")
+        except Exception as e:
+            print(f"Failed to save config: {e}")
 
     # ------------------------------------------------------------------
     # HELPERS
@@ -1586,6 +1617,9 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         child.setText(1, run["rtl"])
         child.setText(2, run["source"])
         child.setText(5, run.get("owner", "Unknown"))
+        
+        child.setData(0, Qt.UserRole + 2, run["block"])
+        child.setData(0, Qt.UserRole + 4, run["r_name"].replace("-FE", "").replace("-BE", ""))
 
         if run["path"] in self._checked_paths:
             child.setCheckState(0, Qt.Checked)
@@ -1597,7 +1631,7 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         tooltip_text = (f"Owner: {run.get('owner','Unknown')}\nSize: Pending\n"
                         f"Runtime: {run['info']['runtime']}\nNONUPF: {run['st_n']}\n"
                         f"UPF: {run['st_u']}\nVSLP: {run['vslp_status']}\n")
-        if is_ir_block: tooltip_text += "Static IR: Check individual stage levels"
+        if is_ir_block: tooltip_text += "\nStatic/Dynamic IR: Check individual stage levels for full tables."
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
 
@@ -1653,11 +1687,20 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             st_item.setData(2, Qt.UserRole, stage["qor_path"])
 
             ir_key  = f"{be_run['r_name']}/{stage['name']}"
-            ir_info = self.ir_data.get(ir_key, {"static": "-", "dynamic": "-", "log": ""})
+            ir_info = self.ir_data.get(ir_key, {"static": "-", "dynamic": "-", "log": "", "static_table": "", "dynamic_table": ""})
 
             tooltip_text = (f"Owner: {owner}\nSize: Pending\nRuntime: {stage['info']['runtime']}\n"
                             f"NONUPF: {stage['st_n']}\nUPF: {stage['st_u']}\nVSLP: {stage['vslp_status']}\n")
-            if is_ir_block: tooltip_text += f"Static IR: {ir_info['static']}\nDynamic IR: {ir_info['dynamic']}"
+            
+            if is_ir_block:
+                tooltip_text += f"\nStatic IR Value: {ir_info['static']}"
+                if ir_info.get('static_table'):
+                    tooltip_text += f"\n{ir_info['static_table']}\n"
+                    
+                tooltip_text += f"\nDynamic IR Value: {ir_info['dynamic']}"
+                if ir_info.get('dynamic_table'):
+                    tooltip_text += f"\n{ir_info['dynamic_table']}\n"
+                    
             st_item.setToolTip(0, tooltip_text)
 
             stage_status = "COMPLETED"
@@ -1914,6 +1957,19 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         fm_u_path = item.text(17); fm_n_path = item.text(18)
         vslp_path = item.text(19); sta_path  = item.text(20); ir_path = item.text(21)
         is_stage  = item.data(0, Qt.UserRole) == "STAGE"
+        
+        target_item = item if not is_stage else item.parent()
+        b_name = target_item.data(0, Qt.UserRole + 2)
+        r_rtl = target_item.text(1)
+        base_run = target_item.data(0, Qt.UserRole + 4)
+        
+        add_config_act = None
+        if b_name and r_rtl and base_run:
+            if self.current_config_path:
+                add_config_act = m.addAction("Add Run to Active Filter Config")
+            else:
+                add_config_act = m.addAction("Create New Filter Config & Add Run")
+            m.addSeparator()
 
         ignore_checked_act = m.addAction("Hide All Checked Runs/Stages")
         m.addSeparator()
@@ -1944,7 +2000,24 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         if not res: return
 
-        if res == ignore_checked_act:
+        if add_config_act and res == add_config_act:
+            if not self.current_config_path:
+                path, _ = QFileDialog.getSaveFileName(self, "Create New Config", "dashboard_filter.cfg", "Config Files (*.cfg *.txt)")
+                if not path: return
+                self.current_config_path = path
+                self.run_filter_config = {}
+                
+            if r_rtl not in self.run_filter_config: self.run_filter_config[r_rtl] = {}
+            if b_name not in self.run_filter_config[r_rtl]: self.run_filter_config[r_rtl][b_name] = set()
+            self.run_filter_config[r_rtl][b_name].add(base_run)
+            
+            self._save_current_config()
+            self.sb_config.setText(f"Config: Active ({os.path.basename(self.current_config_path)})")
+            color = "#d32f2f" if not self.is_dark_mode else "#ffb74d"
+            self.sb_config.setStyleSheet(f"color: {color}; font-weight: bold;")
+            self.refresh_view()
+            
+        elif res == ignore_checked_act:
             def ig(node):
                 for i in range(node.childCount()):
                     c = node.child(i)
@@ -2079,7 +2152,6 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         subprocess.run(["python3.6", SUMMARY_SCRIPT] + sel)
         h = glob.glob(os.path.join(os.getcwd(), "qor_metrices/**/summary.html"), recursive=True)
         if h: subprocess.Popen([FIREFOX_PATH, sorted(h, key=os.path.getmtime)[-1]])
-
 
 # ===========================================================================
 if __name__ == "__main__":
