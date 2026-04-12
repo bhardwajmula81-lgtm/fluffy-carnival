@@ -1796,6 +1796,26 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         if src_mode in ["WS",  "ALL"] and self.ws_data:  runs_to_process.extend(self.ws_data.get("all_runs", []))
         if src_mode in ["OUTFEED","ALL"] and self.out_data: runs_to_process.extend(self.out_data.get("all_runs", []))
 
+        # -----------------------------------------------------------------------
+        # FIX: Synchronize BE runs RTL with their FE parent
+        # This prevents BE runs from vanishing when the user selects a specific 
+        # synX release from the dropdown filter, keeping the tree hierarchy intact.
+        # -----------------------------------------------------------------------
+        fe_info = {}
+        for run in runs_to_process:
+            if run["run_type"] == "FE":
+                fe_base = run["r_name"].replace("-FE", "")
+                fe_info[(run["block"], fe_base)] = run["rtl"]
+
+        for run in runs_to_process:
+            if run["run_type"] == "BE":
+                clean_be = run["r_name"].replace("-BE", "")
+                for (blk, fe_base), fe_rtl in fe_info.items():
+                    if run["block"] == blk and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
+                        run["rtl"] = fe_rtl
+                        break
+        # -----------------------------------------------------------------------
+
         ignored_runs_list, normal_runs_list = [], []
 
         for run in runs_to_process:
@@ -1873,10 +1893,11 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             fe_parent = None
             for i in range(parent_for_run.childCount()):
                 c = parent_for_run.child(i)
-                fe_base = c.text(0).replace("-FE", "")
-                if c.data(0, Qt.UserRole) != "STAGE" and (
-                    f"_{fe_base}_" in be_run["r_name"] or be_run["r_name"].startswith(f"{fe_base}_")):
-                    fe_parent = c; break
+                if c.data(0, Qt.UserRole) != "STAGE":
+                    fe_base = c.text(0).replace("-FE", "")
+                    clean_be = be_run["r_name"].replace("-BE", "")
+                    if clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}"):
+                        fe_parent = c; break
 
             actual_parent = fe_parent if fe_parent else parent_for_run
             be_item = self._create_run_item(actual_parent, be_run)
