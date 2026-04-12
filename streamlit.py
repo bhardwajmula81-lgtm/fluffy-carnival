@@ -20,7 +20,8 @@ from PyQt5.QtWidgets import (
     QProgressBar, QMenu, QSplitter, QFontComboBox, QSpinBox,
     QWidgetAction, QCheckBox, QDialog, QFormLayout, QDialogButtonBox,
     QStatusBar, QFrame, QShortcut, QAction, QToolButton, QStyle, QColorDialog,
-    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QProgressDialog
+    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QProgressDialog,
+    QFileDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QRectF
 from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush, QPainter, QPen
@@ -45,7 +46,7 @@ USER_INFO_UTIL   = "/usr/local/bin/user_info"
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
-# FIX 3: Thread-safe path cache with a lock
+# Thread-safe path cache with a lock
 # ---------------------------------------------------------------------------
 _path_cache = {}
 _path_cache_lock = threading.Lock()
@@ -64,7 +65,6 @@ def clear_path_cache():
         _path_cache.clear()
 
 def prefetch_path_cache(paths):
-    """FIX 7: Pre-populate path cache in parallel before threaded scan starts."""
     unique_paths = [p for p in set(paths) if p]
     if not unique_paths:
         return
@@ -124,7 +124,6 @@ class CustomTreeItem(QTreeWidgetItem):
         t1 = self.text(col).strip() if self.text(col) else ""
         t2 = other.text(col).strip() if other.text(col) else ""
 
-        # FIX: Priority-based sorting for Status/FM/VSLP columns
         if col in [3, 7, 8, 9]:
             def score(val):
                 v_up = val.upper()
@@ -287,11 +286,11 @@ class SettingsDialog(QDialog):
         self.space_spin.setValue(parent.row_spacing if parent else 2)
         layout.addRow("Row Spacing (px):", self.space_spin)
 
-        self.rel_time_cb = QCheckBox("Show relative timestamps (e.g. '2h ago')")
+        self.rel_time_cb = QCheckBox("Show relative timestamps")
         self.rel_time_cb.setChecked(parent.show_relative_time if parent else False)
         layout.addRow("", self.rel_time_cb)
 
-        self.theme_cb = QCheckBox("Enable Dark Mode (Default Theme)")
+        self.theme_cb = QCheckBox("Enable Dark Mode")
         self.theme_cb.setChecked(parent.is_dark_mode if parent else False)
         layout.addRow("", self.theme_cb)
 
@@ -328,7 +327,6 @@ class SettingsDialog(QDialog):
     def pick_sel(self):
         c = QColorDialog.getColor(QColor(self.sel_color), self)
         if c.isValid(): self.sel_color = c.name()
-
 
 class MailDialog(QDialog):
     def __init__(self, default_subject, parent=None):
@@ -410,7 +408,6 @@ class PieChartWidget(QWidget):
                     painter.drawText(int(text_x - tw/2), int(y_offset + th), line)
                     y_offset += th
             start_angle += span_angle
-
 
 class DiskUsageDialog(QDialog):
     def __init__(self, disk_data, is_dark, parent=None):
@@ -531,7 +528,6 @@ class DiskUsageDialog(QDialog):
                     print(f"Failed to send mail to {owner_email}: {e}")
             QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} cleanup emails.")
 
-
 # ===========================================================================
 # --- BACKGROUND WORKER THREADS ---
 # ===========================================================================
@@ -560,7 +556,6 @@ class BatchSizeWorker(QThread):
 
     def cancel(self): self._is_cancelled = True
 
-
 class SingleSizeWorker(QThread):
     result = pyqtSignal(object, str)
 
@@ -579,16 +574,28 @@ class SingleSizeWorker(QThread):
 
     def cancel(self): self._is_cancelled = True
 
-
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
 
-    def _get_dir_info(self, path):
+    def _get_batch_dir_info(self, paths):
+        results = []
+        if not paths: return results
         try:
-            owner = pwd.getpwuid(os.stat(path).st_uid).pw_name
-            sz = int(subprocess.check_output(['du', '-sk', path], stderr=subprocess.DEVNULL).decode().split()[0])
-            return owner, sz, path
-        except: return "Unknown", 0, path
+            cmd = ['du', '-sk'] + paths
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('utf-8')
+            for line in output.strip().split('\n'):
+                if not line: continue
+                parts = line.split('\t')
+                if len(parts) >= 2:
+                    sz_kb = int(parts[0])
+                    full_path = parts[1]
+                    try:
+                        owner = pwd.getpwuid(os.stat(full_path).st_uid).pw_name
+                    except:
+                        owner = "Unknown"
+                    results.append((owner, sz_kb, full_path))
+        except: pass
+        return results
 
     def run(self):
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
@@ -596,30 +603,40 @@ class DiskScannerWorker(QThread):
         outfeed_targets.extend(glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*", "innovus", "*")))
         if not outfeed_targets:
             outfeed_targets = glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*"))
+
         targets_map = {
             "WS (FE)":  glob.glob(os.path.join(BASE_WS_FE_DIR, "*")),
             "WS (BE)":  glob.glob(os.path.join(BASE_WS_BE_DIR, "*")),
             "OUTFEED":  outfeed_targets
         }
-        tasks = [(cat, p) for cat, paths in targets_map.items() for p in paths if os.path.isdir(p)]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-            future_to_cat = {executor.submit(self._get_dir_info, t[1]): t[0] for t in tasks}
+
+        tasks = []
+        for cat, paths in targets_map.items():
+            valid_paths = [p for p in paths if os.path.isdir(p)]
+            for i in range(0, len(valid_paths), 50):
+                chunk = valid_paths[i:i+50]
+                tasks.append((cat, chunk))
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            future_to_cat = {executor.submit(self._get_batch_dir_info, t[1]): t[0] for t in tasks}
             for future in concurrent.futures.as_completed(future_to_cat):
                 cat = future_to_cat[future]
                 try:
-                    owner, sz_kb, full_path = future.result()
-                    if sz_kb > 0:
-                        gb_sz = sz_kb / (1024**2)
-                        if gb_sz > 0.01:
-                            if owner not in results[cat]: results[cat][owner] = {"total": 0, "dirs": []}
-                            results[cat][owner]["total"] += gb_sz
-                            results[cat][owner]["dirs"].append((full_path, gb_sz))
+                    batch_results = future.result()
+                    for owner, sz_kb, full_path in batch_results:
+                        if sz_kb > 0:
+                            gb_sz = sz_kb / (1024**2)
+                            if gb_sz > 0.01:
+                                if owner not in results[cat]: results[cat][owner] = {"total": 0, "dirs": []}
+                                results[cat][owner]["total"] += gb_sz
+                                results[cat][owner]["dirs"].append((full_path, gb_sz))
                 except: pass
+
         for cat in results:
             for owner in results[cat]:
                 results[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
-        self.finished_scan.emit(results)
 
+        self.finished_scan.emit(results)
 
 # ===========================================================================
 # --- MAIN SCANNER WORKER ---
@@ -628,7 +645,6 @@ class ScannerWorker(QThread):
     finished        = pyqtSignal(dict, dict, dict)
     progress_update = pyqtSignal(int, int)
 
-    # ------------------------------------------------------------------ IR
     def scan_ir_dir(self):
         ir_data = {}
         target_lef = f"{PROJECT_PREFIX}.lef.list"
@@ -665,7 +681,6 @@ class ScannerWorker(QThread):
                                     if len(parts) >= 2 and parts[0] != "WIRE" and dynamic_val == "-":
                                         dynamic_val = parts[1]; in_dynamic = False
 
-                                # FIX 3 (IR): Early-exit once both values found
                                 if static_val != "-" and dynamic_val != "-" and run_be_name:
                                     break
 
@@ -678,12 +693,9 @@ class ScannerWorker(QThread):
                     except: pass
         return ir_data
 
-    # ------------------------------------------------------------------ Workspace discovery (FIX 2: parallelized)
     def _scan_single_workspace(self, ws_base, ws_name, tools_to_scan):
-        """Discover all run directories within one workspace. Runs in thread pool."""
         tasks = []
         releases_found = {}
-
         ws_path = os.path.join(ws_base, ws_name)
         if not os.path.isdir(ws_path): return tasks, releases_found
 
@@ -714,7 +726,6 @@ class ScannerWorker(QThread):
 
         return tasks, releases_found
 
-    # ------------------------------------------------------------------ Main run
     def run(self):
         clear_path_cache()
         ws_data  = {"releases": {}, "blocks": set(), "all_runs": []}
@@ -722,14 +733,12 @@ class ScannerWorker(QThread):
         tasks = []
         tools_to_scan = PNR_TOOL_NAMES.split()
 
-        # FIX 2: Parallelize workspace discovery across all workspaces simultaneously
         disc_futures = []
         disc_max_w = min(20, (os.cpu_count() or 4) * 4)
         with concurrent.futures.ThreadPoolExecutor(max_workers=disc_max_w) as disc_ex:
             for ws_base in [BASE_WS_FE_DIR, BASE_WS_BE_DIR]:
                 if not os.path.exists(ws_base): continue
-                try:
-                    ws_names = os.listdir(ws_base)
+                try: ws_names = os.listdir(ws_base)
                 except: continue
                 for ws_name in ws_names:
                     disc_futures.append(
@@ -744,7 +753,6 @@ class ScannerWorker(QThread):
                         for p in paths: self._map_release(ws_data, rtl, p)
                 except: pass
 
-        # OUTFEED discovery (kept sequential — usually fast)
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
                 ent_path = os.path.join(BASE_OUTFEED_DIR, ent_name)
@@ -763,9 +771,6 @@ class ScannerWorker(QThread):
                             if os.path.isdir(rd):
                                 tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
-        # FIX 7: Pre-fetch existence of all common paths before spawning processing threads
-        # This batches all os.path.exists() calls in parallel before the main scan, avoiding
-        # NFS hammering from 40 individual threads all calling cached_exists() simultaneously.
         paths_to_prefetch = []
         for t in tasks:
             rd = t[1]
@@ -840,7 +845,6 @@ class ScannerWorker(QThread):
                     fe_status = "NOT STARTED"
                 else:
                     fe_status = "RUNNING"
-                    # FIX 1: Replace grep subprocesses with a single Python file scan pass
                     try:
                         with open(log_file, 'r', encoding='utf-8', errors='ignore') as lf:
                             for line in lf:
@@ -933,6 +937,8 @@ class PDDashboard(QMainWindow):
         self.ignored_paths       = set()
         self._checked_paths      = set()
         self.current_error_log_path = None
+        
+        self.run_filter_config = None
 
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -949,7 +955,6 @@ class PDDashboard(QMainWindow):
     # CLOSE EVENT
     # ------------------------------------------------------------------
     def closeEvent(self, event):
-        """Kill all background workers immediately on exit."""
         os._exit(0)
 
     # ------------------------------------------------------------------
@@ -962,7 +967,6 @@ class PDDashboard(QMainWindow):
         root_layout.setContentsMargins(6, 6, 6, 4)
         root_layout.setSpacing(4)
 
-        # ---- SINGLE-ROW TOOLBAR ----
         top_layout = QHBoxLayout()
         top_layout.setSpacing(6)
 
@@ -1017,7 +1021,10 @@ class PDDashboard(QMainWindow):
         self.tools_menu.addAction("Expand All   [Ctrl+E]",       lambda: self.tree.expandAll())
         self.tools_menu.addAction("Collapse All [Ctrl+W]",       lambda: self.tree.collapseAll())
         self.tools_menu.addSeparator()
-        # FIX 4: Size calculation is now manual-only (removed auto-calc on scan finish)
+        self.tools_menu.addAction("Load Run Filter Config...",   self.load_filter_config)
+        self.tools_menu.addAction("Clear Run Filter Config",     self.clear_filter_config)
+        self.tools_menu.addAction("Generate Sample Config",      self.generate_sample_config)
+        self.tools_menu.addSeparator()
         self.tools_menu.addAction("Calculate All Run Sizes",     self.calculate_all_sizes)
         self.tools_btn.setMenu(self.tools_menu)
         top_layout.addWidget(self.tools_btn)
@@ -1040,7 +1047,6 @@ class PDDashboard(QMainWindow):
 
         root_layout.addLayout(top_layout)
 
-        # ---- SCAN PROGRESS (thin bar) ----
         self.prog = QProgressBar()
         self.prog.setVisible(False)
         self.prog.setFixedHeight(6)
@@ -1050,10 +1056,8 @@ class PDDashboard(QMainWindow):
             "QProgressBar::chunk { background: #1976D2; border-radius: 3px; }")
         root_layout.addWidget(self.prog)
 
-        # ---- MAIN SPLITTER ----
         self.splitter = QSplitter(Qt.Horizontal)
 
-        # Left: block filter panel
         left_panel = QWidget()
         left_panel.setMaximumWidth(320)
         left_layout = QVBoxLayout(left_panel)
@@ -1089,12 +1093,11 @@ class PDDashboard(QMainWindow):
 
         self.splitter.addWidget(left_panel)
 
-        # Right: tree
         self.tree = QTreeWidget()
         self.tree.setColumnCount(22)
         self.tree.setAlternatingRowColors(True)
-        self.tree.setUniformRowHeights(True)     # FIX 8a: faster row painting
-        self.tree.setAnimated(False)             # FIX 8b: no animation lag
+        self.tree.setUniformRowHeights(True)
+        self.tree.setAnimated(False)
         self.tree.setExpandsOnDoubleClick(False)
         self.tree.setSortingEnabled(True)
         self.tree.header().setSectionsMovable(True)
@@ -1121,10 +1124,6 @@ class PDDashboard(QMainWindow):
         self.tree.setColumnWidth(12, 110); self.tree.setColumnWidth(13, 120)
         self.tree.setColumnWidth(14, 120)
 
-        # FIX 5: REMOVED expand/collapse column resize — caused ~200ms lag per click
-        # self.tree.itemExpanded.connect(lambda: self.tree.resizeColumnToContents(0))
-        # self.tree.itemCollapsed.connect(lambda: self.tree.resizeColumnToContents(0))
-
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
 
         for i in [15, 16, 17, 18, 19, 20, 21]: self.tree.setColumnHidden(i, True)
@@ -1138,7 +1137,6 @@ class PDDashboard(QMainWindow):
         self.splitter.setSizes([260, 1660])
         root_layout.addWidget(self.splitter)
 
-        # ---- STATUS BAR ----
         self.status_bar = QStatusBar()
         self.status_bar.setFixedHeight(26)
         self.setStatusBar(self.status_bar)
@@ -1148,13 +1146,68 @@ class PDDashboard(QMainWindow):
         self.sb_running   = QLabel("Running: 0")
         self.sb_selected  = QLabel("Selected: 0")
         self.sb_scan_time = QLabel("")
+        self.sb_config    = QLabel("Config: None")
 
-        for lbl in [self.sb_total, self.sb_complete, self.sb_running, self.sb_selected, self.sb_scan_time]:
+        for lbl in [self.sb_total, self.sb_complete, self.sb_running, self.sb_selected, self.sb_scan_time, self.sb_config]:
             lbl.setContentsMargins(8, 0, 8, 0)
             self.status_bar.addPermanentWidget(lbl)
             self.status_bar.addPermanentWidget(self._vsep())
 
         self.apply_theme_and_spacing()
+
+    # ------------------------------------------------------------------
+    # CONFIGURATION FILTERING
+    # ------------------------------------------------------------------
+    def generate_sample_config(self):
+        sample_text = """# PD Dashboard Run Filter Configuration
+# Format: RTL_NAME : BLOCK_NAME : run1 run2 run3 ...
+# 
+# Rules:
+# - If an RTL and Block are defined here, ONLY the runs listed will be shown.
+# - If an RTL or Block is NOT defined here, ALL runs for it will be shown normally.
+# - Use spaces to separate multiple run names.
+
+EVT0_ML4_DEV00_syn2 : BLK_CPU : my_test_run fast_route_run
+EVT0_ML4_DEV00      : BLK_GPU : golden_run
+"""
+        path, _ = QFileDialog.getSaveFileName(self, "Save Sample Config", "dashboard_filter.cfg", "Config Files (*.cfg *.txt)")
+        if path:
+            with open(path, 'w') as f:
+                f.write(sample_text)
+            QMessageBox.information(self, "Success", f"Sample config saved to:\n{path}")
+
+    def load_filter_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Run Filter Config", "", "Config Files (*.cfg *.txt);;All Files (*)")
+        if not path: return
+
+        parsed_config = {}
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"): continue
+                    parts = line.split(":", 2)
+                    if len(parts) == 3:
+                        rtl = parts[0].strip()
+                        blk = parts[1].strip()
+                        runs = set(parts[2].strip().split())
+                        if rtl not in parsed_config: parsed_config[rtl] = {}
+                        parsed_config[rtl][blk] = runs
+            
+            self.run_filter_config = parsed_config
+            self.sb_config.setText(f"Config: Active ({os.path.basename(path)})")
+            self.sb_config.setStyleSheet("color: #d32f2f; font-weight: bold;" if not self.is_dark_mode else "color: #ffb74d; font-weight: bold;")
+            self.refresh_view()
+            QMessageBox.information(self, "Config Loaded", "Filter configuration applied successfully. Runs not in the config are now hidden.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to parse config file:\n{e}")
+
+    def clear_filter_config(self):
+        if self.run_filter_config is not None:
+            self.run_filter_config = None
+            self.sb_config.setText("Config: None")
+            self.sb_config.setStyleSheet("")
+            self.refresh_view()
 
     # ------------------------------------------------------------------
     # HELPERS
@@ -1277,7 +1330,6 @@ class PDDashboard(QMainWindow):
             self.on_tree_selection_changed()
 
     def apply_theme_and_spacing(self):
-        """FIX 6: Apply stylesheet only — recolor existing items without full tree rebuild."""
         pad = self.row_spacing
         cb_style = """
             QTreeView::indicator:checked   { background-color: #4CAF50; border: 1px solid #388E3C; image: none; }
@@ -1350,20 +1402,15 @@ class PDDashboard(QMainWindow):
                 {cb_style}"""
 
         self.setStyleSheet(stylesheet)
-
-        # FIX 6: Recolor existing items only — no full tree rebuild on theme change
         self._recolor_existing_items()
 
     def _recolor_existing_items(self):
-        """Walk existing tree items and update colors only — avoids full rebuild on theme switch."""
         def recolor(node):
             for i in range(node.childCount()):
                 child = node.child(i)
                 node_type = child.data(0, Qt.UserRole)
-
                 if node_type == "MILESTONE":
                     child.setForeground(0, QColor("#1e88e5" if not self.is_dark_mode else "#64b5f6"))
-
                 if node_type not in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"):
                     self._apply_status_color(child, 3, child.text(3))
                     self._apply_fm_color(child, 7, child.text(7))
@@ -1374,7 +1421,6 @@ class PDDashboard(QMainWindow):
                         child.setForeground(2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
                     elif src == "WS":
                         child.setForeground(2, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
-
                 recolor(child)
         recolor(self.tree.invisibleRootItem())
 
@@ -1413,12 +1459,9 @@ class PDDashboard(QMainWindow):
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
             self.fit_all_columns()
-        # FIX 4: Do NOT auto-calculate sizes — removed, left as manual Tools action only
 
     def on_source_changed(self):
         src_mode = self.src_combo.currentText()
-
-        # Dynamic column visibility per source
         if src_mode == "WS":
             self.tree.setColumnHidden(2, True);  self.tree.setColumnHidden(3, False); self.tree.setColumnHidden(4, False)
         elif src_mode == "OUTFEED":
@@ -1680,7 +1723,6 @@ class PDDashboard(QMainWindow):
             if hasattr(w, 'cancel'): w.cancel()
         self.item_map.clear()
 
-        # Save expand states
         expanded_states = {}
         def save_state(node):
             for i in range(node.childCount()):
@@ -1689,7 +1731,6 @@ class PDDashboard(QMainWindow):
                 save_state(child)
         save_state(self.tree.invisibleRootItem())
 
-        # FIX 8c: Block ALL signals during tree build — prevents itemChanged firing per item
         self.tree.blockSignals(True)
         self.tree.setUpdatesEnabled(False)
         self.tree.setSortingEnabled(False)
@@ -1717,12 +1758,21 @@ class PDDashboard(QMainWindow):
         for run in runs_to_process:
             if run["path"] in self.ignored_paths: ignored_runs_list.append(run); continue
             if run["block"] not in checked_blks: continue
+
+            if self.run_filter_config is not None:
+                r_rtl = run["rtl"]
+                r_blk = run["block"]
+                if r_rtl in self.run_filter_config and r_blk in self.run_filter_config[r_rtl]:
+                    allowed_runs = self.run_filter_config[r_rtl][r_blk]
+                    base_run_name = run["r_name"].replace("-FE", "").replace("-BE", "")
+                    if base_run_name not in allowed_runs and run["r_name"] not in allowed_runs:
+                        continue 
+
             base_rtl_filter = re.sub(r'_syn\d+$', '', run["rtl"])
             if get_milestone(base_rtl_filter) is None: continue
             if sel_rtl != "[ SHOW ALL ]":
                 if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): continue
 
-            # View preset filter
             preset = self.view_combo.currentText()
             if preset == "FE Only"      and run["run_type"] != "FE": continue
             if preset == "BE Only"      and run["run_type"] != "BE": continue
@@ -1733,7 +1783,6 @@ class PDDashboard(QMainWindow):
                 rt = relative_time(start)
                 if not (rt.endswith("ago") and ("h ago" in rt or "m ago" in rt)): continue
 
-            # Search filter
             if search_pattern != "*":
                 combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
                             f"{run['st_n']} {run['st_u']} {run['vslp_status']} "
@@ -1753,7 +1802,6 @@ class PDDashboard(QMainWindow):
         root     = self.tree.invisibleRootItem()
         ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
 
-        # Place FE runs
         for fe_run in fe_runs:
             blk_name = fe_run["block"]; run_rtl = fe_run["rtl"]
             base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
@@ -1767,7 +1815,6 @@ class PDDashboard(QMainWindow):
                 parent_for_run = block_node
             self._create_run_item(parent_for_run, fe_run)
 
-        # Place BE runs (nested under matching FE)
         for be_run in be_runs:
             blk_name = be_run["block"]; run_rtl = be_run["rtl"]
             base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
@@ -1792,7 +1839,6 @@ class PDDashboard(QMainWindow):
             be_item = self._create_run_item(actual_parent, be_run)
             self._add_stages(be_item, be_run, ign_root)
 
-        # Place ignored runs
         if ignored_runs_list:
             for run in ignored_runs_list:
                 blk_name = run["block"]; run_rtl = run["rtl"]
@@ -1812,7 +1858,6 @@ class PDDashboard(QMainWindow):
 
         self.tree.setSortingEnabled(True)
 
-        # Restore expand states
         def restore_state(node):
             for i in range(node.childCount()):
                 child     = node.child(i)
@@ -1832,7 +1877,6 @@ class PDDashboard(QMainWindow):
                 restore_state(child)
         restore_state(root)
 
-        # FIX 8c: Re-enable signals and updates AFTER tree is fully built
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
         self.tree.resizeColumnToContents(0)
