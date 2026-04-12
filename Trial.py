@@ -9,6 +9,7 @@ import pwd
 import time
 import datetime
 import getpass
+import shutil
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,7 +18,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QMenu, QSplitter, QFontComboBox, QSpinBox,
     QWidgetAction, QCheckBox, QDialog, QFormLayout, QDialogButtonBox,
     QStatusBar, QFrame, QShortcut, QAction, QToolButton, QStyle, QColorDialog,
-    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView
+    QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QProgressDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QRectF
 from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush, QPainter, QPen
@@ -30,7 +31,10 @@ PROJECT_PREFIX = "S5K2P5SP"
 BASE_WS_FE_DIR   = "/user/s5k2p5sx.fe1/s5k2p5sp/WS"
 BASE_WS_BE_DIR   = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
 BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
-BASE_IR_DIR      = "/user/s5k2p5sx.be1/LAYOUT/IR/"
+
+# Supports multiple directories separated by spaces
+BASE_IR_DIR      = "/user/s5k2p5sx.be1/LAYOUT/IR/ /user/s5k2p5sx.be1/LAYOUT/IR2/" 
+
 PNR_TOOL_NAMES   = "fc innovus"
 SUMMARY_SCRIPT   = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
 FIREFOX_PATH     = "/usr/bin/firefox"
@@ -83,6 +87,22 @@ class CustomTreeItem(QTreeWidgetItem):
         col = self.treeWidget().sortColumn()
         t1 = self.text(col).strip() if self.text(col) else ""
         t2 = other.text(col).strip() if other.text(col) else ""
+        
+        # Priority Sorting for Status/FM/VSLP
+        if col in [3, 7, 8, 9]:
+            def score(val):
+                v_up = val.upper()
+                if "PASS" in v_up or "ERROR: 0" in v_up or "COMPLETED" in v_up: return 4
+                if "RUNNING" in v_up: return 3
+                if "FAILS" in v_up or "ERROR:" in v_up or "FATAL" in v_up: return 2
+                if "INTERRUPTED" in v_up or "NOT STARTED" in v_up: return 1
+                return 0
+            
+            s1, s2 = score(t1), score(t2)
+            if s1 != s2:
+                asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
+                return s1 < s2 if asc else s1 > s2
+
         if col == 0:
             if t1 == "[ Ignored Runs ]": return False
             if t2 == "[ Ignored Runs ]": return True
@@ -205,6 +225,17 @@ def extract_rtl(run_dir):
                 if m: return normalize_rtl(m.group(1))
     except: pass
     return "Unknown"
+
+def get_partition_space(path_str):
+    try:
+        total, used, free = shutil.disk_usage(path_str)
+        t_gb = total / (1024**3)
+        u_gb = used / (1024**3)
+        f_gb = free / (1024**3)
+        perc = (used / total) * 100 if total > 0 else 0
+        return f"Total: {t_gb:.1f} GB | Used: {u_gb:.1f} GB ({perc:.1f}%) | Free: {f_gb:.1f} GB"
+    except:
+        return "Partition Space Information Unavailable"
 
 # ===========================================================================
 # --- UI DIALOGS ---
@@ -345,66 +376,146 @@ class PieChartWidget(QWidget):
 class DiskUsageDialog(QDialog):
     def __init__(self, disk_data, is_dark, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Disk Space Usage (User-Wise Breakdown)")
-        self.resize(850, 500)
+        self.setWindowTitle("Disk Space Usage (Advanced Drill-Down)")
+        self.resize(1000, 600)
         self.disk_data = disk_data
         self.is_dark = is_dark
+        self.parent_window = parent
         
         layout = QVBoxLayout(self)
         
+        # --- Top Bar ---
         top_row = QHBoxLayout()
         top_row.addWidget(QLabel("<b>Select Directory Scope:</b>"))
         self.combo = QComboBox()
         self.combo.addItems(["WS (FE)", "WS (BE)", "OUTFEED"])
         self.combo.currentIndexChanged.connect(self.update_view)
         top_row.addWidget(self.combo)
+        
+        top_row.addSpacing(30)
+        self.partition_lbl = QLabel("")
+        self.partition_lbl.setStyleSheet("color: #d32f2f; font-weight: bold;" if not is_dark else "color: #e57373; font-weight: bold;")
+        top_row.addWidget(self.partition_lbl)
+        
         top_row.addStretch()
         layout.addLayout(top_row)
 
+        # --- Main Body (Pie Chart + Tree Widget) ---
         main_body = QHBoxLayout()
         self.pie = PieChartWidget()
+        self.pie.setMinimumWidth(350)
         main_body.addWidget(self.pie, 1)
 
-        self.table = QTableWidget()
-        self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["", "User", "Total (GB)", "Largest Directory Info"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.table.verticalHeader().setVisible(False)
-        main_body.addWidget(self.table, 2)
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["User / Directory Path", "Size (GB)"])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.tree.itemChanged.connect(self.handle_item_changed)
+        main_body.addWidget(self.tree, 2)
 
         layout.addLayout(main_body, 1)
+
+        # --- Bottom Bar (Mail Action) ---
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch()
+        self.mail_btn = QPushButton("Send Cleanup Mail to Selected")
+        self.mail_btn.setMinimumHeight(35)
+        self.mail_btn.clicked.connect(self.send_disk_mail)
+        
+        btn_color = "#2f65ca" if self.is_dark else "#3182ce"
+        self.mail_btn.setStyleSheet(f"QPushButton {{ background-color: {btn_color}; color: white; font-weight: bold; padding: 5px 15px; border-radius: 4px; }}")
+        bottom_row.addWidget(self.mail_btn)
+        layout.addLayout(bottom_row)
+
         self.update_view()
 
     def update_view(self):
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        
         cat = self.combo.currentText()
         data = self.disk_data.get(cat, {})
+        
+        # Update Partition Label
+        if cat == "WS (FE)": p_path = BASE_WS_FE_DIR
+        elif cat == "WS (BE)": p_path = BASE_WS_BE_DIR
+        else: p_path = BASE_OUTFEED_DIR
+        self.partition_lbl.setText(get_partition_space(p_path))
         
         pie_data = {user: info["total"] for user, info in data.items()}
         self.pie.set_data(pie_data, self.is_dark)
         
-        self.table.setRowCount(0)
         sorted_data = sorted(data.items(), key=lambda item: item[1]["total"], reverse=True)
+        
         for i, (user, info) in enumerate(sorted_data):
-            self.table.insertRow(i)
+            user_item = QTreeWidgetItem(self.tree)
+            user_item.setFlags(user_item.flags() | Qt.ItemIsUserCheckable)
+            user_item.setCheckState(0, Qt.Unchecked)
+            user_item.setText(0, user)
+            user_item.setText(1, f"{info['total']:.2f} GB")
             
-            color_item = QTableWidgetItem("")
-            color_item.setBackground(QColor(self.pie.colors[i % len(self.pie.colors)]))
-            
-            it_u = QTableWidgetItem(user)
-            it_u.setForeground(QColor(self.pie.colors[i % len(self.pie.colors)]))
-            
-            it_s = QTableWidgetItem(f"{info['total']:.2f} GB")
-            it_dir = QTableWidgetItem(f"{info['max_dir']} ({info['max_sz']:.2f} GB)")
-            
-            self.table.setItem(i, 0, color_item)
-            self.table.setItem(i, 1, it_u)
-            self.table.setItem(i, 2, it_s)
-            self.table.setItem(i, 3, it_dir)
+            color = QColor(self.pie.colors[i % len(self.pie.colors)])
+            user_item.setForeground(0, color)
+            font = user_item.font(0); font.setBold(True); user_item.setFont(0, font)
+            user_item.setFont(1, font)
+
+            for dir_path, dir_sz in info["dirs"]:
+                dir_item = QTreeWidgetItem(user_item)
+                dir_item.setFlags(dir_item.flags() | Qt.ItemIsUserCheckable)
+                dir_item.setCheckState(0, Qt.Unchecked)
+                dir_item.setText(0, dir_path)
+                dir_item.setText(1, f"{dir_sz:.2f} GB")
+                dir_item.setData(0, Qt.UserRole, user) 
+
+        self.tree.blockSignals(False)
+
+    def handle_item_changed(self, item, column):
+        if column != 0: return
+        self.tree.blockSignals(True)
+        state = item.checkState(0)
+        for i in range(item.childCount()):
+            item.child(i).setCheckState(0, state)
+        self.tree.blockSignals(False)
+
+    def send_disk_mail(self):
+        user_runs = {}
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            user_item = root.child(i)
+            for j in range(user_item.childCount()):
+                dir_item = user_item.child(j)
+                if dir_item.checkState(0) == Qt.Checked:
+                    owner = dir_item.data(0, Qt.UserRole)
+                    path = dir_item.text(0)
+                    if owner not in user_runs:
+                        user_runs[owner] = []
+                    user_runs[owner].append(path)
+
+        if not user_runs:
+            QMessageBox.warning(self, "No Directories Selected", "Please check at least one directory to request cleanup.")
+            return
+
+        dlg = MailDialog("Action Required: Please clean up heavy disk usage runs", self)
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            success_count = 0
+            for owner, paths in user_runs.items():
+                owner_email = get_user_email(owner)
+                if not owner_email: continue
+                final_body = body_template + "\n\n" + "\n".join(paths)
+                cmd = [MAIL_UTIL, "-to", owner_email, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
+                try:
+                    subprocess.Popen(cmd)
+                    success_count += 1
+                except Exception as e:
+                    print(f"Failed to send mail to {owner_email}: {e}")
+            QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} cleanup emails.")
 
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
@@ -419,10 +530,16 @@ class DiskScannerWorker(QThread):
     def run(self):
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
         
+        # Deep Globbing for OUTFEED (fc and innovus)
+        outfeed_targets = glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*", "fc", "*"))
+        outfeed_targets.extend(glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*", "innovus", "*")))
+        if not outfeed_targets:
+            outfeed_targets = glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*"))
+
         targets_map = {
             "WS (FE)": glob.glob(os.path.join(BASE_WS_FE_DIR, "*")),
             "WS (BE)": glob.glob(os.path.join(BASE_WS_BE_DIR, "*")),
-            "OUTFEED": glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "*")) 
+            "OUTFEED": outfeed_targets 
         }
         
         tasks = []
@@ -440,14 +557,14 @@ class DiskScannerWorker(QThread):
                         gb_sz = sz_kb / (1024**2) 
                         if gb_sz > 0.01: 
                             if owner not in results[cat]:
-                                results[cat][owner] = {"total": 0, "max_dir": "", "max_sz": 0}
-                            
+                                results[cat][owner] = {"total": 0, "dirs": []}
                             results[cat][owner]["total"] += gb_sz
-                            
-                            if gb_sz > results[cat][owner]["max_sz"]:
-                                results[cat][owner]["max_sz"] = gb_sz
-                                results[cat][owner]["max_dir"] = os.path.basename(full_path)
+                            results[cat][owner]["dirs"].append((full_path, gb_sz))
                 except: pass
+        
+        for cat in results:
+            for owner in results[cat]:
+                results[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
                 
         self.finished_scan.emit(results)
 
@@ -496,51 +613,54 @@ class ScannerWorker(QThread):
 
     def scan_ir_dir(self):
         ir_data = {}
-        if not os.path.exists(BASE_IR_DIR): return ir_data
         target_lef = f"{PROJECT_PREFIX}.lef.list"
         
-        for root_dir, dirs, files in os.walk(BASE_IR_DIR):
-            for f_name in files:
-                if not f_name.startswith("redhawk.log"): continue
-                log_path = os.path.join(root_dir, f_name)
-                
-                run_be_name = step_name = None
-                static_val = "-"
-                dynamic_val = "-"
-                in_static = False
-                in_dynamic = False
+        ir_dirs = BASE_IR_DIR.split()
+        for ir_base in ir_dirs:
+            if not os.path.exists(ir_base): continue
+            
+            for root_dir, dirs, files in os.walk(ir_base):
+                for f_name in files:
+                    if not f_name.startswith("redhawk.log"): continue
+                    log_path = os.path.join(root_dir, f_name)
+                    
+                    run_be_name = step_name = None
+                    static_val = "-"
+                    dynamic_val = "-"
+                    in_static = False
+                    in_dynamic = False
 
-                try:
-                    with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        for line in f:
-                            if line.startswith("Parsing ") and target_lef in line:
-                                m = re.search(r'/fc/([^/]+-BE)/(?:outputs/)?([^/]+)/', line)
-                                if m: run_be_name = m.group(1); step_name = m.group(2)
-                            
-                            if "Worst Static IR Drop:" in line:
-                                in_static = True; in_dynamic = False; continue
-                            if "Worst Dynamic Voltage Drop:" in line:
-                                in_dynamic = True; in_static = False; continue
+                    try:
+                        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            for line in f:
+                                if line.startswith("Parsing ") and target_lef in line:
+                                    m = re.search(r'/fc/([^/]+-BE)/(?:outputs/)?([^/]+)/', line)
+                                    if m: run_be_name = m.group(1); step_name = m.group(2)
+                                
+                                if "Worst Static IR Drop:" in line:
+                                    in_static = True; in_dynamic = False; continue
+                                if "Worst Dynamic Voltage Drop:" in line:
+                                    in_dynamic = True; in_static = False; continue
 
-                            if in_static and line.strip() and not line.startswith("-") and not line.startswith("Type"):
-                                parts = line.split()
-                                if len(parts) >= 2 and parts[0] != "WIRE" and static_val == "-":
-                                    static_val = parts[1]
-                                    in_static = False
+                                if in_static and line.strip() and not line.startswith("-") and not line.startswith("Type"):
+                                    parts = line.split()
+                                    if len(parts) >= 2 and parts[0] != "WIRE" and static_val == "-":
+                                        static_val = parts[1]
+                                        in_static = False
 
-                            if in_dynamic and line.strip() and not line.startswith("-") and not line.startswith("Type"):
-                                parts = line.split()
-                                if len(parts) >= 2 and parts[0] != "WIRE" and dynamic_val == "-":
-                                    dynamic_val = parts[1]
-                                    in_dynamic = False
+                                if in_dynamic and line.strip() and not line.startswith("-") and not line.startswith("Type"):
+                                    parts = line.split()
+                                    if len(parts) >= 2 and parts[0] != "WIRE" and dynamic_val == "-":
+                                        dynamic_val = parts[1]
+                                        in_dynamic = False
 
-                    if run_be_name and step_name:
-                        key = f"{run_be_name}/{step_name}"
-                        if key not in ir_data:
-                            ir_data[key] = {"static": "-", "dynamic": "-", "log": log_path}
-                        if static_val != "-": ir_data[key]["static"] = static_val
-                        if dynamic_val != "-": ir_data[key]["dynamic"] = dynamic_val
-                except: pass
+                        if run_be_name and step_name:
+                            key = f"{run_be_name}/{step_name}"
+                            if key not in ir_data:
+                                ir_data[key] = {"static": "-", "dynamic": "-", "log": log_path}
+                            if static_val != "-": ir_data[key]["static"] = static_val
+                            if dynamic_val != "-": ir_data[key]["dynamic"] = dynamic_val
+                    except: pass
         return ir_data
 
     def run(self):
@@ -838,7 +958,7 @@ class PDDashboard(QMainWindow):
         self.settings_btn = self._btn("Settings", self.open_settings)
         top_layout.addWidget(self.settings_btn)
 
-        # Window Size Toggle Icon Button (placed gracefully at the end)
+        # Window Size Toggle Icon Button
         self.size_toggle_btn = QToolButton()
         self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
         self.size_toggle_btn.setToolTip("Toggle Compact Window Mode")
@@ -1109,6 +1229,12 @@ class PDDashboard(QMainWindow):
     def apply_theme_and_spacing(self):
         pad = self.row_spacing
         
+        # Ensures checkmark stays visible even when cell is highlighted
+        cb_style = """
+            QTreeView::indicator:checked { background-color: #4CAF50; border: 1px solid #388E3C; }
+            QTreeView::indicator:unchecked { background-color: white; border: 1px solid gray; }
+        """
+        
         if self.use_custom_colors:
             bg, fg, sel = self.custom_bg_color, self.custom_fg_color, self.custom_sel_color
             stylesheet = f"""
@@ -1130,6 +1256,7 @@ class PDDashboard(QMainWindow):
                 QTreeView::item {{ padding: {pad}px; }}
                 QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: {sel}; color: #ffffff; }}
+                {cb_style}
             """
         elif self.is_dark_mode:
             stylesheet = f"""
@@ -1153,6 +1280,7 @@ class PDDashboard(QMainWindow):
                 QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
                 QTableWidget {{ background-color: #1e1f22; alternate-background-color: #26282b; gridline-color: #393b40; }}
+                {cb_style}
             """
         else:
             stylesheet = f"""
@@ -1176,6 +1304,7 @@ class PDDashboard(QMainWindow):
                 QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: #3182ce; color: #ffffff; }}
                 QTableWidget {{ background-color: #ffffff; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; }}
+                {cb_style}
             """
         self.setStyleSheet(stylesheet)
         self.refresh_view()
@@ -1215,9 +1344,19 @@ class PDDashboard(QMainWindow):
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
             self.fit_all_columns()
+            
+        # Automatically calculate missing sizes in the background on load
+        self.calculate_all_sizes()
 
     def on_source_changed(self):
         src_mode = self.src_combo.currentText()
+        
+        # Dynamically hide/show the "Source" column based on selection
+        if src_mode in ["WS", "OUTFEED"]:
+            self.tree.setColumnHidden(2, True)
+        else:
+            self.tree.setColumnHidden(2, False)
+            
         releases, blocks = set(), set()
         if src_mode in ["WS",  "ALL"] and self.ws_data:
             releases.update(self.ws_data.get("releases", {}).keys())
@@ -1394,12 +1533,16 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # ADD STAGES (BE)
     # ------------------------------------------------------------------
-    def _add_stages(self, be_item, be_run):
+    def _add_stages(self, be_item, be_run, ignored_root):
         owner = be_run.get("owner", "Unknown")
         is_ir_block = (be_run["block"].upper() == PROJECT_PREFIX.upper())
         
         for stage in be_run["stages"]:
-            st_item = CustomTreeItem(be_item)
+            if stage["stage_path"] in self.ignored_paths:
+                st_item = CustomTreeItem(ignored_root)
+            else:
+                st_item = CustomTreeItem(be_item)
+                
             st_item.setFlags(st_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             st_item.setCheckState(0, Qt.Unchecked)
             st_item.setData(0, Qt.UserRole, "STAGE")
@@ -1519,6 +1662,7 @@ class PDDashboard(QMainWindow):
 
         src_mode = self.src_combo.currentText()
         sel_rtl  = self.rel_combo.currentText()
+        is_filtered = (self.view_combo.currentText() != "All Runs") or (self.search.text().strip() != "")
 
         raw_query = self.search.text().lower().strip()
         search_pattern = "*" if not raw_query else (f"*{raw_query}*" if '*' not in raw_query else raw_query)
@@ -1554,6 +1698,7 @@ class PDDashboard(QMainWindow):
         be_runs = [r for r in normal_runs_list if r["run_type"] == "BE"]
         
         root = self.tree.invisibleRootItem()
+        ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
 
         # Place FE runs
         for fe_run in fe_runs:
@@ -1599,10 +1744,9 @@ class PDDashboard(QMainWindow):
 
             actual_parent = fe_parent if fe_parent else parent_for_run
             be_item = self._create_run_item(actual_parent, be_run)
-            self._add_stages(be_item, be_run)
+            self._add_stages(be_item, be_run, ign_root)
 
         if ignored_runs_list:
-            ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
             for run in ignored_runs_list:
                 blk_name = run["block"]
                 run_rtl  = run["rtl"]
@@ -1617,7 +1761,10 @@ class PDDashboard(QMainWindow):
                 else: parent_for_run = block_node
                 
                 item = self._create_run_item(parent_for_run, run)
-                if run["run_type"] == "BE": self._add_stages(item, run)
+                if run["run_type"] == "BE": self._add_stages(item, run, ign_root)
+
+        if ign_root.childCount() == 0:
+            root.removeChild(ign_root)
 
         self.tree.setSortingEnabled(True)
 
@@ -1627,9 +1774,11 @@ class PDDashboard(QMainWindow):
                 path_key  = self._get_item_path_id(child)
                 node_type = child.data(0, Qt.UserRole)
                 is_run    = bool(child.text(15)) 
-                if path_key in expanded_states: child.setExpanded(expanded_states[path_key])
+                if path_key in expanded_states: 
+                    child.setExpanded(expanded_states[path_key])
                 else:
                     if child.parent() is None: child.setExpanded(True)
+                    elif is_filtered and node_type in ["BLOCK", "MILESTONE", "RTL"]: child.setExpanded(True)
                     elif node_type == "MILESTONE": child.setExpanded(False)
                     elif sel_rtl == "[ SHOW ALL ]" and node_type == "RTL": child.setExpanded(False) 
                     elif is_run: child.setExpanded(False)
@@ -1677,12 +1826,20 @@ class PDDashboard(QMainWindow):
         vslp_path, sta_path, ir_path = item.text(19), item.text(20), item.text(21)
         is_stage = item.data(0, Qt.UserRole) == "STAGE"
 
-        ignore_checked_act = m.addAction("Ignore All Checked Runs")
+        ignore_checked_act = m.addAction("Hide All Checked Runs/Stages")
         m.addSeparator()
+        
         ignore_act = restore_act = None
-        if run_path and run_path != "N/A" and not is_stage:
-            if run_path in self.ignored_paths: restore_act = m.addAction("Restore Current Run (Un-ignore)")
-            else: ignore_act = m.addAction("Ignore Current Run")
+        target_path = run_path
+        
+        # Determine path to hide based on if it's a stage or a run
+        if is_stage: target_path = item.text(15) 
+            
+        if target_path and target_path != "N/A":
+            if target_path in self.ignored_paths: 
+                restore_act = m.addAction("Restore (Unhide)")
+            else: 
+                ignore_act = m.addAction("Hide/Ignore")
             m.addSeparator()
 
         calc_size_act = None
@@ -1710,13 +1867,15 @@ class PDDashboard(QMainWindow):
             def ig(node):
                 for i in range(node.childCount()):
                     c = node.child(i)
-                    if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
+                    if c.checkState(0) == Qt.Checked:
                         p = c.text(15)
                         if p and p != "N/A": self.ignored_paths.add(p)
                     ig(c)
             ig(self.tree.invisibleRootItem()); self.refresh_view()
-        elif res == ignore_act: self.ignored_paths.add(run_path); self.refresh_view()
-        elif res == restore_act: self.ignored_paths.discard(run_path); self.refresh_view()
+            
+        elif res == ignore_act: self.ignored_paths.add(target_path); self.refresh_view()
+        elif res == restore_act: self.ignored_paths.discard(target_path); self.refresh_view()
+        
         elif copy_cell_act and res == copy_cell_act: QApplication.clipboard().setText(cell_text)
         elif calc_size_act and res == calc_size_act:
             item.setText(6, "Calc...") 
