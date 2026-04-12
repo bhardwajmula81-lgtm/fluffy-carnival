@@ -278,27 +278,24 @@ class SettingsDialog(QDialog):
         if c.isValid(): self.sel_color = c.name()
 
 class MailDialog(QDialog):
-    def __init__(self, user_count, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Group Mail Configuration")
-        self.resize(600, 350)
+        self.resize(600, 250)
         layout = QVBoxLayout(self)
-
-        info = QLabel(f"<b>Batch Setup:</b> Emails will be individually sent to <b>{user_count} unique users.</b><br>Each user will automatically receive a list of ONLY their own runs.")
-        layout.addWidget(info)
 
         form = QFormLayout()
         self.subject_input = QLineEdit("Please remove your old PD runs")
         form.addRow("Subject:", self.subject_input)
         layout.addLayout(form)
 
-        layout.addWidget(QLabel("Message Header (The runs will be appended below this):"))
+        layout.addWidget(QLabel("Message Header (The selected runs will be appended automatically below this):"))
         self.body_input = QTextEdit()
         self.body_input.setPlainText("Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:")
         layout.addWidget(self.body_input)
 
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.button(QDialogButtonBox.Ok).setText("Send All Emails")
+        self.buttons.button(QDialogButtonBox.Ok).setText("Send Mail")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -310,7 +307,7 @@ class PieChartWidget(QWidget):
     def __init__(self):
         super().__init__()
         self.setMinimumSize(300, 300)
-        self.data = {} # user -> size
+        self.data = {} 
         self.colors = [
             QColor("#ef5350"), QColor("#42a5f5"), QColor("#66bb6a"), QColor("#ffa726"),
             QColor("#ab47bc"), QColor("#26c6da"), QColor("#8d6e63"), QColor("#78909c"),
@@ -341,7 +338,7 @@ class PieChartWidget(QWidget):
         for i, (name, val) in enumerate(self.data.items()):
             span_angle = (val / total) * 360 * 16
             painter.setBrush(QBrush(self.colors[i % len(self.colors)]))
-            painter.setPen(QPen(QColor(self.bg_col), 2)) # Stroke matches background
+            painter.setPen(QPen(QColor(self.bg_col), 2)) 
             painter.drawPie(pie_rect, int(start_angle), int(span_angle))
             start_angle += span_angle
 
@@ -393,7 +390,6 @@ class DiskUsageDialog(QDialog):
             it_u = QTableWidgetItem(user)
             it_s = QTableWidgetItem(f"{sz:.2f} GB")
             
-            # Color code dot in table
             dot = QTableWidgetItem("  ■  ")
             dot.setForeground(QColor(self.pie.colors[i % len(self.pie.colors)]))
             it_u.setIcon(dot.icon()) 
@@ -406,31 +402,46 @@ class DiskScannerWorker(QThread):
     progress = pyqtSignal(str)
     finished_scan = pyqtSignal(dict)
 
-    def run(self):
-        targets = {
-            "WS (FE)": BASE_WS_FE_DIR,
-            "WS (BE)": BASE_WS_BE_DIR,
-            "OUTFEED": BASE_OUTFEED_DIR
-        }
-        results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
+    def _get_dir_info(self, path):
+        try:
+            owner = pwd.getpwuid(os.stat(path).st_uid).pw_name
+            sz = int(subprocess.check_output(['du', '-sk', path], stderr=subprocess.DEVNULL).decode().split()[0])
+            return owner, sz
+        except: return "Unknown", 0
 
-        for category, path in targets.items():
-            if not os.path.exists(path): continue
-            self.progress.emit(f"Analyzing {category} space distribution... This may take a minute.")
-            # Fast highly accurate block size count mapped strictly to owners.
-            cmd = f"find {path} -type f -printf '%u %s\\n' 2>/dev/null | awk '{{user[$1]+=$2}} END {{for (u in user) print u, user[u]}}'"
-            try:
-                out = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode()
-                for line in out.strip().split('\n'):
-                    if not line.strip(): continue
-                    parts = line.strip().split()
-                    if len(parts) == 2:
-                        user, bytes_sz = parts[0], int(parts[1])
-                        gb_sz = bytes_sz / (1024**3)
-                        if gb_sz > 0.01: # Filter tiny residual files
-                            results[category][user] = gb_sz
-            except: pass
-            
+    def run(self):
+        results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
+        
+        targets_map = {
+            "WS (FE)": glob.glob(os.path.join(BASE_WS_FE_DIR, "*")),
+            "WS (BE)": glob.glob(os.path.join(BASE_WS_BE_DIR, "*")),
+            "OUTFEED": glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "*")) 
+        }
+        
+        tasks = []
+        for cat, paths in targets_map.items():
+            for p in paths:
+                if os.path.isdir(p): tasks.append((cat, p))
+        
+        total_tasks = len(tasks)
+        completed = 0
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+            future_to_task = {executor.submit(self._get_dir_info, t[1]): t[0] for t in tasks}
+            for future in concurrent.futures.as_completed(future_to_task):
+                cat = future_to_task[future]
+                completed += 1
+                if completed % 10 == 0 or completed == total_tasks:
+                    self.progress.emit(f"Scanning directories... ({completed}/{total_tasks})")
+                
+                try:
+                    owner, sz_kb = future.result()
+                    if sz_kb > 0:
+                        gb_sz = sz_kb / (1024**2) 
+                        if gb_sz > 0.01: 
+                            results[cat][owner] = results[cat].get(owner, 0) + gb_sz
+                except: pass
+                
         self.finished_scan.emit(results)
 
 # ===========================================================================
@@ -690,6 +701,7 @@ class PDDashboard(QMainWindow):
         self.show_relative_time = False 
         self._columns_fitted_once = False
         self._last_scan_time    = None
+        self.is_compact         = False
 
         self.size_workers  = []
         self.item_map      = {}
@@ -719,56 +731,67 @@ class PDDashboard(QMainWindow):
         root_layout.setContentsMargins(6, 6, 6, 4)
         root_layout.setSpacing(4)
 
-        # ---- TOP TOOLBAR ----
-        top = QHBoxLayout()
-        top.setSpacing(6)
+        # ---- TOP TOOLBAR (ROW 1: Search & Core Filters) ----
+        top_row1 = QHBoxLayout()
+        top_row1.setSpacing(6)
 
-        top.addWidget(self._label("Source:"))
+        top_row1.addWidget(self._label("Source:"))
         self.src_combo = QComboBox()
         self.src_combo.addItems(["ALL", "WS", "OUTFEED"])
-        self.src_combo.setFixedWidth(90)
+        self.src_combo.setFixedWidth(120) 
         self.src_combo.currentIndexChanged.connect(self.on_source_changed)
-        top.addWidget(self.src_combo)
+        top_row1.addWidget(self.src_combo)
 
-        self._add_separator(top)
+        self._add_separator(top_row1)
 
-        top.addWidget(self._label("RTL Release:"))
+        top_row1.addWidget(self._label("RTL Release:"))
         self.rel_combo = QComboBox()
-        self.rel_combo.setMinimumWidth(340)
+        self.rel_combo.setMinimumWidth(220) 
         self.rel_combo.currentIndexChanged.connect(self.refresh_view)
-        top.addWidget(self.rel_combo)
+        top_row1.addWidget(self.rel_combo)
 
-        self._add_separator(top)
+        self._add_separator(top_row1)
 
-        top.addWidget(self._label("View:"))
+        top_row1.addWidget(self._label("View:"))
         self.view_combo = QComboBox()
         self.view_combo.addItems(["All Runs", "FE Only", "BE Only", "Running Only", "Failed Only", "Today's Runs"])
         self.view_combo.setFixedWidth(130)
         self.view_combo.currentIndexChanged.connect(self.refresh_view)
-        top.addWidget(self.view_combo)
+        top_row1.addWidget(self.view_combo)
 
-        self._add_separator(top)
+        self._add_separator(top_row1)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search runs, blocks, status, runtime...   [Ctrl+F]")
         self.search.setMinimumWidth(280)
         self.search.textChanged.connect(lambda: self.search_timer.start(500))
-        top.addWidget(self.search)
+        top_row1.addWidget(self.search)
 
-        top.addStretch()
+        top_row1.addStretch()
 
         self.refresh_btn = self._btn("Refresh  [Ctrl+R]", self.start_fs_scan)
-        top.addWidget(self.refresh_btn)
+        top_row1.addWidget(self.refresh_btn)
 
-        top.addWidget(self._label("Auto:"))
+        top_row1.addWidget(self._label("Auto:"))
         self.auto_combo = QComboBox()
         self.auto_combo.addItems(["Off", "1 Min", "5 Min", "10 Min"])
         self.auto_combo.setFixedWidth(75)
         self.auto_combo.currentIndexChanged.connect(self.on_auto_refresh_changed)
-        top.addWidget(self.auto_combo)
+        top_row1.addWidget(self.auto_combo)
 
-        self._add_separator(top)
+        self._add_separator(top_row1)
+        self.size_toggle_btn = self._btn("Compact Window", self.toggle_window_size)
+        top_row1.addWidget(self.size_toggle_btn)
+        top_row1.addWidget(self._btn("Settings", self.open_settings))
+        
+        root_layout.addLayout(top_row1)
 
+        # ---- TOP TOOLBAR (ROW 2: Actions & Tools) ----
+        top_row2 = QHBoxLayout()
+        top_row2.setSpacing(6)
+        
+        top_row2.addSpacing(330) 
+        
         self.tools_btn = QPushButton("Tools")
         self.tools_menu = QMenu(self)
         self.tools_menu.addAction("Fit Columns  [Ctrl+Shift+F]", self.fit_all_columns)
@@ -777,20 +800,19 @@ class PDDashboard(QMainWindow):
         self.tools_menu.addSeparator()
         self.tools_menu.addAction("Calculate All Run Sizes",      self.calculate_all_sizes)
         self.tools_btn.setMenu(self.tools_menu)
-        top.addWidget(self.tools_btn)
+        top_row2.addWidget(self.tools_btn)
 
         self.qor_btn = self._btn("Compare QoR", self.run_qor_comparison)
-        top.addWidget(self.qor_btn)
+        top_row2.addWidget(self.qor_btn)
         
         self.mail_btn = self._btn("Send Mail", self.send_mail_action)
-        top.addWidget(self.mail_btn)
+        top_row2.addWidget(self.mail_btn)
         
         self.disk_btn = self._btn("Disk Space", self.open_disk_usage)
-        top.addWidget(self.disk_btn)
-
-        top.addWidget(self._btn("Settings", self.open_settings))
-
-        root_layout.addLayout(top)
+        top_row2.addWidget(self.disk_btn)
+        
+        top_row2.addStretch()
+        root_layout.addLayout(top_row2)
 
         # ---- SCAN PROGRESS ----
         self.prog = QProgressBar()
@@ -834,6 +856,11 @@ class PDDashboard(QMainWindow):
 
         self.blk_list = QListWidget()
         self.blk_list.setAlternatingRowColors(True)
+        f = self.blk_list.font()
+        f.setPointSize(f.pointSize() + 1)
+        f.setBold(True)
+        self.blk_list.setFont(f)
+        
         self.blk_list.itemChanged.connect(lambda: self.search_timer.start(100))
         left_layout.addWidget(self.blk_list)
         
@@ -940,6 +967,18 @@ class PDDashboard(QMainWindow):
         self.blk_list.blockSignals(False)
         self.refresh_view()
 
+    def toggle_window_size(self):
+        if not self.is_compact:
+            self.showNormal() 
+            self.resize(1280, 720)
+            self.size_toggle_btn.setText("Expand Window")
+            self.is_compact = True
+        else:
+            self.showNormal()
+            self.resize(1920, 1000)
+            self.size_toggle_btn.setText("Compact Window")
+            self.is_compact = False
+
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+R"),       self, self.start_fs_scan)
         QShortcut(QKeySequence("Ctrl+F"),       self, lambda: self.search.setFocus())
@@ -1040,7 +1079,7 @@ class PDDashboard(QMainWindow):
                 QMainWindow, QWidget, QDialog {{ background-color: {bg}; color: {fg}; }}
                 QHeaderView::section {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px; font-weight: bold; }}
                 QTreeWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; }}
-                QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; font-weight: bold; font-size: 14px; }}
+                QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; font-weight: bold; }}
                 QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 4px; border-radius: 4px; }}
                 QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #ffffff; }}
                 QPushButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
@@ -1060,7 +1099,7 @@ class PDDashboard(QMainWindow):
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{ background-color: #2b2d30; color: #dfe1e5; }}
                 QTreeWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; }}
-                QListWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; font-weight: bold; font-size: 14px; }}
+                QListWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; font-weight: bold; }}
                 QHeaderView::section {{ background-color: #2b2d30; color: #a9b7c6; border: 1px solid #1e1f22; padding: 5px; font-weight: bold; }}
                 QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
                 QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
@@ -1084,7 +1123,7 @@ class PDDashboard(QMainWindow):
                 QMainWindow, QWidget, QDialog {{ background-color: #f5f7fa; color: #333333; }}
                 QHeaderView::section {{ background-color: #e4e7eb; color: #4a5568; border: 1px solid #cbd5e0; padding: 5px; font-weight: bold; }}
                 QTreeWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; }}
-                QListWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; font-weight: bold; font-size: 14px; }}
+                QListWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; font-weight: bold; }}
                 QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
                 QComboBox {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
                 QComboBox QAbstractItemView {{ background-color: #ffffff; color: #333333; selection-background-color: #3182ce; selection-color: #ffffff; }}
@@ -1496,7 +1535,7 @@ class PDDashboard(QMainWindow):
 
             self._create_run_item(parent_for_run, fe_run)
 
-        # Place BE runs (No more "Other PNR runs" fallback)
+        # Place BE runs (Hierarchical matching to FE without "Other PNR runs")
         for be_run in be_runs:
             blk_name = be_run["block"]
             run_rtl  = be_run["rtl"]
@@ -1511,7 +1550,7 @@ class PDDashboard(QMainWindow):
             elif sel_rtl == base_rtl and has_syn: parent_for_run = self._get_node(block_node, run_rtl, "RTL")
             else: parent_for_run = block_node
 
-            # Attempt to nest inside matching FE run
+            # Nest inside matching FE run
             fe_parent = None
             for i in range(parent_for_run.childCount()):
                 c = parent_for_run.child(i)
@@ -1693,7 +1732,7 @@ class PDDashboard(QMainWindow):
             QMessageBox.warning(self, "Unknown Users", "Could not determine the owners for the selected runs.")
             return
 
-        dlg = MailDialog(len(user_runs), self)
+        dlg = MailDialog(self)
         if dlg.exec_():
             subject = dlg.subject_input.text().strip()
             body_template = dlg.body_input.toPlainText()
@@ -1729,7 +1768,7 @@ class PDDashboard(QMainWindow):
     # DISK USAGE FEATURE
     # ------------------------------------------------------------------
     def open_disk_usage(self):
-        self.prog_dialog = QProgressDialog("Scanning file systems... This might take a minute.", "Cancel", 0, 0, self)
+        self.prog_dialog = QProgressDialog("Calculating User Storage Distribution... (Fast Scan)", "Cancel", 0, 0, self)
         self.prog_dialog.setWindowTitle("Disk Scan")
         self.prog_dialog.setModal(True)
         self.prog_dialog.setCancelButton(None) 
