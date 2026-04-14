@@ -1,3 +1,4 @@
+
 import os
 import glob
 import re
@@ -324,7 +325,6 @@ class FilterDialog(QDialog):
     def get_selected(self):
         return [self.list_widget.item(i).text() for i in range(self.list_widget.count())
                 if self.list_widget.item(i).checkState() == Qt.Checked]
-
 
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -1017,7 +1017,7 @@ class ScannerWorker(QThread):
 class PDDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Unified PD Dashboard | Pro Edition")
+        self.setWindowTitle("Singularity PD | Pro Edition")
         self.resize(1920, 1000)
 
         self.ws_data  = {}
@@ -1275,15 +1275,16 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def generate_sample_config(self):
         sample_text = """# PD Dashboard Run Filter Configuration
-# Format: RTL_NAME : BLOCK_NAME : run1 run2 run3 ...
+# Format: SOURCE : RTL_NAME : BLOCK_NAME : run1 run2 run3 ...
 # 
 # Rules:
-# - If an RTL and Block are defined here, ONLY the runs listed will be shown.
-# - If an RTL or Block is NOT defined here, ALL runs for it will be shown normally.
+# - SOURCE can be WS or OUTFEED
+# - If a Source, RTL, and Block are defined here, ONLY the runs listed will be shown.
+# - If a Source, RTL, or Block is NOT defined here, ALL runs for it will be shown normally.
 # - Use spaces to separate multiple run names.
 
-EVT0_ML4_DEV00_syn2 : BLK_CPU : my_test_run fast_route_run
-EVT0_ML4_DEV00      : BLK_GPU : golden_run
+OUTFEED : EVT0_ML4_DEV00_syn2 : BLK_CPU : my_test_run fast_route_run
+WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 """
         path, _ = QFileDialog.getSaveFileName(self, "Save Sample Config", "dashboard_filter.cfg", "Config Files (*.cfg *.txt)")
         if path:
@@ -1301,13 +1302,16 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith("#"): continue
-                    parts = line.split(":", 2)
-                    if len(parts) == 3:
-                        rtl = parts[0].strip()
-                        blk = parts[1].strip()
-                        runs = set(parts[2].strip().split())
-                        if rtl not in parsed_config: parsed_config[rtl] = {}
-                        parsed_config[rtl][blk] = runs
+                    parts = line.split(":", 3)
+                    if len(parts) == 4:
+                        src = parts[0].strip()
+                        rtl = parts[1].strip()
+                        blk = parts[2].strip()
+                        runs = set(parts[3].strip().split())
+                        
+                        if src not in parsed_config: parsed_config[src] = {}
+                        if rtl not in parsed_config[src]: parsed_config[src][rtl] = {}
+                        parsed_config[src][rtl][blk] = runs
             
             self.run_filter_config = parsed_config
             self.current_config_path = path
@@ -1331,11 +1335,12 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         try:
             with open(self.current_config_path, 'w') as f:
                 f.write("# PD Dashboard Run Filter Configuration\n")
-                f.write("# Format: RTL_NAME : BLOCK_NAME : run1 run2 run3 ...\n\n")
-                for rtl, blocks in self.run_filter_config.items():
-                    for blk, runs in blocks.items():
-                        if runs:
-                            f.write(f"{rtl} : {blk} : {' '.join(sorted(list(runs)))}\n")
+                f.write("# Format: SOURCE : RTL_NAME : BLOCK_NAME : run1 run2 run3 ...\n\n")
+                for src, rtls in self.run_filter_config.items():
+                    for rtl, blocks in rtls.items():
+                        for blk, runs in blocks.items():
+                            if runs:
+                                f.write(f"{src} : {rtl} : {blk} : {' '.join(sorted(list(runs)))}\n")
         except Exception as e:
             print(f"Failed to save config: {e}")
 
@@ -1995,11 +2000,13 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             if run["path"] in self.ignored_paths: ignored_runs_list.append(run); continue
             if run["block"] not in checked_blks: continue
 
+            # NEW 4-TIER CONFIG CHECK
             if self.run_filter_config is not None:
+                r_src = run["source"]
                 r_rtl = run["rtl"]
                 r_blk = run["block"]
-                if r_rtl in self.run_filter_config and r_blk in self.run_filter_config[r_rtl]:
-                    allowed_runs = self.run_filter_config[r_rtl][r_blk]
+                if r_src in self.run_filter_config and r_rtl in self.run_filter_config[r_src] and r_blk in self.run_filter_config[r_src][r_rtl]:
+                    allowed_runs = self.run_filter_config[r_src][r_rtl][r_blk]
                     base_run_name = run["r_name"].replace("-FE", "").replace("-BE", "")
                     if base_run_name not in allowed_runs and run["r_name"] not in allowed_runs:
                         continue 
@@ -2198,9 +2205,10 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         b_name = target_item.data(0, Qt.UserRole + 2)
         r_rtl = target_item.text(1)
         base_run = target_item.data(0, Qt.UserRole + 4)
+        run_source = target_item.text(2)
         
         add_config_act = None
-        if b_name and r_rtl and base_run:
+        if b_name and r_rtl and base_run and run_source:
             if self.current_config_path:
                 add_config_act = m.addAction("Add Run to Active Filter Config")
             else:
@@ -2243,9 +2251,10 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
                 self.current_config_path = path
                 self.run_filter_config = {}
                 
-            if r_rtl not in self.run_filter_config: self.run_filter_config[r_rtl] = {}
-            if b_name not in self.run_filter_config[r_rtl]: self.run_filter_config[r_rtl][b_name] = set()
-            self.run_filter_config[r_rtl][b_name].add(base_run)
+            if run_source not in self.run_filter_config: self.run_filter_config[run_source] = {}
+            if r_rtl not in self.run_filter_config[run_source]: self.run_filter_config[run_source][r_rtl] = {}
+            if b_name not in self.run_filter_config[run_source][r_rtl]: self.run_filter_config[run_source][r_rtl][b_name] = set()
+            self.run_filter_config[run_source][r_rtl][b_name].add(base_run)
             
             self._save_current_config()
             self.sb_config.setText(f"Config: Active ({os.path.basename(self.current_config_path)})")
