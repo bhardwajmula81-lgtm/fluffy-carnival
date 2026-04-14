@@ -76,6 +76,22 @@ def prefetch_path_cache(paths):
 # ===========================================================================
 # --- HELPERS ---
 # ===========================================================================
+def convert_kst_to_ist_str(time_str):
+    if not time_str or time_str == "N/A": return time_str
+    formats = [
+        "%a %b %d, %Y - %H:%M:%S",
+        "%b %d, %Y - %H:%M",
+        "%b %d, %Y - %H:%M:%S"
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.datetime.strptime(time_str, fmt)
+            dt_ist = dt - datetime.timedelta(hours=3, minutes=30)
+            return dt_ist.strftime(fmt)
+        except ValueError:
+            continue
+    return time_str
+
 def relative_time(date_str):
     if not date_str or date_str == "N/A": return date_str
     try:
@@ -258,11 +274,63 @@ class CustomTreeItem(QTreeWidgetItem):
 # ===========================================================================
 # --- UI DIALOGS ---
 # ===========================================================================
+class FilterDialog(QDialog):
+    def __init__(self, col_name, unique_values, active_values, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Filter Column: {col_name}")
+        self.resize(320, 420)
+        layout = QVBoxLayout(self)
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search items...")
+        self.search.textChanged.connect(self.filter_list)
+        layout.addWidget(self.search)
+
+        self.list_widget = QListWidget()
+        layout.addWidget(self.list_widget)
+
+        btn_layout = QHBoxLayout()
+        sel_all = QPushButton("Select All")
+        desel_all = QPushButton("Clear All")
+        sel_all.clicked.connect(lambda: self.set_all(True))
+        desel_all.clicked.connect(lambda: self.set_all(False))
+        btn_layout.addWidget(sel_all)
+        btn_layout.addWidget(desel_all)
+        layout.addLayout(btn_layout)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+        for val in sorted(unique_values):
+            item = QListWidgetItem(val)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if val in active_values else Qt.Unchecked)
+            self.list_widget.addItem(item)
+
+    def set_all(self, state):
+        s = Qt.Checked if state else Qt.Unchecked
+        for i in range(self.list_widget.count()):
+            if not self.list_widget.item(i).isHidden():
+                self.list_widget.item(i).setCheckState(s)
+
+    def filter_list(self, text):
+        text = text.lower()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            item.setHidden(text not in item.text().lower())
+
+    def get_selected(self):
+        return [self.list_widget.item(i).text() for i in range(self.list_widget.count())
+                if self.list_widget.item(i).checkState() == Qt.Checked]
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Dashboard Settings")
-        self.resize(400, 350)
+        self.resize(400, 420)
         layout = QFormLayout(self)
         layout.setSpacing(12)
 
@@ -284,6 +352,14 @@ class SettingsDialog(QDialog):
         self.rel_time_cb = QCheckBox("Show relative timestamps")
         self.rel_time_cb.setChecked(parent.show_relative_time if parent else False)
         layout.addRow("", self.rel_time_cb)
+
+        self.ist_cb = QCheckBox("Convert Timestamps to IST (from KST)")
+        self.ist_cb.setChecked(parent.convert_to_ist if parent else False)
+        layout.addRow("", self.ist_cb)
+        
+        self.hide_blocks_cb = QCheckBox("Hide Block grouping in Tree")
+        self.hide_blocks_cb.setChecked(parent.hide_block_nodes if parent else False)
+        layout.addRow("", self.hide_blocks_cb)
 
         self.theme_cb = QCheckBox("Enable Dark Mode")
         self.theme_cb.setChecked(parent.is_dark_mode if parent else False)
@@ -438,8 +514,15 @@ class DiskUsageDialog(QDialog):
         self.tree.itemChanged.connect(self.handle_item_changed)
         main_body.addWidget(self.tree, 2)
         layout.addLayout(main_body, 1)
+        
         bottom_row = QHBoxLayout()
+        self.recalc_btn = QPushButton("Recalculate Disk Usage")
+        self.recalc_btn.setMinimumHeight(35)
+        self.recalc_btn.clicked.connect(self.trigger_recalc)
+        bottom_row.addWidget(self.recalc_btn)
+        
         bottom_row.addStretch()
+        
         self.mail_btn = QPushButton("Send Cleanup Mail to Selected")
         self.mail_btn.setMinimumHeight(35)
         self.mail_btn.clicked.connect(self.send_disk_mail)
@@ -481,6 +564,12 @@ class DiskUsageDialog(QDialog):
                 dir_item.setData(0, Qt.UserRole, user)
                 dir_item.setData(0, Qt.UserRole + 1, dir_path)
         self.tree.blockSignals(False)
+
+    def trigger_recalc(self):
+        if self.parent_window:
+            self.recalc_btn.setText("Calculating...")
+            self.recalc_btn.setEnabled(False)
+            self.parent_window.start_bg_disk_scan(force=True)
 
     def handle_item_changed(self, item, column):
         if column != 0: return
@@ -943,6 +1032,8 @@ class PDDashboard(QMainWindow):
 
         self.row_spacing          = 2
         self.show_relative_time   = False
+        self.convert_to_ist       = False
+        self.hide_block_nodes     = False
         self._columns_fitted_once = False
         self._last_scan_time      = None
         self.is_compact           = False
@@ -953,8 +1044,13 @@ class PDDashboard(QMainWindow):
         self._checked_paths      = set()
         self.current_error_log_path = None
         
-        self.run_filter_config = None
+        self.run_filter_config   = None
         self.current_config_path = None
+        self.active_col_filters  = {}
+        
+        # Disk caching
+        self._cached_disk_data = None
+        self.disk_worker = None
 
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
@@ -965,7 +1061,10 @@ class PDDashboard(QMainWindow):
 
         self.init_ui()
         self._setup_shortcuts()
+        
+        # Trigger background scans on init
         self.start_fs_scan()
+        self.start_bg_disk_scan()
 
     # ------------------------------------------------------------------
     # CLOSE EVENT
@@ -1357,8 +1456,10 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             self.custom_sel_color   = dlg.sel_color
             self.row_spacing        = dlg.space_spin.value()
             self.show_relative_time = dlg.rel_time_cb.isChecked()
+            self.convert_to_ist     = dlg.ist_cb.isChecked()
+            self.hide_block_nodes   = dlg.hide_blocks_cb.isChecked()
             self.apply_theme_and_spacing()
-            self.on_tree_selection_changed()
+            self.refresh_view()
 
     def apply_theme_and_spacing(self):
         pad = self.row_spacing
@@ -1606,6 +1707,72 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
 
     # ------------------------------------------------------------------
+    # TREE FILTERING (COLUMN VALUES)
+    # ------------------------------------------------------------------
+    def show_column_filter_dialog(self, col):
+        unique_values = set()
+        def gather(node):
+            if node.data(0, Qt.UserRole) not in ["BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"]:
+                unique_values.add(node.text(col).strip())
+            for i in range(node.childCount()):
+                gather(node.child(i))
+        gather(self.tree.invisibleRootItem())
+
+        if not unique_values:
+            QMessageBox.information(self, "Filter", "No data available in this column to filter.")
+            return
+
+        active = self.active_col_filters.get(col, unique_values)
+        col_name = self.tree.headerItem().text(col).replace(" [*]", "")
+
+        dlg = FilterDialog(col_name, unique_values, active, self)
+        if dlg.exec_():
+            selected = dlg.get_selected()
+            if len(selected) == len(unique_values):
+                if col in self.active_col_filters:
+                    del self.active_col_filters[col]
+            else:
+                self.active_col_filters[col] = selected
+            self.apply_tree_filters()
+
+    def apply_tree_filters(self):
+        for col in range(self.tree.columnCount()):
+            orig_text = self.tree.headerItem().text(col).replace(" [*]", "")
+            if col in self.active_col_filters:
+                self.tree.headerItem().setText(col, orig_text + " [*]")
+            else:
+                self.tree.headerItem().setText(col, orig_text)
+
+        def update_visibility(item):
+            item_matches = True
+            is_group_node = item.data(0, Qt.UserRole) in ["BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"]
+
+            if not is_group_node:
+                for col, allowed in self.active_col_filters.items():
+                    val = item.text(col).strip()
+                    if val not in allowed:
+                        item_matches = False
+                        break
+
+            any_child_visible = False
+            for i in range(item.childCount()):
+                if update_visibility(item.child(i)):
+                    any_child_visible = True
+
+            if is_group_node:
+                is_visible = any_child_visible
+            else:
+                is_visible = item_matches or any_child_visible
+
+            item.setHidden(not is_visible)
+            return is_visible
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            update_visibility(root.child(i))
+
+
+    # ------------------------------------------------------------------
     # CREATE RUN ITEM
     # ------------------------------------------------------------------
     def _create_run_item(self, parent_item, run):
@@ -1647,13 +1814,19 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             child.setText(8, f"UPF - {run['st_u']}")
             child.setText(9, run["vslp_status"])
             child.setText(12, run["info"]["runtime"])
+            
             start_raw = run["info"]["start"]; end_raw = run["info"]["end"]
+            if self.convert_to_ist:
+                start_raw = convert_kst_to_ist_str(start_raw)
+                end_raw = convert_kst_to_ist_str(end_raw)
+                
             if self.show_relative_time:
                 child.setText(13, relative_time(start_raw))
                 child.setText(14, relative_time(end_raw) if run["is_comp"] else "-")
             else:
                 child.setText(13, start_raw); child.setText(14, end_raw)
             child.setToolTip(13, start_raw); child.setToolTip(14, end_raw)
+            
             child.setText(15, run["path"])
             child.setText(16, os.path.join(run["path"], "logs/compile_opt.log"))
             child.setText(17, run["fm_u_path"]); child.setText(18, run["fm_n_path"])
@@ -1722,7 +1895,12 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             st_item.setText(10, ir_info["static"]  if is_ir_block else "-")
             st_item.setText(11, ir_info["dynamic"] if is_ir_block else "-")
             st_item.setText(12, stage["info"]["runtime"])
+            
             s_start = stage["info"]["start"]; s_end = stage["info"]["end"]
+            if self.convert_to_ist:
+                s_start = convert_kst_to_ist_str(s_start)
+                s_end = convert_kst_to_ist_str(s_end)
+
             if self.show_relative_time:
                 st_item.setText(13, relative_time(s_start)); st_item.setText(14, relative_time(s_end))
             else:
@@ -1796,11 +1974,7 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         if src_mode in ["WS",  "ALL"] and self.ws_data:  runs_to_process.extend(self.ws_data.get("all_runs", []))
         if src_mode in ["OUTFEED","ALL"] and self.out_data: runs_to_process.extend(self.out_data.get("all_runs", []))
 
-        # -----------------------------------------------------------------------
-        # FIX: Synchronize BE runs RTL with their FE parent
-        # This prevents BE runs from vanishing when the user selects a specific 
-        # synX release from the dropdown filter, keeping the tree hierarchy intact.
-        # -----------------------------------------------------------------------
+        # Synchronize BE runs RTL with their FE parent
         fe_info = {}
         for run in runs_to_process:
             if run["run_type"] == "FE":
@@ -1814,7 +1988,6 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
                     if run["block"] == blk and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
                         run["rtl"] = fe_rtl
                         break
-        # -----------------------------------------------------------------------
 
         ignored_runs_list, normal_runs_list = [], []
 
@@ -1868,27 +2041,32 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
         for fe_run in fe_runs:
             blk_name = fe_run["block"]; run_rtl = fe_run["rtl"]
             base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
-            block_node = self._get_node(root, blk_name, "BLOCK")
+            
+            base_attach_node = root if self.hide_block_nodes else self._get_node(root, blk_name, "BLOCK")
+
             if sel_rtl == "[ SHOW ALL ]":
-                m_node = self._get_node(block_node, get_milestone(base_rtl), "MILESTONE")
+                m_node = self._get_node(base_attach_node, get_milestone(base_rtl), "MILESTONE")
                 parent_for_run = self._get_node(m_node, base_rtl, "RTL")
             elif sel_rtl == base_rtl and has_syn:
-                parent_for_run = self._get_node(block_node, run_rtl, "RTL")
+                parent_for_run = self._get_node(base_attach_node, run_rtl, "RTL")
             else:
-                parent_for_run = block_node
+                parent_for_run = base_attach_node
+                
             self._create_run_item(parent_for_run, fe_run)
 
         for be_run in be_runs:
             blk_name = be_run["block"]; run_rtl = be_run["rtl"]
             base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
-            block_node = self._get_node(root, blk_name, "BLOCK")
+            
+            base_attach_node = root if self.hide_block_nodes else self._get_node(root, blk_name, "BLOCK")
+
             if sel_rtl == "[ SHOW ALL ]":
-                m_node = self._get_node(block_node, get_milestone(base_rtl), "MILESTONE")
+                m_node = self._get_node(base_attach_node, get_milestone(base_rtl), "MILESTONE")
                 parent_for_run = self._get_node(m_node, base_rtl, "RTL")
             elif sel_rtl == base_rtl and has_syn:
-                parent_for_run = self._get_node(block_node, run_rtl, "RTL")
+                parent_for_run = self._get_node(base_attach_node, run_rtl, "RTL")
             else:
-                parent_for_run = block_node
+                parent_for_run = base_attach_node
 
             fe_parent = None
             for i in range(parent_for_run.childCount()):
@@ -1896,7 +2074,8 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
                 if c.data(0, Qt.UserRole) != "STAGE":
                     fe_base = c.text(0).replace("-FE", "")
                     clean_be = be_run["r_name"].replace("-BE", "")
-                    if clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}"):
+                    # Match exact source AND exact block so they don't cross nest
+                    if c.text(2) == be_run["source"] and c.data(0, Qt.UserRole + 2) == be_run["block"] and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
                         fe_parent = c; break
 
             actual_parent = fe_parent if fe_parent else parent_for_run
@@ -1907,19 +2086,23 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
             for run in ignored_runs_list:
                 blk_name = run["block"]; run_rtl = run["rtl"]
                 base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
-                block_node = self._get_node(ign_root, blk_name, "BLOCK")
+                
+                base_attach_node = ign_root if self.hide_block_nodes else self._get_node(ign_root, blk_name, "BLOCK")
+                
                 if sel_rtl == "[ SHOW ALL ]":
-                    m_node = self._get_node(block_node, get_milestone(base_rtl), "MILESTONE")
+                    m_node = self._get_node(base_attach_node, get_milestone(base_rtl), "MILESTONE")
                     parent_for_run = self._get_node(m_node, base_rtl, "RTL")
                 elif sel_rtl == base_rtl and has_syn:
-                    parent_for_run = self._get_node(block_node, run_rtl, "RTL")
+                    parent_for_run = self._get_node(base_attach_node, run_rtl, "RTL")
                 else:
-                    parent_for_run = block_node
+                    parent_for_run = base_attach_node
+                    
                 item = self._create_run_item(parent_for_run, run)
                 if run["run_type"] == "BE": self._add_stages(item, run, ign_root)
 
         if ign_root.childCount() == 0: root.removeChild(ign_root)
 
+        self.apply_tree_filters()
         self.tree.setSortingEnabled(True)
 
         def restore_state(node):
@@ -1943,26 +2126,58 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
 
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
-        self.tree.resizeColumnToContents(0)
 
         self._refresh_block_colors(list(runs_to_process))
         self._update_status_bar(normal_runs_list)
         self.on_tree_selection_changed()
+        
+        # Ensure column width is recalculated accurately after items are fully rendered/expanded
+        QTimer.singleShot(50, lambda: self.tree.resizeColumnToContents(0))
 
     # ------------------------------------------------------------------
     # CONTEXT MENUS
     # ------------------------------------------------------------------
     def on_header_context_menu(self, pos):
+        col = self.tree.header().logicalIndexAt(pos)
         menu = QMenu(self)
+        col_name = self.tree.headerItem().text(col).replace(" [*]", "")
+
+        sort_asc_act = menu.addAction(f"Sort A to Z")
+        sort_desc_act = menu.addAction(f"Sort Z to A")
+        menu.addSeparator()
+
+        filter_act = menu.addAction(f"Filter Column '{col_name}'...")
+        clear_act = menu.addAction(f"Clear Filter")
+        clear_act.setEnabled(col in self.active_col_filters)
+        
+        clear_all_act = menu.addAction("Clear All Filters")
+        clear_all_act.setEnabled(len(self.active_col_filters) > 0)
+        menu.addSeparator()
+
+        vis_menu = menu.addMenu("Show / Hide Columns")
         for i in range(1, 22):
-            action = QWidgetAction(menu)
-            cb = QCheckBox(self.tree.headerItem().text(i))
+            action = QWidgetAction(vis_menu)
+            cb = QCheckBox(self.tree.headerItem().text(i).replace(" [*]", ""))
             cb.setChecked(not self.tree.isColumnHidden(i))
             cb.setStyleSheet("margin: 2px 8px; background: transparent; color: inherit;")
-            cb.toggled.connect(lambda checked, col=i: self.tree.setColumnHidden(col, not checked))
+            cb.toggled.connect(lambda checked, c=i: self.tree.setColumnHidden(c, not checked))
             action.setDefaultWidget(cb)
-            menu.addAction(action)
-        menu.exec_(self.tree.header().mapToGlobal(pos))
+            vis_menu.addAction(action)
+
+        action = menu.exec_(self.tree.header().mapToGlobal(pos))
+        if action == sort_asc_act:
+            self.tree.sortByColumn(col, Qt.AscendingOrder)
+        elif action == sort_desc_act:
+            self.tree.sortByColumn(col, Qt.DescendingOrder)
+        elif action == filter_act:
+            self.show_column_filter_dialog(col)
+        elif action == clear_act:
+            if col in self.active_col_filters:
+                del self.active_col_filters[col]
+                self.apply_tree_filters()
+        elif action == clear_all_act:
+            self.active_col_filters.clear()
+            self.apply_tree_filters()
 
     def on_context_menu(self, pos):
         item = self.tree.itemAt(pos)
@@ -2135,22 +2350,37 @@ EVT0_ML4_DEV00      : BLK_GPU : golden_run
     # ------------------------------------------------------------------
     # DISK USAGE FEATURE
     # ------------------------------------------------------------------
-    def open_disk_usage(self):
-        if hasattr(self, 'disk_worker') and self.disk_worker.isRunning(): return
+    def start_bg_disk_scan(self, force=False):
+        if self.disk_worker and self.disk_worker.isRunning(): return
+        if not force and self._cached_disk_data is not None: return
+        
         self.disk_btn.setEnabled(False)
-        self.disk_btn.setText("Scanning...")
+        self.disk_btn.setText("Scanning Disk...")
         self.disk_worker = DiskScannerWorker()
-        self.disk_worker.finished_scan.connect(self._on_disk_scan_finished)
+        self.disk_worker.finished_scan.connect(self._on_bg_disk_scan_finished)
         self.disk_worker.start()
 
-    def _on_disk_scan_finished(self, results):
+    def _on_bg_disk_scan_finished(self, results):
+        self._cached_disk_data = results
         self.disk_btn.setEnabled(True)
         self.disk_btn.setText("Disk Space")
-        dlg = DiskUsageDialog(
-            results,
+        
+        if hasattr(self, 'disk_dialog') and self.disk_dialog is not None and self.disk_dialog.isVisible():
+            self.disk_dialog.disk_data = results
+            self.disk_dialog.update_view()
+            self.disk_dialog.recalc_btn.setText("Recalculate Disk Usage")
+            self.disk_dialog.recalc_btn.setEnabled(True)
+
+    def open_disk_usage(self):
+        if self._cached_disk_data is None:
+            QMessageBox.information(self, "Scanning", "Disk usage is still calculating in the background.\nPlease wait a moment and try again.")
+            return
+            
+        self.disk_dialog = DiskUsageDialog(
+            self._cached_disk_data,
             self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"),
             self)
-        dlg.exec_()
+        self.disk_dialog.exec_()
 
     # ------------------------------------------------------------------
     # QoR COMPARISON
