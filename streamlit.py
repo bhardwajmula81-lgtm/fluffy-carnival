@@ -1,4 +1,3 @@
-
 import os
 import glob
 import re
@@ -13,6 +12,7 @@ import getpass
 import shutil
 import math
 import threading
+import configparser
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,27 +22,77 @@ from PyQt5.QtWidgets import (
     QWidgetAction, QCheckBox, QDialog, QFormLayout, QDialogButtonBox,
     QStatusBar, QFrame, QShortcut, QAction, QToolButton, QStyle, QColorDialog,
     QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QProgressDialog,
-    QFileDialog
+    QFileDialog, QCompleter
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QRectF
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QRectF, QStringListModel
 from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush, QPainter, QPen
 
 # ===========================================================================
-# --- CONFIGURATION BLOCK (Project Dependent) ---
+# --- CONFIGURATION INITIALIZATION ---
 # ===========================================================================
-PROJECT_PREFIX = "S5K2P5SP"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(SCRIPT_DIR, "project_config.ini")
+MAIL_USERS_FILE = os.path.join(SCRIPT_DIR, "mail_users.ini")
 
-BASE_WS_FE_DIR   = "/user/s5k2p5sx.fe1/s5k2p5sp/WS"
-BASE_WS_BE_DIR   = "/user/s5k2p5sp.be1/s5k2p5sp/WS"
-BASE_OUTFEED_DIR = "/user/s5k2p5sx.fe1/s5k2p5sp/outfeed"
+config = configparser.ConfigParser()
+DEFAULT_CONFIG = {
+    'PROJECT': {
+        'PROJECT_PREFIX': 'S5K2P5SP',
+        'BASE_WS_FE_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/WS',
+        'BASE_WS_BE_DIR': '/user/s5k2p5sp.be1/s5k2p5sp/WS',
+        'BASE_OUTFEED_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/outfeed',
+        'BASE_IR_DIR': '/user/s5k2p5sx.be1/LAYOUT/IR/ /user/s5k2p5sx.be1/LAYOUT/IR2/'
+    },
+    'TOOLS': {
+        'PNR_TOOL_NAMES': 'fc innovus',
+        'SUMMARY_SCRIPT': '/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py',
+        'FIREFOX_PATH': '/usr/bin/firefox',
+        'MAIL_UTIL': '/user/vwpmailsystem/MAIL/send_mail_for_rhel7',
+        'USER_INFO_UTIL': '/usr/local/bin/user_info'
+    }
+}
 
-BASE_IR_DIR      = "/user/s5k2p5sx.be1/LAYOUT/IR/ /user/s5k2p5sx.be1/LAYOUT/IR2/"
+if not os.path.exists(CONFIG_FILE):
+    config.read_dict(DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            config.write(f)
+    except: pass
+else:
+    config.read(CONFIG_FILE)
 
-PNR_TOOL_NAMES   = "fc innovus"
-SUMMARY_SCRIPT   = "/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py"
-FIREFOX_PATH     = "/usr/bin/firefox"
-MAIL_UTIL        = "/user/vwpmailsystem/MAIL/send_mail_for_rhel7"
-USER_INFO_UTIL   = "/usr/local/bin/user_info"
+# Map Global Variables
+PROJECT_PREFIX   = config.get('PROJECT', 'PROJECT_PREFIX', fallback='S5K2P5SP')
+BASE_WS_FE_DIR   = config.get('PROJECT', 'BASE_WS_FE_DIR', fallback='')
+BASE_WS_BE_DIR   = config.get('PROJECT', 'BASE_WS_BE_DIR', fallback='')
+BASE_OUTFEED_DIR = config.get('PROJECT', 'BASE_OUTFEED_DIR', fallback='')
+BASE_IR_DIR      = config.get('PROJECT', 'BASE_IR_DIR', fallback='')
+
+PNR_TOOL_NAMES   = config.get('TOOLS', 'PNR_TOOL_NAMES', fallback='fc innovus')
+SUMMARY_SCRIPT   = config.get('TOOLS', 'SUMMARY_SCRIPT', fallback='')
+FIREFOX_PATH     = config.get('TOOLS', 'FIREFOX_PATH', fallback='/usr/bin/firefox')
+MAIL_UTIL        = config.get('TOOLS', 'MAIL_UTIL', fallback='')
+USER_INFO_UTIL   = config.get('TOOLS', 'USER_INFO_UTIL', fallback='')
+
+# Load Mail Config
+mail_config = configparser.ConfigParser()
+DEFAULT_MAIL_CONFIG = {
+    'PERMANENT_MEMBERS': {
+        'always_to': '',
+        'always_cc': 'mohit.bhar'
+    },
+    'KNOWN_USERS': {
+        'users': ''
+    }
+}
+if not os.path.exists(MAIL_USERS_FILE):
+    mail_config.read_dict(DEFAULT_MAIL_CONFIG)
+    try:
+        with open(MAIL_USERS_FILE, 'w') as f:
+            mail_config.write(f)
+    except: pass
+else:
+    mail_config.read(MAIL_USERS_FILE)
 
 # ===========================================================================
 # --- THREAD-SAFE CACHE ---
@@ -52,21 +102,17 @@ _path_cache_lock = threading.Lock()
 
 def cached_exists(path):
     with _path_cache_lock:
-        if path in _path_cache:
-            return _path_cache[path]
+        if path in _path_cache: return _path_cache[path]
     result = os.path.exists(path)
-    with _path_cache_lock:
-        _path_cache[path] = result
+    with _path_cache_lock: _path_cache[path] = result
     return result
 
 def clear_path_cache():
-    with _path_cache_lock:
-        _path_cache.clear()
+    with _path_cache_lock: _path_cache.clear()
 
 def prefetch_path_cache(paths):
     unique_paths = [p for p in set(paths) if p]
-    if not unique_paths:
-        return
+    if not unique_paths: return
     max_w = min(30, len(unique_paths))
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as ex:
         results = list(ex.map(os.path.exists, unique_paths))
@@ -79,18 +125,13 @@ def prefetch_path_cache(paths):
 # ===========================================================================
 def convert_kst_to_ist_str(time_str):
     if not time_str or time_str == "N/A": return time_str
-    formats = [
-        "%a %b %d, %Y - %H:%M:%S",
-        "%b %d, %Y - %H:%M",
-        "%b %d, %Y - %H:%M:%S"
-    ]
+    formats = ["%a %b %d, %Y - %H:%M:%S", "%b %d, %Y - %H:%M", "%b %d, %Y - %H:%M:%S"]
     for fmt in formats:
         try:
             dt = datetime.datetime.strptime(time_str, fmt)
             dt_ist = dt - datetime.timedelta(hours=3, minutes=30)
             return dt_ist.strftime(fmt)
-        except ValueError:
-            continue
+        except ValueError: continue
     return time_str
 
 def relative_time(date_str):
@@ -98,8 +139,7 @@ def relative_time(date_str):
     try:
         m = re.search(r'(\w{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{2}):(\d{2})', str(date_str))
         if not m: return date_str
-        month_map = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
-                     "Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
+        month_map = {"Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,"Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
         mon, day, year, hour, minute = m.groups()
         dt = datetime.datetime(int(year), month_map.get(mon, 1), int(day), int(hour), int(minute))
         delta = datetime.datetime.now() - dt
@@ -107,15 +147,15 @@ def relative_time(date_str):
         if total_seconds < 0: return date_str
         if total_seconds < 3600: return f"{total_seconds // 60}m ago"
         if total_seconds < 86400: return f"{total_seconds // 3600}h {(total_seconds % 3600) // 60}m ago"
-        days = total_seconds // 86400
-        return f"{days}d ago"
+        return f"{total_seconds // 86400}d ago"
     except: return date_str
 
 def get_user_email(username):
+    username = username.strip()
     if not username or username == "Unknown": return ""
+    if "@" in username: return username
     try:
-        res = subprocess.check_output([USER_INFO_UTIL, '-a', username],
-                                      stderr=subprocess.DEVNULL).decode('utf-8')
+        res = subprocess.check_output([USER_INFO_UTIL, '-a', username], stderr=subprocess.DEVNULL).decode('utf-8')
         match = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', res)
         if match: return match.group(0)
     except: pass
@@ -124,11 +164,10 @@ def get_user_email(username):
 def get_partition_space(path_str):
     try:
         total, used, free = shutil.disk_usage(path_str)
-        t_gb = total / (1024**3); u_gb = used / (1024**3)
-        f_gb = free / (1024**3); perc = (used / total) * 100 if total > 0 else 0
+        t_gb = total / (1024**3); u_gb = used / (1024**3); f_gb = free / (1024**3)
+        perc = (used / total) * 100 if total > 0 else 0
         return f"Total: {t_gb:.1f} GB | Used: {u_gb:.1f} GB ({perc:.1f}%) | Free: {f_gb:.1f} GB"
-    except:
-        return "Partition Space Information Unavailable"
+    except: return "Partition Space Information Unavailable"
 
 def get_owner(path):
     if not path or not cached_exists(path): return "Unknown"
@@ -148,9 +187,7 @@ def get_milestone(rtl_str):
 
 def format_log_date(date_str):
     match = re.search(r'([A-Z][a-z]{2})\s+([A-Z][a-z]{2})\s+(\d+)\s+(\d{2}:\d{2}:\d{2})\s+(\d{4})', str(date_str))
-    if match:
-        day_of_week, mon, day, t, year = match.groups()
-        return f"{day_of_week} {mon} {day}, {year} - {t}"
+    if match: return f"{match.group(1)} {match.group(2)} {match.group(3)}, {match.group(5)} - {match.group(4)}"
     return str(date_str).strip()
 
 def get_dynamic_evt_path(rtl_tag, block_name):
@@ -217,8 +254,7 @@ def parse_pnr_runtime_rpt(file_path):
                         last_ts = ts_match
                         target_match = time_matches[1] if len(time_matches) > 1 else time_matches[0]
                         days, hours, mins, secs = map(int, target_match)
-                        total_hours = days * 24 + hours
-                        final_time_str = f"{total_hours:02}h:{mins:02}m:{secs:02}s"
+                        final_time_str = f"{days*24+hours:02}h:{mins:02}m:{secs:02}s"
                         if len(parts) > 1 and not parts[1].isdigit(): d["last_stage"] = parts[1]
         if first_ts:
             y, mo, day, H, M = first_ts.groups()
@@ -240,6 +276,30 @@ def extract_rtl(run_dir):
                 if m: return normalize_rtl(m.group(1))
     except: pass
     return "Unknown"
+
+def find_latest_qor_report():
+    h = glob.glob(os.path.join(os.getcwd(), "qor_metrices/**/summary.html"), recursive=True)
+    if h: return sorted(h, key=os.path.getmtime)[-1]
+    return None
+
+def save_mail_users_config(new_users):
+    try:
+        mail_config.read(MAIL_USERS_FILE)
+        existing_str = mail_config.get('KNOWN_USERS', 'users', fallback='')
+        existing = set([u.strip() for u in existing_str.split(',') if u.strip()])
+        existing.update(new_users)
+        if not mail_config.has_section('KNOWN_USERS'): mail_config.add_section('KNOWN_USERS')
+        mail_config.set('KNOWN_USERS', 'users', ', '.join(sorted(existing)))
+        with open(MAIL_USERS_FILE, 'w') as f:
+            mail_config.write(f)
+    except: pass
+
+def get_all_known_mail_users():
+    try:
+        mail_config.read(MAIL_USERS_FILE)
+        existing_str = mail_config.get('KNOWN_USERS', 'users', fallback='')
+        return sorted(list(set([u.strip() for u in existing_str.split(',') if u.strip()])))
+    except: return []
 
 # ===========================================================================
 # --- CUSTOM SORTING UI CLASS ---
@@ -275,6 +335,128 @@ class CustomTreeItem(QTreeWidgetItem):
 # ===========================================================================
 # --- UI DIALOGS ---
 # ===========================================================================
+
+class MultiCompleterLineEdit(QLineEdit):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.completer = QCompleter()
+        self.completer.setWidget(self)
+        self.completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.completer.activated.connect(self.insertCompletion)
+        self.words = []
+
+    def setModel(self, string_list):
+        self.words = string_list
+        model = QStringListModel(self.words, self.completer)
+        self.completer.setModel(model)
+
+    def insertCompletion(self, completion):
+        text = self.text()
+        parts = text.split(',')
+        if len(parts) > 1: text = ','.join(parts[:-1]) + ', ' + completion + ', '
+        else: text = completion + ', '
+        self.setText(text)
+
+    def keyPressEvent(self, e):
+        if self.completer.popup().isVisible():
+            if e.key() in (Qt.Key_Enter, Qt.Key_Return):
+                e.ignore()
+                return
+        super().keyPressEvent(e)
+        cr = self.cursorRect()
+        cr.setWidth(self.completer.popup().sizeHintForColumn(0) + self.completer.popup().verticalScrollBar().sizeHint().width())
+        
+        text = self.text()
+        current_word = text.split(',')[-1].strip()
+        
+        if current_word:
+            self.completer.setCompletionPrefix(current_word)
+            if self.completer.completionCount() > 0:
+                self.completer.complete(cr)
+            else:
+                self.completer.popup().hide()
+        else:
+            self.completer.popup().hide()
+
+
+class AdvancedMailDialog(QDialog):
+    def __init__(self, default_subject, default_body, all_users, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Send EMail Message")
+        self.resize(700, 550)
+        self.attachments = []
+        
+        layout = QVBoxLayout(self)
+        
+        form_layout = QFormLayout()
+        self.to_input = MultiCompleterLineEdit()
+        self.to_input.setModel(all_users)
+        
+        self.cc_input = MultiCompleterLineEdit()
+        self.cc_input.setModel(all_users)
+        
+        # Populate defaults from mail_config
+        try:
+            always_to = mail_config.get('PERMANENT_MEMBERS', 'always_to', fallback='').strip()
+            always_cc = mail_config.get('PERMANENT_MEMBERS', 'always_cc', fallback='').strip()
+            if always_to: self.to_input.setText(always_to + (', ' if not always_to.endswith(',') else ' '))
+            if always_cc: self.cc_input.setText(always_cc + (', ' if not always_cc.endswith(',') else ' '))
+        except: pass
+
+        self.subject_input = QLineEdit(default_subject)
+        
+        form_layout.addRow("<b>To:</b>", self.to_input)
+        form_layout.addRow("<b>CC:</b>", self.cc_input)
+        form_layout.addRow("<b>Subject:</b>", self.subject_input)
+        layout.addLayout(form_layout)
+
+        # Attachments Section
+        attach_layout = QHBoxLayout()
+        attach_layout.addWidget(QLabel("<b>Attachments:</b>"))
+        self.attach_lbl = QLabel("None")
+        self.attach_lbl.setStyleSheet("color: #1976D2;")
+        attach_layout.addWidget(self.attach_lbl)
+        attach_layout.addStretch()
+        
+        btn_qor = QPushButton("Attach Latest QoR Report")
+        btn_qor.clicked.connect(self.attach_qor)
+        btn_browse = QPushButton("Browse Files...")
+        btn_browse.clicked.connect(self.browse_files)
+        attach_layout.addWidget(btn_qor)
+        attach_layout.addWidget(btn_browse)
+        layout.addLayout(attach_layout)
+
+        self.body_input = QTextEdit()
+        self.body_input.setPlainText(default_body)
+        layout.addWidget(self.body_input)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Send | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def update_attach_lbl(self):
+        if not self.attachments: self.attach_lbl.setText("None")
+        else: self.attach_lbl.setText(f"{len(self.attachments)} file(s) attached: " + ", ".join([os.path.basename(p) for p in self.attachments]))
+
+    def attach_qor(self):
+        report = find_latest_qor_report()
+        if report:
+            if report not in self.attachments:
+                self.attachments.append(report)
+                self.update_attach_lbl()
+        else:
+            QMessageBox.warning(self, "Not Found", "No QoR summary.html found in the current environment.")
+
+    def browse_files(self):
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Attachments", "", "All Files (*)")
+        if files:
+            for f in files:
+                if f not in self.attachments: self.attachments.append(f)
+            self.update_attach_lbl()
+
+
 class FilterDialog(QDialog):
     def __init__(self, col_name, unique_values, active_values, parent=None):
         super().__init__(parent)
@@ -399,29 +581,7 @@ class SettingsDialog(QDialog):
         c = QColorDialog.getColor(QColor(self.sel_color), self)
         if c.isValid(): self.sel_color = c.name()
 
-class MailDialog(QDialog):
-    def __init__(self, default_subject, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Group Mail Configuration")
-        self.resize(600, 250)
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        self.subject_input = QLineEdit(default_subject)
-        form.addRow("Subject:", self.subject_input)
-        layout.addLayout(form)
-        layout.addWidget(QLabel("Message Header (The selected runs will be appended automatically below this):"))
-        self.body_input = QTextEdit()
-        self.body_input.setPlainText("Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:")
-        layout.addWidget(self.body_input)
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        self.buttons.button(QDialogButtonBox.Ok).setText("Send Mail")
-        self.buttons.accepted.connect(self.accept)
-        self.buttons.rejected.connect(self.reject)
-        layout.addWidget(self.buttons)
 
-# ===========================================================================
-# --- PIE CHART & DISK USAGE UI ---
-# ===========================================================================
 class PieChartWidget(QWidget):
     def __init__(self):
         super().__init__()
@@ -593,23 +753,39 @@ class DiskUsageDialog(QDialog):
         if not user_runs:
             QMessageBox.warning(self, "No Directories Selected", "Please check at least one directory to request cleanup.")
             return
-        dlg = MailDialog("Action Required: Please clean up heavy disk usage runs", self)
+            
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("Action Required: Please clean up heavy disk usage runs",
+                                 "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n",
+                                 all_known, self)
+        
         if dlg.exec_():
             subject = dlg.subject_input.text().strip()
             body_template = dlg.body_input.toPlainText()
             current_user = getpass.getuser()
             sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
             success_count = 0
             for owner, paths in user_runs.items():
                 owner_email = get_user_email(owner)
                 if not owner_email: continue
-                final_body = body_template + "\n\n" + "\n".join(paths)
-                cmd = [MAIL_UTIL, "-to", owner_email, "-sd", sender_email,
-                       "-s", subject, "-c", final_body, "-fm", "text"]
+                
+                final_body = body_template + "\n" + "\n".join(paths)
+                
+                all_recipients = set(base_to + base_cc + [owner_email])
+                recipients_str = ",".join(all_recipients)
+                
+                cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
+                for att in dlg.attachments:
+                    cmd.extend(["-a", att])
+                    
                 try:
                     subprocess.Popen(cmd); success_count += 1
                 except Exception as e:
-                    print(f"Failed to send mail to {owner_email}: {e}")
+                    print(f"Failed to send mail: {e}")
             QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} cleanup emails.")
 
 # ===========================================================================
@@ -1035,6 +1211,7 @@ class PDDashboard(QMainWindow):
         self.convert_to_ist       = False
         self.hide_block_nodes     = False
         self._columns_fitted_once = False
+        self._initial_size_calc_done = False
         self._last_scan_time      = None
         self.is_compact           = False
 
@@ -1048,7 +1225,6 @@ class PDDashboard(QMainWindow):
         self.current_config_path = None
         self.active_col_filters  = {}
         
-        # Disk caching
         self._cached_disk_data = None
         self.disk_worker = None
 
@@ -1062,13 +1238,9 @@ class PDDashboard(QMainWindow):
         self.init_ui()
         self._setup_shortcuts()
         
-        # Trigger background scans on init
         self.start_fs_scan()
         self.start_bg_disk_scan()
 
-    # ------------------------------------------------------------------
-    # CLOSE EVENT
-    # ------------------------------------------------------------------
     def closeEvent(self, event):
         os._exit(0)
 
@@ -1240,6 +1412,10 @@ class PDDashboard(QMainWindow):
         self.tree.setColumnWidth(14, 120)
 
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
+        
+        # Auto-fit Column 0 on Expand/Collapse
+        self.tree.itemExpanded.connect(lambda: self.tree.resizeColumnToContents(0))
+        self.tree.itemCollapsed.connect(lambda: self.tree.resizeColumnToContents(0))
 
         for i in [15, 16, 17, 18, 19, 20, 21]: self.tree.setColumnHidden(i, True)
 
@@ -1596,6 +1772,16 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
             self.fit_all_columns()
+            
+        if not self._initial_size_calc_done:
+            self._initial_size_calc_done = True
+            self.calculate_all_sizes()
+
+        # Update dynamic mail users config list
+        all_owners = set()
+        for r in self.ws_data.get("all_runs", []) + self.out_data.get("all_runs", []):
+            if r.get("owner") and r["owner"] != "Unknown": all_owners.add(r["owner"])
+        if all_owners: save_mail_users_config(all_owners)
 
     def on_source_changed(self):
         src_mode = self.src_combo.currentText()
@@ -1615,7 +1801,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             blocks.update(self.out_data.get("blocks", set()))
 
         current_rtl  = self.rel_combo.currentText()
-        saved_states = {self.blk_list.item(i).text(): self.blk_list.item(i).checkState()
+        saved_states = {self.blk_list.item(i).data(Qt.UserRole): self.blk_list.item(i).checkState()
                         for i in range(self.blk_list.count())}
 
         self.rel_combo.blockSignals(True); self.rel_combo.clear()
@@ -1628,6 +1814,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self.blk_list.blockSignals(True); self.blk_list.clear()
         for b in sorted(blocks):
             it = QListWidgetItem(b)
+            it.setData(Qt.UserRole, b) # Store RAW block name
             it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
             it.setCheckState(saved_states.get(b, Qt.Checked))
             self.blk_list.addItem(it)
@@ -1926,22 +2113,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
 
     # ------------------------------------------------------------------
-    # BLOCK SIDEBAR COLORS
-    # ------------------------------------------------------------------
-    def _block_aggregate_status(self, block_name, runs):
-        for r in runs:
-            if r["block"] == block_name and r["run_type"] == "FE" and not r["is_comp"]: return "running"
-        return "done"
-
-    def _refresh_block_colors(self, runs):
-        for i in range(self.blk_list.count()):
-            it = self.blk_list.item(i)
-            status = self._block_aggregate_status(it.text(), runs)
-            it.setForeground(QColor("#0277bd" if not self.is_dark_mode else "#64b5f6")
-                             if status == "running"
-                             else QColor("#2e7d32" if not self.is_dark_mode else "#81c784"))
-
-    # ------------------------------------------------------------------
     # MAIN REFRESH
     # ------------------------------------------------------------------
     def refresh_view(self):
@@ -1968,23 +2139,29 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         src_mode   = self.src_combo.currentText()
         sel_rtl    = self.rel_combo.currentText()
         is_filtered = (self.view_combo.currentText() != "All Runs") or (self.search.text().strip() != "")
+        is_running_view = (self.view_combo.currentText() == "Running Only")
 
         raw_query      = self.search.text().lower().strip()
         search_pattern = "*" if not raw_query else (f"*{raw_query}*" if '*' not in raw_query else raw_query)
 
-        checked_blks = [self.blk_list.item(i).text() for i in range(self.blk_list.count())
+        checked_blks = [self.blk_list.item(i).data(Qt.UserRole) for i in range(self.blk_list.count())
                         if self.blk_list.item(i).checkState() == Qt.Checked]
 
         runs_to_process = []
         if src_mode in ["WS",  "ALL"] and self.ws_data:  runs_to_process.extend(self.ws_data.get("all_runs", []))
         if src_mode in ["OUTFEED","ALL"] and self.out_data: runs_to_process.extend(self.out_data.get("all_runs", []))
 
+        # Dynamically fetch running count per block to update sidebar
+        running_counts = {b: 0 for b in [self.blk_list.item(x).data(Qt.UserRole) for x in range(self.blk_list.count())]}
+        
         # Synchronize BE runs RTL with their FE parent
         fe_info = {}
         for run in runs_to_process:
             if run["run_type"] == "FE":
                 fe_base = run["r_name"].replace("-FE", "")
                 fe_info[(run["block"], fe_base)] = run["rtl"]
+                if not run["is_comp"]:
+                    if run["block"] in running_counts: running_counts[run["block"]] += 1
 
         for run in runs_to_process:
             if run["run_type"] == "BE":
@@ -1994,13 +2171,23 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                         run["rtl"] = fe_rtl
                         break
 
+        # Sidebar text update
+        for i in range(self.blk_list.count()):
+            it = self.blk_list.item(i)
+            raw_name = it.data(Qt.UserRole)
+            if is_running_view:
+                c = running_counts.get(raw_name, 0)
+                it.setText(f"{raw_name} - {c} runs" if c > 0 else f"{raw_name} - NO runs")
+            else:
+                it.setText(raw_name)
+
+
         ignored_runs_list, normal_runs_list = [], []
 
         for run in runs_to_process:
             if run["path"] in self.ignored_paths: ignored_runs_list.append(run); continue
             if run["block"] not in checked_blks: continue
 
-            # NEW 4-TIER CONFIG CHECK
             if self.run_filter_config is not None:
                 r_src = run["source"]
                 r_rtl = run["rtl"]
@@ -2081,7 +2268,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                 if c.data(0, Qt.UserRole) != "STAGE":
                     fe_base = c.text(0).replace("-FE", "")
                     clean_be = be_run["r_name"].replace("-BE", "")
-                    # Match exact source AND exact block so they don't cross nest
                     if c.text(2) == be_run["source"] and c.data(0, Qt.UserRole + 2) == be_run["block"] and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
                         fe_parent = c; break
 
@@ -2134,11 +2320,9 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
 
-        self._refresh_block_colors(list(runs_to_process))
         self._update_status_bar(normal_runs_list)
         self.on_tree_selection_changed()
         
-        # Ensure column width is recalculated accurately after items are fully rendered/expanded
         QTimer.singleShot(50, lambda: self.tree.resizeColumnToContents(0))
 
     # ------------------------------------------------------------------
@@ -2297,23 +2481,13 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             step_name = item.data(1, Qt.UserRole)
             qor_path  = item.data(2, Qt.UserRole)
             subprocess.run(["python3.6", SUMMARY_SCRIPT, qor_path, "-stage", step_name])
-            h = glob.glob(os.path.join(os.getcwd(), "qor_metrices/**/summary.html"), recursive=True)
-            if h: subprocess.Popen([FIREFOX_PATH, sorted(h, key=os.path.getmtime)[-1]])
-
-    def on_item_double_clicked(self, item, col):
-        if item.parent():
-            log = item.text(16)
-            if log and cached_exists(log): subprocess.Popen(['gvim', log])
+            h = find_latest_qor_report()
+            if h: subprocess.Popen([FIREFOX_PATH, h])
 
     # ------------------------------------------------------------------
     # MAIL FEATURE
     # ------------------------------------------------------------------
     def send_mail_action(self):
-        if not self._checked_paths:
-            QMessageBox.warning(self, "No Runs Selected",
-                                "Please select at least one run using the checkboxes before sending mail.")
-            return
-
         user_runs = {}
         is_fe_selected = False
 
@@ -2331,30 +2505,53 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                 find_owners(c)
         find_owners(self.tree.invisibleRootItem())
 
-        if not user_runs:
-            QMessageBox.warning(self, "Unknown Users", "Could not determine the owners for the selected runs.")
-            return
-
-        default_subject = "Please remove your old PI runs" if is_fe_selected else "Please remove your old PD runs"
-        dlg = MailDialog(default_subject, self)
+        default_subject = "Action Required: Please clean up heavy disk usage runs"
+        if user_runs:
+            default_subject = "Please remove your old PI runs" if is_fe_selected else "Please remove your old PD runs"
+            
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog(default_subject,
+                                 "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n",
+                                 all_known, self)
+                                 
         if dlg.exec_():
-            subject       = dlg.subject_input.text().strip()
+            subject = dlg.subject_input.text().strip()
             body_template = dlg.body_input.toPlainText()
-            current_user  = getpass.getuser()
-            sender_email  = get_user_email(current_user) or f"{current_user}@samsung.com"
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
             success_count = 0
-            for owner, paths in user_runs.items():
-                owner_email = get_user_email(owner)
-                if not owner_email: continue
-                final_body = body_template + "\n\n" + "\n".join(paths)
-                cmd = [MAIL_UTIL, "-to", owner_email, "-sd", sender_email,
-                       "-s", subject, "-c", final_body, "-fm", "text"]
-                try:
-                    subprocess.Popen(cmd); success_count += 1
-                except Exception as e:
-                    print(f"Failed to send mail to {owner_email}: {e}")
-            QMessageBox.information(self, "Mail Operation Complete",
-                                    f"Successfully triggered {success_count} emails to individual owners.")
+            
+            if not user_runs:
+                # Send generic mail if no runs checked
+                all_recipients = set(base_to + base_cc)
+                if not all_recipients: return
+                recipients_str = ",".join(all_recipients)
+                cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+                for att in dlg.attachments: cmd.extend(["-a", att])
+                try: subprocess.Popen(cmd); success_count += 1
+                except: pass
+            else:
+                for owner, paths in user_runs.items():
+                    owner_email = get_user_email(owner)
+                    if not owner_email: continue
+                    
+                    final_body = body_template + "\n" + "\n".join(paths)
+                    all_recipients = set(base_to + base_cc + [owner_email])
+                    recipients_str = ",".join(all_recipients)
+                    
+                    cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
+                    for att in dlg.attachments: cmd.extend(["-a", att])
+                        
+                    try:
+                        subprocess.Popen(cmd); success_count += 1
+                    except Exception as e:
+                        print(f"Failed to send mail: {e}")
+                        
+            QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} emails.")
 
     # ------------------------------------------------------------------
     # DISK USAGE FEATURE
@@ -2410,8 +2607,8 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         get_checked(root)
         if len(sel) < 2: return
         subprocess.run(["python3.6", SUMMARY_SCRIPT] + sel)
-        h = glob.glob(os.path.join(os.getcwd(), "qor_metrices/**/summary.html"), recursive=True)
-        if h: subprocess.Popen([FIREFOX_PATH, sorted(h, key=os.path.getmtime)[-1]])
+        h = find_latest_qor_report()
+        if h: subprocess.Popen([FIREFOX_PATH, h])
 
 # ===========================================================================
 if __name__ == "__main__":
