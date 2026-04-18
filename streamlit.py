@@ -13,6 +13,7 @@ import shutil
 import math
 import threading
 import configparser
+import json
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -22,7 +23,7 @@ from PyQt5.QtWidgets import (
     QWidgetAction, QCheckBox, QDialog, QFormLayout, QDialogButtonBox,
     QStatusBar, QFrame, QShortcut, QAction, QToolButton, QStyle, QColorDialog,
     QTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QProgressDialog,
-    QFileDialog, QCompleter
+    QFileDialog, QCompleter, QGroupBox
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QDateTime, QRectF, QStringListModel
 from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrush, QPainter, QPen
@@ -33,6 +34,11 @@ from PyQt5.QtGui import QColor, QFont, QClipboard, QKeySequence, QPalette, QBrus
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "project_config.ini")
 MAIL_USERS_FILE = os.path.join(SCRIPT_DIR, "mail_users.ini")
+NOTES_DIR = os.path.join(SCRIPT_DIR, "dashboard_notes")
+
+if not os.path.exists(NOTES_DIR):
+    try: os.makedirs(NOTES_DIR)
+    except: pass
 
 config = configparser.ConfigParser()
 DEFAULT_CONFIG = {
@@ -301,6 +307,41 @@ def get_all_known_mail_users():
         return sorted(list(set([u.strip() for u in existing_str.split(',') if u.strip()])))
     except: return []
 
+def load_all_notes():
+    global_notes = {}
+    if not os.path.exists(NOTES_DIR): return global_notes
+    for file in os.listdir(NOTES_DIR):
+        if file.endswith(".json"):
+            try:
+                with open(os.path.join(NOTES_DIR, file), 'r') as f:
+                    data = json.load(f)
+                    for key, val in data.items():
+                        if key not in global_notes: global_notes[key] = []
+                        global_notes[key].append(val)
+            except: pass
+    return global_notes
+
+def save_user_note(identifier, note_text):
+    current_user = getpass.getuser()
+    user_file = os.path.join(NOTES_DIR, f"notes_{current_user}.json")
+    user_data = {}
+    if os.path.exists(user_file):
+        try:
+            with open(user_file, 'r') as f:
+                user_data = json.load(f)
+        except: pass
+    
+    if note_text.strip():
+        user_data[identifier] = f"[{current_user}] {note_text.strip()}"
+    else:
+        if identifier in user_data: del user_data[identifier]
+        
+    try:
+        with open(user_file, 'w') as f:
+            json.dump(user_data, f, indent=4)
+    except Exception as e:
+        print(f"Failed to save note: {e}")
+
 # ===========================================================================
 # --- CUSTOM SORTING UI CLASS ---
 # ===========================================================================
@@ -335,7 +376,6 @@ class CustomTreeItem(QTreeWidgetItem):
 # ===========================================================================
 # --- UI DIALOGS ---
 # ===========================================================================
-
 class MultiCompleterLineEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -381,7 +421,7 @@ class MultiCompleterLineEdit(QLineEdit):
 
 
 class AdvancedMailDialog(QDialog):
-    def __init__(self, default_subject, default_body, all_users, parent=None):
+    def __init__(self, default_subject, default_body, all_users, prefill_to="", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Send EMail Message")
         self.resize(700, 550)
@@ -396,11 +436,15 @@ class AdvancedMailDialog(QDialog):
         self.cc_input = MultiCompleterLineEdit()
         self.cc_input.setModel(all_users)
         
-        # Populate defaults from mail_config
         try:
             always_to = mail_config.get('PERMANENT_MEMBERS', 'always_to', fallback='').strip()
             always_cc = mail_config.get('PERMANENT_MEMBERS', 'always_cc', fallback='').strip()
-            if always_to: self.to_input.setText(always_to + (', ' if not always_to.endswith(',') else ' '))
+            
+            final_to = always_to
+            if prefill_to:
+                final_to = always_to + (", " if always_to else "") + prefill_to
+                
+            if final_to: self.to_input.setText(final_to + (', ' if not final_to.endswith(',') else ' '))
             if always_cc: self.cc_input.setText(always_cc + (', ' if not always_cc.endswith(',') else ' '))
         except: pass
 
@@ -431,7 +475,8 @@ class AdvancedMailDialog(QDialog):
         self.body_input.setPlainText(default_body)
         layout.addWidget(self.body_input)
 
-        self.buttons = QDialogButtonBox(QDialogButtonBox.Send | QDialogButtonBox.Cancel)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self.buttons.button(QDialogButtonBox.Ok).setText("Send Mail")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         layout.addWidget(self.buttons)
@@ -456,6 +501,80 @@ class AdvancedMailDialog(QDialog):
                 if f not in self.attachments: self.attachments.append(f)
             self.update_attach_lbl()
 
+class ScanSummaryDialog(QDialog):
+    def __init__(self, stats, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Scan Complete")
+        self.resize(500, 450)
+        layout = QVBoxLayout(self)
+
+        header = QLabel("<b>Scan Summary</b>")
+        font = header.font()
+        font.setPointSize(14)
+        header.setFont(font)
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine); sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+
+        grid = QFormLayout()
+        grid.addRow("<b>Total Workspace Runs Found:</b>", QLabel(str(stats['ws'])))
+        grid.addRow("<b>Total Outfeed Runs Found:</b>", QLabel(str(stats['outfeed'])))
+        grid.addRow("", QLabel(""))
+        grid.addRow("<b>Total FC Runs:</b>", QLabel(str(stats['fc'])))
+        grid.addRow("<b>Total Innovus Runs:</b>", QLabel(str(stats['innovus'])))
+        layout.addLayout(grid)
+
+        layout.addWidget(QLabel("<b>Runs per Block Breakdown:</b>"))
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["Block Name", "Number of Runs"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.setRowCount(len(stats['blocks']))
+        
+        row = 0
+        for blk, count in sorted(stats['blocks'].items(), key=lambda x: x[1], reverse=True):
+            table.setItem(row, 0, QTableWidgetItem(blk))
+            count_item = QTableWidgetItem(str(count))
+            count_item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(row, 1, count_item)
+            row += 1
+            
+        layout.addWidget(table)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok)
+        btn_box.accepted.connect(self.accept)
+        layout.addWidget(btn_box)
+
+
+class EditNoteDialog(QDialog):
+    def __init__(self, current_text, identifier_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Alias / Personal Note")
+        self.resize(400, 250)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"<b>Edit Note for:</b><br>{identifier_name}"))
+        
+        self.text_edit = QTextEdit()
+        # Clean current user tag if editing own note
+        clean_text = current_text
+        user_tag = f"[{getpass.getuser()}]"
+        if user_tag in clean_text:
+            clean_text = clean_text.split(user_tag)[-1].strip()
+        self.text_edit.setPlainText(clean_text)
+        layout.addWidget(self.text_edit)
+        
+        layout.addWidget(QLabel("<i>Notes are visible to all dashboard users.</i>"))
+        
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addWidget(self.buttons)
+
+    def get_text(self):
+        return self.text_edit.toPlainText().strip()
 
 class FilterDialog(QDialog):
     def __init__(self, col_name, unique_values, active_values, parent=None):
@@ -757,7 +876,7 @@ class DiskUsageDialog(QDialog):
         all_known = get_all_known_mail_users()
         dlg = AdvancedMailDialog("Action Required: Please clean up heavy disk usage runs",
                                  "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n",
-                                 all_known, self)
+                                 all_known, "", self)
         
         if dlg.exec_():
             subject = dlg.subject_input.text().strip()
@@ -902,8 +1021,9 @@ class DiskScannerWorker(QThread):
 # --- MAIN SCANNER WORKER ---
 # ===========================================================================
 class ScannerWorker(QThread):
-    finished        = pyqtSignal(dict, dict, dict)
+    finished        = pyqtSignal(dict, dict, dict, dict)
     progress_update = pyqtSignal(int, int)
+    status_update   = pyqtSignal(str)
 
     def scan_ir_dir(self):
         ir_data = {}
@@ -1009,8 +1129,12 @@ class ScannerWorker(QThread):
 
     def run(self):
         clear_path_cache()
+        self.status_update.emit("Discovering Workspaces...")
+        
         ws_data  = {"releases": {}, "blocks": set(), "all_runs": []}
         out_data = {"releases": {}, "blocks": set(), "all_runs": []}
+        scan_stats = {'ws': 0, 'outfeed': 0, 'blocks': {}, 'fc': 0, 'innovus': 0}
+        
         tasks = []
         tools_to_scan = PNR_TOOL_NAMES.split()
 
@@ -1034,6 +1158,7 @@ class ScannerWorker(QThread):
                         for p in paths: self._map_release(ws_data, rtl, p)
                 except: pass
 
+        self.status_update.emit("Discovering OUTFEED directories...")
         if os.path.exists(BASE_OUTFEED_DIR):
             for ent_name in os.listdir(BASE_OUTFEED_DIR):
                 ent_path = os.path.join(BASE_OUTFEED_DIR, ent_name)
@@ -1058,12 +1183,15 @@ class ScannerWorker(QThread):
             paths_to_prefetch.append(os.path.join(rd, "pass/compile_opt.pass"))
             paths_to_prefetch.append(os.path.join(rd, "logs/compile_opt.log"))
             paths_to_prefetch.append(os.path.join(rd, "reports/runtime.V2.rpt"))
+            
+        self.status_update.emit("Prefetching file metadata...")
         prefetch_path_cache(paths_to_prefetch)
 
         total_tasks = len(tasks)
         completed_tasks = 0
         max_w = min(40, (os.cpu_count() or 4) * 6)
 
+        self.status_update.emit("Processing run data and parsing reports...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
             ir_future = executor.submit(self.scan_ir_dir)
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
@@ -1074,19 +1202,32 @@ class ScannerWorker(QThread):
                         if result["source"] == "WS":
                             ws_data["blocks"].add(result["block"])
                             ws_data["all_runs"].append(result)
+                            scan_stats['ws'] += 1
                             if result["run_type"] == "BE":
                                 self._map_release(ws_data, result["rtl"], result["parent"])
                         else:
                             out_data["blocks"].add(result["block"])
                             out_data["all_runs"].append(result)
+                            scan_stats['outfeed'] += 1
                             self._map_release(out_data, result["rtl"], result["path"])
+                            
+                        # Stat gathering
+                        blk = result["block"]
+                        if blk not in scan_stats['blocks']: scan_stats['blocks'][blk] = 0
+                        scan_stats['blocks'][blk] += 1
+                        
+                        if "/fc/" in result["path"]: scan_stats['fc'] += 1
+                        elif "/innovus/" in result["path"]: scan_stats['innovus'] += 1
+                            
                 except Exception: pass
                 completed_tasks += 1
                 self.progress_update.emit(completed_tasks, total_tasks)
+                if completed_tasks % 20 == 0:
+                    self.status_update.emit(f"Processing runs... ({completed_tasks}/{total_tasks})")
 
             ir_data = ir_future.result()
 
-        self.finished.emit(ws_data, out_data, ir_data)
+        self.finished.emit(ws_data, out_data, ir_data, scan_stats)
 
     def _thread_process_run(self, task_tuple):
         b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
@@ -1199,6 +1340,7 @@ class PDDashboard(QMainWindow):
         self.ws_data  = {}
         self.out_data = {}
         self.ir_data  = {}
+        self.global_notes = {}
 
         self.is_dark_mode       = False
         self.use_custom_colors  = False
@@ -1317,11 +1459,19 @@ class PDDashboard(QMainWindow):
         top_layout.addWidget(self.tools_btn)
 
         self.qor_btn  = self._btn("Compare QoR", self.run_qor_comparison)
-        self.mail_btn = self._btn("Send Mail",    self.send_mail_action)
+        top_layout.addWidget(self.qor_btn)
+        
+        # New Mail Dropdown
+        self.mail_btn = QPushButton("Send Mail")
+        self.mail_menu = QMenu(self)
+        self.mail_menu.addAction("Cleanup Mail (Selected Runs)", self.send_cleanup_mail_action)
+        self.mail_menu.addAction("Send Compare QoR Mail", self.send_qor_mail_action)
+        self.mail_menu.addAction("Send Custom Mail", self.send_custom_mail_action)
+        self.mail_btn.setMenu(self.mail_menu)
+        top_layout.addWidget(self.mail_btn)
+        
         self.disk_btn = self._btn("Disk Space",   self.open_disk_usage)
         self.settings_btn = self._btn("Settings", self.open_settings)
-        top_layout.addWidget(self.qor_btn)
-        top_layout.addWidget(self.mail_btn)
         top_layout.addWidget(self.disk_btn)
         top_layout.addWidget(self.settings_btn)
 
@@ -1334,14 +1484,22 @@ class PDDashboard(QMainWindow):
 
         root_layout.addLayout(top_layout)
 
+        # Enhanced Progress UI
+        self.prog_container = QWidget()
+        self.prog_container.setVisible(False)
+        self.prog_layout = QHBoxLayout(self.prog_container)
+        self.prog_layout.setContentsMargins(4, 0, 4, 0)
+        self.prog_lbl = QLabel("Initializing Scanner...")
+        self.prog_lbl.setStyleSheet("color: #1976D2; font-weight: bold;")
         self.prog = QProgressBar()
-        self.prog.setVisible(False)
         self.prog.setFixedHeight(6)
         self.prog.setTextVisible(False)
         self.prog.setStyleSheet(
             "QProgressBar { border: none; border-radius: 3px; background: #ddd; }"
             "QProgressBar::chunk { background: #1976D2; border-radius: 3px; }")
-        root_layout.addWidget(self.prog)
+        self.prog_layout.addWidget(self.prog_lbl)
+        self.prog_layout.addWidget(self.prog, 1)
+        root_layout.addWidget(self.prog_container)
 
         self.splitter = QSplitter(Qt.Horizontal)
 
@@ -1381,7 +1539,7 @@ class PDDashboard(QMainWindow):
         self.splitter.addWidget(left_panel)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(22)
+        self.tree.setColumnCount(23)
         self.tree.setAlternatingRowColors(True)
         self.tree.setUniformRowHeights(True)
         self.tree.setAnimated(False)
@@ -1393,7 +1551,7 @@ class PDDashboard(QMainWindow):
         headers = [
             "Run Name (Select)", "RTL Release Version", "Source", "Status", "Stage", "User", "Size",
             "FM - NONUPF", "FM - UPF", "VSLP Status", "Static IR", "Dynamic IR", "Runtime", "Start", "End",
-            "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT", "STA_RPT", "IR_LOG"
+            "Path", "Log", "UPF_RPT", "NONUPF_RPT", "VSLP_RPT", "STA_RPT", "IR_LOG", "Alias / Notes"
         ]
         self.tree.setHeaderLabels(headers)
         for i in range(self.tree.columnCount()):
@@ -1409,7 +1567,7 @@ class PDDashboard(QMainWindow):
         self.tree.setColumnWidth(8, 160); self.tree.setColumnWidth(9, 200)
         self.tree.setColumnWidth(10, 100); self.tree.setColumnWidth(11, 100)
         self.tree.setColumnWidth(12, 110); self.tree.setColumnWidth(13, 120)
-        self.tree.setColumnWidth(14, 120)
+        self.tree.setColumnWidth(14, 120); self.tree.setColumnWidth(22, 300)
 
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         
@@ -1749,25 +1907,32 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 
     def start_fs_scan(self):
         if hasattr(self, 'worker') and self.worker.isRunning(): return
-        self.prog.setVisible(True)
+        self.prog_container.setVisible(True)
         self.prog.setRange(0, 0)
+        self.prog_lbl.setText("Initializing Scanner...")
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Scanning...")
         self.worker = ScannerWorker()
         self.worker.progress_update.connect(self.update_progress)
+        self.worker.status_update.connect(self.update_status_lbl)
         self.worker.finished.connect(self.on_scan_finished)
         self.worker.start()
 
     def update_progress(self, current, total):
         self.prog.setRange(0, total)
         self.prog.setValue(current)
+        
+    def update_status_lbl(self, message):
+        self.prog_lbl.setText(message)
 
-    def on_scan_finished(self, ws, out, ir):
+    def on_scan_finished(self, ws, out, ir, stats):
         self.ws_data, self.out_data, self.ir_data = ws, out, ir
-        self.prog.setVisible(False)
+        self.prog_container.setVisible(False)
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("Refresh")
         self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
+        self.global_notes = load_all_notes()
+        
         self.on_source_changed()
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
@@ -1777,11 +1942,14 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             self._initial_size_calc_done = True
             self.calculate_all_sizes()
 
-        # Update dynamic mail users config list
         all_owners = set()
         for r in self.ws_data.get("all_runs", []) + self.out_data.get("all_runs", []):
             if r.get("owner") and r["owner"] != "Unknown": all_owners.add(r["owner"])
         if all_owners: save_mail_users_config(all_owners)
+        
+        # Display Scan Summary Pop-up
+        summary_dlg = ScanSummaryDialog(stats, self)
+        summary_dlg.exec_()
 
     def on_source_changed(self):
         src_mode = self.src_combo.currentText()
@@ -1869,6 +2037,11 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             f = p.font(0); f.setBold(True); p.setFont(0, f)
         elif node_type == "RTL":
             f = p.font(0); f.setItalic(True); p.setFont(0, f)
+            if text in self.global_notes:
+                notes = " | ".join(self.global_notes[text])
+                p.setText(22, notes)
+                p.setToolTip(22, notes)
+                p.setForeground(22, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
         return p
 
     def _get_item_path_id(self, item):
@@ -2031,8 +2204,18 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             child.setText(6, "-"); child.setText(10, "-"); child.setText(11, "-")
             child.setText(15, run["path"]); child.setText(21, "")
 
-        for i in range(1, 22): child.setTextAlignment(i, Qt.AlignCenter)
+        for i in range(1, 23): child.setTextAlignment(i, Qt.AlignCenter)
         child.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+        child.setTextAlignment(22, Qt.AlignLeft | Qt.AlignVCenter)
+        
+        # Load and set notes
+        run_identifier = f"{run['rtl']} : {run['r_name']}"
+        if run_identifier in self.global_notes:
+            notes = " | ".join(self.global_notes[run_identifier])
+            child.setText(22, notes)
+            child.setToolTip(22, notes)
+            child.setForeground(22, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
+
         return child
 
     # ------------------------------------------------------------------
@@ -2109,8 +2292,27 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             self._apply_status_color(st_item, 4,
                 stage_status if stage_status in ("COMPLETED","RUNNING","FAILED") else "RUNNING")
 
-            for i in range(1, 22): st_item.setTextAlignment(i, Qt.AlignCenter)
+            for i in range(1, 23): st_item.setTextAlignment(i, Qt.AlignCenter)
             st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)
+            st_item.setTextAlignment(22, Qt.AlignLeft | Qt.AlignVCenter)
+
+    # ------------------------------------------------------------------
+    # BLOCK SIDEBAR COLORS
+    # ------------------------------------------------------------------
+    def _block_aggregate_status(self, block_name, runs):
+        for r in runs:
+            if r["block"] == block_name and r["run_type"] == "FE" and not r["is_comp"]: return "running"
+        return "done"
+
+    def _refresh_block_colors(self, runs):
+        for i in range(self.blk_list.count()):
+            it = self.blk_list.item(i)
+            raw_name = it.data(Qt.UserRole)
+            status = self._block_aggregate_status(raw_name, runs)
+            # User request: Green if running, Blue if not
+            it.setForeground(QColor("#2e7d32" if not self.is_dark_mode else "#81c784")
+                             if status == "running"
+                             else QColor("#0277bd" if not self.is_dark_mode else "#64b5f6"))
 
     # ------------------------------------------------------------------
     # MAIN REFRESH
@@ -2214,9 +2416,14 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                 if not (rt.endswith("ago") and ("h ago" in rt or "m ago" in rt)): continue
 
             if search_pattern != "*":
+                # Include notes in search
+                note_id = f"{run['rtl']} : {run['r_name']}"
+                notes = " | ".join(self.global_notes.get(note_id, []))
+                
                 combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
                             f"{run['st_n']} {run['st_u']} {run['vslp_status']} "
-                            f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']}").lower()
+                            f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']} "
+                            f"{notes}").lower()
                 matches = fnmatch.fnmatch(combined, search_pattern)
                 if not matches and run["run_type"] == "BE":
                     for stage in run["stages"]:
@@ -2320,6 +2527,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
 
+        self._refresh_block_colors(list(runs_to_process))
         self._update_status_bar(normal_runs_list)
         self.on_tree_selection_changed()
         
@@ -2346,7 +2554,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         menu.addSeparator()
 
         vis_menu = menu.addMenu("Show / Hide Columns")
-        for i in range(1, 22):
+        for i in range(1, 23):
             action = QWidgetAction(vis_menu)
             cb = QCheckBox(self.tree.headerItem().text(i).replace(" [*]", ""))
             cb.setChecked(not self.tree.isColumnHidden(i))
@@ -2384,12 +2592,25 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         fm_u_path = item.text(17); fm_n_path = item.text(18)
         vslp_path = item.text(19); sta_path  = item.text(20); ir_path = item.text(21)
         is_stage  = item.data(0, Qt.UserRole) == "STAGE"
+        is_rtl    = item.data(0, Qt.UserRole) == "RTL"
         
         target_item = item if not is_stage else item.parent()
         b_name = target_item.data(0, Qt.UserRole + 2)
         r_rtl = target_item.text(1)
         base_run = target_item.data(0, Qt.UserRole + 4)
         run_source = target_item.text(2)
+        
+        # Add / Edit Note Logic
+        edit_note_act = None
+        note_identifier = ""
+        if run_path and run_path != "N/A" and not is_stage:
+            note_identifier = f"{r_rtl} : {item.text(0)}"
+            edit_note_act = m.addAction("Add / Edit Personal Note")
+            m.addSeparator()
+        elif is_rtl:
+            note_identifier = item.text(0)
+            edit_note_act = m.addAction("Add / Edit Alias Note for RTL")
+            m.addSeparator()
         
         add_config_act = None
         if b_name and r_rtl and base_run and run_source:
@@ -2427,8 +2648,16 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         if not res: return
+        
+        if edit_note_act and res == edit_note_act:
+            current_note = item.text(22)
+            dlg = EditNoteDialog(current_note, note_identifier, self)
+            if dlg.exec_():
+                save_user_note(note_identifier, dlg.get_text())
+                self.global_notes = load_all_notes()
+                self.refresh_view()
 
-        if add_config_act and res == add_config_act:
+        elif add_config_act and res == add_config_act:
             if not self.current_config_path:
                 path, _ = QFileDialog.getSaveFileName(self, "Create New Config", "dashboard_filter.cfg", "Config Files (*.cfg *.txt)")
                 if not path: return
@@ -2484,10 +2713,16 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             h = find_latest_qor_report()
             if h: subprocess.Popen([FIREFOX_PATH, h])
 
+    def on_item_double_clicked(self, item, col):
+        if item.parent():
+            log = item.text(16)
+            if log and cached_exists(log): 
+                subprocess.Popen(['gvim', log])
+
     # ------------------------------------------------------------------
     # MAIL FEATURE
     # ------------------------------------------------------------------
-    def send_mail_action(self):
+    def send_cleanup_mail_action(self):
         user_runs = {}
         is_fe_selected = False
 
@@ -2505,14 +2740,25 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                 find_owners(c)
         find_owners(self.tree.invisibleRootItem())
 
+        if not user_runs:
+            QMessageBox.warning(self, "No Runs Selected", "Please select at least one run to send a cleanup mail.")
+            return
+
         default_subject = "Action Required: Please clean up heavy disk usage runs"
         if user_runs:
             default_subject = "Please remove your old PI runs" if is_fe_selected else "Please remove your old PD runs"
             
         all_known = get_all_known_mail_users()
+        
+        # Prefill 'To' based on selected owners
+        unique_emails = []
+        for owner in user_runs.keys():
+            e = get_user_email(owner)
+            if e: unique_emails.append(e)
+            
         dlg = AdvancedMailDialog(default_subject,
                                  "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n",
-                                 all_known, self)
+                                 all_known, ", ".join(unique_emails), self)
                                  
         if dlg.exec_():
             subject = dlg.subject_input.text().strip()
@@ -2524,34 +2770,78 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
             
             success_count = 0
-            
-            if not user_runs:
-                # Send generic mail if no runs checked
-                all_recipients = set(base_to + base_cc)
-                if not all_recipients: return
+            for owner, paths in user_runs.items():
+                owner_email = get_user_email(owner)
+                if not owner_email: continue
+                
+                final_body = body_template + "\n" + "\n".join(paths)
+                all_recipients = set(base_to + base_cc + [owner_email])
                 recipients_str = ",".join(all_recipients)
-                cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+                
+                cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
                 for att in dlg.attachments: cmd.extend(["-a", att])
-                try: subprocess.Popen(cmd); success_count += 1
-                except: pass
-            else:
-                for owner, paths in user_runs.items():
-                    owner_email = get_user_email(owner)
-                    if not owner_email: continue
                     
-                    final_body = body_template + "\n" + "\n".join(paths)
-                    all_recipients = set(base_to + base_cc + [owner_email])
-                    recipients_str = ",".join(all_recipients)
+                try:
+                    subprocess.Popen(cmd); success_count += 1
+                except Exception as e:
+                    print(f"Failed to send mail: {e}")
                     
-                    cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
-                    for att in dlg.attachments: cmd.extend(["-a", att])
-                        
-                    try:
-                        subprocess.Popen(cmd); success_count += 1
-                    except Exception as e:
-                        print(f"Failed to send mail: {e}")
-                        
             QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} emails.")
+            
+    def send_qor_mail_action(self):
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("Latest Compare QoR Report",
+                                 "Hi Team,\n\nPlease find the attached latest QoR Report for your reference.\n\nRegards",
+                                 all_known, "", self)
+        dlg.attach_qor()
+        
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            all_recipients = set(base_to + base_cc)
+            if not all_recipients: return
+            recipients_str = ",".join(all_recipients)
+            
+            cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+            for att in dlg.attachments: cmd.extend(["-a", att])
+                
+            try:
+                subprocess.Popen(cmd)
+                QMessageBox.information(self, "Mail Sent", "Successfully sent the Compare QoR mail.")
+            except Exception as e:
+                print(f"Failed to send mail: {e}")
+
+    def send_custom_mail_action(self):
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("", "", all_known, "", self)
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            all_recipients = set(base_to + base_cc)
+            if not all_recipients: return
+            recipients_str = ",".join(all_recipients)
+            
+            cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+            for att in dlg.attachments: cmd.extend(["-a", att])
+                
+            try:
+                subprocess.Popen(cmd)
+                QMessageBox.information(self, "Mail Sent", "Successfully sent the custom mail.")
+            except Exception as e:
+                print(f"Failed to send mail: {e}")
+
 
     # ------------------------------------------------------------------
     # DISK USAGE FEATURE
