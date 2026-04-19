@@ -191,7 +191,7 @@ def load_all_notes():
     global_notes = {}
     if not os.path.exists(NOTES_DIR): return global_notes
     for file in os.listdir(NOTES_DIR):
-        if file.endswith(".json"):
+        if file.endswith(".json") and not file.startswith("pins_"):
             try:
                 with open(os.path.join(NOTES_DIR, file), 'r') as f:
                     data = json.load(f)
@@ -221,3 +221,19 @@ def save_user_note(identifier, note_text):
             json.dump(user_data, f, indent=4)
     except Exception as e:
         print(f"Failed to save note: {e}")
+
+def get_pins_file():
+    return os.path.join(NOTES_DIR, f"pins_{getpass.getuser()}.json")
+
+def load_user_pins():
+    fpath = get_pins_file()
+    if os.path.exists(fpath):
+        try:
+            with open(fpath, 'r') as f: return json.load(f)
+        except: pass
+    return {}
+
+def save_user_pins(pins_dict):
+    try:
+        with open(get_pins_file(), 'w') as f: json.dump(pins_dict, f, indent=4)
+    except: pass
