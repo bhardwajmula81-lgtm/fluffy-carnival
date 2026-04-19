@@ -44,107 +44,20 @@ class GanttChartDialog(QDialog):
             painter.drawText(x_start + int(bar_w) + 10, y + 15, data['time_str'])
             y += 40
 
-class MiniPieChart(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setMinimumSize(200, 150)
-        self.data = {'Passed': 0, 'Failed': 0, 'Running': 0}
-        self.colors = {'Passed': QColor("#4CAF50"), 'Failed': QColor("#F44336"), 'Running': QColor("#2196F3")}
-        self.bg_col = "#ffffff"
-
-    def update_data(self, p, f, r, is_dark):
-        self.data = {'Passed': p, 'Failed': f, 'Running': r}
-        self.bg_col = "#2b2d30" if is_dark else "#f5f7fa"
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect()
-        margin = 10
-        min_dim = min(rect.width(), rect.height()) - 2 * margin
-        if min_dim <= 0: return
-        center_x = margin + min_dim/2
-        center_y = rect.center().y()
-        pie_rect = QRectF(center_x - min_dim/2, center_y - min_dim/2, min_dim, min_dim)
-        total = sum(self.data.values())
-        if total == 0:
-            painter.setPen(QColor("#888888"))
-            painter.drawText(rect, Qt.AlignCenter, "No Data")
-            return
-        start_angle = 0
-        for name, val in self.data.items():
-            if val == 0: continue
-            span_angle = (val / total) * 360 * 16
-            painter.setBrush(QBrush(self.colors[name]))
-            painter.setPen(QPen(QColor(self.bg_col), 1))
-            painter.drawPie(pie_rect, int(start_angle), int(span_angle))
-            start_angle += span_angle
-        leg_x = center_x + min_dim/2 + 15
-        leg_y = center_y - 20
-        font = painter.font(); font.setPointSize(8); painter.setFont(font)
-        for name in ['Passed', 'Running', 'Failed']:
-            painter.setBrush(QBrush(self.colors[name]))
-            painter.drawRect(int(leg_x), int(leg_y), 10, 10)
-            painter.setPen(QPen(Qt.white if self.bg_col == "#2b2d30" else Qt.black))
-            painter.drawText(int(leg_x) + 15, int(leg_y) + 10, f"{name}: {self.data[name]}")
-            leg_y += 18
-
-class LogTailer(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.layout = QVBoxLayout(self)
-        self.layout.setContentsMargins(0,0,0,0)
-        header = QHBoxLayout()
-        self.lbl = QLabel("<b>Select a log file to view...</b>")
-        header.addWidget(self.lbl); header.addStretch()
-        self.layout.addLayout(header)
-        self.text = QPlainTextEdit()
-        self.text.setReadOnly(True)
-        self.text.setFont(QFont("Courier", 9))
-        self.layout.addWidget(self.text)
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.read_log)
-        self.current_file = None
-        self.last_pos = 0
-
-    def tail_file(self, path):
-        self.current_file = path
-        self.lbl.setText(f"<b>Tailing:</b> {path}")
-        self.text.clear()
-        self.last_pos = 0
-        self.show()
-        self.timer.start(1000)
-        self.read_log()
-
-    def read_log(self):
-        if not self.current_file or not os.path.exists(self.current_file): return
-        try:
-            with open(self.current_file, 'r') as f:
-                f.seek(self.last_pos)
-                new_data = f.read()
-                if new_data:
-                    self.text.appendPlainText(new_data)
-                    self.last_pos = f.tell()
-                    bar = self.text.verticalScrollBar()
-                    bar.setValue(bar.maximum())
-        except: pass
-
-    def hideEvent(self, event):
-        self.timer.stop(); super().hideEvent(event)
-
 class CustomTreeItem(QTreeWidgetItem):
     def __lt__(self, other):
         col = self.treeWidget().sortColumn()
+        
+        # --- Golden Run Pin to Top Logic ---
+        if col == 0:
+            pin1 = self.data(0, Qt.UserRole + 5)
+            pin2 = other.data(0, Qt.UserRole + 5)
+            asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
+            if pin1 == 'golden' and pin2 != 'golden': return asc
+            if pin2 == 'golden' and pin1 != 'golden': return not asc
+
         t1 = self.text(col).strip() if self.text(col) else ""
         t2 = other.text(col).strip() if other.text(col) else ""
-
-        if col == 0:
-            s1 = bool(self.data(0, Qt.UserRole + 5))
-            s2 = bool(other.data(0, Qt.UserRole + 5))
-            if s1 != s2:
-                asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
-                return s1 if asc else not s1
 
         if col in [3, 7, 8, 9]:
             def score(val):
@@ -210,61 +123,3 @@ class MultiCompleterLineEdit(QLineEdit):
                 self.completer.popup().hide()
         else:
             self.completer.popup().hide()
-
-class PieChartWidget(QWidget):
-    def __init__(self):
-        super().__init__()
-        self.setMinimumSize(450, 450)
-        self.data = {}
-        self.colors = [
-            QColor("#ef5350"), QColor("#42a5f5"), QColor("#66bb6a"), QColor("#ffa726"),
-            QColor("#ab47bc"), QColor("#26c6da"), QColor("#8d6e63"), QColor("#78909c"),
-            QColor("#d4e157"), QColor("#ec407a")
-        ]
-        self.bg_col = "#ffffff"
-
-    def set_data(self, data, is_dark):
-        self.data = dict(sorted(data.items(), key=lambda item: item[1], reverse=True))
-        self.bg_col = "#2b2d30" if is_dark else "#ffffff"
-        self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        rect = self.rect()
-        margin = 30
-        min_dim = min(rect.width(), rect.height()) - 2 * margin
-        if min_dim <= 0: return
-        center = rect.center()
-        pie_rect = QRectF(center.x() - min_dim/2, center.y() - min_dim/2, min_dim, min_dim)
-        total = sum(self.data.values())
-        if total == 0:
-            painter.setPen(QColor("#888888"))
-            painter.drawText(rect, Qt.AlignCenter, "No Data Available")
-            return
-        start_angle = 0
-        for i, (name, val) in enumerate(self.data.items()):
-            span_angle = (val / total) * 360 * 16
-            painter.setBrush(QBrush(self.colors[i % len(self.colors)]))
-            painter.setPen(QPen(QColor(self.bg_col), 2))
-            painter.drawPie(pie_rect, int(start_angle), int(span_angle))
-            if (val / total) > 0.03:
-                mid_angle_deg = (start_angle + span_angle / 2) / 16.0
-                mid_angle_rad = math.radians(mid_angle_deg)
-                text_x = center.x() + (min_dim / 2 * 0.65) * math.cos(mid_angle_rad)
-                text_y = center.y() - (min_dim / 2 * 0.65) * math.sin(mid_angle_rad)
-                perc = (val / total) * 100
-                text = f"{name}\n{perc:.1f}%"
-                font = painter.font(); font.setBold(True); font.setPointSize(9)
-                painter.setFont(font)
-                fm = painter.fontMetrics()
-                lines = text.split('\n'); th = fm.height()
-                y_offset = text_y - (th * len(lines)) / 2
-                for line in lines:
-                    tw = fm.horizontalAdvance(line)
-                    painter.setPen(QPen(QColor(0, 0, 0, 180)))
-                    painter.drawText(int(text_x - tw/2 + 1), int(y_offset + th + 1), line)
-                    painter.setPen(QPen(Qt.white))
-                    painter.drawText(int(text_x - tw/2), int(y_offset + th), line)
-                    y_offset += th
-            start_angle += span_angle
