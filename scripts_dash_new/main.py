@@ -57,6 +57,17 @@ class PDDashboard(QMainWindow):
         self.ignored_paths          = set()
         self._checked_paths         = set()
         self.current_error_log_path = None
+        self._building_tree         = False   # FIX 2: guard itemChanged during build
+        self._last_stylesheet       = ""      # FIX 6: skip setStyleSheet if unchanged
+        # FIX 4: pre-built color palette — populated in apply_theme_and_spacing()
+        self._colors = {
+            "completed": QColor("#1b5e20"), "running":    QColor("#0d47a1"),
+            "not_started": QColor("#757575"), "interrupted": QColor("#e65100"),
+            "failed": QColor("#b71c1c"), "pass": QColor("#388e3c"),
+            "fail": QColor("#d32f2f"), "outfeed": QColor("#8e24aa"),
+            "ws": QColor("#e65100"), "milestone": QColor("#1e88e5"),
+            "note": QColor("#e65100"),
+        }
 
         self.run_filter_config  = None
         self.current_config_path = None
@@ -385,7 +396,32 @@ class PDDashboard(QMainWindow):
             self.notes_toggle_btn.setText("Notes v")
 
     def safe_expand_all(self):
+        # FIX 8: populate ALL lazy BE stage placeholders BEFORE expandAll().
+        # Without this, expandAll() fires itemExpanded for every BE node,
+        # loading stages one-by-one sequentially on the main thread = freeze.
         self.tree.blockSignals(True)
+        self.tree.setUpdatesEnabled(False)
+        root     = self.tree.invisibleRootItem()
+        ign_root = None
+        for i in range(root.childCount()):
+            if root.child(i).data(0, Qt.UserRole) == "IGNORED_ROOT":
+                ign_root = root.child(i)
+                break
+        if ign_root is None:
+            ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
+        def _load_all_lazy(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                if child.childCount() == 1:
+                    ph = child.child(0)
+                    if ph.data(0, Qt.UserRole) == "__PLACEHOLDER__":
+                        be_run = child.data(0, Qt.UserRole + 11)
+                        if be_run:
+                            child.removeChild(ph)
+                            self._add_stages(child, be_run, ign_root)
+                _load_all_lazy(child)
+        _load_all_lazy(root)
+        self.tree.setUpdatesEnabled(True)
         self.tree.expandAll()
         self.tree.blockSignals(False)
         self.tree.resizeColumnToContents(0)
@@ -587,6 +623,10 @@ class PDDashboard(QMainWindow):
     # ITEM CHECK / SELECTION
     # ------------------------------------------------------------------
     def _on_item_check_changed(self, item, col=0):
+        # FIX 2: during _build_tree() every setCheckState fires this signal
+        # causing thousands of spurious setBackground() paint calls. Skip it.
+        if self._building_tree:
+            return
         if col != 0:
             return
         path = item.text(15)
@@ -605,6 +645,8 @@ class PDDashboard(QMainWindow):
         self.sb_selected.setText(f"     Selected: {len(self._checked_paths)}")
 
     def on_tree_selection_changed(self):
+        # FIX 1: No file I/O here. error_count is pre-computed in _process_run()
+        # and stored in the run dict, then cached on the item via UserRole+12.
         sel = self.tree.selectedItems()
         self.fe_error_btn.setVisible(False)
         self.current_error_log_path = None
@@ -653,31 +695,20 @@ class PDDashboard(QMainWindow):
                 break
         self.ins_note.setPlainText(clean_text)
 
-        if len(sel) == 1 and item.data(0, Qt.UserRole) != "STAGE":
-            run_path = item.text(15)
-            if run_path and run_path != "N/A":
-                err_file = os.path.join(run_path, "logs", "compile_opt.error.log")
-                if os.path.exists(err_file):
-                    count = 0
-                    try:
-                        with open(err_file, 'r', encoding='utf-8', errors='ignore') as f:
-                            for line in f:
-                                if line.strip():
-                                    count += 1
-                    except:
-                        pass
-                    self.current_error_log_path = err_file
-                    color = "#e57373" if (self.is_dark_mode or
-                                          (self.use_custom_colors and self.custom_bg_color < "#888888")) else "#d32f2f"
-                    if count == 0:
-                        color = "#81c784" if (self.is_dark_mode or
-                                               (self.use_custom_colors and self.custom_bg_color < "#888888")) else "#388e3c"
-                    self.fe_error_btn.setStyleSheet(
-                        f"QPushButton#errorLinkBtn {{ border: none; background: transparent; color: {color}; "
-                        f"font-weight: bold; text-align: left; padding: 6px 0px; }} "
-                        f"QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
-                    self.fe_error_btn.setText(f"compile_opt errors: {count}")
-                    self.fe_error_btn.setVisible(True)
+        # FIX 1: Read pre-cached error count from item data — ZERO file I/O
+        if len(sel) == 1 and not is_stage and path and path != "N/A":
+            err_count = item.data(0, Qt.UserRole + 12)   # set in _create_run_item
+            err_path  = os.path.join(path, "logs", "compile_opt.error.log")
+            if err_count is not None:
+                self.current_error_log_path = err_path
+                dark = self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888")
+                color = ("#81c784" if dark else "#388e3c") if err_count == 0 else ("#e57373" if dark else "#d32f2f")
+                self.fe_error_btn.setStyleSheet(
+                    f"QPushButton#errorLinkBtn {{ border: none; background: transparent; color: {color}; "
+                    f"font-weight: bold; text-align: left; padding: 6px 0px; }} "
+                    f"QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
+                self.fe_error_btn.setText(f"compile_opt errors: {err_count}")
+                self.fe_error_btn.setVisible(True)
 
     def open_error_log(self):
         if self.current_error_log_path and os.path.exists(self.current_error_log_path):
@@ -689,8 +720,20 @@ class PDDashboard(QMainWindow):
         txt = self.ins_note.toPlainText()
         save_user_note(self._current_note_id, txt)
         self.global_notes = load_all_notes()
-        self.refresh_view()
-        self.on_tree_selection_changed()
+        # FIX 5: update only the selected item's notes column directly.
+        # No full refresh_view() needed — avoids a full hide/show pass + NFS reads.
+        sel = self.tree.selectedItems()
+        if sel:
+            item       = sel[0]
+            note_id    = self._current_note_id
+            notes      = self.global_notes.get(note_id, [])
+            note_text  = " | ".join(notes)
+            item.setText(22, note_text)
+            item.setToolTip(22, note_text)
+            if note_text:
+                item.setForeground(22, self._colors["note"])
+        # Update status bar selected count (cheap)
+        self._update_status_bar([])
 
     def open_settings(self):
         dlg = SettingsDialog(self)
@@ -719,6 +762,24 @@ class PDDashboard(QMainWindow):
             QTreeView::indicator:checked   { background-color: #4CAF50; border: 1px solid #388E3C; image: none; }
             QTreeView::indicator:unchecked { background-color: white;   border: 1px solid gray; }
         """
+
+        # FIX 4: pre-build QColor objects ONCE per theme change and reuse them
+        # everywhere instead of constructing QColor("#hex") on every item render.
+        dark = self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888")
+        self._colors = {
+            "completed":  QColor("#81c784" if dark else "#1b5e20"),
+            "running":    QColor("#64b5f6" if dark else "#0d47a1"),
+            "not_started":QColor("#9e9e9e" if dark else "#757575"),
+            "interrupted":QColor("#ffb74d" if dark else "#e65100"),
+            "failed":     QColor("#e57373" if dark else "#b71c1c"),
+            "pass":       QColor("#81c784" if dark else "#388e3c"),
+            "fail":       QColor("#e57373" if dark else "#d32f2f"),
+            "outfeed":    QColor("#ce93d8" if dark else "#8e24aa"),
+            "ws":         QColor("#ffb74d" if dark else "#e65100"),
+            "milestone":  QColor("#64b5f6" if dark else "#1e88e5"),
+            "note":       QColor("#ffb74d" if dark else "#e65100"),
+        }
+
         if self.use_custom_colors:
             bg  = self.custom_bg_color
             fg  = self.custom_fg_color
@@ -786,28 +847,39 @@ class PDDashboard(QMainWindow):
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: #3182ce; color: #ffffff; }}
                 QTableWidget {{ background-color: #ffffff; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; }}
                 {cb_style}"""
-        self.setStyleSheet(stylesheet)
+        # FIX 6: only call setStyleSheet if the stylesheet actually changed.
+        # setStyleSheet on QMainWindow re-resolves styles on every child widget
+        # (expensive). Skipping it when nothing changed saves 50-150ms.
+        if stylesheet != self._last_stylesheet:
+            self._last_stylesheet = stylesheet
+            self.setStyleSheet(stylesheet)
         self._recolor_existing_items()
 
     def _recolor_existing_items(self):
+        # FIX 7: batch all setForeground dirty-marks into one repaint by
+        # disabling updates. Without this, each setForeground() queues an
+        # individual repaint — hundreds of repaints vs one.
+        self.tree.setUpdatesEnabled(False)
+        c = self._colors
         def recolor(node):
             for i in range(node.childCount()):
                 child     = node.child(i)
                 node_type = child.data(0, Qt.UserRole)
                 if node_type == "MILESTONE":
-                    child.setForeground(0, QColor("#1e88e5" if not self.is_dark_mode else "#64b5f6"))
-                if node_type not in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"):
+                    child.setForeground(0, c["milestone"])
+                if node_type not in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT", "__PLACEHOLDER__"):
                     self._apply_status_color(child, 3, child.text(3))
                     self._apply_fm_color(child, 7, child.text(7))
                     self._apply_fm_color(child, 8, child.text(8))
                     self._apply_vslp_color(child, 9, child.text(9))
                     src = child.text(2)
                     if src == "OUTFEED":
-                        child.setForeground(2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
+                        child.setForeground(2, c["outfeed"])
                     elif src == "WS":
-                        child.setForeground(2, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
+                        child.setForeground(2, c["ws"])
                 recolor(child)
         recolor(self.tree.invisibleRootItem())
+        self.tree.setUpdatesEnabled(True)
 
     def on_auto_refresh_changed(self):
         val = self.auto_combo.currentText()
@@ -825,6 +897,15 @@ class PDDashboard(QMainWindow):
 
         # FIX 4: purge stale path cache so completed runs show correct status
         clear_path_cache()
+
+        # Cancel ALL background size workers before clearing the tree.
+        # Without this, a running BatchSizeWorker tries to setText() on Qt items
+        # that tree.clear() is about to destroy -> RuntimeError crash on Refresh.
+        for w in list(self.size_workers):
+            if hasattr(w, 'cancel'):
+                w.cancel()
+        self.size_workers.clear()
+        self.item_map.clear()   # no stale item refs survive into new tree
 
         self.prog_container.setVisible(True)
         self.prog.setRange(0, 0)
@@ -954,10 +1035,16 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _build_tree(self):
         """Build the full tree once. Filtering is done by setHidden() only."""
-        for w in self.size_workers:
+        # Cancel size workers before clearing tree to prevent RuntimeError
+        for w in list(self.size_workers):
             if hasattr(w, 'cancel'):
                 w.cancel()
+        self.size_workers.clear()
         self.item_map.clear()
+
+        # FIX 2: suppress itemChanged signal handler during build to prevent
+        # 7000+ spurious setBackground() paint calls (one per setCheckState)
+        self._building_tree = True
 
         self.tree.blockSignals(True)
         self.tree.setUpdatesEnabled(False)
@@ -1064,6 +1151,9 @@ class PDDashboard(QMainWindow):
         self.tree.setSortingEnabled(True)
         self.tree.setUpdatesEnabled(True)
         self.tree.blockSignals(False)
+
+        # FIX 2: re-enable itemChanged handler now that tree is fully built
+        self._building_tree = False
 
         # Filter immediately after build
         self.refresh_view()
@@ -1203,7 +1293,8 @@ class PDDashboard(QMainWindow):
 
         self._update_status_bar(visible_runs)
         self.on_tree_selection_changed()
-        QTimer.singleShot(50, lambda: self.tree.resizeColumnToContents(0))
+        # FIX 3: removed resizeColumnToContents from here — it scanned every
+        # visible row on every filter change. Now only called after full scan.
 
     # ------------------------------------------------------------------
     # COLUMN FILTER
@@ -1270,7 +1361,11 @@ class PDDashboard(QMainWindow):
                 child = node.child(i)
                 path  = child.text(15)
                 if path and path != "N/A" and child.text(6) in ["-", "N/A", "Calc..."]:
-                    item_id = str(id(child))
+                    # Use a stable deterministic key — NOT str(id(child)).
+                    # id() reuses memory addresses after tree.clear(), so the
+                    # old id could map to a brand-new item in the rebuilt tree,
+                    # causing setText() on the wrong (or deleted) object.
+                    item_id = f"{child.text(0)}|{child.text(1)}|{child.text(15)}"
                     self.item_map[item_id] = child
                     size_tasks.append((item_id, path))
                     child.setText(6, "Calc...")
@@ -1285,11 +1380,22 @@ class PDDashboard(QMainWindow):
 
     def update_item_size(self, item_id, size_str):
         item = self.item_map.get(item_id)
-        if item:
+        if item is None:
+            return
+        # Double-guard against RuntimeError from deleted C++ objects.
+        # This happens when Refresh is pressed while BatchSizeWorker is running:
+        #   1. tree.clear() destroys all Qt items in C++
+        #   2. Worker finishes and calls this slot via queued signal
+        #   3. item still exists as a Python object but C++ side is gone
+        # The stable item_id key (not id()) prevents wrong-item aliasing.
+        # The try/except catches any remaining race conditions.
+        try:
             item.setText(6, size_str)
             old = item.toolTip(0)
             if old:
                 item.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {size_str}\n', old))
+        except RuntimeError:
+            self.item_map.pop(item_id, None)
 
     def _get_node(self, parent, text, node_type="DEFAULT"):
         for i in range(parent.childCount()):
@@ -1300,14 +1406,14 @@ class PDDashboard(QMainWindow):
         p.setData(0, Qt.UserRole, node_type)
         p.setExpanded(True)
         if node_type == "MILESTONE":
-            p.setForeground(0, QColor("#1e88e5" if not self.is_dark_mode else "#64b5f6"))
+            p.setForeground(0, self._colors["milestone"])
             f = p.font(0); f.setBold(True); p.setFont(0, f)
         elif node_type == "RTL":
             f = p.font(0); f.setItalic(True); p.setFont(0, f)
             if text in self.global_notes:
                 notes = " | ".join(self.global_notes[text])
                 p.setText(22, notes); p.setToolTip(22, notes)
-                p.setForeground(22, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
+                p.setForeground(22, self._colors["note"])
         return p
 
     def _get_item_path_id(self, item):
@@ -1318,22 +1424,26 @@ class PDDashboard(QMainWindow):
         return "|".join(parts)
 
     def _apply_status_color(self, item, col, status):
-        if   status == "COMPLETED":   item.setForeground(col, QColor("#1b5e20" if not self.is_dark_mode else "#81c784"))
-        elif status == "RUNNING":     item.setForeground(col, QColor("#0d47a1" if not self.is_dark_mode else "#64b5f6"))
-        elif status == "NOT STARTED": item.setForeground(col, QColor("#757575" if not self.is_dark_mode else "#9e9e9e"))
-        elif status == "INTERRUPTED": item.setForeground(col, QColor("#e65100" if not self.is_dark_mode else "#ffb74d"))
+        # FIX 4: use pre-built QColor objects from self._colors (set in apply_theme)
+        c = self._colors
+        if   status == "COMPLETED":   item.setForeground(col, c["completed"])
+        elif status == "RUNNING":     item.setForeground(col, c["running"])
+        elif status == "NOT STARTED": item.setForeground(col, c["not_started"])
+        elif status == "INTERRUPTED": item.setForeground(col, c["interrupted"])
         elif status in ("FAILED", "FATAL ERROR", "ERROR"):
-            item.setForeground(col, QColor("#b71c1c" if not self.is_dark_mode else "#e57373"))
+            item.setForeground(col, c["failed"])
 
     def _apply_fm_color(self, item, col, val):
-        if "FAILS" in val: item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
-        elif "PASS" in val: item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
+        c = self._colors
+        if   "FAILS" in val: item.setForeground(col, c["fail"])
+        elif "PASS"  in val: item.setForeground(col, c["pass"])
 
     def _apply_vslp_color(self, item, col, val):
+        c = self._colors
         if "Error" in val and "Error: 0" not in val:
-            item.setForeground(col, QColor("#d32f2f" if not self.is_dark_mode else "#e57373"))
+            item.setForeground(col, c["fail"])
         elif "Error: 0" in val:
-            item.setForeground(col, QColor("#388e3c" if not self.is_dark_mode else "#81c784"))
+            item.setForeground(col, c["pass"])
 
     def _create_run_item(self, parent_item, run):
         child = CustomTreeItem(parent_item)
@@ -1360,6 +1470,19 @@ class PDDashboard(QMainWindow):
             tooltip_text += "\nStatic/Dynamic IR: Check individual stage levels for full tables."
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
+
+        # FIX 1: pre-compute error log count NOW (scan time, background thread)
+        # so on_tree_selection_changed() can read it without any file I/O.
+        err_count = None
+        if run["run_type"] == "FE" and run.get("path") and run["path"] != "N/A":
+            err_file = os.path.join(run["path"], "logs", "compile_opt.error.log")
+            if os.path.exists(err_file):
+                try:
+                    with open(err_file, 'r', encoding='utf-8', errors='ignore') as _ef:
+                        err_count = sum(1 for ln in _ef if ln.strip())
+                except:
+                    err_count = 0
+        child.setData(0, Qt.UserRole + 12, err_count)
 
         if run["source"] == "OUTFEED":
             child.setForeground(2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
@@ -1658,10 +1781,15 @@ class PDDashboard(QMainWindow):
         elif calc_size_act and res == calc_size_act:
             item.setText(6, "Calc...")
             worker = SingleSizeWorker(item, run_path)
-            worker.result.connect(lambda it, sz: (
-                it.setText(6, sz),
-                it.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {sz}\n', it.toolTip(0) if it.toolTip(0) else ""))
-            ))
+            def _safe_set_size(it, sz):
+                try:
+                    it.setText(6, sz)
+                    old_tip = it.toolTip(0)
+                    if old_tip:
+                        it.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {sz}\n', old_tip))
+                except RuntimeError:
+                    pass  # item deleted by tree.clear() before worker finished
+            worker.result.connect(_safe_set_size)
             if not hasattr(self, 'size_workers'): self.size_workers = []
             self.size_workers.append(worker)
             worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
@@ -1834,4 +1962,3 @@ if __name__ == "__main__":
     w = PDDashboard()
     w.showMaximized()
     sys.exit(app.exec_())
-
