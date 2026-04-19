@@ -205,6 +205,7 @@ def save_user_note(identifier, note_text):
     current_user = getpass.getuser()
     user_file = os.path.join(NOTES_DIR, f"notes_{current_user}.json")
     user_data = {}
+    
     if os.path.exists(user_file):
         try:
             with open(user_file, 'r') as f:
@@ -212,7 +213,9 @@ def save_user_note(identifier, note_text):
         except: pass
     
     if note_text.strip():
-        user_data[identifier] = f"[{current_user}] {note_text.strip()}"
+        # Add the sleek stacked chat timestamp here!
+        ts = datetime.datetime.now().strftime("%b %d, %H:%M")
+        user_data[identifier] = f"[{current_user} - {ts}] {note_text.strip()}"
     else:
         if identifier in user_data: del user_data[identifier]
         
