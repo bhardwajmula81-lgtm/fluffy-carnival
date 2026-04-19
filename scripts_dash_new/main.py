@@ -1558,14 +1558,16 @@ class PDDashboard(QMainWindow):
                 QTableWidget {{ background-color: #ffffff; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; }}
                 {cb_style}"""
         # FIX 6: only call setStyleSheet if the stylesheet actually changed.
-        # setStyleSheet on QMainWindow re-resolves styles on every child widget
-        # (expensive). Skipping it when nothing changed saves 50-150ms.
         if stylesheet != self._last_stylesheet:
             self._last_stylesheet = stylesheet
             self.setStyleSheet(stylesheet)
-        self._recolor_existing_items()
+            # Only recolor if stylesheet actually changed (saves 100ms+ on redundant calls)
+            self._recolor_existing_items()
 
     def _recolor_existing_items(self):
+        # SPEED 8: skip recolor if tree is empty (e.g. called during scan)
+        if self.tree.invisibleRootItem().childCount() == 0:
+            return
         # FIX 7: batch all setForeground dirty-marks into one repaint by
         # disabling updates. Without this, each setForeground() queues an
         # individual repaint — hundreds of repaints vs one.
@@ -1765,8 +1767,11 @@ class PDDashboard(QMainWindow):
         self._rebuild_filter_dropdowns()
         # FEAT 1: Restore last filter state after dropdowns are populated
         self._restore_filter_state()
-        # Build full tree once
-        self._build_tree()
+
+        # SPEED 4: Defer tree build so Qt repaints FIRST (progress bar hides,
+        # refresh btn re-enables, UI unfreezes visually) then tree builds.
+        # singleShot(0) = run after current event loop iteration completes.
+        QTimer.singleShot(0, self._build_tree)
 
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
@@ -1948,9 +1953,23 @@ class PDDashboard(QMainWindow):
         root     = self.tree.invisibleRootItem()
         ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
 
-        _item_count = 0
+        # SPEED 6: Pre-compute base_rtl and milestone for each unique RTL string
+        # Avoids 3000+ re.sub() calls during the build loop
+        _rtl_cache = {}
         for run in runs_to_process:
-            if get_milestone(re.sub(r'_syn\d+$', '', run["rtl"])) is None:
+            rtl = run["rtl"]
+            if rtl not in _rtl_cache:
+                base = re.sub(r'_syn\d+$', '', rtl)
+                ms   = get_milestone(base)
+                _rtl_cache[rtl] = (base, base != rtl, ms)
+
+        _item_count = 0
+        _ignored    = self.ignored_paths
+        _hide_blk   = self.hide_block_nodes
+        for run in runs_to_process:
+            run_rtl = run["rtl"]
+            base_rtl, has_syn, milestone = _rtl_cache.get(run_rtl, (run_rtl, False, None))
+            if milestone is None:
                 continue
 
             # FIX F: process Qt events every 100 items to stay responsive
@@ -1958,17 +1977,14 @@ class PDDashboard(QMainWindow):
             if _item_count % 100 == 0:
                 QApplication.processEvents()
 
-            is_ignored   = run["path"] in self.ignored_paths
+            is_ignored   = run["path"] in _ignored
             attach_root  = ign_root if is_ignored else root
-            run_rtl      = run["rtl"]
-            base_rtl     = re.sub(r'_syn\d+$', '', run_rtl)
-            has_syn      = (run_rtl != base_rtl)
             blk_name     = run["block"]
 
-            base_attach_node = attach_root if self.hide_block_nodes else self._get_node(attach_root, blk_name, "BLOCK")
+            base_attach_node = attach_root if _hide_blk else self._get_node(attach_root, blk_name, "BLOCK")
 
             # Always build full hierarchy — filter hides nodes, not omits
-            m_node = self._get_node(base_attach_node, get_milestone(base_rtl), "MILESTONE")
+            m_node = self._get_node(base_attach_node, milestone, "MILESTONE")
             if has_syn:
                 rtl_parent   = self._get_node(m_node, base_rtl, "RTL")
                 parent_for_run = self._get_node(rtl_parent, run_rtl, "RTL")
@@ -2075,89 +2091,116 @@ class PDDashboard(QMainWindow):
 
         visible_runs = []
 
+        # SPEED 5: Pre-compute constants outside _passes() so they aren't
+        # re-evaluated on every single item (can be 1500+ calls per filter)
+        _src_ws      = (src_mode == "WS")
+        _src_out     = (src_mode == "OUTFEED")
+        _sel_rtl_all = (sel_rtl == "[ SHOW ALL ]")
+        _sel_rtl_sfx = sel_rtl + "_"
+        _do_search   = (search_pattern != "*")
+        _fe_only     = (preset == "FE Only")
+        _be_only     = (preset == "BE Only")
+        _run_only    = (preset == "Running Only")
+        _fail_only   = (preset == "Failed Only")
+        _today_only  = (preset == "Today's Runs")
+        _pins        = self.user_pins
+        _rfc         = self.run_filter_config
+        _notes       = self.global_notes
+
         def _passes(run):
             if run is None:
                 return False
-            # Source
-            if src_mode == "WS"      and run["source"] != "WS":      return False
-            if src_mode == "OUTFEED" and run["source"] != "OUTFEED": return False
-            # Golden bypass
-            is_golden = (self.user_pins.get(run["path"]) == "golden")
+            src = run["source"]
+            if _src_ws  and src != "WS":      return False
+            if _src_out and src != "OUTFEED": return False
+
+            path = run["path"]
+            is_golden = (_pins.get(path) == "golden")
             if not is_golden:
                 if run["block"] not in checked_blks:
                     return False
-                if self.run_filter_config is not None:
-                    rs, rr, rb = run["source"], run["rtl"], run["block"]
-                    if (rs in self.run_filter_config
-                            and rr in self.run_filter_config[rs]
-                            and rb in self.run_filter_config[rs][rr]):
-                        allowed   = self.run_filter_config[rs][rr][rb]
+                if _rfc is not None:
+                    rr, rb = run["rtl"], run["block"]
+                    if (src in _rfc and rr in _rfc[src] and rb in _rfc[src][rr]):
+                        allowed   = _rfc[src][rr][rb]
                         base_name = run["r_name"].replace("-FE", "").replace("-BE", "")
                         if base_name not in allowed and run["r_name"] not in allowed:
                             return False
-            # RTL
-            if sel_rtl != "[ SHOW ALL ]":
-                if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")):
+
+            rtl = run["rtl"]
+            if not _sel_rtl_all:
+                if rtl != sel_rtl and not rtl.startswith(_sel_rtl_sfx):
                     return False
-            # View preset
-            if preset == "FE Only"      and run["run_type"] != "FE": return False
-            if preset == "BE Only"      and run["run_type"] != "BE": return False
-            if preset == "Running Only" and not (run["run_type"] == "FE" and not run["is_comp"]): return False
-            if preset == "Failed Only":
-                has_fail = ("FAILS" in run.get("st_n", "") or "FAILS" in run.get("st_u", "")
-                            or run.get("fe_status", "") in ("FAILED", "FATAL ERROR", "ERROR"))
-                if not has_fail: return False
-            if preset == "Today's Runs":
-                rt = relative_time(run["info"].get("start", ""))
+
+            rt_type = run["run_type"]
+            if _fe_only  and rt_type != "FE": return False
+            if _be_only  and rt_type != "BE": return False
+            if _run_only and not (rt_type == "FE" and not run["is_comp"]): return False
+            if _fail_only:
+                if not ("FAILS" in run.get("st_n","") or "FAILS" in run.get("st_u","")
+                        or run.get("fe_status","") in ("FAILED","FATAL ERROR","ERROR")):
+                    return False
+            if _today_only:
+                rt = relative_time(run["info"].get("start",""))
                 if not (rt.endswith("ago") and ("h ago" in rt or "m ago" in rt)):
                     return False
-            # Search
-            if search_pattern != "*":
-                note_id  = f"{run['rtl']} : {run['r_name']}"
-                notes    = " | ".join(self.global_notes.get(note_id, []))
-                combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
-                            f"{run.get('st_n','')} {run.get('st_u','')} {run.get('vslp_status','')} "
-                            f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']} {notes}").lower()
+
+            if _do_search:
+                note_id  = f"{rtl} : {run['r_name']}"
+                notes    = " | ".join(_notes.get(note_id, []))
+                combined = (f"{run['r_name']} {rtl} {src} {rt_type} "
+                            f"{run.get('st_n','')} {run.get('st_u','')} "
+                            f"{run.get('vslp_status','')} "
+                            f"{run['info']['runtime']} {run['info']['start']} "
+                            f"{run['info']['end']} {notes}").lower()
                 if not fnmatch.fnmatch(combined, search_pattern):
-                    if run["run_type"] == "BE":
-                        stage_match = any(
+                    if rt_type == "BE":
+                        if not any(
                             fnmatch.fnmatch(
-                                f"{s['name']} {s['st_n']} {s['st_u']} {s['vslp_status']} {s['info']['runtime']}".lower(),
+                                f"{s['name']} {s['st_n']} {s['st_u']} "
+                                f"{s['vslp_status']} {s['info']['runtime']}".lower(),
                                 search_pattern)
-                            for s in run.get("stages", []))
-                        if not stage_match: return False
+                            for s in run.get("stages",[])):
+                            return False
                     else:
                         return False
             return True
 
+        # SPEED 7: pre-compute set for group check
+        _GROUP_TYPES = frozenset(("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"))
+        _expand_when_filtered = (preset != "All Runs" or bool(raw_query))
+        _UR     = Qt.UserRole
+        _UR10   = Qt.UserRole + 10
+
         def _update_visibility(item):
-            node_type = item.data(0, Qt.UserRole)
+            node_type = item.data(0, _UR)
             if node_type == "__PLACEHOLDER__":
                 item.setHidden(True)
                 return False
-            is_group = node_type in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT")
-            if is_group:
+            if node_type in _GROUP_TYPES:
                 any_visible = False
                 for i in range(item.childCount()):
                     if _update_visibility(item.child(i)):
                         any_visible = True
                 item.setHidden(not any_visible)
-                if any_visible and (preset != "All Runs" or raw_query):
+                if any_visible and _expand_when_filtered:
                     item.setExpanded(True)
                 return any_visible
             else:
-                run    = item.data(0, Qt.UserRole + 10)
+                run    = item.data(0, _UR10)
                 passes = _passes(run)
                 item.setHidden(not passes)
                 if passes and run:
                     visible_runs.append(run)
-                # Keep stage/placeholder children consistent with parent
-                for i in range(item.childCount()):
-                    ch = item.child(i)
-                    if ch.data(0, Qt.UserRole) == "__PLACEHOLDER__":
-                        ch.setHidden(True)
-                    else:
-                        ch.setHidden(not passes)
+                n = item.childCount()
+                if n:
+                    _UR_ph = Qt.UserRole
+                    for i in range(n):
+                        ch = item.child(i)
+                        if ch.data(0, _UR_ph) == "__PLACEHOLDER__":
+                            ch.setHidden(True)
+                        else:
+                            ch.setHidden(not passes)
                 return passes
 
         root = self.tree.invisibleRootItem()
@@ -2353,6 +2396,16 @@ class PDDashboard(QMainWindow):
             tooltip_text += "\nStatic/Dynamic IR: Check individual stage levels for full tables."
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
+
+        # SPEED 2: Pre-compute path existence at build time, store on item
+        # Context menu reads these flags instead of calling cached_exists() live
+        child.setData(0, Qt.UserRole + 20, {
+            'run_path':  bool(run.get("path") and run["path"] != "N/A"),
+            'log':       bool(run.get("path") and os.path.join(run["path"], "logs/compile_opt.log")),
+            'fm_n':      cached_exists(run.get("fm_n_path", "")),
+            'fm_u':      cached_exists(run.get("fm_u_path", "")),
+            'vslp':      cached_exists(run.get("vslp_rpt_path", "")),
+        })
 
         # FIX 1: pre-compute error log count NOW (scan time, background thread)
         # so on_tree_selection_changed() can read it without any file I/O.
@@ -2598,14 +2651,21 @@ class PDDashboard(QMainWindow):
                          if run_path and run_path != "N/A" and cached_exists(run_path) else None)
         if calc_size_act: m.addSeparator()
 
-        fm_n_act    = m.addAction("Open NONUPF Formality Report") if fm_n_path and fm_n_path != "N/A" and cached_exists(fm_n_path) else None
-        fm_u_act    = m.addAction("Open UPF Formality Report")    if fm_u_path and fm_u_path != "N/A" and cached_exists(fm_u_path) else None
-        v_act       = m.addAction("Open VSLP Report")             if vslp_path and vslp_path != "N/A" and cached_exists(vslp_path) else None
-        sta_act     = m.addAction("Open PT STA Summary")          if sta_path  and sta_path  != "N/A" and cached_exists(sta_path)  else None
-        ir_stat_act = m.addAction("Open Static IR Log")           if ir_path   and ir_path   != "N/A" and cached_exists(ir_path)   else None
-        ir_dyn_act  = (m.addAction("Open Dynamic IR Log")
-                       if is_stage and ir_path and ir_path != "N/A" and cached_exists(ir_path) else None)
-        log_act     = m.addAction("Open Log File")                if log_path  and log_path  != "N/A" and cached_exists(log_path)  else None
+        # SPEED 3: Use pre-computed path flags (set in _create_run_item)
+        # Zero NFS calls here — context menu appears instantly
+        _flags = target_item.data(0, Qt.UserRole + 20) or {}
+
+        # For stage items, fall back to cached_exists only if needed
+        def _ex(path):
+            return bool(path and path != "N/A" and cached_exists(path))
+
+        fm_n_act    = m.addAction("Open NONUPF Formality Report") if _flags.get('fm_n') or _ex(fm_n_path)   else None
+        fm_u_act    = m.addAction("Open UPF Formality Report")    if _flags.get('fm_u') or _ex(fm_u_path)   else None
+        v_act       = m.addAction("Open VSLP Report")             if _flags.get('vslp') or _ex(vslp_path)   else None
+        sta_act     = m.addAction("Open PT STA Summary")          if _ex(sta_path)  else None
+        ir_stat_act = m.addAction("Open Static IR Log")           if _ex(ir_path)   else None
+        ir_dyn_act  = m.addAction("Open Dynamic IR Log")          if is_stage and _ex(ir_path) else None
+        log_act     = m.addAction("Open Log File")                if _flags.get('log') or _ex(log_path) else None
         term_act    = None  # Open Terminal Here removed per user request
 
         m.addSeparator()
@@ -2668,8 +2728,23 @@ class PDDashboard(QMainWindow):
                         if p and p != "N/A": self.ignored_paths.add(p)
                     ig(c)
             ig(self.tree.invisibleRootItem()); self.refresh_view()
-        elif res == ignore_act:   self.ignored_paths.add(target_path);      self.refresh_view()
-        elif res == restore_act:  self.ignored_paths.discard(target_path);   self.refresh_view()
+        elif res == ignore_act:
+            self.ignored_paths.add(target_path)
+            # SPEED 9: just hide the item directly — no full refresh needed
+            item.setHidden(True)
+            if item.parent():
+                # hide parent group node if no visible siblings
+                parent = item.parent()
+                if all(parent.child(i).isHidden() for i in range(parent.childCount())):
+                    parent.setHidden(True)
+        elif res == restore_act:
+            self.ignored_paths.discard(target_path)
+            item.setHidden(False)
+            # ensure parent chain is visible
+            p = item.parent()
+            while p and p.parent():
+                p.setHidden(False)
+                p = p.parent()
         elif calc_size_act and res == calc_size_act:
             item.setText(6, "Calc...")
             worker = SingleSizeWorker(item, run_path)
