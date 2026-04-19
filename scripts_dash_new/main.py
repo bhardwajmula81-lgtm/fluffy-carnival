@@ -64,6 +64,7 @@ class PDDashboard(QMainWindow):
         self._cached_disk_data = None
         self.disk_worker = None
 
+        # Ultra-fast hide/show filters only need 150ms timeout now
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.refresh_view)
@@ -108,14 +109,14 @@ class PDDashboard(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(6, 6, 6, 4)
-        root_layout.setSpacing(4)
+        root_layout.setContentsMargins(8, 8, 8, 4)
+        root_layout.setSpacing(6)
 
         # TOP BAR
         top_layout = QHBoxLayout()
-        top_layout.setSpacing(6)
+        top_layout.setSpacing(8)
 
-        top_layout.addWidget(self._label("Source:"))
+        top_layout.addWidget(self._label("<b>Source:</b>"))
         self.src_combo = QComboBox()
         self.src_combo.addItems(["ALL", "WS", "OUTFEED"])
         self.src_combo.setFixedWidth(100)
@@ -123,14 +124,14 @@ class PDDashboard(QMainWindow):
         top_layout.addWidget(self.src_combo)
 
         self._add_separator(top_layout)
-        top_layout.addWidget(self._label("RTL Release:"))
+        top_layout.addWidget(self._label("<b>RTL Release:</b>"))
         self.rel_combo = QComboBox()
         self.rel_combo.setMinimumWidth(220)
         self.rel_combo.currentIndexChanged.connect(self.refresh_view)
         top_layout.addWidget(self.rel_combo)
 
         self._add_separator(top_layout)
-        top_layout.addWidget(self._label("View:"))
+        top_layout.addWidget(self._label("<b>View:</b>"))
         self.view_combo = QComboBox()
         self.view_combo.addItems(["All Runs", "FE Only", "BE Only", "Running Only", "Failed Only", "Today's Runs"])
         self.view_combo.setFixedWidth(120)
@@ -141,12 +142,13 @@ class PDDashboard(QMainWindow):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search runs, blocks, status, runtime...   [Ctrl+F]")
         self.search.setMinimumWidth(260)
-        self.search.textChanged.connect(lambda: self.search_timer.start(500))
+        self.search.textChanged.connect(lambda: self.search_timer.start(150))
         top_layout.addWidget(self.search)
 
         top_layout.addStretch()
 
         self.refresh_btn = QPushButton("Refresh")
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
         self.refresh_btn.clicked.connect(self.start_fs_scan)
         top_layout.addWidget(self.refresh_btn)
 
@@ -158,18 +160,27 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top_layout)
 
-        # MEGA MENU
+        # MODULAR UTILITY BUTTONS
+        self.qor_btn = QPushButton("Compare QoR")
+        self.qor_btn.setCursor(Qt.PointingHandCursor)
+        self.qor_btn.clicked.connect(self.run_qor_comparison)
+        top_layout.addWidget(self.qor_btn)
+        
+        self.settings_btn = QPushButton("Settings")
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.clicked.connect(self.open_settings)
+        top_layout.addWidget(self.settings_btn)
+
         self.actions_btn = QPushButton("Actions v")
+        self.actions_btn.setCursor(Qt.PointingHandCursor)
         self.actions_menu = QMenu(self)
         
         self.actions_menu.addAction("Fit Columns", self.fit_all_columns)
         self.actions_menu.addAction("Expand All", self.safe_expand_all)
         self.actions_menu.addAction("Collapse All", self.safe_collapse_all)
         self.actions_menu.addSeparator()
-        
         self.actions_menu.addAction("Calculate All Run Sizes", self.calculate_all_sizes)
         self.actions_menu.addAction("Export to CSV", self.export_csv)
-        self.actions_menu.addAction("Compare QoR", self.run_qor_comparison)
         self.actions_menu.addSeparator()
         
         mail_menu = self.actions_menu.addMenu("Send Mail...")
@@ -183,9 +194,7 @@ class PDDashboard(QMainWindow):
         filt_menu.addAction("Clear Run Filter Config", self.clear_filter_config)
         filt_menu.addAction("Generate Sample Config", self.generate_sample_config)
         self.actions_menu.addSeparator()
-        
         self.actions_menu.addAction("Disk Space", self.open_disk_usage)
-        self.actions_menu.addAction("Settings", self.open_settings)
         
         self.actions_btn.setMenu(self.actions_menu)
         top_layout.addWidget(self.actions_btn)
@@ -194,6 +203,7 @@ class PDDashboard(QMainWindow):
         
         # NOTES TOGGLER
         self.notes_toggle_btn = QPushButton("Notes <")
+        self.notes_toggle_btn.setCursor(Qt.PointingHandCursor)
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
@@ -242,7 +252,7 @@ class PDDashboard(QMainWindow):
         self.blk_list.setAlternatingRowColors(True)
         f = self.blk_list.font(); f.setPointSize(f.pointSize() + 1); f.setBold(True)
         self.blk_list.setFont(f)
-        self.blk_list.itemChanged.connect(lambda: self.search_timer.start(100))
+        self.blk_list.itemChanged.connect(lambda: self.search_timer.start(50))
         left_layout.addWidget(self.blk_list, 1)
 
         self.fe_error_btn = QPushButton("")
@@ -252,7 +262,7 @@ class PDDashboard(QMainWindow):
         self.fe_error_btn.clicked.connect(self.open_error_log)
         left_layout.addWidget(self.fe_error_btn)
         
-        # META PANEL (Replaces Pie Chart)
+        # META PANEL
         self.meta_panel = QWidget()
         meta_layout = QVBoxLayout(self.meta_panel)
         meta_layout.setContentsMargins(0, 8, 0, 0)
@@ -316,19 +326,27 @@ class PDDashboard(QMainWindow):
         self.main_splitter.addWidget(self.tree)
         root_layout.addWidget(self.main_splitter)
 
-        # Right Panel (Inspector Dock Widget)
+        # Right Panel (Inspector Dock Widget - Stacked Chat Format)
         self.inspector = QWidget()
         ins_layout = QVBoxLayout(self.inspector)
         self.ins_lbl = QLabel("Select a run to view details.")
         self.ins_lbl.setWordWrap(True)
+        
+        self.ins_history = QTextEdit()
+        self.ins_history.setReadOnly(True)
+        
         self.ins_note = QTextEdit()
-        self.ins_note.setPlaceholderText("Enter aliases or personal notes here...\n\nVisible to all dashboard users.")
-        self.ins_save_btn = QPushButton("Save Note")
+        self.ins_note.setPlaceholderText("Enter your new note or update your existing note here...")
+        self.ins_note.setMaximumHeight(100)
+        
+        self.ins_save_btn = QPushButton("Save / Update Note")
         self.ins_save_btn.clicked.connect(self.save_inspector_note)
         
         ins_layout.addWidget(self.ins_lbl)
-        ins_layout.addWidget(QLabel("<b>Shared Notes:</b>"))
-        ins_layout.addWidget(self.ins_note)
+        ins_layout.addWidget(QLabel("<b>Shared Notes History:</b>"))
+        ins_layout.addWidget(self.ins_history, 1)
+        ins_layout.addWidget(QLabel("<b>Your Contribution:</b>"))
+        ins_layout.addWidget(self.ins_note, 0)
         ins_layout.addWidget(self.ins_save_btn)
         
         self.inspector_dock = QDockWidget(self)
@@ -480,6 +498,12 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                 text = item.text(col).strip()
                 if text: QApplication.clipboard().setText(text)
 
+    def on_item_double_clicked(self, item, col):
+        if item.parent():
+            log = item.text(16)
+            if log and cached_exists(log): 
+                subprocess.Popen(['gvim', log])
+
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "dashboard_export.csv", "CSV Files (*.csv)")
         if not path: return
@@ -533,9 +557,8 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         if not sel:
             self.ins_lbl.setText("Select a run to view details.")
             self.meta_status.clear(); self.meta_path.clear(); self.meta_log.clear()
-            self.ins_note.clear()
-            self.ins_note.setEnabled(False)
-            self.ins_save_btn.setEnabled(False)
+            self.ins_history.clear(); self.ins_note.clear()
+            self.ins_note.setEnabled(False); self.ins_save_btn.setEnabled(False)
             return
 
         item = sel[0]
@@ -547,11 +570,9 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self.meta_status.setText(item.text(3) if not is_stage else item.text(4))
         self.meta_path.setText(path)
         self.meta_log.setText(item.text(16))
-        self.meta_path.setCursorPosition(0)
-        self.meta_log.setCursorPosition(0)
+        self.meta_path.setCursorPosition(0); self.meta_log.setCursorPosition(0)
 
-        self.ins_note.setEnabled(True)
-        self.ins_save_btn.setEnabled(True)
+        self.ins_note.setEnabled(True); self.ins_save_btn.setEnabled(True)
 
         if is_stage:
             p_name = item.parent().text(0)
@@ -564,13 +585,19 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             self.ins_lbl.setText(f"<b>Run:</b> {run_name}<br><b>RTL:</b> {rtl}")
             self._current_note_id = f"{rtl} : {run_name}"
 
+        # POPULATE STACKED CHAT
         notes = self.global_notes.get(self._current_note_id, [])
-        clean_text = "\n".join(notes)
-        tag = f"[{getpass.getuser()}]"
-        for line in notes:
-            if line.startswith(tag):
-                clean_text = line.replace(tag, "").strip(); break
-        self.ins_note.setPlainText(clean_text)
+        full_history = "\n\n".join(notes) if notes else "No notes have been saved for this run yet."
+        self.ins_history.setPlainText(full_history)
+        
+        my_note = ""
+        tag_prefix = f"[{getpass.getuser()} -"
+        for n in notes:
+            if n.startswith(tag_prefix):
+                parts = n.split("] ", 1)
+                if len(parts) == 2: my_note = parts[1]
+                break
+        self.ins_note.setPlainText(my_note)
         
         if len(sel) == 1:
             if item.data(0, Qt.UserRole) != "STAGE":
@@ -603,8 +630,24 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         txt = self.ins_note.toPlainText()
         save_user_note(self._current_note_id, txt)
         self.global_notes = load_all_notes()
-        self.refresh_view()
-        self.on_tree_selection_changed()
+        self.on_tree_selection_changed() # Updates the history text instantly
+        
+        # Optionally trigger a quick hide/show refresh so tree column 22 updates
+        for i in range(self.tree.topLevelItemCount()):
+            self._update_note_labels(self.tree.topLevelItem(i))
+
+    def _update_note_labels(self, node):
+        node_type = node.data(0, Qt.UserRole)
+        if node_type == "RTL":
+            note_id = node.text(0)
+            if note_id in self.global_notes:
+                node.setText(22, " | ".join(self.global_notes[note_id]))
+        elif node_type == "DEFAULT":
+            note_id = f"{node.text(1)} : {node.text(0)}"
+            if note_id in self.global_notes:
+                node.setText(22, " | ".join(self.global_notes[note_id]))
+        for i in range(node.childCount()):
+            self._update_note_labels(node.child(i))
 
     def open_settings(self):
         dlg = SettingsDialog(self)
@@ -622,7 +665,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             self.convert_to_ist     = dlg.ist_cb.isChecked()
             self.hide_block_nodes   = dlg.hide_blocks_cb.isChecked()
             self.apply_theme_and_spacing()
-            self.refresh_view()
 
     def apply_theme_and_spacing(self):
         pad = self.row_spacing
@@ -631,16 +673,15 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             QTreeView::indicator:unchecked { background-color: white;   border: 1px solid gray; }
         """
         if self.use_custom_colors:
-            bg, self.custom_bg_color, fg = self.custom_bg_color, self.custom_bg_color, self.custom_fg_color
-            sel = self.custom_sel_color
+            bg, fg, sel = self.custom_bg_color, self.custom_fg_color, self.custom_sel_color
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{ background-color: {bg}; color: {fg}; }}
-                QHeaderView::section {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px; font-weight: bold; }}
+                QHeaderView::section {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 6px; font-weight: bold; }}
                 QTreeWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; }}
                 QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; font-weight: bold; }}
-                QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 4px; border-radius: 4px; }}
-                QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #ffffff; }}
-                QPushButton, QToolButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
+                QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 6px; border-radius: 6px; }}
+                QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #ffffff; border-radius: 6px; }}
+                QPushButton, QToolButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 6px 14px; border-radius: 6px; font-weight: bold; }}
                 QPushButton:hover, QToolButton:hover {{ border-color: {sel}; }}
                 QPushButton:pressed, QToolButton:pressed {{ background-color: {sel}; color: #ffffff; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: {sel}; padding: 0px 4px; min-width: 0px; }}
@@ -657,11 +698,11 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                 QMainWindow, QWidget, QDialog {{ background-color: #2b2d30; color: #dfe1e5; }}
                 QTreeWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; }}
                 QListWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; font-weight: bold; }}
-                QHeaderView::section {{ background-color: #2b2d30; color: #a9b7c6; border: 1px solid #1e1f22; padding: 5px; font-weight: bold; }}
-                QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
-                QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 4px; }}
-                QComboBox QAbstractItemView {{ background-color: #2b2d30; color: #dfe1e5; selection-background-color: #2f65ca; selection-color: #ffffff; }}
-                QPushButton, QToolButton {{ background-color: #393b40; color: #dfe1e5; border: 1px solid #43454a; padding: 5px 12px; border-radius: 4px; }}
+                QHeaderView::section {{ background-color: #2b2d30; color: #a9b7c6; border: 1px solid #1e1f22; padding: 6px; font-weight: bold; }}
+                QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 6px; border-radius: 6px; }}
+                QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 6px; border-radius: 6px; }}
+                QComboBox QAbstractItemView {{ background-color: #2b2d30; color: #dfe1e5; selection-background-color: #2f65ca; selection-color: #ffffff; border-radius: 6px; }}
+                QPushButton, QToolButton {{ background-color: #393b40; color: #dfe1e5; border: 1px solid #43454a; padding: 6px 14px; border-radius: 6px; }}
                 QPushButton:hover, QToolButton:hover {{ background-color: #43454a; }}
                 QPushButton:pressed, QToolButton:pressed {{ background-color: #2f65ca; color: #ffffff; border-color: #2f65ca; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: #64b5f6; padding: 0px 4px; min-width: 0px; }}
@@ -677,15 +718,15 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         else:
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{ background-color: #f5f7fa; color: #333333; }}
-                QHeaderView::section {{ background-color: #e4e7eb; color: #4a5568; border: 1px solid #cbd5e0; padding: 5px; font-weight: bold; }}
+                QHeaderView::section {{ background-color: #e4e7eb; color: #4a5568; border: 1px solid #cbd5e0; padding: 6px; font-weight: bold; }}
                 QTreeWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; }}
                 QListWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; font-weight: bold; }}
-                QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
-                QComboBox {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 4px; border-radius: 4px; }}
-                QComboBox QAbstractItemView {{ background-color: #ffffff; color: #333333; selection-background-color: #3182ce; selection-color: #ffffff; }}
-                QPushButton, QToolButton {{ background-color: #ffffff; color: #4a5568; border: 1px solid #cbd5e0; padding: 5px 12px; border-radius: 4px; font-weight: bold; }}
+                QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 6px; border-radius: 6px; }}
+                QComboBox {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 6px; border-radius: 6px; }}
+                QComboBox QAbstractItemView {{ background-color: #ffffff; color: #333333; selection-background-color: #3182ce; selection-color: #ffffff; border-radius: 6px; }}
+                QPushButton, QToolButton {{ background-color: #ffffff; color: #4a5568; border: 1px solid #cbd5e0; padding: 6px 14px; border-radius: 6px; font-weight: bold; }}
                 QPushButton:hover, QToolButton:hover {{ background-color: #edf2f7; border-color: #a0aec0; }}
-                QPushButton:pressed, QToolButton:pressed {{ background-color: #e2e8f0; }}
+                QPushButton:pressed, QToolButton:pressed {{ background-color: #e2e8f0; border-color: #a0aec0; }}
                 QPushButton#linkBtn {{ border: none; background: transparent; color: #3182ce; padding: 0px 4px; min-width: 0px; }}
                 QPushButton#linkBtn:hover {{ text-decoration: underline; }}
                 QSplitter::handle {{ background-color: #cbd5e0; }}
@@ -774,7 +815,9 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
         self.global_notes = load_all_notes()
         
-        self.on_source_changed()
+        self.update_combos()
+        self.build_tree() # Core rewrite: Tree is only built once per scan
+        
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
             self.fit_all_columns()
@@ -791,26 +834,17 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         summary_dlg = ScanSummaryDialog(stats, self)
         summary_dlg.exec_()
 
-    def on_source_changed(self):
-        src_mode = self.src_combo.currentText()
-        if src_mode == "WS":
-            self.tree.setColumnHidden(2, True);  self.tree.setColumnHidden(3, False); self.tree.setColumnHidden(4, False)
-        elif src_mode == "OUTFEED":
-            self.tree.setColumnHidden(2, True);  self.tree.setColumnHidden(3, True);  self.tree.setColumnHidden(4, True)
-        else:
-            self.tree.setColumnHidden(2, False); self.tree.setColumnHidden(3, False); self.tree.setColumnHidden(4, False)
-
+    def update_combos(self):
         releases, blocks = set(), set()
-        if src_mode in ["WS",  "ALL"] and self.ws_data:
+        if self.ws_data:
             releases.update(self.ws_data.get("releases", {}).keys())
             blocks.update(self.ws_data.get("blocks", set()))
-        if src_mode in ["OUTFEED", "ALL"] and self.out_data:
+        if self.out_data:
             releases.update(self.out_data.get("releases", {}).keys())
             blocks.update(self.out_data.get("blocks", set()))
 
         current_rtl  = self.rel_combo.currentText()
-        saved_states = {self.blk_list.item(i).data(Qt.UserRole): self.blk_list.item(i).checkState()
-                        for i in range(self.blk_list.count())}
+        saved_states = {self.blk_list.item(i).data(Qt.UserRole): self.blk_list.item(i).checkState() for i in range(self.blk_list.count())}
 
         self.rel_combo.blockSignals(True); self.rel_combo.clear()
         valid = [r for r in releases if "Unknown" not in r and get_milestone(r) is not None]
@@ -827,7 +861,202 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             it.setCheckState(saved_states.get(b, Qt.Checked))
             self.blk_list.addItem(it)
         self.blk_list.blockSignals(False)
+
+    def on_source_changed(self):
+        src_mode = self.src_combo.currentText()
+        if src_mode == "WS":
+            self.tree.setColumnHidden(2, True);  self.tree.setColumnHidden(3, False); self.tree.setColumnHidden(4, False)
+        elif src_mode == "OUTFEED":
+            self.tree.setColumnHidden(2, True);  self.tree.setColumnHidden(3, True);  self.tree.setColumnHidden(4, True)
+        else:
+            self.tree.setColumnHidden(2, False); self.tree.setColumnHidden(3, False); self.tree.setColumnHidden(4, False)
+        
         self.refresh_view()
+
+    # --- THE NEW HIDE/SHOW FILTER METHOD ---
+    def refresh_view(self):
+        self.tree.blockSignals(True)
+        self.tree.setUpdatesEnabled(False)
+        
+        src_mode = self.src_combo.currentText()
+        sel_rtl = self.rel_combo.currentText()
+        preset = self.view_combo.currentText()
+        raw_query = self.search.text().lower().strip()
+        search_pattern = "*" if not raw_query else (f"*{raw_query}*" if '*' not in raw_query else raw_query)
+        checked_blks = [self.blk_list.item(i).data(Qt.UserRole) for i in range(self.blk_list.count()) if self.blk_list.item(i).checkState() == Qt.Checked]
+        
+        is_actively_filtered = (preset != "All Runs") or (raw_query != "") or (sel_rtl != "[ SHOW ALL ]") or (src_mode != "ALL")
+
+        def check_run(run):
+            if self.user_pins.get(run["path"]) == "golden": return True
+            if src_mode != "ALL" and run["source"] != src_mode: return False
+            if run["block"] not in checked_blks: return False
+            
+            if self.run_filter_config is not None:
+                r_src, r_rtl, r_blk = run["source"], run["rtl"], run["block"]
+                if r_src in self.run_filter_config and r_rtl in self.run_filter_config[r_src] and r_blk in self.run_filter_config[r_src][r_rtl]:
+                    allowed = self.run_filter_config[r_src][r_rtl][r_blk]
+                    b_name = run["r_name"].replace("-FE", "").replace("-BE", "")
+                    if b_name not in allowed and run["r_name"] not in allowed: return False
+                    
+            base_rtl_filter = re.sub(r'_syn\d+$', '', run["rtl"])
+            if sel_rtl != "[ SHOW ALL ]":
+                if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): return False
+                
+            if preset == "FE Only" and run["run_type"] != "FE": return False
+            if preset == "BE Only" and run["run_type"] != "BE": return False
+            if preset == "Running Only" and not (run["run_type"] == "FE" and not run["is_comp"]): return False
+            if preset == "Failed Only" and not ("FAILS" in run.get("st_n","") or "FAILS" in run.get("st_u","") or run.get("fe_status") == "FATAL ERROR"): return False
+            if preset == "Today's Runs":
+                start = run["info"].get("start","")
+                rt = relative_time(start)
+                if not (rt.endswith("ago") and ("h ago" in rt or "m ago" in rt)): return False
+                
+            if search_pattern != "*":
+                note_id = f"{run['rtl']} : {run['r_name']}"
+                notes = " | ".join(self.global_notes.get(note_id, []))
+                combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
+                            f"{run['st_n']} {run['st_u']} {run['vslp_status']} "
+                            f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']} {notes}").lower()
+                if not fnmatch.fnmatch(combined, search_pattern): return False
+            return True
+            
+        def check_stage(stage, run):
+            if self.user_pins.get(run["path"]) == "golden": return True
+            if src_mode != "ALL" and run["source"] != src_mode: return False
+            if run["block"] not in checked_blks: return False
+            if sel_rtl != "[ SHOW ALL ]" and not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): return False
+            if preset == "FE Only": return False
+            if preset == "Failed Only" and not ("FAILS" in stage.get("st_n","") or "FAILS" in stage.get("st_u","")): return False
+            if search_pattern != "*":
+                sc = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
+                if not fnmatch.fnmatch(sc, search_pattern): return False
+            return True
+
+        visible_runs = []
+        
+        def update_vis(node):
+            node_type = node.data(0, Qt.UserRole)
+            is_group = node_type in ["BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"]
+            
+            if node_type == "DEFAULT":
+                run = node.data(0, Qt.UserRole + 10)
+                matches = check_run(run)
+                
+                child_matches = False
+                for i in range(node.childCount()):
+                    if update_vis(node.child(i)): child_matches = True
+                        
+                is_vis = matches or child_matches
+                node.setHidden(not is_vis)
+                if is_vis: visible_runs.append(run)
+                return is_vis
+                
+            elif node_type == "STAGE":
+                stage = node.data(0, Qt.UserRole + 10)
+                parent_run = node.parent().data(0, Qt.UserRole + 10)
+                matches = check_stage(stage, parent_run)
+                node.setHidden(not matches)
+                return matches
+                
+            else:
+                any_vis = False
+                for i in range(node.childCount()):
+                    if update_vis(node.child(i)): any_vis = True
+                
+                if is_actively_filtered and any_vis: node.setExpanded(True)
+                elif not is_actively_filtered and node_type in ["MILESTONE", "RTL"]: node.setExpanded(False)
+                    
+                node.setHidden(not any_vis)
+                return any_vis
+                
+        update_vis(self.tree.invisibleRootItem())
+        
+        self.apply_tree_filters()
+        self._update_status_bar(visible_runs)
+        
+        self.tree.setUpdatesEnabled(True)
+        self.tree.blockSignals(False)
+
+    # --- THE NEW CORE TREE BUILDER (Runs exactly once per scan) ---
+    def build_tree(self):
+        self.tree.blockSignals(True)
+        self.tree.setUpdatesEnabled(False)
+        self.tree.setSortingEnabled(False)
+        self.tree.clear()
+        
+        runs_to_process = []
+        if self.ws_data: runs_to_process.extend(self.ws_data.get("all_runs", []))
+        if self.out_data: runs_to_process.extend(self.out_data.get("all_runs", []))
+        
+        fe_info = {}
+        for run in runs_to_process:
+            if run["run_type"] == "FE":
+                fe_base = run["r_name"].replace("-FE", "")
+                fe_info[(run["block"], fe_base)] = run["rtl"]
+        
+        for run in runs_to_process:
+            if run["run_type"] == "BE":
+                clean_be = run["r_name"].replace("-BE", "")
+                for (blk, fe_base), fe_rtl in fe_info.items():
+                    if run["block"] == blk and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
+                        run["rtl"] = fe_rtl; break
+                        
+        root = self.tree.invisibleRootItem()
+        ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
+        
+        fe_runs = [r for r in runs_to_process if r["run_type"] == "FE"]
+        be_runs = [r for r in runs_to_process if r["run_type"] == "BE"]
+        
+        for run in fe_runs:
+            target_root = ign_root if run["path"] in self.ignored_paths else root
+            base_attach_node = target_root if self.hide_block_nodes else self._get_node(target_root, run["block"], "BLOCK")
+            base_rtl = re.sub(r'_syn\d+$', '', run["rtl"])
+            m_node = self._get_node(base_attach_node, get_milestone(base_rtl) or "UNKNOWN", "MILESTONE")
+            parent_for_run = self._get_node(m_node, base_rtl, "RTL") 
+            
+            item = self._create_run_item(parent_for_run, run)
+            item.setData(0, Qt.UserRole + 10, run) # Attaches Raw Data for Lightning Fast Filtering
+            
+        for run in be_runs:
+            target_root = ign_root if run["path"] in self.ignored_paths else root
+            base_attach_node = target_root if self.hide_block_nodes else self._get_node(target_root, run["block"], "BLOCK")
+            base_rtl = re.sub(r'_syn\d+$', '', run["rtl"])
+            m_node = self._get_node(base_attach_node, get_milestone(base_rtl) or "UNKNOWN", "MILESTONE")
+            parent_for_run = self._get_node(m_node, base_rtl, "RTL")
+            
+            fe_parent = None
+            for i in range(parent_for_run.childCount()):
+                c = parent_for_run.child(i)
+                if c.data(0, Qt.UserRole) != "STAGE":
+                    fe_base = c.text(0).replace("-FE", "")
+                    clean_be = run["r_name"].replace("-BE", "")
+                    if c.text(2) == run["source"] and c.data(0, Qt.UserRole + 2) == run["block"] and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
+                        fe_parent = c; break
+                        
+            actual_parent = fe_parent if fe_parent else parent_for_run
+            be_item = self._create_run_item(actual_parent, run)
+            be_item.setData(0, Qt.UserRole + 10, run)
+            self._add_stages(be_item, run, ign_root)
+            
+        if ign_root.childCount() == 0: root.removeChild(ign_root)
+        
+        def update_pins(node):
+            if node.data(0, Qt.UserRole) not in ["BLOCK", "RTL", "MILESTONE", "IGNORED_ROOT"]:
+                pin_type = self.user_pins.get(node.text(15))
+                if pin_type in self.icons:
+                    node.setIcon(0, self.icons[pin_type])
+                    node.setData(0, Qt.UserRole + 5, pin_type)
+                else:
+                    node.setIcon(0, QIcon())
+                    node.setData(0, Qt.UserRole + 5, None)
+            for i in range(node.childCount()): update_pins(node.child(i))
+        update_pins(root)
+        
+        self.tree.blockSignals(False)
+        self.tree.setUpdatesEnabled(True)
+        self.tree.setSortingEnabled(True)
+        self.refresh_view() # Applies the instant filters
 
     def fit_all_columns(self):
         self.tree.setUpdatesEnabled(False)
@@ -1035,6 +1264,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             st_item.setData(0, Qt.UserRole, "STAGE")
             st_item.setData(1, Qt.UserRole, stage["name"])
             st_item.setData(2, Qt.UserRole, stage["qor_path"])
+            st_item.setData(0, Qt.UserRole + 10, stage)
 
             ir_key  = f"{be_run['r_name']}/{stage['name']}"
             ir_info = self.ir_data.get(ir_key, {"static": "-", "dynamic": "-", "log": "", "static_table": "", "dynamic_table": ""})
@@ -1087,391 +1317,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 
             for i in range(1, 23): st_item.setTextAlignment(i, Qt.AlignCenter)
             st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter); st_item.setTextAlignment(22, Qt.AlignLeft | Qt.AlignVCenter)
-
-    def refresh_view(self):
-        for w in self.size_workers:
-            if hasattr(w, 'cancel'): w.cancel()
-        self.item_map.clear()
-
-        expanded_states = {}
-        def save_state(node):
-            for i in range(node.childCount()):
-                child = node.child(i)
-                expanded_states[self._get_item_path_id(child)] = child.isExpanded()
-                save_state(child)
-        save_state(self.tree.invisibleRootItem())
-
-        self.tree.blockSignals(True); self.tree.setUpdatesEnabled(False)
-        self.tree.setSortingEnabled(False); self.tree.clear()
-
-        if self.rel_combo.currentText() == "[ SHOW ALL ]": self.tree.setColumnHidden(1, False)
-        else: self.tree.setColumnHidden(1, True)
-
-        src_mode   = self.src_combo.currentText(); sel_rtl    = self.rel_combo.currentText()
-        is_filtered = (self.view_combo.currentText() != "All Runs") or (self.search.text().strip() != "")
-
-        raw_query      = self.search.text().lower().strip()
-        search_pattern = "*" if not raw_query else (f"*{raw_query}*" if '*' not in raw_query else raw_query)
-
-        checked_blks = [self.blk_list.item(i).data(Qt.UserRole) for i in range(self.blk_list.count()) if self.blk_list.item(i).checkState() == Qt.Checked]
-
-        runs_to_process = []
-        if src_mode in ["WS",  "ALL"] and self.ws_data:  runs_to_process.extend(self.ws_data.get("all_runs", []))
-        if src_mode in ["OUTFEED","ALL"] and self.out_data: runs_to_process.extend(self.out_data.get("all_runs", []))
-
-        fe_info = {}
-        for run in runs_to_process:
-            if run["run_type"] == "FE":
-                fe_base = run["r_name"].replace("-FE", "")
-                fe_info[(run["block"], fe_base)] = run["rtl"]
-
-        for run in runs_to_process:
-            if run["run_type"] == "BE":
-                clean_be = run["r_name"].replace("-BE", "")
-                for (blk, fe_base), fe_rtl in fe_info.items():
-                    if run["block"] == blk and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
-                        run["rtl"] = fe_rtl; break
-
-        ignored_runs_list, normal_runs_list = [], []
-
-        for run in runs_to_process:
-            if run["path"] in self.ignored_paths: ignored_runs_list.append(run); continue
-            
-            # --- GOLDEN RUN EXCEPTION ---
-            is_golden = (self.user_pins.get(run["path"]) == "golden")
-            
-            if not is_golden: # Only apply filters if it's NOT a Golden Run
-                if run["block"] not in checked_blks: continue
-
-                if self.run_filter_config is not None:
-                    r_src = run["source"]; r_rtl = run["rtl"]; r_blk = run["block"]
-                    if r_src in self.run_filter_config and r_rtl in self.run_filter_config[r_src] and r_blk in self.run_filter_config[r_src][r_rtl]:
-                        allowed_runs = self.run_filter_config[r_src][r_rtl][r_blk]
-                        base_run_name = run["r_name"].replace("-FE", "").replace("-BE", "")
-                        if base_run_name not in allowed_runs and run["r_name"] not in allowed_runs: continue 
-
-                base_rtl_filter = re.sub(r'_syn\d+$', '', run["rtl"])
-                if get_milestone(base_rtl_filter) is None: continue
-                if sel_rtl != "[ SHOW ALL ]":
-                    if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): continue
-
-                preset = self.view_combo.currentText()
-                if preset == "FE Only"      and run["run_type"] != "FE": continue
-                if preset == "BE Only"      and run["run_type"] != "BE": continue
-                if preset == "Running Only" and not (run["run_type"] == "FE" and not run["is_comp"]): continue
-                if preset == "Failed Only"  and not ("FAILS" in run.get("st_n","") or "FAILS" in run.get("st_u","") or run.get("fe_status") == "FATAL ERROR"): continue
-                if preset == "Today's Runs":
-                    start = run["info"].get("start",""); rt = relative_time(start)
-                    if not (rt.endswith("ago") and ("h ago" in rt or "m ago" in rt)): continue
-
-                if search_pattern != "*":
-                    note_id = f"{run['rtl']} : {run['r_name']}"
-                    notes = " | ".join(self.global_notes.get(note_id, []))
-                    combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
-                                f"{run['st_n']} {run['st_u']} {run['vslp_status']} "
-                                f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']} {notes}").lower()
-                    matches = fnmatch.fnmatch(combined, search_pattern)
-                    if not matches and run["run_type"] == "BE":
-                        for stage in run["stages"]:
-                            sc = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
-                            if fnmatch.fnmatch(sc, search_pattern): matches = True; break
-                    if not matches: continue
-
-            normal_runs_list.append(run)
-
-        fe_runs = [r for r in normal_runs_list if r["run_type"] == "FE"]
-        be_runs = [r for r in normal_runs_list if r["run_type"] == "BE"]
-
-        root     = self.tree.invisibleRootItem()
-        ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
-
-        for fe_run in fe_runs:
-            blk_name = fe_run["block"]; run_rtl = fe_run["rtl"]
-            base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
-            base_attach_node = root if self.hide_block_nodes else self._get_node(root, blk_name, "BLOCK")
-
-            if sel_rtl == "[ SHOW ALL ]":
-                m_node = self._get_node(base_attach_node, get_milestone(base_rtl), "MILESTONE")
-                parent_for_run = self._get_node(m_node, base_rtl, "RTL")
-            elif sel_rtl == base_rtl and has_syn: parent_for_run = self._get_node(base_attach_node, run_rtl, "RTL")
-            else: parent_for_run = base_attach_node
-                
-            self._create_run_item(parent_for_run, fe_run)
-
-        for be_run in be_runs:
-            blk_name = be_run["block"]; run_rtl = be_run["rtl"]
-            base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
-            base_attach_node = root if self.hide_block_nodes else self._get_node(root, blk_name, "BLOCK")
-
-            if sel_rtl == "[ SHOW ALL ]":
-                m_node = self._get_node(base_attach_node, get_milestone(base_rtl), "MILESTONE")
-                parent_for_run = self._get_node(m_node, base_rtl, "RTL")
-            elif sel_rtl == base_rtl and has_syn: parent_for_run = self._get_node(base_attach_node, run_rtl, "RTL")
-            else: parent_for_run = base_attach_node
-
-            fe_parent = None
-            for i in range(parent_for_run.childCount()):
-                c = parent_for_run.child(i)
-                if c.data(0, Qt.UserRole) != "STAGE":
-                    fe_base = c.text(0).replace("-FE", "")
-                    clean_be = be_run["r_name"].replace("-BE", "")
-                    if c.text(2) == be_run["source"] and c.data(0, Qt.UserRole + 2) == be_run["block"] and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
-                        fe_parent = c; break
-
-            actual_parent = fe_parent if fe_parent else parent_for_run
-            be_item = self._create_run_item(actual_parent, be_run)
-            self._add_stages(be_item, be_run, ign_root)
-
-        if ignored_runs_list:
-            for run in ignored_runs_list:
-                blk_name = run["block"]; run_rtl = run["rtl"]
-                base_rtl = re.sub(r'_syn\d+$', '', run_rtl); has_syn = (run_rtl != base_rtl)
-                base_attach_node = ign_root if self.hide_block_nodes else self._get_node(ign_root, blk_name, "BLOCK")
-                
-                if sel_rtl == "[ SHOW ALL ]":
-                    m_node = self._get_node(base_attach_node, get_milestone(base_rtl), "MILESTONE")
-                    parent_for_run = self._get_node(m_node, base_rtl, "RTL")
-                elif sel_rtl == base_rtl and has_syn: parent_for_run = self._get_node(base_attach_node, run_rtl, "RTL")
-                else: parent_for_run = base_attach_node
-                    
-                item = self._create_run_item(parent_for_run, run)
-                if run["run_type"] == "BE": self._add_stages(item, run, ign_root)
-
-        if ign_root.childCount() == 0: root.removeChild(ign_root)
-
-        def update_nodes(node):
-            if node.data(0, Qt.UserRole) not in ["BLOCK", "RTL", "MILESTONE", "IGNORED_ROOT"]:
-                pin_type = self.user_pins.get(node.text(15))
-                if pin_type in self.icons:
-                    node.setIcon(0, self.icons[pin_type])
-                    node.setData(0, Qt.UserRole + 5, pin_type)
-                else:
-                    node.setIcon(0, QIcon())
-                    node.setData(0, Qt.UserRole + 5, None)
-                    
-            for i in range(node.childCount()): update_nodes(node.child(i))
-            
-        update_nodes(root)
-
-        self.apply_tree_filters()
-        self.tree.setSortingEnabled(True)
-
-        def restore_state(node):
-            for i in range(node.childCount()):
-                child     = node.child(i)
-                path_key  = self._get_item_path_id(child)
-                node_type = child.data(0, Qt.UserRole)
-                is_run    = bool(child.text(15))
-                if is_filtered and node_type in ["BLOCK", "MILESTONE", "RTL"]: child.setExpanded(True)
-                elif path_key in expanded_states: child.setExpanded(expanded_states[path_key])
-                else:
-                    if child.parent() is None:   child.setExpanded(True)
-                    elif node_type == "MILESTONE": child.setExpanded(False)
-                    elif sel_rtl == "[ SHOW ALL ]" and node_type == "RTL": child.setExpanded(False)
-                    elif is_run:                   child.setExpanded(False)
-                    else:                          child.setExpanded(True)
-                restore_state(child)
-        restore_state(root)
-
-        self.tree.blockSignals(False); self.tree.setUpdatesEnabled(True)
-        self._update_status_bar(normal_runs_list)
-        self.on_tree_selection_changed()
-        
-        QTimer.singleShot(50, lambda: self.tree.resizeColumnToContents(0))
-
-    def on_header_context_menu(self, pos):
-        col = self.tree.header().logicalIndexAt(pos)
-        menu = QMenu(self)
-        col_name = self.tree.headerItem().text(col).replace(" [*]", "")
-
-        sort_asc_act = menu.addAction(f"Sort A to Z")
-        sort_desc_act = menu.addAction(f"Sort Z to A")
-        menu.addSeparator()
-
-        filter_act = menu.addAction(f"Filter Column '{col_name}'...")
-        clear_act = menu.addAction(f"Clear Filter")
-        clear_act.setEnabled(col in self.active_col_filters)
-        
-        clear_all_act = menu.addAction("Clear All Filters")
-        clear_all_act.setEnabled(len(self.active_col_filters) > 0)
-        menu.addSeparator()
-
-        vis_menu = menu.addMenu("Show / Hide Columns")
-        for i in range(1, 24):
-            action = QWidgetAction(vis_menu)
-            cb = QCheckBox(self.tree.headerItem().text(i).replace(" [*]", ""))
-            cb.setChecked(not self.tree.isColumnHidden(i))
-            cb.setStyleSheet("margin: 2px 8px; background: transparent; color: inherit;")
-            cb.toggled.connect(lambda checked, c=i: self.tree.setColumnHidden(c, not checked))
-            action.setDefaultWidget(cb)
-            vis_menu.addAction(action)
-
-        action = menu.exec_(self.tree.header().mapToGlobal(pos))
-        if action == sort_asc_act: self.tree.sortByColumn(col, Qt.AscendingOrder)
-        elif action == sort_desc_act: self.tree.sortByColumn(col, Qt.DescendingOrder)
-        elif action == filter_act: self.show_column_filter_dialog(col)
-        elif action == clear_act:
-            if col in self.active_col_filters:
-                del self.active_col_filters[col]; self.apply_tree_filters()
-        elif action == clear_all_act:
-            self.active_col_filters.clear(); self.apply_tree_filters()
-
-    def on_context_menu(self, pos):
-        item = self.tree.itemAt(pos)
-        if not item or not item.parent(): return
-        col = self.tree.columnAt(pos.x())
-        m   = QMenu()
-
-        run_path  = item.text(15)
-        fm_u_path = item.text(17); fm_n_path = item.text(18)
-        vslp_path = item.text(19); sta_path  = item.text(20); ir_path = item.text(21)
-        log_path  = item.text(16)
-        is_stage  = item.data(0, Qt.UserRole) == "STAGE"
-        is_rtl    = item.data(0, Qt.UserRole) == "RTL"
-        
-        target_item = item if not is_stage else item.parent()
-        b_name = target_item.data(0, Qt.UserRole + 2)
-        r_rtl = target_item.text(1)
-        base_run = target_item.data(0, Qt.UserRole + 4)
-        run_source = target_item.text(2)
-        
-        act_gold = act_good = act_red = act_later = act_clear = None
-        gantt_act = None
-        
-        if (run_path and run_path != "N/A") or is_stage:
-            pin_menu = m.addMenu("Pin as...")
-            act_gold = pin_menu.addAction(self.icons['golden'], "Golden Run")
-            act_good = pin_menu.addAction(self.icons['good'], "Good Run")
-            act_red = pin_menu.addAction(self.icons['redundant'], "Redundant Run")
-            act_later = pin_menu.addAction(self.icons['later'], "Mark for Later")
-            pin_menu.addSeparator()
-            act_clear = pin_menu.addAction("Clear Pin")
-            m.addSeparator()
-            
-            if item.childCount() > 0 and item.child(0).data(0, Qt.UserRole) == "STAGE":
-                gantt_act = m.addAction("Show Timeline (Gantt Chart)")
-                m.addSeparator()
-        
-        edit_note_act = None; note_identifier = ""
-        if run_path and run_path != "N/A" and not is_stage:
-            note_identifier = f"{r_rtl} : {item.text(0)}"
-            edit_note_act = m.addAction("Add / Edit Personal Note"); m.addSeparator()
-        elif is_rtl:
-            note_identifier = item.text(0)
-            edit_note_act = m.addAction("Add / Edit Alias Note for RTL"); m.addSeparator()
-        
-        add_config_act = None
-        if b_name and r_rtl and base_run and run_source:
-            if self.current_config_path: add_config_act = m.addAction("Add Run to Active Filter Config")
-            else: add_config_act = m.addAction("Create New Filter Config & Add Run")
-            m.addSeparator()
-
-        ignore_checked_act = m.addAction("Hide All Checked Runs/Stages")
-        m.addSeparator()
-
-        ignore_act = restore_act = None
-        target_path = item.text(15)
-        if target_path and target_path != "N/A":
-            if target_path in self.ignored_paths: restore_act = m.addAction("Restore (Unhide)")
-            else: ignore_act = m.addAction("Hide/Ignore")
-            m.addSeparator()
-
-        calc_size_act = m.addAction("Calculate Folder Size") if run_path and run_path != "N/A" and cached_exists(run_path) else None
-        if calc_size_act: m.addSeparator()
-
-        fm_n_act    = m.addAction("Open NONUPF Formality Report") if fm_n_path and fm_n_path != "N/A" and cached_exists(fm_n_path) else None
-        fm_u_act    = m.addAction("Open UPF Formality Report")    if fm_u_path and fm_u_path != "N/A" and cached_exists(fm_u_path) else None
-        v_act       = m.addAction("Open VSLP Report")             if vslp_path and vslp_path != "N/A" and cached_exists(vslp_path) else None
-        sta_act     = m.addAction("Open PT STA Summary")          if sta_path  and sta_path  != "N/A" and cached_exists(sta_path)  else None
-        ir_stat_act = m.addAction("Open Static IR Log")           if ir_path   and ir_path   != "N/A" and cached_exists(ir_path)   else None
-        ir_dyn_act  = m.addAction("Open Dynamic IR Log")          if is_stage and ir_path and ir_path != "N/A" and cached_exists(ir_path) else None
-        log_act     = m.addAction("Open Log File")                if log_path  and log_path  != "N/A" and cached_exists(log_path)  else None
-
-        m.addSeparator()
-        qor_act = None
-        if is_stage: m.addSeparator(); qor_act = m.addAction("Run Single Stage QoR")
-
-        res = m.exec_(self.tree.viewport().mapToGlobal(pos))
-        if not res: return
-        
-        if res in [act_gold, act_good, act_red, act_later, act_clear]:
-            p_target = run_path if run_path and run_path != "N/A" else (item.parent().text(15) if is_stage else None)
-            if p_target:
-                if res == act_gold: self.user_pins[p_target] = 'golden'
-                elif res == act_good: self.user_pins[p_target] = 'good'
-                elif res == act_red: self.user_pins[p_target] = 'redundant'
-                elif res == act_later: self.user_pins[p_target] = 'later'
-                elif res == act_clear: self.user_pins.pop(p_target, None)
-                save_user_pins(self.user_pins)
-                self.refresh_view()
-            
-        elif gantt_act and res == gantt_act:
-            stages = []
-            for i in range(item.childCount()):
-                c = item.child(i)
-                if c.data(0, Qt.UserRole) == "STAGE":
-                    rt = c.text(12)
-                    stages.append({'name': c.text(0), 'time_str': rt, 'sec': self._time_to_seconds(rt)})
-            dlg = GanttChartDialog(item.text(0), stages, self); dlg.exec_()
-        
-        elif edit_note_act and res == edit_note_act:
-            current_note = item.text(22)
-            dlg = EditNoteDialog(current_note, note_identifier, self)
-            if dlg.exec_():
-                save_user_note(note_identifier, dlg.get_text())
-                self.global_notes = load_all_notes(); self.refresh_view()
-
-        elif add_config_act and res == add_config_act:
-            if not self.current_config_path:
-                path, _ = QFileDialog.getSaveFileName(self, "Create New Config", "dashboard_filter.cfg", "Config Files (*.cfg *.txt)")
-                if not path: return
-                self.current_config_path = path
-                self.run_filter_config = {}
-                
-            if run_source not in self.run_filter_config: self.run_filter_config[run_source] = {}
-            if r_rtl not in self.run_filter_config[run_source]: self.run_filter_config[run_source][r_rtl] = {}
-            if b_name not in self.run_filter_config[run_source][r_rtl]: self.run_filter_config[run_source][r_rtl][b_name] = set()
-            self.run_filter_config[run_source][r_rtl][b_name].add(base_run)
-            
-            self._save_current_config()
-            self.sb_config.setText(f"Config: Active ({os.path.basename(self.current_config_path)})")
-            self.sb_config.setStyleSheet(f"color: {'#d32f2f' if not self.is_dark_mode else '#ffb74d'}; font-weight: bold;")
-            self.refresh_view()
-            
-        elif res == ignore_checked_act:
-            def ig(node):
-                for i in range(node.childCount()):
-                    c = node.child(i)
-                    if c.checkState(0) == Qt.Checked:
-                        p = c.text(15)
-                        if p and p != "N/A": self.ignored_paths.add(p)
-                    ig(c)
-            ig(self.tree.invisibleRootItem()); self.refresh_view()
-        elif res == ignore_act:  self.ignored_paths.add(target_path);    self.refresh_view()
-        elif res == restore_act: self.ignored_paths.discard(target_path); self.refresh_view()
-        elif calc_size_act and res == calc_size_act:
-            item.setText(6, "Calc...")
-            worker = SingleSizeWorker(item, run_path)
-            worker.result.connect(lambda it, sz: (
-                it.setText(6, sz),
-                it.setToolTip(0, re.sub(r'Size: .*?\n', f'Size: {sz}\n', it.toolTip(0) if it.toolTip(0) else ""))
-            ))
-            if not hasattr(self, 'size_workers'): self.size_workers = []
-            self.size_workers.append(worker)
-            worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
-            worker.start()
-        elif fm_n_act    and res == fm_n_act:    subprocess.Popen(['gvim', fm_n_path])
-        elif fm_u_act    and res == fm_u_act:    subprocess.Popen(['gvim', fm_u_path])
-        elif v_act       and res == v_act:       subprocess.Popen(['gvim', vslp_path])
-        elif sta_act     and res == sta_act:     subprocess.Popen(['gvim', sta_path])
-        elif ir_stat_act and res == ir_stat_act: subprocess.Popen(['gvim', ir_path])
-        elif ir_dyn_act  and res == ir_dyn_act:  subprocess.Popen(['gvim', ir_path])
-        elif log_act     and res == log_act:     subprocess.Popen(['gvim', log_path])
-        elif qor_act and res == qor_act:
-            step_name = item.data(1, Qt.UserRole); qor_path  = item.data(2, Qt.UserRole)
-            subprocess.run(["python3.6", SUMMARY_SCRIPT, qor_path, "-stage", step_name])
-            h = find_latest_qor_report()
-            if h: subprocess.Popen([FIREFOX_PATH, h])
 
     def send_cleanup_mail_action(self):
         user_runs = {}; is_fe_selected = False
