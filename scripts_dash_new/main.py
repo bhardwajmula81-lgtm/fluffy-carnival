@@ -195,7 +195,7 @@ class PDDashboard(QMainWindow):
 
         self.size_toggle_btn = QToolButton()
         self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
-        self.size_toggle_btn.setToolTip("Toggle Compact Window Mode")
+        self.size_toggle_btn.setToolTip("Toggle Compact Mode")
         self.size_toggle_btn.clicked.connect(self.toggle_window_size)
         self.size_toggle_btn.setFixedSize(28, 28)
         top_layout.addWidget(self.size_toggle_btn)
@@ -444,11 +444,18 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 
     def toggle_window_size(self):
         if not self.is_compact:
-            self.showNormal(); self.resize(1280, 720); self.is_compact = True
+            # Switch to compact mode
+            self.showNormal()
+            self.resize(1280, 720)
+            self.is_compact = True
             self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
+            self.size_toggle_btn.setToolTip("Maximize Window")
         else:
-            self.showNormal(); self.resize(1920, 1000); self.is_compact = False
+            # Switch back to full screen / maximized
+            self.showMaximized()
+            self.is_compact = False
             self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
+            self.size_toggle_btn.setToolTip("Toggle Compact Mode")
 
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+R"),       self, self.start_fs_scan)
@@ -698,13 +705,36 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 
     def start_fs_scan(self):
         if hasattr(self, 'worker') and self.worker.isRunning(): return
+        
         self.prog_container.setVisible(True)
         self.prog.setRange(0, 0)
         self.prog_lbl.setText("Scanning Workspaces...")
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Scanning...")
+        
+        # --- Skeleton Loading UI ---
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        
+        # Determine skeleton text color based on theme
+        skel_color = QColor("#555555" if self.is_dark_mode else "#aaaaaa")
+        
+        # Create 8 placeholder skeleton rows
+        for _ in range(8):
+            skel = QTreeWidgetItem(self.tree)
+            skel.setText(0, "Discovering runs...")
+            skel.setText(1, "...")
+            skel.setText(3, "SCANNING")
+            skel.setText(5, "...")
+            skel.setFlags(Qt.NoItemFlags) # Make it unselectable and immutable
+            
+            for col in range(24):
+                skel.setForeground(col, skel_color)
+                
+        self.tree.blockSignals(False)
         self.tree.setEnabled(False) 
         
+        # Start the background worker
         self.worker = ScannerWorker()
         self.worker.progress_update.connect(self.update_progress)
         self.worker.status_update.connect(self.update_status_lbl)
@@ -1619,5 +1649,5 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     w = PDDashboard()
-    w.show()
+    w.showMaximized()
     sys.exit(app.exec_())
