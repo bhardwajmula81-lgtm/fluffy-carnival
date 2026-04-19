@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import sys
 import os
 import re
@@ -158,7 +159,7 @@ class PDDashboard(QMainWindow):
         self._add_separator(top_layout)
 
         # MEGA MENU
-        self.actions_btn = QPushButton("Actions ▾")
+        self.actions_btn = QPushButton("Actions v")
         self.actions_menu = QMenu(self)
         
         self.actions_menu.addAction("Fit Columns", self.fit_all_columns)
@@ -192,7 +193,7 @@ class PDDashboard(QMainWindow):
         self._add_separator(top_layout)
         
         # NOTES TOGGLER
-        self.notes_toggle_btn = QPushButton("📝 Notes ◂")
+        self.notes_toggle_btn = QPushButton("Notes <")
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
@@ -363,10 +364,10 @@ class PDDashboard(QMainWindow):
     def toggle_notes_dock(self):
         if self.inspector_dock.isVisible():
             self.inspector_dock.hide()
-            self.notes_toggle_btn.setText("📝 Notes ◂")
+            self.notes_toggle_btn.setText("Notes <")
         else:
             self.inspector_dock.show()
-            self.notes_toggle_btn.setText("📝 Notes ▾")
+            self.notes_toggle_btn.setText("Notes v")
 
     def safe_expand_all(self):
         self.tree.blockSignals(True)
@@ -630,7 +631,8 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             QTreeView::indicator:unchecked { background-color: white;   border: 1px solid gray; }
         """
         if self.use_custom_colors:
-            bg, fg, sel = self.custom_bg_color, self.custom_fg_color, self.custom_sel_color
+            bg, self.custom_bg_color, fg = self.custom_bg_color, self.custom_bg_color, self.custom_fg_color
+            sel = self.custom_sel_color
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{ background-color: {bg}; color: {fg}; }}
                 QHeaderView::section {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px; font-weight: bold; }}
@@ -1470,6 +1472,154 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             subprocess.run(["python3.6", SUMMARY_SCRIPT, qor_path, "-stage", step_name])
             h = find_latest_qor_report()
             if h: subprocess.Popen([FIREFOX_PATH, h])
+
+    def send_cleanup_mail_action(self):
+        user_runs = {}; is_fe_selected = False
+
+        def find_owners(node):
+            nonlocal is_fe_selected
+            for i in range(node.childCount()):
+                c = node.child(i)
+                if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
+                    path  = c.text(15); owner = c.text(5)
+                    if "FE" in c.text(0): is_fe_selected = True
+                    if path and path != "N/A" and owner and owner != "Unknown":
+                        if owner not in user_runs: user_runs[owner] = []
+                        user_runs[owner].append(path)
+                find_owners(c)
+        find_owners(self.tree.invisibleRootItem())
+
+        if not user_runs:
+            QMessageBox.warning(self, "No Runs Selected", "Please select at least one run to send a cleanup mail.")
+            return
+
+        default_subject = "Action Required: Please clean up heavy disk usage runs"
+        if user_runs: default_subject = "Please remove your old PI runs" if is_fe_selected else "Please remove your old PD runs"
+            
+        all_known = get_all_known_mail_users()
+        unique_emails = [get_user_email(owner) for owner in user_runs.keys() if get_user_email(owner)]
+            
+        dlg = AdvancedMailDialog(default_subject, "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n",
+                                 all_known, ", ".join(unique_emails), self)
+                                 
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            success_count = 0
+            for owner, paths in user_runs.items():
+                owner_email = get_user_email(owner)
+                if not owner_email: continue
+                
+                final_body = body_template + "\n" + "\n".join(paths)
+                all_recipients = set(base_to + base_cc + [owner_email])
+                recipients_str = ",".join(all_recipients)
+                
+                cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
+                for att in dlg.attachments: cmd.extend(["-a", att])
+                    
+                try:
+                    subprocess.Popen(cmd); success_count += 1
+                except Exception as e: print(f"Failed to send mail: {e}")
+                    
+            QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} emails.")
+            
+    def send_qor_mail_action(self):
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("Latest Compare QoR Report", "Hi Team,\n\nPlease find the attached latest QoR Report for your reference.\n\nRegards", all_known, "", self)
+        dlg.attach_qor()
+        
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            all_recipients = set(base_to + base_cc)
+            if not all_recipients: return
+            
+            cmd = [MAIL_UTIL, "-to", ",".join(all_recipients), "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+            for att in dlg.attachments: cmd.extend(["-a", att])
+                
+            try:
+                subprocess.Popen(cmd); QMessageBox.information(self, "Mail Sent", "Successfully sent the Compare QoR mail.")
+            except Exception as e: print(f"Failed to send mail: {e}")
+
+    def send_custom_mail_action(self):
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("", "", all_known, "", self)
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            all_recipients = set(base_to + base_cc)
+            if not all_recipients: return
+            
+            cmd = [MAIL_UTIL, "-to", ",".join(all_recipients), "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+            for att in dlg.attachments: cmd.extend(["-a", att])
+                
+            try:
+                subprocess.Popen(cmd); QMessageBox.information(self, "Mail Sent", "Successfully sent the custom mail.")
+            except Exception as e: print(f"Failed to send mail: {e}")
+
+    def start_bg_disk_scan(self, force=False):
+        if self.disk_worker and self.disk_worker.isRunning(): return
+        if not force and self._cached_disk_data is not None: return
+        
+        self.disk_worker = DiskScannerWorker()
+        self.disk_worker.finished_scan.connect(self._on_bg_disk_scan_finished)
+        self.disk_worker.start()
+
+    def _on_bg_disk_scan_finished(self, results):
+        self._cached_disk_data = results
+        
+        if hasattr(self, 'disk_dialog') and self.disk_dialog is not None and self.disk_dialog.isVisible():
+            self.disk_dialog.disk_data = results
+            self.disk_dialog.update_view()
+            self.disk_dialog.recalc_btn.setText("Recalculate Disk Usage")
+            self.disk_dialog.recalc_btn.setEnabled(True)
+
+    def open_disk_usage(self):
+        if self._cached_disk_data is None:
+            QMessageBox.information(self, "Scanning", "Disk usage is still calculating in the background.\nPlease wait a moment and try again.")
+            return
+            
+        self.disk_dialog = DiskUsageDialog(
+            self._cached_disk_data,
+            self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"),
+            self)
+        self.disk_dialog.exec_()
+
+    def run_qor_comparison(self):
+        sel  = []
+        root = self.tree.invisibleRootItem()
+        def get_checked(node):
+            for i in range(node.childCount()):
+                c = node.child(i)
+                if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
+                    qp  = c.text(15); src = c.text(2)
+                    if src == "OUTFEED" and qp: qp = os.path.dirname(qp)
+                    if qp and not qp.endswith("/"): qp += "/"
+                    sel.append(qp)
+                get_checked(c)
+        get_checked(root)
+        if len(sel) < 2: return
+        subprocess.run(["python3.6", SUMMARY_SCRIPT] + sel)
+        h = find_latest_qor_report()
+        if h: subprocess.Popen([FIREFOX_PATH, h])
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
