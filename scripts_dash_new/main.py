@@ -38,7 +38,6 @@ class RunFilterProxyModel(QSortFilterProxyModel):
         self.user_pins = {}
         self.global_notes = {}
         
-        # Enables recursive filtering (Qt 5.10+). If a child matches, parents are kept.
         if hasattr(self, 'setRecursiveFilteringEnabled'):
             self.setRecursiveFilteringEnabled(True)
 
@@ -51,13 +50,12 @@ class RunFilterProxyModel(QSortFilterProxyModel):
         self.filter_config = config
         self.user_pins = pins
         self.global_notes = notes
-        self.invalidateFilter() # Instantly triggers C++ re-filter
+        self.invalidateFilter() 
 
     def filterAcceptsRow(self, source_row, source_parent):
         idx0 = self.sourceModel().index(source_row, 0, source_parent)
         node_type = self.sourceModel().data(idx0, Qt.UserRole)
         
-        # Always evaluate children if recursive filtering isn't supported natively
         if not hasattr(self, 'setRecursiveFilteringEnabled'):
             for i in range(self.sourceModel().rowCount(idx0)):
                 if self.filterAcceptsRow(i, idx0): return True
@@ -73,7 +71,6 @@ class RunFilterProxyModel(QSortFilterProxyModel):
             if not stage_data or not parent_run: return True
             return self._check_stage(stage_data, parent_run)
             
-        # For Group nodes (BLOCK, RTL, etc.), show them if they contain matching children
         return False if hasattr(self, 'setRecursiveFilteringEnabled') else True
 
     def _check_run(self, run):
@@ -119,7 +116,6 @@ class RunFilterProxyModel(QSortFilterProxyModel):
             if not fnmatch.fnmatch(sc, self.search_text): return False
         return True
 
-
 # =====================================================================
 # MAIN DASHBOARD CLASS
 # =====================================================================
@@ -158,6 +154,7 @@ class PDDashboard(QMainWindow):
         
         self.run_filter_config   = None
         self.current_config_path = None
+        self.active_col_filters  = {}
         
         self._cached_disk_data = None
         self.disk_worker = None
@@ -209,7 +206,7 @@ class PDDashboard(QMainWindow):
         root_layout.setContentsMargins(8, 8, 8, 4)
         root_layout.setSpacing(6)
 
-        # TOP BAR
+        # TOP BAR - MODULAR
         top_layout = QHBoxLayout()
         top_layout.setSpacing(8)
 
@@ -239,7 +236,7 @@ class PDDashboard(QMainWindow):
         self.search = QLineEdit()
         self.search.setPlaceholderText("Search runs, blocks, status, runtime...   [Ctrl+F]")
         self.search.setMinimumWidth(260)
-        self.search.textChanged.connect(lambda: self.search_timer.start(100)) # Ultra low latency typing
+        self.search.textChanged.connect(lambda: self.search_timer.start(100))
         top_layout.addWidget(self.search)
 
         top_layout.addStretch()
@@ -257,7 +254,7 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top_layout)
 
-        # MODULAR BUTTONS
+        # BUTTONS
         self.qor_btn = QPushButton("Compare QoR")
         self.qor_btn.setCursor(Qt.PointingHandCursor)
         self.qor_btn.clicked.connect(self.run_qor_comparison)
@@ -276,6 +273,7 @@ class PDDashboard(QMainWindow):
         self.actions_menu.addAction("Expand All", self.safe_expand_all)
         self.actions_menu.addAction("Collapse All", self.safe_collapse_all)
         self.actions_menu.addSeparator()
+        self.actions_menu.addAction("Calculate All Run Sizes", self.calculate_all_sizes)
         self.actions_menu.addAction("Export to CSV", self.export_csv)
         self.actions_menu.addSeparator()
         
@@ -283,6 +281,12 @@ class PDDashboard(QMainWindow):
         mail_menu.addAction("Cleanup Mail (Selected Runs)", self.send_cleanup_mail_action)
         mail_menu.addAction("Send Compare QoR Mail", self.send_qor_mail_action)
         mail_menu.addAction("Send Custom Mail", self.send_custom_mail_action)
+        self.actions_menu.addSeparator()
+        
+        filt_menu = self.actions_menu.addMenu("Filter Configs...")
+        filt_menu.addAction("Load Run Filter Config...", self.load_filter_config)
+        filt_menu.addAction("Clear Run Filter Config", self.clear_filter_config)
+        filt_menu.addAction("Generate Sample Config", self.generate_sample_config)
         self.actions_menu.addSeparator()
         self.actions_menu.addAction("Disk Space", self.open_disk_usage)
         self.actions_btn.setMenu(self.actions_menu)
@@ -441,7 +445,7 @@ class PDDashboard(QMainWindow):
         self.prog_container.setVisible(True); self.prog.setRange(0, 0)
         self.prog_lbl.setText("Scanning Workspaces...")
         self.refresh_btn.setEnabled(False); self.refresh_btn.setText("Scanning...")
-        self.model.removeRows(0, self.model.rowCount()) # Clear model instantly
+        self.model.removeRows(0, self.model.rowCount()) 
         
         self.worker = ScannerWorker()
         self.worker.progress_update.connect(lambda c, t: (self.prog.setRange(0, t), self.prog.setValue(c)))
@@ -457,12 +461,16 @@ class PDDashboard(QMainWindow):
         self.global_notes = load_all_notes()
         
         self.update_combos()
-        self.build_model() # Construct QStandardItemModel ONCE
-        self.apply_proxy_filters() # Trigger lightning fast C++ view
+        self.build_model()
+        self.apply_proxy_filters() 
         
         if not self._columns_fitted_once:
             self._columns_fitted_once = True; self.fit_all_columns()
             
+        if not self._initial_size_calc_done:
+            self._initial_size_calc_done = True
+            self.calculate_all_sizes()
+
         all_owners = set()
         for r in self.ws_data.get("all_runs", []) + self.out_data.get("all_runs", []):
             if r.get("owner") and r["owner"] != "Unknown": all_owners.add(r["owner"])
@@ -497,7 +505,7 @@ class PDDashboard(QMainWindow):
         self.blk_list.blockSignals(False)
 
     # ------------------------------------------------------------------
-    # CORE MODEL BUILDING (The secret to QTreeView speed)
+    # CORE MODEL BUILDING
     # ------------------------------------------------------------------
     def build_model(self):
         self.tree.setUpdatesEnabled(False)
@@ -591,7 +599,7 @@ class PDDashboard(QMainWindow):
         row[0].setData("DEFAULT", Qt.UserRole)
         row[0].setData(run["block"], Qt.UserRole + 2)
         row[0].setData(run["source"], Qt.UserRole + 12)
-        row[0].setData(run, Qt.UserRole + 10) # Inject full dict for Proxy to read instantly
+        row[0].setData(run, Qt.UserRole + 10) 
         
         pin_type = self.user_pins.get(run["path"])
         if pin_type in self.icons: row[0].setIcon(self.icons[pin_type])
@@ -639,6 +647,7 @@ class PDDashboard(QMainWindow):
             
             row[0].setData("STAGE", Qt.UserRole)
             row[0].setData(stage["name"], Qt.UserRole + 1)
+            row[0].setData(stage["qor_path"], Qt.UserRole + 2)
             row[0].setData(stage, Qt.UserRole + 10)
             
             ir_info = self.ir_data.get(f"{be_run['r_name']}/{stage['name']}", {"static": "-", "dynamic": "-"})
@@ -653,6 +662,7 @@ class PDDashboard(QMainWindow):
             row[15].setText(stage["stage_path"]); row[16].setText(stage["log"])
             row[17].setText(stage["fm_u_path"]); row[18].setText(stage["fm_n_path"])
             row[19].setText(stage["vslp_rpt_path"]); row[20].setText(stage["sta_rpt_path"])
+            row[21].setText(ir_info.get("log", ""))
             
             self._apply_fm_color(row[7], stage["st_n"]); self._apply_fm_color(row[8], stage["st_u"])
             self._apply_vslp_color(row[9], stage["vslp_status"])
@@ -685,8 +695,6 @@ class PDDashboard(QMainWindow):
             self.src_combo.currentText(), self.rel_combo.currentText(), self.view_combo.currentText(),
             self.search.text(), blks, self.run_filter_config, self.user_pins, self.global_notes
         )
-        
-        # Determine Expansion state dynamically post-filter
         if self.search.text() != "" or self.view_combo.currentText() != "All Runs": self.tree.expandAll()
         else: self.tree.collapseAll()
 
@@ -709,9 +717,13 @@ class PDDashboard(QMainWindow):
 
     def on_tree_selection_changed(self):
         indexes = self.tree.selectionModel().selectedRows()
+        self.fe_error_btn.setVisible(False)
+        self.current_error_log_path = None
+        
         if not indexes:
             self.ins_lbl.setText("Select a run to view details.")
             self.ins_history.clear(); self.ins_note.clear(); self.ins_note.setEnabled(False); self.ins_save_btn.setEnabled(False)
+            self.meta_status.clear(); self.meta_path.clear(); self.meta_log.clear()
             return
 
         idx = self.proxy.mapToSource(indexes[0])
@@ -723,6 +735,7 @@ class PDDashboard(QMainWindow):
         self.meta_status.setText(self.model.itemFromIndex(idx.siblingAtColumn(3)).text())
         self.meta_path.setText(self.model.itemFromIndex(idx.siblingAtColumn(15)).text())
         self.meta_log.setText(self.model.itemFromIndex(idx.siblingAtColumn(16)).text())
+        self.meta_path.setCursorPosition(0); self.meta_log.setCursorPosition(0)
         
         self.ins_note.setEnabled(True); self.ins_save_btn.setEnabled(True)
 
@@ -747,21 +760,136 @@ class PDDashboard(QMainWindow):
                 if len(parts) == 2: my_note = parts[1]
                 break
         self.ins_note.setPlainText(my_note)
+        
+        if len(indexes) == 1 and node_type != "STAGE":
+            run_path = self.model.itemFromIndex(idx.siblingAtColumn(15)).text()
+            if run_path and run_path != "N/A":
+                err_file = os.path.join(run_path, "logs", "compile_opt.error.log")
+                if os.path.exists(err_file):
+                    count = sum(1 for line in open(err_file, 'r', encoding='utf-8', errors='ignore') if line.strip())
+                    self.current_error_log_path = err_file
+                    color = ("#e57373" if (self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888")) else "#d32f2f")
+                    if count == 0: color = ("#81c784" if (self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888")) else "#388e3c")
+                    self.fe_error_btn.setStyleSheet(
+                        f"QPushButton#errorLinkBtn {{ border: none; background: transparent; color: {color}; "
+                        f"font-weight: bold; text-align: left; padding: 6px 0px; }} "
+                        f"QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
+                    self.fe_error_btn.setText(f"compile_opt errors: {count}")
+                    self.fe_error_btn.setVisible(True)
 
     def save_inspector_note(self):
         if not hasattr(self, '_current_note_id'): return
         save_user_note(self._current_note_id, self.ins_note.toPlainText())
         self.global_notes = load_all_notes()
         self.on_tree_selection_changed()
-        self.build_model() # Refresh model to show note in column 22
+        self.build_model() 
 
     def on_item_double_clicked(self, index):
         src_idx = self.proxy.mapToSource(index)
         log = self.model.itemFromIndex(src_idx.siblingAtColumn(16)).text()
         if log and cached_exists(log): subprocess.Popen(['gvim', log])
+        
+    def open_error_log(self):
+        if self.current_error_log_path and os.path.exists(self.current_error_log_path):
+            subprocess.Popen(['gvim', self.current_error_log_path])
 
     # ------------------------------------------------------------------
-    # REST OF UTILITIES (Same functionality, adapted for QTreeView)
+    # UTILITIES AND ACTIONS (Export, Filter Loading)
+    # ------------------------------------------------------------------
+    def _label(self, text): return QLabel(text)
+    def _add_separator(self, layout):
+        sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(sep)
+    def _vsep(self):
+        sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
+        sep.setFixedHeight(16); return sep
+
+    def _set_all_blocks(self, checked):
+        state = Qt.Checked if checked else Qt.Unchecked
+        self.blk_list.blockSignals(True)
+        for i in range(self.blk_list.count()): self.blk_list.item(i).setCheckState(state)
+        self.blk_list.blockSignals(False)
+        self.apply_proxy_filters()
+
+    def _setup_shortcuts(self):
+        QShortcut(QKeySequence("Ctrl+R"), self, self.start_fs_scan)
+        QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.search.setFocus())
+        QShortcut(QKeySequence("Ctrl+E"), self, self.safe_expand_all)
+        QShortcut(QKeySequence("Ctrl+W"), self, self.safe_collapse_all)
+
+    def export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "dashboard_export.csv", "CSV Files (*.csv)")
+        if not path: return
+        try:
+            with open(path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                headers = [self.model.horizontalHeaderItem(i).text() for i in range(15)] + ["Alias / Notes"]
+                writer.writerow(headers)
+                
+                # Traverse the proxy model to only export visible items
+                def export_node(proxy_index):
+                    if proxy_index.isValid():
+                        src_idx = self.proxy.mapToSource(proxy_index)
+                        node_text = self.model.itemFromIndex(src_idx.siblingAtColumn(0)).text()
+                        if "[ Ignored" not in node_text:
+                            row_data = [self.model.itemFromIndex(src_idx.siblingAtColumn(i)).text() for i in range(15)]
+                            row_data.append(self.model.itemFromIndex(src_idx.siblingAtColumn(22)).text())
+                            writer.writerow(row_data)
+                    for r in range(self.proxy.rowCount(proxy_index)):
+                        export_node(self.proxy.index(r, 0, proxy_index))
+                
+                export_node(QModelIndex())
+            QMessageBox.information(self, "Export Successful", f"Data exported to {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to export: {e}")
+
+    def generate_sample_config(self):
+        sample_text = """# PD Dashboard Run Filter Configuration
+# Format: SOURCE : RTL_NAME : BLOCK_NAME : run1 run2 run3 ...
+OUTFEED : EVT0_ML4_DEV00_syn2 : BLK_CPU : my_test_run fast_route_run
+WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
+"""
+        path, _ = QFileDialog.getSaveFileName(self, "Save Sample Config", "dashboard_filter.cfg", "Config Files (*.cfg *.txt)")
+        if path:
+            with open(path, 'w') as f: f.write(sample_text)
+            QMessageBox.information(self, "Success", f"Sample config saved to:\n{path}")
+
+    def load_filter_config(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load Run Filter Config", "", "Config Files (*.cfg *.txt);;All Files (*)")
+        if not path: return
+        parsed_config = {}
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"): continue
+                    parts = line.split(":", 3)
+                    if len(parts) == 4:
+                        src = parts[0].strip(); rtl = parts[1].strip(); blk = parts[2].strip()
+                        runs = set(parts[3].strip().split())
+                        if src not in parsed_config: parsed_config[src] = {}
+                        if rtl not in parsed_config[src]: parsed_config[src][rtl] = {}
+                        parsed_config[src][rtl][blk] = runs
+            
+            self.run_filter_config = parsed_config
+            self.current_config_path = path
+            self.sb_config.setText(f"Config: Active ({os.path.basename(path)})")
+            self.sb_config.setStyleSheet("color: #d32f2f; font-weight: bold;" if not self.is_dark_mode else "color: #ffb74d; font-weight: bold;")
+            self.apply_proxy_filters()
+            QMessageBox.information(self, "Config Loaded", "Filter configuration applied successfully.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to parse config file:\n{e}")
+
+    def clear_filter_config(self):
+        if self.run_filter_config is not None:
+            self.run_filter_config = None
+            self.current_config_path = None
+            self.sb_config.setText("Config: None")
+            self.sb_config.setStyleSheet("")
+            self.apply_proxy_filters()
+
+    # ------------------------------------------------------------------
+    # FULL CONTEXT MENU RESTORED (Open Logs, QOR, Gantt)
     # ------------------------------------------------------------------
     def on_context_menu(self, pos):
         idx = self.tree.indexAt(pos)
@@ -772,24 +900,349 @@ class PDDashboard(QMainWindow):
         m = QMenu()
         run_path = self.model.itemFromIndex(src_idx.siblingAtColumn(15)).text()
         log_path = self.model.itemFromIndex(src_idx.siblingAtColumn(16)).text()
-        node_type = item0.data(Qt.UserRole)
+        fm_u_path = self.model.itemFromIndex(src_idx.siblingAtColumn(17)).text()
+        fm_n_path = self.model.itemFromIndex(src_idx.siblingAtColumn(18)).text()
+        vslp_path = self.model.itemFromIndex(src_idx.siblingAtColumn(19)).text()
+        sta_path  = self.model.itemFromIndex(src_idx.siblingAtColumn(20)).text()
+        ir_path   = self.model.itemFromIndex(src_idx.siblingAtColumn(21)).text()
         
-        if run_path and node_type in ["DEFAULT", "STAGE"]:
+        node_type = item0.data(Qt.UserRole)
+        is_stage  = node_type == "STAGE"
+        is_rtl    = node_type == "RTL"
+        
+        act_gold = act_good = act_red = act_later = act_clear = None
+        gantt_act = None
+        
+        if run_path and run_path != "N/A" and node_type in ["DEFAULT", "STAGE"]:
             pin_menu = m.addMenu("Pin as...")
             act_gold = pin_menu.addAction(self.icons['golden'], "Golden Run")
+            act_good = pin_menu.addAction(self.icons['good'], "Good Run")
+            act_red = pin_menu.addAction(self.icons['redundant'], "Redundant Run")
+            act_later = pin_menu.addAction(self.icons['later'], "Mark for Later")
+            pin_menu.addSeparator()
             act_clear = pin_menu.addAction("Clear Pin")
             m.addSeparator()
             
-            res = m.exec_(self.tree.viewport().mapToGlobal(pos))
-            if res == act_gold: self.user_pins[run_path] = 'golden'; save_user_pins(self.user_pins); self.build_model()
-            elif res == act_clear: self.user_pins.pop(run_path, None); save_user_pins(self.user_pins); self.build_model()
+            if item0.hasChildren() and item0.child(0, 0).data(Qt.UserRole) == "STAGE":
+                gantt_act = m.addAction("Show Timeline (Gantt Chart)")
+                m.addSeparator()
+                
+        ignore_checked_act = m.addAction("Hide All Checked Runs/Stages")
+        m.addSeparator()
+
+        ignore_act = restore_act = None
+        if run_path and run_path != "N/A":
+            if run_path in self.ignored_paths: restore_act = m.addAction("Restore (Unhide)")
+            else: ignore_act = m.addAction("Hide/Ignore")
+            m.addSeparator()
+
+        calc_size_act = m.addAction("Calculate Folder Size") if run_path and run_path != "N/A" and cached_exists(run_path) else None
+        if calc_size_act: m.addSeparator()
+
+        fm_n_act    = m.addAction("Open NONUPF Formality Report") if fm_n_path and fm_n_path != "N/A" and cached_exists(fm_n_path) else None
+        fm_u_act    = m.addAction("Open UPF Formality Report")    if fm_u_path and fm_u_path != "N/A" and cached_exists(fm_u_path) else None
+        v_act       = m.addAction("Open VSLP Report")             if vslp_path and vslp_path != "N/A" and cached_exists(vslp_path) else None
+        sta_act     = m.addAction("Open PT STA Summary")          if sta_path  and sta_path  != "N/A" and cached_exists(sta_path)  else None
+        ir_stat_act = m.addAction("Open Static IR Log")           if ir_path   and ir_path   != "N/A" and cached_exists(ir_path)   else None
+        ir_dyn_act  = m.addAction("Open Dynamic IR Log")          if is_stage and ir_path and ir_path != "N/A" and cached_exists(ir_path) else None
+        log_act     = m.addAction("Open Log File")                if log_path  and log_path  != "N/A" and cached_exists(log_path)  else None
+
+        m.addSeparator()
+        qor_act = None
+        if is_stage: m.addSeparator(); qor_act = m.addAction("Run Single Stage QoR")
+            
+        res = m.exec_(self.tree.viewport().mapToGlobal(pos))
+        if not res: return
+        
+        if res in [act_gold, act_good, act_red, act_later, act_clear]:
+            if res == act_gold: self.user_pins[run_path] = 'golden'
+            elif res == act_good: self.user_pins[run_path] = 'good'
+            elif res == act_red: self.user_pins[run_path] = 'redundant'
+            elif res == act_later: self.user_pins[run_path] = 'later'
+            elif res == act_clear: self.user_pins.pop(run_path, None)
+            save_user_pins(self.user_pins); self.build_model()
+            
+        elif gantt_act and res == gantt_act:
+            stages = []
+            for i in range(item0.rowCount()):
+                c = item0.child(i, 0)
+                if c.data(Qt.UserRole) == "STAGE":
+                    rt = item0.child(i, 12).text()
+                    stages.append({'name': c.text(), 'time_str': rt, 'sec': self._time_to_seconds(rt)})
+            dlg = GanttChartDialog(item0.text(), stages, self); dlg.exec_()
+            
+        elif res == ignore_checked_act:
+            for r in self._checked_paths: self.ignored_paths.add(r)
+            self.build_model()
+            
+        elif res == ignore_act:  self.ignored_paths.add(run_path); self.build_model()
+        elif res == restore_act: self.ignored_paths.discard(run_path); self.build_model()
+        
+        elif calc_size_act and res == calc_size_act:
+            item6 = self.model.itemFromIndex(src_idx.siblingAtColumn(6))
+            item6.setText("Calc...")
+            worker = SingleSizeWorker(item6, run_path) # Needs update in workers.py to support QStandardItem if it expects QTreeWidgetItem
+            worker.result.connect(lambda it, sz: it.setText(sz))
+            if not hasattr(self, 'size_workers'): self.size_workers = []
+            self.size_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
+            worker.start()
+            
+        elif fm_n_act    and res == fm_n_act:    subprocess.Popen(['gvim', fm_n_path])
+        elif fm_u_act    and res == fm_u_act:    subprocess.Popen(['gvim', fm_u_path])
+        elif v_act       and res == v_act:       subprocess.Popen(['gvim', vslp_path])
+        elif sta_act     and res == sta_act:     subprocess.Popen(['gvim', sta_path])
+        elif ir_stat_act and res == ir_stat_act: subprocess.Popen(['gvim', ir_path])
+        elif ir_dyn_act  and res == ir_dyn_act:  subprocess.Popen(['gvim', ir_path])
+        elif log_act     and res == log_act:     subprocess.Popen(['gvim', log_path])
+        elif qor_act and res == qor_act:
+            step_name = item0.data(Qt.UserRole + 1); qor_path  = item0.data(Qt.UserRole + 2)
+            subprocess.run(["python3.6", SUMMARY_SCRIPT, qor_path, "-stage", step_name])
+            h = find_latest_qor_report()
+            if h: subprocess.Popen([FIREFOX_PATH, h])
 
     def on_header_context_menu(self, pos):
         col = self.tree.header().logicalIndexAt(pos)
         m = QMenu()
         m.addAction("Sort A to Z").triggered.connect(lambda: self.tree.sortByColumn(col, Qt.AscendingOrder))
         m.addAction("Sort Z to A").triggered.connect(lambda: self.tree.sortByColumn(col, Qt.DescendingOrder))
+        m.addSeparator()
+        
+        vis_menu = m.addMenu("Show / Hide Columns")
+        for i in range(1, 24):
+            action = QWidgetAction(vis_menu)
+            cb = QCheckBox(self.model.horizontalHeaderItem(i).text())
+            cb.setChecked(not self.tree.isColumnHidden(i))
+            cb.setStyleSheet("margin: 2px 8px; background: transparent; color: inherit;")
+            cb.toggled.connect(lambda checked, c=i: self.tree.setColumnHidden(c, not checked))
+            action.setDefaultWidget(cb)
+            vis_menu.addAction(action)
+            
         m.exec_(self.tree.header().mapToGlobal(pos))
+
+    # ------------------------------------------------------------------
+    # EMAILS & DISK USAGE & QOR 
+    # ------------------------------------------------------------------
+    def run_qor_comparison(self):
+        sel = list(self._checked_paths)
+        if len(sel) < 2: return
+        # Modify logic to point exactly to the qor paths instead of run root if needed
+        subprocess.run(["python3.6", SUMMARY_SCRIPT] + sel)
+        h = find_latest_qor_report()
+        if h: subprocess.Popen([FIREFOX_PATH, h])
+
+    def start_bg_disk_scan(self, force=False):
+        if self.disk_worker and self.disk_worker.isRunning(): return
+        if not force and self._cached_disk_data is not None: return
+        self.disk_worker = DiskScannerWorker()
+        self.disk_worker.finished_scan.connect(self._on_bg_disk_scan_finished)
+        self.disk_worker.start()
+
+    def _on_bg_disk_scan_finished(self, results):
+        self._cached_disk_data = results
+        if hasattr(self, 'disk_dialog') and self.disk_dialog is not None and self.disk_dialog.isVisible():
+            self.disk_dialog.disk_data = results
+            self.disk_dialog.update_view()
+            self.disk_dialog.recalc_btn.setText("Recalculate Disk Usage")
+            self.disk_dialog.recalc_btn.setEnabled(True)
+
+    def open_disk_usage(self):
+        if self._cached_disk_data is None:
+            QMessageBox.information(self, "Scanning", "Disk usage is still calculating in the background.\nPlease wait a moment and try again.")
+            return
+        self.disk_dialog = DiskUsageDialog(
+            self._cached_disk_data,
+            self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"),
+            self)
+        self.disk_dialog.exec_()
+
+    def send_cleanup_mail_action(self):
+        if not self._checked_paths:
+            QMessageBox.warning(self, "No Runs Selected", "Please select at least one run to send a cleanup mail.")
+            return
+
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("Action Required: Please clean up heavy disk usage runs", "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n", all_known, "", self)
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            final_body = body_template + "\n" + "\n".join(self._checked_paths)
+            all_recipients = set(base_to + base_cc)
+            recipients_str = ",".join(all_recipients)
+            
+            cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
+            for att in dlg.attachments: cmd.extend(["-a", att])
+            try:
+                subprocess.Popen(cmd)
+                QMessageBox.information(self, "Mail Sent", "Successfully triggered emails.")
+            except Exception as e: print(f"Failed to send mail: {e}")
+            
+    def send_qor_mail_action(self):
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("Latest Compare QoR Report", "Hi Team,\n\nPlease find the attached latest QoR Report for your reference.\n\nRegards", all_known, "", self)
+        dlg.attach_qor()
+        
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            all_recipients = set(base_to + base_cc)
+            if not all_recipients: return
+            
+            cmd = [MAIL_UTIL, "-to", ",".join(all_recipients), "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+            for att in dlg.attachments: cmd.extend(["-a", att])
+            try: subprocess.Popen(cmd)
+            except Exception as e: print(f"Failed to send mail: {e}")
+
+    def send_custom_mail_action(self):
+        all_known = get_all_known_mail_users()
+        dlg = AdvancedMailDialog("", "", all_known, "", self)
+        if dlg.exec_():
+            subject = dlg.subject_input.text().strip()
+            body_template = dlg.body_input.toPlainText()
+            current_user = getpass.getuser()
+            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
+            
+            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+            
+            all_recipients = set(base_to + base_cc)
+            if not all_recipients: return
+            
+            cmd = [MAIL_UTIL, "-to", ",".join(all_recipients), "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
+            for att in dlg.attachments: cmd.extend(["-a", att])
+            try: subprocess.Popen(cmd)
+            except Exception as e: print(f"Failed to send mail: {e}")
+
+    # ------------------------------------------------------------------
+    # SETTINGS & THEME
+    # ------------------------------------------------------------------
+    def open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec_():
+            font = dlg.font_combo.currentFont()
+            font.setPointSize(dlg.size_spin.value())
+            QApplication.setFont(font)
+            self.is_dark_mode       = dlg.theme_cb.isChecked()
+            self.use_custom_colors  = dlg.use_custom_cb.isChecked()
+            self.custom_bg_color    = dlg.bg_color
+            self.custom_fg_color    = dlg.fg_color
+            self.custom_sel_color   = dlg.sel_color
+            self.row_spacing        = dlg.space_spin.value()
+            self.show_relative_time = dlg.rel_time_cb.isChecked()
+            self.convert_to_ist     = dlg.ist_cb.isChecked()
+            self.hide_block_nodes   = dlg.hide_blocks_cb.isChecked()
+            self.apply_theme_and_spacing()
+
+    def apply_theme_and_spacing(self):
+        pad = self.row_spacing
+        cb_style = """
+            QTreeView::indicator:checked   { background-color: #4CAF50; border: 1px solid #388E3C; image: none; }
+            QTreeView::indicator:unchecked { background-color: white;   border: 1px solid gray; }
+        """
+        if self.use_custom_colors:
+            bg, fg, sel = self.custom_bg_color, self.custom_fg_color, self.custom_sel_color
+            stylesheet = f"""
+                QMainWindow, QWidget, QDialog {{ background-color: {bg}; color: {fg}; }}
+                QHeaderView::section {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 6px; font-weight: bold; }}
+                QTreeView {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; }}
+                QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; border: 1px solid {fg}; font-weight: bold; }}
+                QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 6px; border-radius: 6px; }}
+                QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #ffffff; border-radius: 6px; }}
+                QPushButton, QToolButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 6px 14px; border-radius: 6px; font-weight: bold; }}
+                QPushButton:hover, QToolButton:hover {{ border-color: {sel}; }}
+                QPushButton:pressed, QToolButton:pressed {{ background-color: {sel}; color: #ffffff; }}
+                QPushButton#linkBtn {{ border: none; background: transparent; color: {sel}; padding: 0px 4px; min-width: 0px; }}
+                QPushButton#linkBtn:hover {{ text-decoration: underline; }}
+                QSplitter::handle {{ background-color: {sel}; }}
+                QMenu {{ border: 1px solid {fg}; background-color: {bg}; color: {fg}; }}
+                QMenu::item:selected {{ background-color: {sel}; color: #ffffff; }}
+                QStatusBar {{ background: {bg}; color: {fg}; border-top: 1px solid {fg}; }}
+                QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
+                QTreeView::item:selected, QListWidget::item:selected {{ background-color: {sel}; color: #ffffff; }}
+                {cb_style}"""
+        elif self.is_dark_mode:
+            stylesheet = f"""
+                QMainWindow, QWidget, QDialog {{ background-color: #2b2d30; color: #dfe1e5; }}
+                QTreeView {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; }}
+                QListWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #393b40; border: 1px solid #393b40; font-weight: bold; }}
+                QHeaderView::section {{ background-color: #2b2d30; color: #a9b7c6; border: 1px solid #1e1f22; padding: 6px; font-weight: bold; }}
+                QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 6px; border-radius: 6px; }}
+                QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 6px; border-radius: 6px; }}
+                QComboBox QAbstractItemView {{ background-color: #2b2d30; color: #dfe1e5; selection-background-color: #2f65ca; selection-color: #ffffff; border-radius: 6px; }}
+                QPushButton, QToolButton {{ background-color: #393b40; color: #dfe1e5; border: 1px solid #43454a; padding: 6px 14px; border-radius: 6px; }}
+                QPushButton:hover, QToolButton:hover {{ background-color: #43454a; }}
+                QPushButton:pressed, QToolButton:pressed {{ background-color: #2f65ca; color: #ffffff; border-color: #2f65ca; }}
+                QPushButton#linkBtn {{ border: none; background: transparent; color: #64b5f6; padding: 0px 4px; min-width: 0px; }}
+                QPushButton#linkBtn:hover {{ text-decoration: underline; }}
+                QSplitter::handle {{ background-color: #393b40; }}
+                QMenu {{ border: 1px solid #43454a; background-color: #2b2d30; color: #dfe1e5; }}
+                QMenu::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
+                QStatusBar {{ background: #2b2d30; color: #808080; border-top: 1px solid #393b40; }}
+                QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
+                QTreeView::item:selected, QListWidget::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
+                {cb_style}"""
+        else:
+            stylesheet = f"""
+                QMainWindow, QWidget, QDialog {{ background-color: #f5f7fa; color: #333333; }}
+                QHeaderView::section {{ background-color: #e4e7eb; color: #4a5568; border: 1px solid #cbd5e0; padding: 6px; font-weight: bold; }}
+                QTreeView {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; }}
+                QListWidget {{ background-color: #ffffff; color: #333333; alternate-background-color: #f8fafc; gridline-color: #e2e8f0; border: 1px solid #cbd5e0; font-weight: bold; }}
+                QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 6px; border-radius: 6px; }}
+                QComboBox {{ background-color: #ffffff; color: #333333; border: 1px solid #cbd5e0; padding: 6px; border-radius: 6px; }}
+                QComboBox QAbstractItemView {{ background-color: #ffffff; color: #333333; selection-background-color: #3182ce; selection-color: #ffffff; border-radius: 6px; }}
+                QPushButton, QToolButton {{ background-color: #ffffff; color: #4a5568; border: 1px solid #cbd5e0; padding: 6px 14px; border-radius: 6px; font-weight: bold; }}
+                QPushButton:hover, QToolButton:hover {{ background-color: #edf2f7; border-color: #a0aec0; }}
+                QPushButton:pressed, QToolButton:pressed {{ background-color: #e2e8f0; border-color: #a0aec0; }}
+                QPushButton#linkBtn {{ border: none; background: transparent; color: #3182ce; padding: 0px 4px; min-width: 0px; }}
+                QPushButton#linkBtn:hover {{ text-decoration: underline; }}
+                QSplitter::handle {{ background-color: #cbd5e0; }}
+                QMenu {{ border: 1px solid #cbd5e0; background-color: #ffffff; color: #333333; }}
+                QMenu::item:selected {{ background-color: #3182ce; color: #ffffff; }}
+                QStatusBar {{ background: #e4e7eb; color: #4a5568; border-top: 1px solid #cbd5e0; }}
+                QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
+                QTreeView::item:selected, QListWidget::item:selected {{ background-color: #3182ce; color: #ffffff; }}
+                {cb_style}"""
+
+        self.setStyleSheet(stylesheet)
+        self.build_model() # Recolor the items
+
+    def calculate_all_sizes(self):
+        size_tasks = []
+        def gather(parent_index):
+            for i in range(self.model.rowCount(parent_index)):
+                idx = self.model.index(i, 0, parent_index)
+                path = self.model.data(idx.siblingAtColumn(15))
+                if path and path != "N/A":
+                    item6 = self.model.itemFromIndex(idx.siblingAtColumn(6))
+                    if item6.text() in ["-", "N/A", "Calc..."]:
+                        size_tasks.append((str(id(item6)), path))
+                        self.item_map[str(id(item6))] = item6
+                        item6.setText("Calc...")
+                gather(idx)
+        gather(QModelIndex())
+        
+        if size_tasks:
+            worker = BatchSizeWorker(size_tasks)
+            worker.size_calculated.connect(self.update_item_size)
+            self.size_workers.append(worker)
+            worker.finished.connect(lambda w=worker: self.size_workers.remove(w) if w in self.size_workers else None)
+            worker.start()
+
+    def update_item_size(self, item_id, size_str):
+        item = self.item_map.get(item_id)
+        if item: item.setText(size_str)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
