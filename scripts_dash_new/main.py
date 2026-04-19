@@ -259,14 +259,16 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top_layout)
 
-        # FEAT 6: Column view presets
-        for lbl, preset in [("Compact", 1), ("Standard", 2), ("Full", 3)]:
-            btn = QPushButton(lbl)
-            btn.setFixedWidth(62)
-            btn.setObjectName("linkBtn")
-            btn.setCursor(Qt.PointingHandCursor)
-            btn.clicked.connect(lambda _, p=preset: self._set_col_preset(p))
-            top_layout.addWidget(btn)
+        # FEAT 6: Column view preset as single compact dropdown
+        top_layout.addWidget(self._label("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Standard", "Compact", "Full"])
+        self.mode_combo.setFixedWidth(82)
+        self.mode_combo.setToolTip("Column view preset\n1=Compact  2=Standard  3=Full")
+        self.mode_combo.currentIndexChanged.connect(
+            lambda i: self._set_col_preset({"Standard":2,"Compact":1,"Full":3}.get(
+                self.mode_combo.currentText(), 2)))
+        top_layout.addWidget(self.mode_combo)
 
         self._add_separator(top_layout)
 
@@ -381,23 +383,29 @@ class PDDashboard(QMainWindow):
         meta_layout.addWidget(QLabel("<b>Quick Info (Select a Run):</b>"))
 
         def _field_row(label_txt):
-            row = QHBoxLayout()
+            """Compact row: label on left, copy btn right-aligned, field fills middle."""
+            container = QWidget()
+            row = QHBoxLayout(container)
+            row.setContentsMargins(0, 0, 0, 0)
             row.setSpacing(3)
+            lbl = QLabel(label_txt)
+            lbl.setFixedWidth(28)
             field = QLineEdit(); field.setReadOnly(True)
+            field.setStyleSheet("font-size: 11px;")
             copy_btn = QPushButton("Copy")
-            copy_btn.setFixedWidth(38)
-            copy_btn.setFixedHeight(22)
+            copy_btn.setFixedWidth(36)
+            copy_btn.setFixedHeight(20)
             copy_btn.setObjectName("linkBtn")
+            copy_btn.setStyleSheet(
+                "QPushButton#linkBtn { font-size: 10px; padding: 0 2px; }")
             copy_btn.setCursor(Qt.PointingHandCursor)
             copy_btn.clicked.connect(lambda _, f=field: (
                 QApplication.clipboard().setText(f.text()) if f.text() else None
             ))
+            row.addWidget(lbl)
             row.addWidget(field, 1)
             row.addWidget(copy_btn)
-            lbl = QLabel(label_txt)
-            lbl.setFixedWidth(44)
-            meta_layout.addWidget(lbl)
-            meta_layout.addLayout(row)
+            meta_layout.addWidget(container)
             return field
 
         self.meta_status = QLineEdit(); self.meta_status.setReadOnly(True)
@@ -406,13 +414,7 @@ class PDDashboard(QMainWindow):
         self.meta_path = _field_row("Path:")
         self.meta_log  = _field_row("Log:")
 
-        # FEAT 3: Terminal button
-        self.terminal_btn = QPushButton("Open Terminal Here")
-        self.terminal_btn.setObjectName("linkBtn")
-        self.terminal_btn.setCursor(Qt.PointingHandCursor)
-        self.terminal_btn.setVisible(False)
-        self.terminal_btn.clicked.connect(self._open_terminal_here)
-        meta_layout.addWidget(self.terminal_btn)
+        # Terminal button removed per user request
 
         left_layout.addWidget(self.meta_panel, 0)
 
@@ -748,7 +750,7 @@ class PDDashboard(QMainWindow):
             ("Ctrl+C",          "Copy selected cell to clipboard"),
             ("Ctrl+?",          "Show this shortcuts dialog"),
             ("L",               "Open log file for selected run (gvim)"),
-            ("T",               "Open Terminal Here for selected run"),
+
             ("D",               "Toggle dark / light mode"),
             ("1",               "Compact column view"),
             ("2",               "Standard column view"),
@@ -795,22 +797,20 @@ class PDDashboard(QMainWindow):
 
     def _set_col_preset(self, preset):
         """FEAT 6: Column view presets — 1=Compact, 2=Standard, 3=Full."""
-        # Compact: Run Name, Status, Stage, User, Runtime, Start
-        compact  = {0, 3, 4, 5, 12, 13}
-        # Standard: adds FM, VSLP, Source, Size, End
-        standard = compact | {2, 6, 7, 8, 9, 14}
-        # Full: everything visible
-        full_vis = set(range(15)) | {22}
-        # Always hidden: raw path columns
+        compact      = {0, 3, 4, 5, 12, 13}
+        standard     = compact | {2, 6, 7, 8, 9, 14}
+        full_vis     = set(range(15)) | {22}
         always_hidden = {15, 16, 17, 18, 19, 20, 21, 23}
-        if preset == 1:
-            visible = compact
-        elif preset == 2:
-            visible = standard
-        else:
-            visible = full_vis
+        visible = compact if preset == 1 else (standard if preset == 2 else full_vis)
         for i in range(self.tree.columnCount()):
             self.tree.setColumnHidden(i, i not in visible or i in always_hidden)
+        # Sync the mode combo without triggering signal
+        name_map = {1: "Compact", 2: "Standard", 3: "Full"}
+        if hasattr(self, 'mode_combo'):
+            self.mode_combo.blockSignals(True)
+            idx = self.mode_combo.findText(name_map.get(preset, "Standard"))
+            if idx >= 0: self.mode_combo.setCurrentIndex(idx)
+            self.mode_combo.blockSignals(False)
 
     def _copy_tree_cell(self):
         item = self.tree.currentItem()
@@ -959,12 +959,6 @@ class PDDashboard(QMainWindow):
                 break
         self.ins_note.setPlainText(clean_text)
 
-        # FEAT 3: Show/hide terminal button based on path availability
-        run_path = item.text(15)
-        self.terminal_btn.setVisible(
-            bool(run_path and run_path != "N/A" and not is_stage and not is_rtl)
-        )
-
         # FIX 1: Read pre-cached error count from item data — ZERO file I/O
         if len(sel) == 1 and not is_stage and path and path != "N/A":
             err_count = item.data(0, Qt.UserRole + 12)   # set in _create_run_item
@@ -985,162 +979,318 @@ class PDDashboard(QMainWindow):
             subprocess.Popen(['gvim', self.current_error_log_path])
 
     def show_analytics(self):
-        """FEAT 9: Analytics dialog — runtime distribution and block health."""
+        """FIX 5: Analytics — FE block summary, BE stage summary, RTL summary."""
         all_runs = (self.ws_data.get("all_runs", []) +
                     self.out_data.get("all_runs", []))
-        fe_runs = [r for r in all_runs if r.get("run_type") == "FE"]
-        if not fe_runs:
-            QMessageBox.information(self, "Analytics", "No FE run data available yet.")
+        if not all_runs:
+            QMessageBox.information(self, "Analytics", "No run data available yet.")
             return
+
+        def _parse_hrs(rt):
+            try:
+                m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
+                if m:
+                    return int(m.group(1)) + int(m.group(2))/60 + int(m.group(3))/3600
+            except:
+                pass
+            return None
+
+        def _normalize_stage(name):
+            """eco01_abcd -> eco01, chip_finish_abc -> chip_finish."""
+            parts = name.split("_")
+            if len(parts) >= 3:
+                return "_".join(parts[:2])
+            return name
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Analytics Dashboard")
-        dlg.resize(820, 560)
+        dlg.resize(940, 620)
         layout = QVBoxLayout(dlg)
 
         from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget
         tabs = QTabWidget()
 
-        # --- Tab 1: Block Summary ---
+        # --- TAB 1: FE Block Summary (COMPLETED runs only for avg) ---
+        fe_runs = [r for r in all_runs if r.get("run_type") == "FE"]
         block_stats = {}
         for r in fe_runs:
             blk = r.get("block", "Unknown")
             if blk not in block_stats:
-                block_stats[blk] = {"total": 0, "completed": 0, "running": 0,
-                                    "failed": 0, "runtimes": []}
-            block_stats[blk]["total"] += 1
+                block_stats[blk] = {
+                    "total": 0, "completed": 0, "running": 0,
+                    "failed": 0, "not_started": 0, "comp_runtimes": []
+                }
+            s = block_stats[blk]
+            s["total"] += 1
             st = r.get("fe_status", "")
-            if r.get("is_comp"):      block_stats[blk]["completed"] += 1
-            elif st == "RUNNING":     block_stats[blk]["running"] += 1
-            elif st in ("FAILED","FATAL ERROR","INTERRUPTED"):
-                block_stats[blk]["failed"] += 1
-            rt = r.get("info", {}).get("runtime", "")
-            try:
-                m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt)
-                if m:
-                    mins = int(m.group(1))*60 + int(m.group(2))
-                    block_stats[blk]["runtimes"].append(mins)
-            except: pass
+            if r.get("is_comp"):
+                s["completed"] += 1
+                hrs = _parse_hrs(r.get("info", {}).get("runtime", ""))
+                if hrs and hrs > 0:
+                    s["comp_runtimes"].append(hrs)
+            elif st == "RUNNING":
+                s["running"] += 1
+            elif st == "NOT STARTED":
+                s["not_started"] += 1
+            elif st in ("FAILED", "FATAL ERROR", "INTERRUPTED"):
+                s["failed"] += 1
 
-        tbl1 = QTableWidget(0, 6)
+        tbl1 = QTableWidget(0, 7)
         tbl1.setHorizontalHeaderLabels([
-            "Block", "Total Runs", "Completed", "Running", "Failed", "Avg Runtime (min)"])
+            "Block", "Total", "Completed", "Running",
+            "Failed", "Not Started", "Avg Runtime (hrs, completed only)"])
         tbl1.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        for _ in range(1, 6): tbl1.horizontalHeader().setSectionResizeMode(_, QHeaderView.Stretch)
+        tbl1.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
+        for i in range(1, 6):
+            tbl1.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
         tbl1.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl1.setAlternatingRowColors(True)
         tbl1.verticalHeader().setVisible(False)
+        tbl1.setSortingEnabled(True)
         for blk, s in sorted(block_stats.items()):
-            r = tbl1.rowCount(); tbl1.insertRow(r)
-            avg_rt = f"{sum(s['runtimes'])/len(s['runtimes']):.0f}" if s['runtimes'] else "N/A"
-            for c, v in enumerate([blk, s["total"], s["completed"], s["running"],
-                                    s["failed"], avg_rt]):
+            row = tbl1.rowCount()
+            tbl1.insertRow(row)
+            rts = s["comp_runtimes"]
+            avg_h = f"{sum(rts)/len(rts):.2f}h" if rts else "N/A"
+            vals = [blk, s["total"], s["completed"], s["running"],
+                    s["failed"], s["not_started"], avg_h]
+            for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
-                item.setTextAlignment(Qt.AlignCenter)
-                if c == 4 and int(v) > 0: item.setForeground(QColor("#d32f2f"))
-                if c == 2 and int(v) > 0: item.setForeground(QColor("#388e3c"))
-                tbl1.setItem(r, c, item)
-        tabs.addTab(tbl1, "Block Summary")
+                item.setTextAlignment(
+                    Qt.AlignLeft | Qt.AlignVCenter if c == 0 else Qt.AlignCenter)
+                if c == 4 and str(v) not in ("0", "N/A"):
+                    item.setForeground(QColor("#d32f2f"))
+                if c == 2 and str(v) not in ("0", "N/A"):
+                    item.setForeground(QColor("#388e3c"))
+                if c == 3 and str(v) not in ("0", "N/A"):
+                    item.setForeground(QColor("#1976d2"))
+                tbl1.setItem(row, c, item)
+        tabs.addTab(tbl1, f"FE Block Summary ({len(fe_runs)} runs)")
 
-        # --- Tab 2: RTL Release Summary ---
-        rtl_stats = {}
-        for r in fe_runs:
-            rtl = r.get("rtl", "Unknown")
-            if rtl not in rtl_stats:
-                rtl_stats[rtl] = {"total": 0, "completed": 0, "failed": 0}
-            rtl_stats[rtl]["total"] += 1
-            if r.get("is_comp"): rtl_stats[rtl]["completed"] += 1
-            elif r.get("fe_status","") in ("FAILED","FATAL ERROR"): rtl_stats[rtl]["failed"] += 1
+        # --- TAB 2: BE Stage Summary — grouped by normalized stage name ---
+        be_runs = [r for r in all_runs if r.get("run_type") == "BE"]
+        stage_stats = {}  # key = (block, stage_group)
+        for r in be_runs:
+            blk = r.get("block", "Unknown")
+            for stage in r.get("stages", []):
+                raw_name = stage.get("name", "unknown")
+                grp_name = _normalize_stage(raw_name)
+                key = (blk, grp_name)
+                if key not in stage_stats:
+                    stage_stats[key] = {
+                        "count": 0, "comp_count": 0,
+                        "comp_runtimes": [], "examples": set()
+                    }
+                s = stage_stats[key]
+                s["count"] += 1
+                s["examples"].add(raw_name)
+                rt_str = stage.get("info", {}).get("runtime", "")
+                hrs = _parse_hrs(rt_str)
+                if hrs and hrs > 0:
+                    s["comp_count"] += 1
+                    s["comp_runtimes"].append(hrs)
 
-        tbl2 = QTableWidget(0, 4)
-        tbl2.setHorizontalHeaderLabels(["RTL Release", "Total", "Completed", "Failed"])
-        tbl2.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        tbl2 = QTableWidget(0, 6)
+        tbl2.setHorizontalHeaderLabels([
+            "Block", "Stage Group", "Example Names",
+            "Total Stages", "With Runtime", "Avg Runtime (hrs)"])
+        tbl2.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        tbl2.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tbl2.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        for i in [3, 4, 5]:
+            tbl2.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
         tbl2.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl2.setAlternatingRowColors(True)
         tbl2.verticalHeader().setVisible(False)
-        for rtl, s in sorted(rtl_stats.items()):
-            r = tbl2.rowCount(); tbl2.insertRow(r)
-            for c, v in enumerate([rtl, s["total"], s["completed"], s["failed"]]):
+        tbl2.setSortingEnabled(True)
+        for (blk, grp), s in sorted(stage_stats.items()):
+            row = tbl2.rowCount()
+            tbl2.insertRow(row)
+            rts = s["comp_runtimes"]
+            avg_h = f"{sum(rts)/len(rts):.2f}h" if rts else "N/A"
+            examples = ", ".join(sorted(s["examples"])[:3])
+            if len(s["examples"]) > 3:
+                examples += "..."
+            vals = [blk, grp, examples, s["count"], s["comp_count"], avg_h]
+            for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
-                item.setTextAlignment(Qt.AlignCenter)
-                tbl2.setItem(r, c, item)
-        tabs.addTab(tbl2, "RTL Release Summary")
+                item.setTextAlignment(
+                    Qt.AlignLeft | Qt.AlignVCenter if c <= 2 else Qt.AlignCenter)
+                tbl2.setItem(row, c, item)
+
+        note_lbl = QLabel(
+            "<small><i>Stage names grouped by first 2 underscore-separated parts. "
+            "eco01_abcd and eco01_xyz both appear under eco01. "
+            "Avg uses only stages where runtime is available (not N/A).</i></small>")
+        tab2_w = QWidget()
+        t2l = QVBoxLayout(tab2_w)
+        t2l.setContentsMargins(0, 0, 0, 0)
+        t2l.addWidget(tbl2)
+        t2l.addWidget(note_lbl)
+        tabs.addTab(tab2_w, f"BE Stage Summary ({len(be_runs)} runs)")
+
+        # --- TAB 3: RTL Release Summary ---
+        rtl_stats = {}
+        for r in all_runs:
+            rtl = r.get("rtl", "Unknown")
+            if rtl not in rtl_stats:
+                rtl_stats[rtl] = {
+                    "fe_total": 0, "fe_comp": 0, "fe_fail": 0,
+                    "be_total": 0, "be_comp": 0
+                }
+            s = rtl_stats[rtl]
+            if r.get("run_type") == "FE":
+                s["fe_total"] += 1
+                if r.get("is_comp"):
+                    s["fe_comp"] += 1
+                elif r.get("fe_status", "") in ("FAILED", "FATAL ERROR"):
+                    s["fe_fail"] += 1
+            else:
+                s["be_total"] += 1
+                if r.get("is_comp"):
+                    s["be_comp"] += 1
+
+        tbl3 = QTableWidget(0, 6)
+        tbl3.setHorizontalHeaderLabels([
+            "RTL Release", "FE Total", "FE Completed",
+            "FE Failed", "BE Total", "BE Completed"])
+        tbl3.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 6):
+            tbl3.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        tbl3.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl3.setAlternatingRowColors(True)
+        tbl3.verticalHeader().setVisible(False)
+        tbl3.setSortingEnabled(True)
+        for rtl, s in sorted(rtl_stats.items()):
+            row = tbl3.rowCount()
+            tbl3.insertRow(row)
+            for c, v in enumerate([rtl, s["fe_total"], s["fe_comp"], s["fe_fail"],
+                                    s["be_total"], s["be_comp"]]):
+                item = QTableWidgetItem(str(v))
+                item.setTextAlignment(
+                    Qt.AlignLeft | Qt.AlignVCenter if c == 0 else Qt.AlignCenter)
+                if c == 3 and str(v) != "0":
+                    item.setForeground(QColor("#d32f2f"))
+                if c in (2, 5) and str(v) != "0":
+                    item.setForeground(QColor("#388e3c"))
+                tbl3.setItem(row, c, item)
+        tabs.addTab(tbl3, "RTL Release Summary")
 
         layout.addWidget(tabs)
-        btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
         layout.addWidget(btn)
         dlg.exec_()
-
     def show_team_workload(self):
-        """FEAT 9: Team workload — runs grouped by owner with summary."""
+        """FIX 4: Team workload — ALL runs (FE+BE, WS+OUTFEED) per engineer."""
         all_runs = (self.ws_data.get("all_runs", []) +
                     self.out_data.get("all_runs", []))
-        fe_runs = [r for r in all_runs if r.get("run_type") == "FE"]
-        if not fe_runs:
-            QMessageBox.information(self, "Team Workload", "No FE run data available yet.")
+        if not all_runs:
+            QMessageBox.information(self, "Team Workload", "No run data available yet.")
             return
 
-        owner_stats = {}
-        for r in fe_runs:
-            owner = r.get("owner", "Unknown")
-            if owner not in owner_stats:
-                owner_stats[owner] = {"total": 0, "completed": 0, "running": 0,
-                                      "failed": 0, "blocks": set(), "runtimes": []}
-            owner_stats[owner]["total"] += 1
-            owner_stats[owner]["blocks"].add(r.get("block",""))
-            st = r.get("fe_status","")
-            if r.get("is_comp"):   owner_stats[owner]["completed"] += 1
-            elif st == "RUNNING":  owner_stats[owner]["running"] += 1
-            elif st in ("FAILED","FATAL ERROR","INTERRUPTED"): owner_stats[owner]["failed"] += 1
-            rt = r.get("info",{}).get("runtime","")
+        def _parse_hrs(rt):
             try:
-                m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt)
-                if m: owner_stats[owner]["runtimes"].append(
-                    int(m.group(1))*60+int(m.group(2)))
-            except: pass
+                m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
+                if m:
+                    return int(m.group(1)) + int(m.group(2))/60 + int(m.group(3))/3600
+            except:
+                pass
+            return None
+
+        owner_stats = {}
+        for r in all_runs:
+            owner = r.get("owner", "")
+            if not owner or owner == "Unknown":
+                path = r.get("path", "") or r.get("parent", "")
+                m = re.search(r'/WS/([^/]+?)_S5K2P5SP', path)
+                owner = m.group(1) if m else "Unknown"
+            if owner not in owner_stats:
+                owner_stats[owner] = {
+                    "fe_total": 0, "fe_comp": 0, "fe_run": 0, "fe_fail": 0,
+                    "be_total": 0, "be_comp": 0,
+                    "blocks": set(), "sources": set(), "fe_runtimes": []
+                }
+            s = owner_stats[owner]
+            s["blocks"].add(r.get("block", ""))
+            s["sources"].add(r.get("source", ""))
+            if r.get("run_type") == "FE":
+                s["fe_total"] += 1
+                st = r.get("fe_status", "")
+                if r.get("is_comp"):
+                    s["fe_comp"] += 1
+                    hrs = _parse_hrs(r.get("info", {}).get("runtime", ""))
+                    if hrs and hrs > 0:
+                        s["fe_runtimes"].append(hrs)
+                elif st == "RUNNING":
+                    s["fe_run"] += 1
+                elif st in ("FAILED", "FATAL ERROR", "INTERRUPTED"):
+                    s["fe_fail"] += 1
+            else:
+                s["be_total"] += 1
+                if r.get("is_comp"):
+                    s["be_comp"] += 1
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Team Workload View")
-        dlg.resize(760, 420)
+        dlg.resize(940, 480)
         layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(
+            f"<b>Team Workload</b> — {len(owner_stats)} engineers, "
+            f"{len(all_runs)} total runs (FE + BE, WS + OUTFEED)"))
 
         from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
-        tbl = QTableWidget(0, 7)
+        tbl = QTableWidget(0, 9)
         tbl.setHorizontalHeaderLabels([
-            "Engineer", "Blocks", "Total Runs", "Completed", "Running",
-            "Failed", "Avg Runtime (min)"])
+            "Engineer", "Source", "Blocks",
+            "FE Total", "FE Done", "FE Running", "FE Failed",
+            "BE Total", "FE Avg Runtime"])
         tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        for i in range(2,7): tbl.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        for i in range(3, 9):
+            tbl.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
         tbl.verticalHeader().setVisible(False)
         tbl.setSortingEnabled(True)
 
-        for owner, s in sorted(owner_stats.items(), key=lambda x: -x[1]["total"]):
-            r = tbl.rowCount(); tbl.insertRow(r)
-            avg_rt = f"{sum(s['runtimes'])/len(s['runtimes']):.0f}" if s['runtimes'] else "N/A"
+        for owner, s in sorted(owner_stats.items(),
+                                key=lambda x: -(x[1]["fe_total"] + x[1]["be_total"])):
+            row = tbl.rowCount()
+            tbl.insertRow(row)
+            rts = s["fe_runtimes"]
+            avg_h = f"{sum(rts)/len(rts):.2f}h" if rts else "N/A"
             blk_str = ", ".join(sorted(s["blocks"]))
-            for c, v in enumerate([owner, blk_str, s["total"], s["completed"],
-                                    s["running"], s["failed"], avg_rt]):
+            src_str = "+".join(sorted(s["sources"]))
+            vals = [owner, src_str, blk_str,
+                    s["fe_total"], s["fe_comp"], s["fe_run"], s["fe_fail"],
+                    s["be_total"], avg_h]
+            for c, v in enumerate(vals):
                 item = QTableWidgetItem(str(v))
-                item.setTextAlignment(Qt.AlignCenter if c != 1 else Qt.AlignLeft | Qt.AlignVCenter)
-                if c == 5 and str(v) != "0": item.setForeground(QColor("#d32f2f"))
-                if c == 3 and str(v) != "0": item.setForeground(QColor("#388e3c"))
-                if c == 4 and str(v) != "0": item.setForeground(QColor("#1976d2"))
-                tbl.setItem(r, c, item)
+                align = (Qt.AlignLeft | Qt.AlignVCenter) if c == 2 else Qt.AlignCenter
+                item.setTextAlignment(align)
+                if c == 6 and str(v) not in ("0", "N/A"):
+                    item.setForeground(QColor("#d32f2f"))
+                if c == 4 and str(v) not in ("0", "N/A"):
+                    item.setForeground(QColor("#388e3c"))
+                if c == 5 and str(v) not in ("0", "N/A"):
+                    item.setForeground(QColor("#1976d2"))
+                tbl.setItem(row, c, item)
 
         layout.addWidget(tbl)
-        layout.addWidget(QLabel("Double-click a row to filter tree to that engineer's runs."))
+        hint = QLabel("Double-click any row to filter tree to that engineer's runs.")
+        hint.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(hint)
         tbl.cellDoubleClicked.connect(
             lambda row, col, t=tbl: (
-                self.search.setText(t.item(row, 0).text() if t.item(row,0) else ""),
+                self.search.setText(t.item(row, 0).text() if t.item(row, 0) else ""),
                 dlg.accept()
             ))
-        btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
         layout.addWidget(btn)
         dlg.exec_()
-
     def show_failed_digest(self):
         """FEAT 8: Show all failing runs grouped by failure type."""
         groups = {"FATAL ERROR": [], "INTERRUPTED": [], "FM FAILS": [],
@@ -1626,8 +1776,18 @@ class PDDashboard(QMainWindow):
             f"WS: {ws_c}  OUTFEED: {out_c}  FC: {fc_c}  Innovus: {inv_c}"
         )
 
-        summary_dlg = ScanSummaryDialog(stats, self)
-        summary_dlg.exec_()
+        # FIX 6: Show scan summary as a non-blocking notification in status bar
+        # instead of a modal dialog that freezes the window.
+        # The full scan stats are already visible in the health strip + status bar.
+        total_r = stats.get("ws", 0) + stats.get("outfeed", 0)
+        self.sb_scan_time.setText(
+            f"     Last scan: {self._last_scan_time} "
+            f"({total_r} runs, {stats.get('fc',0)} fc, {stats.get('innovus',0)} innovus)   "
+        )
+        # Optional: flash the status bar briefly to confirm scan completed
+        orig_style = self.status_bar.styleSheet()
+        self.status_bar.setStyleSheet(orig_style + " QStatusBar { background: #e8f5e9; }")
+        QTimer.singleShot(1500, lambda: self.status_bar.setStyleSheet(orig_style))
 
     # ------------------------------------------------------------------
     # FEAT 1: Restore filter state from last session
@@ -2411,7 +2571,7 @@ class PDDashboard(QMainWindow):
         ir_dyn_act  = (m.addAction("Open Dynamic IR Log")
                        if is_stage and ir_path and ir_path != "N/A" and cached_exists(ir_path) else None)
         log_act     = m.addAction("Open Log File")                if log_path  and log_path  != "N/A" and cached_exists(log_path)  else None
-        term_act    = m.addAction("Open Terminal Here")            if run_path  and run_path  != "N/A" and not is_stage else None
+        term_act    = None  # Open Terminal Here removed per user request
 
         m.addSeparator()
         qor_act = None
