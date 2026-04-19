@@ -1,3 +1,4 @@
+
 import os
 import re
 import pwd
@@ -213,7 +214,7 @@ def save_user_note(identifier, note_text):
         except: pass
     
     if note_text.strip():
-        # Add the sleek stacked chat timestamp here!
+        # Adds the stacked chat timestamp
         ts = datetime.datetime.now().strftime("%b %d, %H:%M")
         user_data[identifier] = f"[{current_user} - {ts}] {note_text.strip()}"
     else:
@@ -240,3 +241,5 @@ def save_user_pins(pins_dict):
     try:
         with open(get_pins_file(), 'w') as f: json.dump(pins_dict, f, indent=4)
     except: pass
+
+
