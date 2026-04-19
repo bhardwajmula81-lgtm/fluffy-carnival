@@ -206,7 +206,7 @@ class PDDashboard(QMainWindow):
         root_layout.setContentsMargins(8, 8, 8, 4)
         root_layout.setSpacing(6)
 
-        # TOP BAR - MODULAR
+        # TOP BAR
         top_layout = QHBoxLayout()
         top_layout.setSpacing(8)
 
@@ -647,7 +647,7 @@ class PDDashboard(QMainWindow):
             
             row[0].setData("STAGE", Qt.UserRole)
             row[0].setData(stage["name"], Qt.UserRole + 1)
-            row[0].setData(stage["qor_path"], Qt.UserRole + 2)
+            row[0].setData(stage.get("qor_path", ""), Qt.UserRole + 2)
             row[0].setData(stage, Qt.UserRole + 10)
             
             ir_info = self.ir_data.get(f"{be_run['r_name']}/{stage['name']}", {"static": "-", "dynamic": "-"})
@@ -697,6 +697,28 @@ class PDDashboard(QMainWindow):
         )
         if self.search.text() != "" or self.view_combo.currentText() != "All Runs": self.tree.expandAll()
         else: self.tree.collapseAll()
+        self._update_status_bar()
+
+    def _update_status_bar(self):
+        total = completed = running = 0
+        def count_runs(parent_idx):
+            nonlocal total, completed, running
+            for i in range(self.proxy.rowCount(parent_idx)):
+                idx = self.proxy.index(i, 0, parent_idx)
+                if self.proxy.data(idx, Qt.UserRole) == "DEFAULT":
+                    run_data = self.proxy.data(idx, Qt.UserRole + 10)
+                    if run_data and run_data.get("run_type") == "FE":
+                        total += 1
+                        if run_data.get("is_comp"): completed += 1
+                        elif run_data.get("fe_status") == "RUNNING": running += 1
+                if self.proxy.hasChildren(idx): count_runs(idx)
+        count_runs(QModelIndex())
+        
+        self.sb_total.setText(f"  Total: {total}")
+        self.sb_complete.setText(f"  Completed: {completed}")
+        self.sb_running.setText(f"  Running: {running}")
+        self.sb_selected.setText(f"  Selected: {len(self._checked_paths)}")
+        if self._last_scan_time: self.sb_scan_time.setText(f"  Last scan: {self._last_scan_time}  ")
 
     # ------------------------------------------------------------------
     # EVENTS & INTERACTION
@@ -794,8 +816,14 @@ class PDDashboard(QMainWindow):
             subprocess.Popen(['gvim', self.current_error_log_path])
 
     # ------------------------------------------------------------------
-    # UTILITIES AND ACTIONS (Export, Filter Loading)
+    # UTILITIES AND ACTIONS
     # ------------------------------------------------------------------
+    def fit_all_columns(self):
+        self.tree.setUpdatesEnabled(False)
+        for i in range(self.model.columnCount()):
+            if not self.tree.isColumnHidden(i): self.tree.resizeColumnToContents(i)
+        self.tree.setUpdatesEnabled(True)
+
     def _label(self, text): return QLabel(text)
     def _add_separator(self, layout):
         sep = QFrame(); sep.setFrameShape(QFrame.VLine); sep.setFrameShadow(QFrame.Sunken)
@@ -816,6 +844,13 @@ class PDDashboard(QMainWindow):
         QShortcut(QKeySequence("Ctrl+F"), self, lambda: self.search.setFocus())
         QShortcut(QKeySequence("Ctrl+E"), self, self.safe_expand_all)
         QShortcut(QKeySequence("Ctrl+W"), self, self.safe_collapse_all)
+        QShortcut(QKeySequence("Ctrl+C"), self.tree, self._copy_tree_cell)
+
+    def _copy_tree_cell(self):
+        idx = self.tree.currentIndex()
+        if idx.isValid():
+            text = str(idx.data(Qt.DisplayRole)).strip()
+            if text: QApplication.clipboard().setText(text)
 
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "dashboard_export.csv", "CSV Files (*.csv)")
@@ -826,7 +861,6 @@ class PDDashboard(QMainWindow):
                 headers = [self.model.horizontalHeaderItem(i).text() for i in range(15)] + ["Alias / Notes"]
                 writer.writerow(headers)
                 
-                # Traverse the proxy model to only export visible items
                 def export_node(proxy_index):
                     if proxy_index.isValid():
                         src_idx = self.proxy.mapToSource(proxy_index)
@@ -908,7 +942,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         
         node_type = item0.data(Qt.UserRole)
         is_stage  = node_type == "STAGE"
-        is_rtl    = node_type == "RTL"
         
         act_gold = act_good = act_red = act_later = act_clear = None
         gantt_act = None
@@ -981,7 +1014,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         elif calc_size_act and res == calc_size_act:
             item6 = self.model.itemFromIndex(src_idx.siblingAtColumn(6))
             item6.setText("Calc...")
-            worker = SingleSizeWorker(item6, run_path) # Needs update in workers.py to support QStandardItem if it expects QTreeWidgetItem
+            worker = SingleSizeWorker(item6, run_path)
             worker.result.connect(lambda it, sz: it.setText(sz))
             if not hasattr(self, 'size_workers'): self.size_workers = []
             self.size_workers.append(worker)
@@ -1026,7 +1059,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
     def run_qor_comparison(self):
         sel = list(self._checked_paths)
         if len(sel) < 2: return
-        # Modify logic to point exactly to the qor paths instead of run root if needed
         subprocess.run(["python3.6", SUMMARY_SCRIPT] + sel)
         h = find_latest_qor_report()
         if h: subprocess.Popen([FIREFOX_PATH, h])
@@ -1057,12 +1089,34 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self.disk_dialog.exec_()
 
     def send_cleanup_mail_action(self):
-        if not self._checked_paths:
+        user_runs = {}; is_fe_selected = False
+        def find_owners(parent_item):
+            nonlocal is_fe_selected
+            for i in range(parent_item.rowCount()):
+                c = parent_item.child(i, 0)
+                if c and c.checkState() == Qt.Checked and c.data(Qt.UserRole) != "STAGE":
+                    path = parent_item.child(i, 15).text()
+                    owner = parent_item.child(i, 5).text()
+                    if "FE" in c.text(): is_fe_selected = True
+                    if path and path != "N/A" and owner and owner != "Unknown":
+                        if owner not in user_runs: user_runs[owner] = []
+                        user_runs[owner].append(path)
+                if c and c.hasChildren(): find_owners(c)
+        find_owners(self.model.invisibleRootItem())
+
+        if not user_runs:
             QMessageBox.warning(self, "No Runs Selected", "Please select at least one run to send a cleanup mail.")
             return
 
+        default_subject = "Action Required: Please clean up heavy disk usage runs"
+        if user_runs: default_subject = "Please remove your old PI runs" if is_fe_selected else "Please remove your old PD runs"
+            
         all_known = get_all_known_mail_users()
-        dlg = AdvancedMailDialog("Action Required: Please clean up heavy disk usage runs", "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n", all_known, "", self)
+        unique_emails = [get_user_email(owner) for owner in user_runs.keys() if get_user_email(owner)]
+            
+        dlg = AdvancedMailDialog(default_subject, "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n",
+                                 all_known, ", ".join(unique_emails), self)
+                                 
         if dlg.exec_():
             subject = dlg.subject_input.text().strip()
             body_template = dlg.body_input.toPlainText()
@@ -1072,16 +1126,23 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
             base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
             
-            final_body = body_template + "\n" + "\n".join(self._checked_paths)
-            all_recipients = set(base_to + base_cc)
-            recipients_str = ",".join(all_recipients)
-            
-            cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
-            for att in dlg.attachments: cmd.extend(["-a", att])
-            try:
-                subprocess.Popen(cmd)
-                QMessageBox.information(self, "Mail Sent", "Successfully triggered emails.")
-            except Exception as e: print(f"Failed to send mail: {e}")
+            success_count = 0
+            for owner, paths in user_runs.items():
+                owner_email = get_user_email(owner)
+                if not owner_email: continue
+                
+                final_body = body_template + "\n" + "\n".join(paths)
+                all_recipients = set(base_to + base_cc + [owner_email])
+                recipients_str = ",".join(all_recipients)
+                
+                cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
+                for att in dlg.attachments: cmd.extend(["-a", att])
+                    
+                try:
+                    subprocess.Popen(cmd); success_count += 1
+                except Exception as e: print(f"Failed to send mail: {e}")
+                    
+            QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} emails.")
             
     def send_qor_mail_action(self):
         all_known = get_all_known_mail_users()
@@ -1216,7 +1277,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                 {cb_style}"""
 
         self.setStyleSheet(stylesheet)
-        self.build_model() # Recolor the items
+        self.build_model() 
 
     def calculate_all_sizes(self):
         size_tasks = []
