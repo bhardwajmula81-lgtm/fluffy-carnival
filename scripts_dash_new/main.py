@@ -1834,3 +1834,4 @@ if __name__ == "__main__":
     w = PDDashboard()
     w.showMaximized()
     sys.exit(app.exec_())
+
