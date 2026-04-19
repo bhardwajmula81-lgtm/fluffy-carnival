@@ -12,12 +12,11 @@ from PyQt5.QtWidgets import (
     QPushButton, QMessageBox, QListWidget, QListWidgetItem,
     QProgressBar, QMenu, QSplitter, QWidgetAction, QCheckBox,
     QStatusBar, QFrame, QShortcut, QToolButton, QStyle,
-    QHeaderView, QFileDialog, QGroupBox, QTextEdit, QDockWidget
+    QHeaderView, QFileDialog, QGroupBox, QTextEdit, QDockWidget, QFormLayout
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime
 from PyQt5.QtGui import QColor, QFont, QKeySequence, QBrush, QPainter, QPen, QPixmap, QIcon
 
-# Import our custom modules
 from config import *
 from utils import *
 from workers import *
@@ -28,12 +27,14 @@ class PDDashboard(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Singularity PD | Pro Edition")
-        self.resize(1920, 1000)
+        self.resize(1280, 720)
+        self.setMinimumSize(800, 600)
 
         self.ws_data  = {}
         self.out_data = {}
         self.ir_data  = {}
         self.global_notes = {}
+        self.user_pins = load_user_pins()
 
         self.is_dark_mode       = False
         self.use_custom_colors  = False
@@ -48,7 +49,6 @@ class PDDashboard(QMainWindow):
         self._columns_fitted_once = False
         self._initial_size_calc_done = False
         self._last_scan_time      = None
-        self.is_compact           = False
 
         self.size_workers        = []
         self.item_map            = {}
@@ -63,9 +63,6 @@ class PDDashboard(QMainWindow):
         self._cached_disk_data = None
         self.disk_worker = None
 
-        starred_str = prefs.get('USER', 'starred_runs', fallback='')
-        self.starred_runs = set([x for x in starred_str.split('|') if x])
-
         self.search_timer = QTimer(self)
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.refresh_view)
@@ -73,7 +70,12 @@ class PDDashboard(QMainWindow):
         self.auto_refresh_timer = QTimer(self)
         self.auto_refresh_timer.timeout.connect(self.start_fs_scan)
 
-        self.star_icon = self._create_golden_dot()
+        self.icons = {
+            'golden': self._create_dot_icon("#FFC107", "#FF9800"),
+            'good': self._create_dot_icon("#4CAF50", "#388E3C"),
+            'redundant': self._create_dot_icon("#F44336", "#D32F2F"),
+            'later': self._create_dot_icon("#FF9800", "#F57C00")
+        }
 
         self.init_ui()
         self._setup_shortcuts()
@@ -81,24 +83,20 @@ class PDDashboard(QMainWindow):
         self.start_fs_scan()
         self.start_bg_disk_scan()
 
-    def _create_golden_dot(self):
+    def _create_dot_icon(self, hex_color, border_color):
         pixmap = QPixmap(16, 16)
         pixmap.fill(Qt.transparent)
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QBrush(QColor("#FFC107"))) # Golden amber
-        painter.setPen(QPen(QColor("#FF9800"), 1))
+        painter.setBrush(QBrush(QColor(hex_color)))
+        painter.setPen(QPen(QColor(border_color), 1))
         painter.drawEllipse(4, 4, 8, 8)
         painter.end()
         return QIcon(pixmap)
 
     def closeEvent(self, event):
         if not prefs.has_section('UI'): prefs.add_section('UI')
-        if not prefs.has_section('USER'): prefs.add_section('USER')
-        
-        prefs.set('USER', 'starred_runs', '|'.join(self.starred_runs))
         prefs.set('UI', 'main_splitter', ','.join(map(str, self.main_splitter.sizes())))
-
         with open(USER_PREFS_FILE, 'w') as f: prefs.write(f)
         os._exit(0)
 
@@ -112,6 +110,7 @@ class PDDashboard(QMainWindow):
         root_layout.setContentsMargins(6, 6, 6, 4)
         root_layout.setSpacing(4)
 
+        # TOP BAR
         top_layout = QHBoxLayout()
         top_layout.setSpacing(6)
 
@@ -147,63 +146,61 @@ class PDDashboard(QMainWindow):
         top_layout.addStretch()
 
         self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.setToolTip("Refresh [Ctrl+R]")
         self.refresh_btn.clicked.connect(self.start_fs_scan)
         top_layout.addWidget(self.refresh_btn)
 
         self.auto_combo = QComboBox()
         self.auto_combo.addItems(["Off", "1 Min", "5 Min", "10 Min"])
         self.auto_combo.setFixedWidth(75)
-        self.auto_combo.setToolTip("Auto-refresh interval")
         self.auto_combo.currentIndexChanged.connect(self.on_auto_refresh_changed)
         top_layout.addWidget(self.auto_combo)
 
         self._add_separator(top_layout)
 
-        self.tools_btn = QPushButton("Tools")
-        self.tools_menu = QMenu(self)
-        self.tools_menu.addAction("Fit Columns  [Ctrl+Shift+F]", self.fit_all_columns)
-        self.tools_menu.addAction("Expand All   [Ctrl+E]",       self.safe_expand_all)
-        self.tools_menu.addAction("Collapse All [Ctrl+W]",       self.safe_collapse_all)
-        self.tools_menu.addSeparator()
-        self.tools_menu.addAction("Load Run Filter Config...",   self.load_filter_config)
-        self.tools_menu.addAction("Clear Run Filter Config",     self.clear_filter_config)
-        self.tools_menu.addAction("Generate Sample Config",      self.generate_sample_config)
-        self.tools_menu.addSeparator()
-        self.tools_menu.addAction("Calculate All Run Sizes",     self.calculate_all_sizes)
-        self.tools_btn.setMenu(self.tools_menu)
-        top_layout.addWidget(self.tools_btn)
-
-        self.export_btn = QPushButton("Export CSV"); self.export_btn.clicked.connect(self.export_csv)
-        top_layout.addWidget(self.export_btn)
-
-        self.qor_btn  = self._btn("Compare QoR", self.run_qor_comparison)
-        top_layout.addWidget(self.qor_btn)
+        # MEGA MENU
+        self.actions_btn = QPushButton("Actions ▾")
+        self.actions_menu = QMenu(self)
         
-        self.mail_btn = QPushButton("Send Mail")
-        self.mail_menu = QMenu(self)
-        self.mail_menu.addAction("Cleanup Mail (Selected Runs)", self.send_cleanup_mail_action)
-        self.mail_menu.addAction("Send Compare QoR Mail", self.send_qor_mail_action)
-        self.mail_menu.addAction("Send Custom Mail", self.send_custom_mail_action)
-        self.mail_btn.setMenu(self.mail_menu)
-        top_layout.addWidget(self.mail_btn)
+        self.actions_menu.addAction("Fit Columns", self.fit_all_columns)
+        self.actions_menu.addAction("Expand All", self.safe_expand_all)
+        self.actions_menu.addAction("Collapse All", self.safe_collapse_all)
+        self.actions_menu.addSeparator()
         
-        self.disk_btn = self._btn("Disk Space",   self.open_disk_usage)
-        self.settings_btn = self._btn("Settings", self.open_settings)
-        top_layout.addWidget(self.disk_btn)
-        top_layout.addWidget(self.settings_btn)
-
-        self.size_toggle_btn = QToolButton()
-        self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
-        self.size_toggle_btn.setToolTip("Toggle Compact Mode")
-        self.size_toggle_btn.clicked.connect(self.toggle_window_size)
-        self.size_toggle_btn.setFixedSize(28, 28)
-        top_layout.addWidget(self.size_toggle_btn)
+        self.actions_menu.addAction("Calculate All Run Sizes", self.calculate_all_sizes)
+        self.actions_menu.addAction("Export to CSV", self.export_csv)
+        self.actions_menu.addAction("Compare QoR", self.run_qor_comparison)
+        self.actions_menu.addSeparator()
+        
+        mail_menu = self.actions_menu.addMenu("Send Mail...")
+        mail_menu.addAction("Cleanup Mail (Selected Runs)", self.send_cleanup_mail_action)
+        mail_menu.addAction("Send Compare QoR Mail", self.send_qor_mail_action)
+        mail_menu.addAction("Send Custom Mail", self.send_custom_mail_action)
+        self.actions_menu.addSeparator()
+        
+        filt_menu = self.actions_menu.addMenu("Filter Configs...")
+        filt_menu.addAction("Load Run Filter Config...", self.load_filter_config)
+        filt_menu.addAction("Clear Run Filter Config", self.clear_filter_config)
+        filt_menu.addAction("Generate Sample Config", self.generate_sample_config)
+        self.actions_menu.addSeparator()
+        
+        self.actions_menu.addAction("Disk Space", self.open_disk_usage)
+        self.actions_menu.addAction("Settings", self.open_settings)
+        
+        self.actions_btn.setMenu(self.actions_menu)
+        top_layout.addWidget(self.actions_btn)
+        
+        self._add_separator(top_layout)
+        
+        # NOTES TOGGLER
+        self.notes_toggle_btn = QPushButton("📝 Notes ◂")
+        self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
+        top_layout.addWidget(self.notes_toggle_btn)
 
         root_layout.addLayout(top_layout)
 
         # Loading Progress Bar
         self.prog_container = QWidget()
+        self.prog_container.setFixedHeight(30)
         self.prog_container.setVisible(False)
         self.prog_layout = QHBoxLayout(self.prog_container)
         self.prog_layout.setContentsMargins(4, 0, 4, 0)
@@ -245,11 +242,7 @@ class PDDashboard(QMainWindow):
         f = self.blk_list.font(); f.setPointSize(f.pointSize() + 1); f.setBold(True)
         self.blk_list.setFont(f)
         self.blk_list.itemChanged.connect(lambda: self.search_timer.start(100))
-        left_layout.addWidget(self.blk_list)
-
-        self.mini_pie = MiniPieChart()
-        left_layout.addWidget(QLabel("<b>Current View Health</b>"))
-        left_layout.addWidget(self.mini_pie)
+        left_layout.addWidget(self.blk_list, 1)
 
         self.fe_error_btn = QPushButton("")
         self.fe_error_btn.setCursor(Qt.PointingHandCursor)
@@ -257,6 +250,24 @@ class PDDashboard(QMainWindow):
         self.fe_error_btn.setVisible(False)
         self.fe_error_btn.clicked.connect(self.open_error_log)
         left_layout.addWidget(self.fe_error_btn)
+        
+        # META PANEL (Replaces Pie Chart)
+        self.meta_panel = QWidget()
+        meta_layout = QVBoxLayout(self.meta_panel)
+        meta_layout.setContentsMargins(0, 8, 0, 0)
+        meta_layout.addWidget(QLabel("<b>Quick Info (Select a Run):</b>"))
+        
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        self.meta_status = QLineEdit(); self.meta_status.setReadOnly(True)
+        self.meta_path = QLineEdit(); self.meta_path.setReadOnly(True)
+        self.meta_log = QLineEdit(); self.meta_log.setReadOnly(True)
+        
+        form.addRow("Status:", self.meta_status)
+        form.addRow("Path:", self.meta_path)
+        form.addRow("Log:", self.meta_log)
+        meta_layout.addLayout(form)
+        left_layout.addWidget(self.meta_panel, 0)
 
         self.main_splitter.addWidget(left_panel)
 
@@ -292,6 +303,7 @@ class PDDashboard(QMainWindow):
         self.tree.setColumnWidth(14, 120); self.tree.setColumnWidth(22, 300)
 
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
+        self.tree.itemExpanded.connect(self.on_item_expanded)
 
         for i in [15, 16, 17, 18, 19, 20, 21, 23]: self.tree.setColumnHidden(i, True)
 
@@ -304,7 +316,7 @@ class PDDashboard(QMainWindow):
         root_layout.addWidget(self.main_splitter)
 
         # Right Panel (Inspector Dock Widget)
-        self.inspector = QGroupBox("Run Details & Notes")
+        self.inspector = QWidget()
         ins_layout = QVBoxLayout(self.inspector)
         self.ins_lbl = QLabel("Select a run to view details.")
         self.ins_lbl.setWordWrap(True)
@@ -318,17 +330,12 @@ class PDDashboard(QMainWindow):
         ins_layout.addWidget(self.ins_note)
         ins_layout.addWidget(self.ins_save_btn)
         
-        self.inspector_dock = QDockWidget("Run Details & Notes", self)
+        self.inspector_dock = QDockWidget(self)
         self.inspector_dock.setAllowedAreas(Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
+        self.inspector_dock.setTitleBarWidget(QWidget()) # Hide default dock title bar
         self.inspector_dock.setWidget(self.inspector)
         self.addDockWidget(Qt.RightDockWidgetArea, self.inspector_dock)
-
-        # Log Viewer Dock
-        self.log_viewer = LogTailer()
-        self.log_dock = QDockWidget("Live Log Viewer", self)
-        self.log_dock.setWidget(self.log_viewer)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.log_dock)
-        self.log_dock.hide()
+        self.inspector_dock.hide()
 
         try:
             m_sizes = [int(x) for x in prefs.get('UI', 'main_splitter', fallback='250,1200').split(',')]
@@ -353,6 +360,14 @@ class PDDashboard(QMainWindow):
 
         self.apply_theme_and_spacing()
 
+    def toggle_notes_dock(self):
+        if self.inspector_dock.isVisible():
+            self.inspector_dock.hide()
+            self.notes_toggle_btn.setText("📝 Notes ◂")
+        else:
+            self.inspector_dock.show()
+            self.notes_toggle_btn.setText("📝 Notes ▾")
+
     def safe_expand_all(self):
         self.tree.blockSignals(True)
         self.tree.expandAll()
@@ -364,6 +379,13 @@ class PDDashboard(QMainWindow):
         self.tree.collapseAll()
         self.tree.blockSignals(False)
         self.tree.resizeColumnToContents(0)
+        
+    def on_item_expanded(self, item):
+        QTimer.singleShot(10, self._resize_first_col)
+
+    def _resize_first_col(self):
+        self.tree.resizeColumnToContents(0)
+        if self.tree.columnWidth(0) > 450: self.tree.setColumnWidth(0, 450)
 
     def generate_sample_config(self):
         sample_text = """# PD Dashboard Run Filter Configuration
@@ -442,27 +464,20 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self.blk_list.blockSignals(False)
         self.refresh_view()
 
-    def toggle_window_size(self):
-        if not self.is_compact:
-            # Switch to compact mode
-            self.showNormal()
-            self.resize(1280, 720)
-            self.is_compact = True
-            self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMaxButton))
-            self.size_toggle_btn.setToolTip("Maximize Window")
-        else:
-            # Switch back to full screen / maximized
-            self.showMaximized()
-            self.is_compact = False
-            self.size_toggle_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarNormalButton))
-            self.size_toggle_btn.setToolTip("Toggle Compact Mode")
-
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+R"),       self, self.start_fs_scan)
         QShortcut(QKeySequence("Ctrl+F"),       self, lambda: self.search.setFocus())
         QShortcut(QKeySequence("Ctrl+E"),       self, self.safe_expand_all)
         QShortcut(QKeySequence("Ctrl+W"),       self, self.safe_collapse_all)
-        QShortcut(QKeySequence("Ctrl+Shift+F"), self, self.fit_all_columns)
+        QShortcut(QKeySequence("Ctrl+C"),       self.tree, self._copy_tree_cell)
+
+    def _copy_tree_cell(self):
+        item = self.tree.currentItem()
+        if item:
+            col = self.tree.currentColumn()
+            if col >= 0:
+                text = item.text(col).strip()
+                if text: QApplication.clipboard().setText(text)
 
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(self, "Export to CSV", "dashboard_export.csv", "CSV Files (*.csv)")
@@ -516,6 +531,7 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         
         if not sel:
             self.ins_lbl.setText("Select a run to view details.")
+            self.meta_status.clear(); self.meta_path.clear(); self.meta_log.clear()
             self.ins_note.clear()
             self.ins_note.setEnabled(False)
             self.ins_save_btn.setEnabled(False)
@@ -526,19 +542,25 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         is_stage = item.data(0, Qt.UserRole) == "STAGE"
         is_rtl = item.data(0, Qt.UserRole) == "RTL"
         path = item.text(15)
+        
+        self.meta_status.setText(item.text(3) if not is_stage else item.text(4))
+        self.meta_path.setText(path)
+        self.meta_log.setText(item.text(16))
+        self.meta_path.setCursorPosition(0)
+        self.meta_log.setCursorPosition(0)
 
         self.ins_note.setEnabled(True)
         self.ins_save_btn.setEnabled(True)
 
         if is_stage:
             p_name = item.parent().text(0)
-            self.ins_lbl.setText(f"<b>Stage:</b> {run_name}<br><b>Parent:</b> {p_name}<br><b>Path:</b> {path}")
+            self.ins_lbl.setText(f"<b>Stage:</b> {run_name}<br><b>Parent:</b> {p_name}")
             self._current_note_id = f"{item.parent().text(1)} : {p_name}"
         elif is_rtl:
             self.ins_lbl.setText(f"<b>RTL Release:</b> {run_name}")
             self._current_note_id = run_name
         else:
-            self.ins_lbl.setText(f"<b>Run:</b> {run_name}<br><b>RTL:</b> {rtl}<br><b>Path:</b> {path}")
+            self.ins_lbl.setText(f"<b>Run:</b> {run_name}<br><b>RTL:</b> {rtl}")
             self._current_note_id = f"{rtl} : {run_name}"
 
         notes = self.global_notes.get(self._current_note_id, [])
@@ -712,29 +734,22 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Scanning...")
         
-        # --- Skeleton Loading UI ---
         self.tree.blockSignals(True)
         self.tree.clear()
         
-        # Determine skeleton text color based on theme
         skel_color = QColor("#555555" if self.is_dark_mode else "#aaaaaa")
-        
-        # Create 8 placeholder skeleton rows
         for _ in range(8):
             skel = QTreeWidgetItem(self.tree)
             skel.setText(0, "Discovering runs...")
             skel.setText(1, "...")
             skel.setText(3, "SCANNING")
             skel.setText(5, "...")
-            skel.setFlags(Qt.NoItemFlags) # Make it unselectable and immutable
-            
-            for col in range(24):
-                skel.setForeground(col, skel_color)
+            skel.setFlags(Qt.NoItemFlags) 
+            for col in range(24): skel.setForeground(col, skel_color)
                 
         self.tree.blockSignals(False)
         self.tree.setEnabled(False) 
         
-        # Start the background worker
         self.worker = ScannerWorker()
         self.worker.progress_update.connect(self.update_progress)
         self.worker.status_update.connect(self.update_status_lbl)
@@ -1071,19 +1086,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             for i in range(1, 23): st_item.setTextAlignment(i, Qt.AlignCenter)
             st_item.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter); st_item.setTextAlignment(22, Qt.AlignLeft | Qt.AlignVCenter)
 
-    def _block_aggregate_status(self, block_name, runs):
-        for r in runs:
-            if r["block"] == block_name and r["run_type"] == "FE" and not r["is_comp"]: return "running"
-        return "done"
-
-    def _refresh_block_colors(self, runs):
-        for i in range(self.blk_list.count()):
-            it = self.blk_list.item(i)
-            raw_name = it.data(Qt.UserRole)
-            status = self._block_aggregate_status(raw_name, runs)
-            it.setForeground(QColor("#2e7d32" if not self.is_dark_mode else "#81c784")
-                             if status == "running" else QColor("#0277bd" if not self.is_dark_mode else "#64b5f6"))
-
     def refresh_view(self):
         for w in self.size_workers:
             if hasattr(w, 'cancel'): w.cancel()
@@ -1105,7 +1107,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 
         src_mode   = self.src_combo.currentText(); sel_rtl    = self.rel_combo.currentText()
         is_filtered = (self.view_combo.currentText() != "All Runs") or (self.search.text().strip() != "")
-        is_running_view = (self.view_combo.currentText() == "Running Only")
 
         raw_query      = self.search.text().lower().strip()
         search_pattern = "*" if not raw_query else (f"*{raw_query}*" if '*' not in raw_query else raw_query)
@@ -1116,15 +1117,11 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         if src_mode in ["WS",  "ALL"] and self.ws_data:  runs_to_process.extend(self.ws_data.get("all_runs", []))
         if src_mode in ["OUTFEED","ALL"] and self.out_data: runs_to_process.extend(self.out_data.get("all_runs", []))
 
-        running_counts = {b: 0 for b in [self.blk_list.item(x).data(Qt.UserRole) for x in range(self.blk_list.count())]}
-        
         fe_info = {}
         for run in runs_to_process:
             if run["run_type"] == "FE":
                 fe_base = run["r_name"].replace("-FE", "")
                 fe_info[(run["block"], fe_base)] = run["rtl"]
-                if not run["is_comp"]:
-                    if run["block"] in running_counts: running_counts[run["block"]] += 1
 
         for run in runs_to_process:
             if run["run_type"] == "BE":
@@ -1133,53 +1130,50 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
                     if run["block"] == blk and (clean_be == fe_base or f"_{fe_base}_" in clean_be or clean_be.startswith(f"{fe_base}_") or clean_be.endswith(f"_{fe_base}")):
                         run["rtl"] = fe_rtl; break
 
-        for i in range(self.blk_list.count()):
-            it = self.blk_list.item(i)
-            raw_name = it.data(Qt.UserRole)
-            if is_running_view:
-                c = running_counts.get(raw_name, 0)
-                it.setText(f"{raw_name} - {c} runs" if c > 0 else f"{raw_name} - NO runs")
-            else: it.setText(raw_name)
-
         ignored_runs_list, normal_runs_list = [], []
 
         for run in runs_to_process:
             if run["path"] in self.ignored_paths: ignored_runs_list.append(run); continue
-            if run["block"] not in checked_blks: continue
+            
+            # --- GOLDEN RUN EXCEPTION ---
+            is_golden = (self.user_pins.get(run["path"]) == "golden")
+            
+            if not is_golden: # Only apply filters if it's NOT a Golden Run
+                if run["block"] not in checked_blks: continue
 
-            if self.run_filter_config is not None:
-                r_src = run["source"]; r_rtl = run["rtl"]; r_blk = run["block"]
-                if r_src in self.run_filter_config and r_rtl in self.run_filter_config[r_src] and r_blk in self.run_filter_config[r_src][r_rtl]:
-                    allowed_runs = self.run_filter_config[r_src][r_rtl][r_blk]
-                    base_run_name = run["r_name"].replace("-FE", "").replace("-BE", "")
-                    if base_run_name not in allowed_runs and run["r_name"] not in allowed_runs: continue 
+                if self.run_filter_config is not None:
+                    r_src = run["source"]; r_rtl = run["rtl"]; r_blk = run["block"]
+                    if r_src in self.run_filter_config and r_rtl in self.run_filter_config[r_src] and r_blk in self.run_filter_config[r_src][r_rtl]:
+                        allowed_runs = self.run_filter_config[r_src][r_rtl][r_blk]
+                        base_run_name = run["r_name"].replace("-FE", "").replace("-BE", "")
+                        if base_run_name not in allowed_runs and run["r_name"] not in allowed_runs: continue 
 
-            base_rtl_filter = re.sub(r'_syn\d+$', '', run["rtl"])
-            if get_milestone(base_rtl_filter) is None: continue
-            if sel_rtl != "[ SHOW ALL ]":
-                if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): continue
+                base_rtl_filter = re.sub(r'_syn\d+$', '', run["rtl"])
+                if get_milestone(base_rtl_filter) is None: continue
+                if sel_rtl != "[ SHOW ALL ]":
+                    if not (run["rtl"] == sel_rtl or run["rtl"].startswith(sel_rtl + "_")): continue
 
-            preset = self.view_combo.currentText()
-            if preset == "FE Only"      and run["run_type"] != "FE": continue
-            if preset == "BE Only"      and run["run_type"] != "BE": continue
-            if preset == "Running Only" and not (run["run_type"] == "FE" and not run["is_comp"]): continue
-            if preset == "Failed Only"  and not ("FAILS" in run.get("st_n","") or "FAILS" in run.get("st_u","") or run.get("fe_status") == "FATAL ERROR"): continue
-            if preset == "Today's Runs":
-                start = run["info"].get("start",""); rt = relative_time(start)
-                if not (rt.endswith("ago") and ("h ago" in rt or "m ago" in rt)): continue
+                preset = self.view_combo.currentText()
+                if preset == "FE Only"      and run["run_type"] != "FE": continue
+                if preset == "BE Only"      and run["run_type"] != "BE": continue
+                if preset == "Running Only" and not (run["run_type"] == "FE" and not run["is_comp"]): continue
+                if preset == "Failed Only"  and not ("FAILS" in run.get("st_n","") or "FAILS" in run.get("st_u","") or run.get("fe_status") == "FATAL ERROR"): continue
+                if preset == "Today's Runs":
+                    start = run["info"].get("start",""); rt = relative_time(start)
+                    if not (rt.endswith("ago") and ("h ago" in rt or "m ago" in rt)): continue
 
-            if search_pattern != "*":
-                note_id = f"{run['rtl']} : {run['r_name']}"
-                notes = " | ".join(self.global_notes.get(note_id, []))
-                combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
-                            f"{run['st_n']} {run['st_u']} {run['vslp_status']} "
-                            f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']} {notes}").lower()
-                matches = fnmatch.fnmatch(combined, search_pattern)
-                if not matches and run["run_type"] == "BE":
-                    for stage in run["stages"]:
-                        sc = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
-                        if fnmatch.fnmatch(sc, search_pattern): matches = True; break
-                if not matches: continue
+                if search_pattern != "*":
+                    note_id = f"{run['rtl']} : {run['r_name']}"
+                    notes = " | ".join(self.global_notes.get(note_id, []))
+                    combined = (f"{run['r_name']} {run['rtl']} {run['source']} {run['run_type']} "
+                                f"{run['st_n']} {run['st_u']} {run['vslp_status']} "
+                                f"{run['info']['runtime']} {run['info']['start']} {run['info']['end']} {notes}").lower()
+                    matches = fnmatch.fnmatch(combined, search_pattern)
+                    if not matches and run["run_type"] == "BE":
+                        for stage in run["stages"]:
+                            sc = f"{stage['name']} {stage['st_n']} {stage['st_u']} {stage['vslp_status']} {stage['info']['runtime']}".lower()
+                            if fnmatch.fnmatch(sc, search_pattern): matches = True; break
+                    if not matches: continue
 
             normal_runs_list.append(run)
 
@@ -1243,26 +1237,22 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
 
         if ign_root.childCount() == 0: root.removeChild(ign_root)
 
-        p = f = r = 0
         def update_nodes(node):
-            nonlocal p, f, r
             if node.data(0, Qt.UserRole) not in ["BLOCK", "RTL", "MILESTONE", "IGNORED_ROOT"]:
-                st = node.text(3).upper()
-                if "COMPLETED" in st: p += 1
-                elif "FAILED" in st or "FATAL" in st: f += 1
-                elif "RUNNING" in st: r += 1
-                
-                if node.text(15) in self.starred_runs:
-                    node.setIcon(0, self.star_icon); node.setData(0, Qt.UserRole + 5, True) 
+                pin_type = self.user_pins.get(node.text(15))
+                if pin_type in self.icons:
+                    node.setIcon(0, self.icons[pin_type])
+                    node.setData(0, Qt.UserRole + 5, pin_type)
                 else:
-                    node.setIcon(0, QIcon()); node.setData(0, Qt.UserRole + 5, False)
+                    node.setIcon(0, QIcon())
+                    node.setData(0, Qt.UserRole + 5, None)
                     
             for i in range(node.childCount()): update_nodes(node.child(i))
             
         update_nodes(root)
-        self.mini_pie.update_data(p, f, r, self.is_dark_mode)
 
-        self.apply_tree_filters(); self.tree.setSortingEnabled(True)
+        self.apply_tree_filters()
+        self.tree.setSortingEnabled(True)
 
         def restore_state(node):
             for i in range(node.childCount()):
@@ -1282,8 +1272,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         restore_state(root)
 
         self.tree.blockSignals(False); self.tree.setUpdatesEnabled(True)
-
-        self._refresh_block_colors(list(runs_to_process))
         self._update_status_bar(normal_runs_list)
         self.on_tree_selection_changed()
         
@@ -1326,29 +1314,16 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         elif action == clear_all_act:
             self.active_col_filters.clear(); self.apply_tree_filters()
 
-    def _time_to_seconds(self, time_str):
-        try:
-            parts = time_str.split('h:')
-            h = int(parts[0])
-            m_s = parts[1].split('m:')
-            m = int(m_s[0])
-            s = int(m_s[1].replace('s',''))
-            return h * 3600 + m * 60 + s
-        except: return 0
-
     def on_context_menu(self, pos):
         item = self.tree.itemAt(pos)
         if not item or not item.parent(): return
         col = self.tree.columnAt(pos.x())
         m   = QMenu()
 
-        cell_text    = item.text(col).strip()
-        copy_cell_act = m.addAction("Copy Cell Text") if cell_text else None
-        if copy_cell_act: m.addSeparator()
-
-        run_path  = item.text(15); log_path  = item.text(16)
+        run_path  = item.text(15)
         fm_u_path = item.text(17); fm_n_path = item.text(18)
         vslp_path = item.text(19); sta_path  = item.text(20); ir_path = item.text(21)
+        log_path  = item.text(16)
         is_stage  = item.data(0, Qt.UserRole) == "STAGE"
         is_rtl    = item.data(0, Qt.UserRole) == "RTL"
         
@@ -1358,12 +1333,17 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         base_run = target_item.data(0, Qt.UserRole + 4)
         run_source = target_item.text(2)
         
-        star_act = tail_act = gantt_act = None
+        act_gold = act_good = act_red = act_later = act_clear = None
+        gantt_act = None
         
         if (run_path and run_path != "N/A") or is_stage:
-            star_act = m.addAction("Unpin Run" if run_path in self.starred_runs else "Pin Run (Golden Dot)")
-            m.addSeparator()
-            tail_act = m.addAction("Tail Log in Dashboard") if log_path else None
+            pin_menu = m.addMenu("Pin as...")
+            act_gold = pin_menu.addAction(self.icons['golden'], "Golden Run")
+            act_good = pin_menu.addAction(self.icons['good'], "Good Run")
+            act_red = pin_menu.addAction(self.icons['redundant'], "Redundant Run")
+            act_later = pin_menu.addAction(self.icons['later'], "Mark for Later")
+            pin_menu.addSeparator()
+            act_clear = pin_menu.addAction("Clear Pin")
             m.addSeparator()
             
             if item.childCount() > 0 and item.child(0).data(0, Qt.UserRole) == "STAGE":
@@ -1406,19 +1386,22 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         log_act     = m.addAction("Open Log File")                if log_path  and log_path  != "N/A" and cached_exists(log_path)  else None
 
         m.addSeparator()
-        c_act   = m.addAction("Copy Path")
         qor_act = None
         if is_stage: m.addSeparator(); qor_act = m.addAction("Run Single Stage QoR")
 
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         if not res: return
         
-        if star_act and res == star_act:
-            if run_path in self.starred_runs: self.starred_runs.remove(run_path)
-            else: self.starred_runs.add(run_path)
-            self.refresh_view()
-            
-        elif tail_act and res == tail_act: self.log_viewer.tail_file(log_path)
+        if res in [act_gold, act_good, act_red, act_later, act_clear]:
+            p_target = run_path if run_path and run_path != "N/A" else (item.parent().text(15) if is_stage else None)
+            if p_target:
+                if res == act_gold: self.user_pins[p_target] = 'golden'
+                elif res == act_good: self.user_pins[p_target] = 'good'
+                elif res == act_red: self.user_pins[p_target] = 'redundant'
+                elif res == act_later: self.user_pins[p_target] = 'later'
+                elif res == act_clear: self.user_pins.pop(p_target, None)
+                save_user_pins(self.user_pins)
+                self.refresh_view()
             
         elif gantt_act and res == gantt_act:
             stages = []
@@ -1464,7 +1447,6 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
             ig(self.tree.invisibleRootItem()); self.refresh_view()
         elif res == ignore_act:  self.ignored_paths.add(target_path);    self.refresh_view()
         elif res == restore_act: self.ignored_paths.discard(target_path); self.refresh_view()
-        elif copy_cell_act and res == copy_cell_act: QApplication.clipboard().setText(cell_text)
         elif calc_size_act and res == calc_size_act:
             item.setText(6, "Calc...")
             worker = SingleSizeWorker(item, run_path)
@@ -1483,167 +1465,11 @@ WS : EVT0_ML4_DEV00 : BLK_GPU : golden_run
         elif ir_stat_act and res == ir_stat_act: subprocess.Popen(['gvim', ir_path])
         elif ir_dyn_act  and res == ir_dyn_act:  subprocess.Popen(['gvim', ir_path])
         elif log_act     and res == log_act:     subprocess.Popen(['gvim', log_path])
-        elif res == c_act: QApplication.clipboard().setText(run_path)
         elif qor_act and res == qor_act:
             step_name = item.data(1, Qt.UserRole); qor_path  = item.data(2, Qt.UserRole)
             subprocess.run(["python3.6", SUMMARY_SCRIPT, qor_path, "-stage", step_name])
             h = find_latest_qor_report()
             if h: subprocess.Popen([FIREFOX_PATH, h])
-
-    def on_item_double_clicked(self, item, col):
-        if item.parent():
-            log = item.text(16)
-            if log and cached_exists(log): subprocess.Popen(['gvim', log])
-
-    def send_cleanup_mail_action(self):
-        user_runs = {}; is_fe_selected = False
-
-        def find_owners(node):
-            nonlocal is_fe_selected
-            for i in range(node.childCount()):
-                c = node.child(i)
-                if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
-                    path  = c.text(15); owner = c.text(5)
-                    if "FE" in c.text(0): is_fe_selected = True
-                    if path and path != "N/A" and owner and owner != "Unknown":
-                        if owner not in user_runs: user_runs[owner] = []
-                        user_runs[owner].append(path)
-                find_owners(c)
-        find_owners(self.tree.invisibleRootItem())
-
-        if not user_runs:
-            QMessageBox.warning(self, "No Runs Selected", "Please select at least one run to send a cleanup mail.")
-            return
-
-        default_subject = "Action Required: Please clean up heavy disk usage runs"
-        if user_runs: default_subject = "Please remove your old PI runs" if is_fe_selected else "Please remove your old PD runs"
-            
-        all_known = get_all_known_mail_users()
-        unique_emails = [get_user_email(owner) for owner in user_runs.keys() if get_user_email(owner)]
-            
-        dlg = AdvancedMailDialog(default_subject, "Hi,\n\nPlease remove these runs as they are consuming disk space and are no longer needed:\n\n",
-                                 all_known, ", ".join(unique_emails), self)
-                                 
-        if dlg.exec_():
-            subject = dlg.subject_input.text().strip()
-            body_template = dlg.body_input.toPlainText()
-            current_user = getpass.getuser()
-            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
-            
-            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
-            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
-            
-            success_count = 0
-            for owner, paths in user_runs.items():
-                owner_email = get_user_email(owner)
-                if not owner_email: continue
-                
-                final_body = body_template + "\n" + "\n".join(paths)
-                all_recipients = set(base_to + base_cc + [owner_email])
-                recipients_str = ",".join(all_recipients)
-                
-                cmd = [MAIL_UTIL, "-to", recipients_str, "-sd", sender_email, "-s", subject, "-c", final_body, "-fm", "text"]
-                for att in dlg.attachments: cmd.extend(["-a", att])
-                    
-                try:
-                    subprocess.Popen(cmd); success_count += 1
-                except Exception as e: print(f"Failed to send mail: {e}")
-                    
-            QMessageBox.information(self, "Mail Sent", f"Successfully triggered {success_count} emails.")
-            
-    def send_qor_mail_action(self):
-        all_known = get_all_known_mail_users()
-        dlg = AdvancedMailDialog("Latest Compare QoR Report", "Hi Team,\n\nPlease find the attached latest QoR Report for your reference.\n\nRegards", all_known, "", self)
-        dlg.attach_qor()
-        
-        if dlg.exec_():
-            subject = dlg.subject_input.text().strip()
-            body_template = dlg.body_input.toPlainText()
-            current_user = getpass.getuser()
-            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
-            
-            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
-            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
-            
-            all_recipients = set(base_to + base_cc)
-            if not all_recipients: return
-            
-            cmd = [MAIL_UTIL, "-to", ",".join(all_recipients), "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
-            for att in dlg.attachments: cmd.extend(["-a", att])
-                
-            try:
-                subprocess.Popen(cmd); QMessageBox.information(self, "Mail Sent", "Successfully sent the Compare QoR mail.")
-            except Exception as e: print(f"Failed to send mail: {e}")
-
-    def send_custom_mail_action(self):
-        all_known = get_all_known_mail_users()
-        dlg = AdvancedMailDialog("", "", all_known, "", self)
-        if dlg.exec_():
-            subject = dlg.subject_input.text().strip()
-            body_template = dlg.body_input.toPlainText()
-            current_user = getpass.getuser()
-            sender_email = get_user_email(current_user) or f"{current_user}@samsung.com"
-            
-            base_to = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
-            base_cc = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
-            
-            all_recipients = set(base_to + base_cc)
-            if not all_recipients: return
-            
-            cmd = [MAIL_UTIL, "-to", ",".join(all_recipients), "-sd", sender_email, "-s", subject, "-c", body_template, "-fm", "text"]
-            for att in dlg.attachments: cmd.extend(["-a", att])
-                
-            try:
-                subprocess.Popen(cmd); QMessageBox.information(self, "Mail Sent", "Successfully sent the custom mail.")
-            except Exception as e: print(f"Failed to send mail: {e}")
-
-    def start_bg_disk_scan(self, force=False):
-        if self.disk_worker and self.disk_worker.isRunning(): return
-        if not force and self._cached_disk_data is not None: return
-        
-        self.disk_btn.setEnabled(False); self.disk_btn.setText("Scanning Disk...")
-        self.disk_worker = DiskScannerWorker()
-        self.disk_worker.finished_scan.connect(self._on_bg_disk_scan_finished)
-        self.disk_worker.start()
-
-    def _on_bg_disk_scan_finished(self, results):
-        self._cached_disk_data = results
-        self.disk_btn.setEnabled(True); self.disk_btn.setText("Disk Space")
-        
-        if hasattr(self, 'disk_dialog') and self.disk_dialog is not None and self.disk_dialog.isVisible():
-            self.disk_dialog.disk_data = results
-            self.disk_dialog.update_view()
-            self.disk_dialog.recalc_btn.setText("Recalculate Disk Usage")
-            self.disk_dialog.recalc_btn.setEnabled(True)
-
-    def open_disk_usage(self):
-        if self._cached_disk_data is None:
-            QMessageBox.information(self, "Scanning", "Disk usage is still calculating in the background.\nPlease wait a moment and try again.")
-            return
-            
-        self.disk_dialog = DiskUsageDialog(
-            self._cached_disk_data,
-            self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"),
-            self)
-        self.disk_dialog.exec_()
-
-    def run_qor_comparison(self):
-        sel  = []
-        root = self.tree.invisibleRootItem()
-        def get_checked(node):
-            for i in range(node.childCount()):
-                c = node.child(i)
-                if c.checkState(0) == Qt.Checked and c.data(0, Qt.UserRole) != "STAGE":
-                    qp  = c.text(15); src = c.text(2)
-                    if src == "OUTFEED" and qp: qp = os.path.dirname(qp)
-                    if qp and not qp.endswith("/"): qp += "/"
-                    sel.append(qp)
-                get_checked(c)
-        get_checked(root)
-        if len(sel) < 2: return
-        subprocess.run(["python3.6", SUMMARY_SCRIPT] + sel)
-        h = find_latest_qor_report()
-        if h: subprocess.Popen([FIREFOX_PATH, h])
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
