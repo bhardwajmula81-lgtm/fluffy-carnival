@@ -1,10 +1,10 @@
-import os
 import math
-from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QScrollArea, QPlainTextEdit, QTreeWidgetItem,
-                             QLineEdit, QCompleter, QDialog)
-from PyQt5.QtCore import Qt, QTimer, QRectF, QStringListModel
+from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
+                              QScrollArea, QLineEdit, QCompleter, QDialog)
+from PyQt5.QtCore import Qt, QRectF, QStringListModel
 from PyQt5.QtGui import QColor, QBrush, QPainter, QPen, QFont
+from PyQt5.QtWidgets import QTreeWidgetItem
+
 
 class GanttChartDialog(QDialog):
     def __init__(self, run_name, stages_data, parent=None):
@@ -23,7 +23,8 @@ class GanttChartDialog(QDialog):
 
     def paintEvent(self, event):
         super().paintEvent(event)
-        if not self.stages_data: return
+        if not self.stages_data:
+            return
         painter = QPainter(self.scene)
         painter.setRenderHint(QPainter.Antialiasing)
         w = self.scene.width() - 40
@@ -44,11 +45,12 @@ class GanttChartDialog(QDialog):
             painter.drawText(x_start + int(bar_w) + 10, y + 15, data['time_str'])
             y += 40
 
+
 class CustomTreeItem(QTreeWidgetItem):
     def __lt__(self, other):
         col = self.treeWidget().sortColumn()
-        
-        # --- Golden Run Pin to Top Logic ---
+
+        # Golden Run pins to top
         if col == 0:
             pin1 = self.data(0, Qt.UserRole + 5)
             pin2 = other.data(0, Qt.UserRole + 5)
@@ -81,6 +83,7 @@ class CustomTreeItem(QTreeWidgetItem):
                 return m_order[t1] < m_order[t2] if asc else m_order[t1] > m_order[t2]
         return t1 < t2
 
+
 class MultiCompleterLineEdit(QLineEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -99,8 +102,10 @@ class MultiCompleterLineEdit(QLineEdit):
     def insertCompletion(self, completion):
         text = self.text()
         parts = text.split(',')
-        if len(parts) > 1: text = ','.join(parts[:-1]) + ', ' + completion + ', '
-        else: text = completion + ', '
+        if len(parts) > 1:
+            text = ','.join(parts[:-1]) + ', ' + completion + ', '
+        else:
+            text = completion + ', '
         self.setText(text)
 
     def keyPressEvent(self, e):
@@ -110,11 +115,12 @@ class MultiCompleterLineEdit(QLineEdit):
                 return
         super().keyPressEvent(e)
         cr = self.cursorRect()
-        cr.setWidth(self.completer.popup().sizeHintForColumn(0) + self.completer.popup().verticalScrollBar().sizeHint().width())
-        
+        cr.setWidth(
+            self.completer.popup().sizeHintForColumn(0) +
+            self.completer.popup().verticalScrollBar().sizeHint().width()
+        )
         text = self.text()
         current_word = text.split(',')[-1].strip()
-        
         if current_word:
             self.completer.setCompletionPrefix(current_word)
             if self.completer.completionCount() > 0:
@@ -123,3 +129,71 @@ class MultiCompleterLineEdit(QLineEdit):
                 self.completer.popup().hide()
         else:
             self.completer.popup().hide()
+
+
+class PieChartWidget(QWidget):
+    """Pie chart widget used by DiskUsageDialog."""
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(450, 450)
+        self.data = {}
+        self.colors = [
+            QColor("#ef5350"), QColor("#42a5f5"), QColor("#66bb6a"), QColor("#ffa726"),
+            QColor("#ab47bc"), QColor("#26c6da"), QColor("#8d6e63"), QColor("#78909c"),
+            QColor("#d4e157"), QColor("#ec407a")
+        ]
+        self.bg_col = "#ffffff"
+
+    def set_data(self, data, is_dark):
+        self.data = dict(sorted(data.items(), key=lambda item: item[1], reverse=True))
+        self.bg_col = "#2b2d30" if is_dark else "#ffffff"
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect()
+        margin = 30
+        min_dim = min(rect.width(), rect.height()) - 2 * margin
+        if min_dim <= 0:
+            return
+        center = rect.center()
+        pie_rect = QRectF(
+            center.x() - min_dim / 2,
+            center.y() - min_dim / 2,
+            min_dim, min_dim
+        )
+        total = sum(self.data.values())
+        if total == 0:
+            painter.setPen(QColor("#888888"))
+            painter.drawText(rect, Qt.AlignCenter, "No Data Available")
+            return
+        start_angle = 0
+        for i, (name, val) in enumerate(self.data.items()):
+            span_angle = (val / total) * 360 * 16
+            painter.setBrush(QBrush(self.colors[i % len(self.colors)]))
+            painter.setPen(QPen(QColor(self.bg_col), 2))
+            painter.drawPie(pie_rect, int(start_angle), int(span_angle))
+            if (val / total) > 0.03:
+                mid_angle_deg = (start_angle + span_angle / 2) / 16.0
+                mid_angle_rad = math.radians(mid_angle_deg)
+                text_x = center.x() + (min_dim / 2 * 0.65) * math.cos(mid_angle_rad)
+                text_y = center.y() - (min_dim / 2 * 0.65) * math.sin(mid_angle_rad)
+                perc = (val / total) * 100
+                text = f"{name}\n{perc:.1f}%"
+                font = painter.font()
+                font.setBold(True)
+                font.setPointSize(9)
+                painter.setFont(font)
+                fm = painter.fontMetrics()
+                lines = text.split('\n')
+                th = fm.height()
+                y_offset = text_y - (th * len(lines)) / 2
+                for line in lines:
+                    tw = fm.horizontalAdvance(line)
+                    painter.setPen(QPen(QColor(0, 0, 0, 180)))
+                    painter.drawText(int(text_x - tw / 2 + 1), int(y_offset + th + 1), line)
+                    painter.setPen(QPen(Qt.white))
+                    painter.drawText(int(text_x - tw / 2), int(y_offset + th), line)
+                    y_offset += th
+            start_angle += span_angle
