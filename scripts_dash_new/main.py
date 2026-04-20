@@ -1434,10 +1434,19 @@ class PDDashboard(QMainWindow):
                 ms   = self.get_milestone_label(base)
                 _rtl_cache[rtl] = (base, base != rtl, ms)
 
+        _ignored  = self.ignored_paths
+        _hide_blk = self.hide_block_nodes
+
+        # CRITICAL: process FE runs first so FE tree items exist
+        # before any BE/innovus run tries to find its FE parent.
+        # Without this, BE runs processed before their FE run silently
+        # attach to the RTL node instead of the FE item.
+        runs_fe = [r for r in runs_to_process if r["run_type"] == "FE"]
+        runs_be = [r for r in runs_to_process if r["run_type"] != "FE"]
+        ordered_runs = runs_fe + runs_be
+
         _item_count = 0
-        _ignored    = self.ignored_paths
-        _hide_blk   = self.hide_block_nodes
-        for run in runs_to_process:
+        for run in ordered_runs:
             run_rtl = run["rtl"]
             base_rtl, has_syn, milestone = _rtl_cache.get(
                 run_rtl, (run_rtl, False, None))
