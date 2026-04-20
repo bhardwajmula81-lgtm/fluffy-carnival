@@ -1267,6 +1267,12 @@ class PDDashboard(QMainWindow):
         log = item.text(16)
         if log and log != "N/A" and os.path.exists(log):
             subprocess.Popen(['gvim', log])
+        elif (item.data(0, Qt.UserRole) == "STAGE"
+              and item.text(15) and item.text(15) != "N/A"):
+            # Try to open the stage directory in file manager
+            stage_dir = item.text(15)
+            if os.path.isdir(stage_dir):
+                subprocess.Popen(['gvim', stage_dir])
 
     def open_error_log(self):
         if self.current_error_log_path and os.path.exists(
@@ -2098,13 +2104,16 @@ class PDDashboard(QMainWindow):
             s_item.setFlags(
                 Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
             s_item.setCheckState(0, Qt.Unchecked)
-            s_item.setText(0, stage.get("name", ""))
+            s_item.setText(0,  stage.get("name", ""))
             s_item.setText(7,  f"NONUPF - {stage.get('st_n', '')}")
             s_item.setText(8,  f"UPF - {stage.get('st_u', '')}")
             s_item.setText(9,  stage.get("vslp_status", ""))
             s_item.setText(12, stage.get("info", {}).get("runtime", ""))
             s_item.setText(13, stage.get("info", {}).get("start",   ""))
             s_item.setText(14, stage.get("info", {}).get("end",     ""))
+            # Col 15 = stage directory path, Col 16 = stage log file
+            s_item.setText(15, stage.get("stage_path", "N/A"))
+            s_item.setText(16, stage.get("log",        "N/A"))
             s_item.setText(20, stage.get("sta_rpt_path",  "N/A"))
             s_item.setText(21, stage.get("qor_path",      "N/A"))
             self._apply_fm_color(s_item, 7, s_item.text(7))
@@ -3127,8 +3136,14 @@ class PDDashboard(QMainWindow):
                 self, "QoR Compare", "QoR script did not produce output.")
 
     def _run_single_stage_qor(self, item, b_name, r_rtl, base_run):
-        stage_name = item.text(0)
-        stage_path = item.text(21)
+        """Run QoR summary for a single PNR stage.
+        summary.py expects the BE run directory (not the stage subdir).
+        It will iterate all stages configured in config.pnr_stages.
+        Pass the parent BE run path (col 15 of the parent item)."""
+        stage_name  = item.text(0)
+        stage_path  = item.text(15)  # stage directory path
+        parent_item = item.parent()  # BE run item
+        be_run_path = parent_item.text(15) if parent_item else stage_path
         # QOR_SUMMARY_SCRIPT may not be defined in config for all projects
         try:
             script = QOR_SUMMARY_SCRIPT
@@ -3143,7 +3158,12 @@ class PDDashboard(QMainWindow):
             QMessageBox.warning(
                 self, "QoR", f"Script not found:\n{script}")
             return
-        worker = QoRWorker(script, [stage_path])
+        # Pass the BE run directory -- summary.py detects "BE" in the path
+        # and automatically scans all pnr_stages configured in config.py
+        if be_run_path and be_run_path != "N/A" and os.path.isdir(be_run_path):
+            worker = QoRWorker(script, [be_run_path])
+        else:
+            worker = QoRWorker(script, [stage_path])
         worker.finished.connect(self._on_qor_done)
         worker.start()
         self._qor_worker = worker
