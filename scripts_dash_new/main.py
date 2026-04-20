@@ -267,7 +267,8 @@ class PDDashboard(QMainWindow):
         self._run_history[key] = self._run_history[key][-20:]
 
     def _check_regression(self, run):
-        """Compare run to previous entry. Return (has_regression, message)."""
+        """Compare run to previous entry. Return (has_regression, message).
+        All helpers are module-level -- no imports or closures per call."""
         key = f"{run['block']}|{run['r_name']}"
         history = self._run_history.get(key, [])
         if len(history) < 2:
@@ -276,41 +277,31 @@ class PDDashboard(QMainWindow):
         curr = history[-1]
         issues = []
         # Runtime regression: >15% increase
-        def _parse_mins(rt):
-            import re as _re
-            try:
-                m = _re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
-                if m:
-                    return int(m.group(1))*60 + int(m.group(2))
-            except Exception:
-                pass
-            return None
-        pm = _parse_mins(prev.get("runtime", ""))
-        cm = _parse_mins(curr.get("runtime", ""))
+        def _mins(rt):
+            m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
+            return int(m.group(1))*60+int(m.group(2)) if m else None
+        pm, cm = _mins(prev.get("runtime","")), _mins(curr.get("runtime",""))
         if pm and cm and pm > 0 and cm > pm * 1.15:
-            pct = int((cm - pm) / pm * 100)
-            issues.append(f"Runtime +{pct}% ({prev['runtime']} -> {curr['runtime']})")
-        # FM regression: PASS -> FAILS
+            issues.append(
+                f"Runtime +{int((cm-pm)/pm*100)}%"
+                f" ({prev['runtime']} -> {curr['runtime']})")
+        # FM regression
         if ("PASS" in prev.get("fm_n","").upper()
                 and "FAIL" in curr.get("fm_n","").upper()):
-            issues.append("FM-NONUPF regressed PASS -> FAILS")
+            issues.append("FM-NONUPF PASS->FAILS")
         if ("PASS" in prev.get("fm_u","").upper()
                 and "FAIL" in curr.get("fm_u","").upper()):
-            issues.append("FM-UPF regressed PASS -> FAILS")
+            issues.append("FM-UPF PASS->FAILS")
         # VSLP regression
-        def _vslp_errors(v):
-            import re as _re
-            m = _re.search(r'Error:\s*(\d+)', v or "")
+        def _verr(v):
+            m = re.search(r'Error:\s*(\d+)', v or "")
             return int(m.group(1)) if m else 0
-        pe = _vslp_errors(prev.get("vslp",""))
-        ce = _vslp_errors(curr.get("vslp",""))
+        pe, ce = _verr(prev.get("vslp","")), _verr(curr.get("vslp",""))
         if ce > pe and pe == 0:
-            issues.append(f"VSLP errors: 0 -> {ce}")
-        elif ce > pe * 1.5 and pe > 0:
-            issues.append(f"VSLP errors increased: {pe} -> {ce}")
-        if issues:
-            return True, " | ".join(issues)
-        return False, ""
+            issues.append(f"VSLP errors 0->{ce}")
+        elif ce > pe*1.5 and pe > 0:
+            issues.append(f"VSLP errors {pe}->{ce}")
+        return (True, " | ".join(issues)) if issues else (False, "")
 
     def _get_run_history_text(self, run):
         """Return formatted history string for inspector panel."""
@@ -340,6 +331,51 @@ class PDDashboard(QMainWindow):
                 self.setWindowTitle(f"{base}  [T+{abs(days)} days post-tapeout]")
         else:
             self.setWindowTitle(base)
+
+    # ------------------------------------------------------------------
+    # CLOSURE PASS (deferred -- runs after tree is fully painted)
+    # ------------------------------------------------------------------
+    def _run_closure_pass(self):
+        """Apply closure scorecard + regression detection to all FE items.
+        Deferred via QTimer so it doesn't block the initial tree paint.
+        Only walks run items (skips group nodes) for maximum speed."""
+        GROUP = frozenset(("BLOCK","MILESTONE","RTL",
+                           "IGNORED_ROOT","STAGE","__PLACEHOLDER__"))
+        _UR   = Qt.UserRole
+        _UR10 = Qt.UserRole + 10
+        count = [0]
+
+        def _walk(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                nt = child.data(0, _UR)
+                if nt in GROUP:
+                    _walk(child)
+                    continue
+                if nt is not None:
+                    continue
+                # FE run item only
+                run = child.data(0, _UR10)
+                if not run or run.get("run_type") != "FE":
+                    _walk(child)
+                    continue
+                # Closure scorecard
+                self._update_closure_on_item(child)
+                # Regression check (only for completed runs with history)
+                if run.get("is_comp"):
+                    has_reg, msg = self._check_regression(run)
+                    if has_reg:
+                        child.setToolTip(
+                            0, child.toolTip(0) + f"\n[REGRESSION] {msg}")
+                        child.setForeground(0, QColor("#f57c00"))
+                        child.setData(0, Qt.UserRole + 30, msg)
+                # Yield to Qt every 50 items to keep UI responsive
+                count[0] += 1
+                if count[0] % 50 == 0:
+                    QApplication.processEvents()
+                _walk(child)
+
+        _walk(self.tree.invisibleRootItem())
 
     # ------------------------------------------------------------------
     # SIGN-OFF CLOSURE SCORECARD
@@ -391,10 +427,9 @@ class PDDashboard(QMainWindow):
             else:        dot_chars.append("(?)")
         summary = f"Closure: {total_pass}/6  " + "  ".join(labels)
         old_tip = item.toolTip(0)
-        # Replace or append closure line
-        import re as _re
+        # Replace or append closure line (re already imported at module level)
         if "Closure:" in old_tip:
-            new_tip = _re.sub(r"Closure:.*", summary, old_tip)
+            new_tip = re.sub(r"Closure:.*", summary, old_tip)
         else:
             new_tip = old_tip + "\n" + summary
         item.setToolTip(0, new_tip)
@@ -1184,14 +1219,16 @@ class PDDashboard(QMainWindow):
             run_data = item.data(0, Qt.UserRole + 10)
             reg_msg  = item.data(0, Qt.UserRole + 30)
             hist_txt = ""
-            if run_data:
+            if run_data and self._run_history:
                 hist_txt = self._get_run_history_text(run_data)
-            reg_part = (f"<br><span style='color:#f57c00'>"
-                        f"[REGRESSION] {reg_msg}</span>"
-                        if reg_msg else "")
-            hist_part = (f"<br><small><b>History:</b><br>"
-                         f"{hist_txt.replace(chr(10), '<br>')}</small>"
-                         if hist_txt and hist_txt != "No history yet." else "")
+            reg_part = (
+                f"<br><span style='color:#f57c00'>"
+                f"[!] {reg_msg}</span>"
+                if reg_msg else "")
+            hist_part = (
+                f"<br><small><b>History (last 5):</b><br>"
+                + hist_txt.replace("\n", "<br>") + "</small>"
+                if hist_txt and hist_txt != "No history yet." else "")
             self.ins_lbl.setText(
                 f"<b>Run:</b> {run_name}<br><b>RTL:</b> {rtl}"
                 f"{reg_part}{hist_part}")
@@ -1881,28 +1918,10 @@ class PDDashboard(QMainWindow):
             save_mail_users_config(all_owners)
 
         QApplication.processEvents()
-        # FEAT 1: Update closure scores and FEAT 3: regression warnings
-        def _apply_closure(node):
-            for i in range(node.childCount()):
-                child = node.child(i)
-                self._update_closure_on_item(child)
-                # FEAT 3: regression detection
-                run = child.data(0, Qt.UserRole + 10)
-                if run and run.get("run_type") == "FE" and run.get("is_comp"):
-                    has_reg, msg = self._check_regression(run)
-                    if has_reg:
-                        # Add regression warning to tooltip
-                        old_tip = child.toolTip(0)
-                        child.setToolTip(
-                            0, old_tip + f"\n[REGRESSION] {msg}")
-                        # Amber color on run name
-                        child.setForeground(0, QColor("#f57c00"))
-                        # Store regression flag for inspector
-                        child.setData(0, Qt.UserRole + 30, msg)
-                _apply_closure(child)
-        _apply_closure(self.tree.invisibleRootItem())
-
         self.refresh_view()
+        # Defer closure+regression scan -- runs after UI is responsive
+        # Uses QTimer so tree is fully painted before the extra pass
+        QTimer.singleShot(200, self._run_closure_pass)
         # Auto-expand to RTL level on first load only
         if not hasattr(self, '_auto_expanded_once'):
             self._auto_expanded_once = True
