@@ -455,7 +455,8 @@ class ScannerWorker(QThread):
         if source == "OUTFEED":
             rtl = self._resolve_outfeed_rtl(rd, phys_evt)
         else:
-            rtl = extract_rtl(rd) if run_type == "BE" else base_rtl
+            per_run_rtl = extract_rtl(rd)
+            rtl = per_run_rtl if (per_run_rtl and per_run_rtl != "Unknown") else base_rtl
             if rtl == "Unknown":
                 rtl = base_rtl
         return self._process_run(b_name, rd, parent_path, rtl, source, run_type)
