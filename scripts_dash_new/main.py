@@ -74,6 +74,9 @@ class PDDashboard(QMainWindow):
         self.active_col_filters     = {}
         self._tree_builder          = None
 
+        # -- milestone map (user-configurable in Settings > Milestones) --
+        self._milestone_map = self._load_milestone_map()
+
         # -- color palette (rebuilt on theme change) ----------------------
         self._colors = {
             "completed":   QColor("#1b5e20"), "running":     QColor("#0d47a1"),
@@ -156,6 +159,45 @@ class PDDashboard(QMainWindow):
         with open(USER_PREFS_FILE, 'w') as f:
             prefs.write(f)
         os._exit(0)
+
+    # ------------------------------------------------------------------
+    # MILESTONE MAP (user-configurable)
+    # ------------------------------------------------------------------
+    def _load_milestone_map(self):
+        """Load milestone pattern->label map from prefs.
+        Default: _ML1_->INITIAL RELEASE, _ML2_->PRE-SVP, etc.
+        User can add custom patterns like _ML0_->TAPE-IN."""
+        import json
+        default = {
+            "_ML1_": "INITIAL RELEASE",
+            "_ML2_": "PRE-SVP",
+            "_ML3_": "SVP",
+            "_ML4_": "FFN",
+        }
+        try:
+            saved = prefs.get('MILESTONES', 'map', fallback='')
+            if saved:
+                loaded = json.loads(saved)
+                if isinstance(loaded, dict) and loaded:
+                    return loaded
+        except Exception:
+            pass
+        return default
+
+    def _save_milestone_map(self, m):
+        import json
+        if not prefs.has_section('MILESTONES'):
+            prefs.add_section('MILESTONES')
+        prefs.set('MILESTONES', 'map', json.dumps(m))
+        with open(USER_PREFS_FILE, 'w') as f:
+            prefs.write(f)
+
+    def get_milestone_label(self, rtl_str):
+        """Apply user-defined milestone map to an RTL string."""
+        for pattern, label in self._milestone_map.items():
+            if pattern in rtl_str:
+                return label
+        return None
 
     # ------------------------------------------------------------------
     # ICONS
@@ -402,6 +444,11 @@ class PDDashboard(QMainWindow):
         meta_layout.setContentsMargins(0, 6, 0, 0)
         meta_layout.setSpacing(4)
         meta_layout.addWidget(QLabel("<b>Quick Info:</b>"))
+        self.meta_run_name = QLabel("")
+        self.meta_run_name.setWordWrap(True)
+        self.meta_run_name.setStyleSheet(
+            "font-weight: bold; font-size: 11px; color: #1976d2;")
+        meta_layout.addWidget(self.meta_run_name)
 
         def _field_row(label_txt):
             grp = QWidget()
@@ -812,6 +859,7 @@ class PDDashboard(QMainWindow):
 
         if not sel:
             self.ins_lbl.setText("Select a run to view details.")
+            self.meta_run_name.setText("")
             self.meta_path.clear()
             self.meta_log.clear()
             self.ins_note.clear()
@@ -830,6 +878,14 @@ class PDDashboard(QMainWindow):
         self.meta_log.setText(item.text(16))
         self.meta_path.home(False)
         self.meta_log.home(False)
+        # Show run name in Quick Info
+        if is_stage:
+            self.meta_run_name.setText(
+                f"{item.parent().text(0)} / {run_name}")
+        elif is_rtl:
+            self.meta_run_name.setText(run_name)
+        else:
+            self.meta_run_name.setText(run_name)
 
         self.ins_note.setEnabled(True)
         self.ins_save_btn.setEnabled(True)
@@ -1142,7 +1198,7 @@ class PDDashboard(QMainWindow):
         self.rel_combo.blockSignals(True)
         self.rel_combo.clear()
         valid = [r for r in releases
-                 if "Unknown" not in r and get_milestone(r) is not None]
+                 if "Unknown" not in r and self.get_milestone_label(r) is not None]
         new_releases = ["[ SHOW ALL ]"] + sorted(valid)
         self.rel_combo.addItems(new_releases)
         self.rel_combo.setCurrentText(
@@ -1349,17 +1405,19 @@ class PDDashboard(QMainWindow):
 
         for run in runs_to_process:
             if run["run_type"] == "BE":
-                # Strip EVT prefix (innovus naming) then -BE suffix
-                r = run["r_name"]
-                r = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', r)
-                clean_be = r[:-3] if r.endswith("-BE") else r
+                # FE names have NO underscores (only hyphens).
+                # Pattern: EVT*_ML*_DEV**_<FE_NAME>_<PNR_SUFFIX>
+                # After stripping EVT prefix, split at FIRST underscore
+                # to get FE_NAME exactly.
+                r = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', run["r_name"])
+                idx = r.find('_')
+                if idx == -1:
+                    # No underscore -- could be a direct fc BE run like run1-BE
+                    fe_name_from_be = r[:-3] if r.endswith('-BE') else r
+                else:
+                    fe_name_from_be = r[:idx]   # everything before first _
                 for (blk, fe_base), fe_rtl in fe_info.items():
-                    if run["block"] == blk and (
-                        clean_be == fe_base
-                        or clean_be.startswith(fe_base + "_")
-                        or clean_be.startswith(fe_base + "-")
-                        or fe_base in clean_be
-                    ):
+                    if run["block"] == blk and fe_name_from_be == fe_base:
                         run["rtl"] = fe_rtl
                         break
 
@@ -1372,7 +1430,8 @@ class PDDashboard(QMainWindow):
             rtl = run["rtl"]
             if rtl not in _rtl_cache:
                 base = re.sub(r'_syn\d+$', '', rtl)
-                ms   = get_milestone(base)
+                # Use user-configurable milestone map
+                ms   = self.get_milestone_label(base)
                 _rtl_cache[rtl] = (base, base != rtl, ms)
 
         _item_count = 0
@@ -1405,37 +1464,54 @@ class PDDashboard(QMainWindow):
                 run_item.setData(0, Qt.UserRole + 10, run)
 
             elif run["run_type"] == "BE":
-                fe_parent = None
-                for i in range(parent_for_run.childCount()):
-                    c = parent_for_run.child(i)
-                    if c.data(0, Qt.UserRole) in (
-                            "STAGE", "__PLACEHOLDER__", "BLOCK",
-                            "MILESTONE", "RTL", "IGNORED_ROOT"):
-                        continue
-                    # FE base name
-                    fe_base = c.text(0)
-                    if fe_base.endswith("-FE"):
-                        fe_base = fe_base[:-3]
-                    # BE clean name -- strip EVT prefix then -BE suffix
-                    r = run["r_name"]
-                    r = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', r)
-                    clean_be = r[:-3] if r.endswith("-BE") else r
-                    # Match by source + block + name
-                    # WS BE/innovus attaches to WS FE only
-                    # OUTFEED BE attaches to OUTFEED FE only
-                    fe_source = c.text(2).strip()
-                    be_source = run["source"]
-                    source_ok = (fe_source == be_source
-                                 or fe_source == ""
-                                 or be_source == "")
-                    if (source_ok
-                            and c.data(0, Qt.UserRole + 2) == run["block"]
-                            and (clean_be == fe_base
-                                 or clean_be.startswith(fe_base + "_")
-                                 or clean_be.startswith(fe_base + "-")
-                                 or fe_base in clean_be)):
-                        fe_parent = c
-                        break
+                # Pre-compute FE name from BE run name.
+                # FE names have NO underscores -- split at first _ after EVT prefix.
+                _r = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', run["r_name"])
+                _idx = _r.find('_')
+                if _idx == -1:
+                    # Direct fc BE: run1-BE -> run1
+                    fe_name_from_be = _r[:-3] if _r.endswith('-BE') else _r
+                else:
+                    fe_name_from_be = _r[:_idx]  # e.g. "M2D2S2-mohit-bhar-..."
+                be_source = run["source"]
+                be_block  = run["block"]
+
+                def _find_fe_parent(search_node):
+                    """Search for matching FE run.
+                    Uses exact name match: after stripping EVT prefix,
+                    split at first underscore to extract FE name,
+                    then compare directly with FE item text."""
+                    for i in range(search_node.childCount()):
+                        c = search_node.child(i)
+                        nt = c.data(0, Qt.UserRole)
+                        if nt in ("RTL", "MILESTONE"):
+                            found = _find_fe_parent(c)
+                            if found:
+                                return found
+                        if nt in ("STAGE","__PLACEHOLDER__","BLOCK",
+                                  "MILESTONE","RTL","IGNORED_ROOT"):
+                            continue
+                        # FE candidate -- must be from same source
+                        fe_source = c.text(2).strip()
+                        source_ok = (fe_source == be_source
+                                     or not fe_source or not be_source)
+                        if not source_ok:
+                            continue
+                        if c.data(0, Qt.UserRole + 2) != be_block:
+                            continue
+                        fe_text = c.text(0)
+                        fe_base = fe_text[:-3] if fe_text.endswith("-FE") else fe_text
+                        # Exact match using first-underscore split rule
+                        if fe_name_from_be == fe_base:
+                            return c
+                    return None
+
+                # First try the same RTL node (fast path)
+                fe_parent = _find_fe_parent(parent_for_run)
+                # If not found, search the entire block subtree
+                # (handles innovus runs with different RTL than FE)
+                if fe_parent is None:
+                    fe_parent = _find_fe_parent(base_attach)
 
                 actual_parent = fe_parent if fe_parent else parent_for_run
                 be_item = self._create_run_item(actual_parent, run)
@@ -1466,6 +1542,9 @@ class PDDashboard(QMainWindow):
         update_nodes(root)
 
         self.tree.setSortingEnabled(True)
+        # Default sort: Run Name column A-Z ascending
+        self.tree.sortByColumn(0, Qt.AscendingOrder)
+        self.tree.header().setSortIndicator(0, Qt.AscendingOrder)
         self.tree.setUpdatesEnabled(True)
         self.tree.blockSignals(False)
         self._building_tree = False
@@ -1988,8 +2067,30 @@ class PDDashboard(QMainWindow):
             m.addSeparator()
             qor_act = m.addAction("Run Single Stage QoR")
 
+        # Copy cell submenu -- copy any visible column value
+        m.addSeparator()
+        copy_menu = m.addMenu("Copy Cell Value...")
+        _col_names = [
+            "Run Name", "RTL Release", "Source", "Status", "Stage",
+            "User", "Size", "FM-NONUPF", "FM-UPF", "VSLP",
+            "Static IR", "Dynamic IR", "Runtime", "Start", "End"]
+        _copy_acts = {}
+        for _ci, _cn in enumerate(_col_names):
+            _val = item.text(_ci)
+            if _val and _val not in ("-", "N/A", ""):
+                _act = copy_menu.addAction(f"{_cn}: {_val[:40]}")
+                _copy_acts[_act] = _val
+        if item.text(22):
+            _act = copy_menu.addAction(f"Notes: {item.text(22)[:40]}")
+            _copy_acts[_act] = item.text(22)
+
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         if not res:
+            return
+
+        # Handle copy actions
+        if res in _copy_acts:
+            QApplication.clipboard().setText(_copy_acts[res])
             return
 
         if res in [act_gold, act_good, act_red, act_later, act_clear]:
@@ -2435,6 +2536,59 @@ class PDDashboard(QMainWindow):
         sc_l.addWidget(sc_tbl)
         tabs.addTab(sc_w, "Shortcuts")
 
+        # -- Milestones tab --
+        ms_w = QWidget()
+        ms_l = QVBoxLayout(ms_w)
+        ms_l.addWidget(QLabel(
+            "<b>Milestone Pattern Mapping</b><br>"
+            "<small>Pattern is matched as substring of RTL release name.<br>"
+            "e.g. pattern <b>_ML2_</b> matches S5K2P5SP_EVT0_ML2_DEV00.<br>"
+            "Add custom patterns like _ML0_ -> TAPE-IN for new releases.</small>"))
+
+        ms_tbl = QTableWidget(0, 2)
+        ms_tbl.setHorizontalHeaderLabels(["Pattern (e.g. _ML2_)", "Label (e.g. PRE-SVP)"])
+        ms_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        ms_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        ms_tbl.setAlternatingRowColors(True)
+        ms_tbl.verticalHeader().setVisible(False)
+        ms_tbl.setSortingEnabled(False)
+
+        # Populate with current map
+        current_ms_map = dict(self._milestone_map)
+        for pattern, label in current_ms_map.items():
+            r = ms_tbl.rowCount(); ms_tbl.insertRow(r)
+            ms_tbl.setItem(r, 0, QTableWidgetItem(pattern))
+            ms_tbl.setItem(r, 1, QTableWidgetItem(label))
+
+        ms_l.addWidget(ms_tbl)
+
+        ms_btn_row = QHBoxLayout()
+        add_ms_btn = QPushButton("Add Row")
+        del_ms_btn = QPushButton("Delete Selected Row")
+        reset_ms_btn = QPushButton("Reset to Defaults")
+        add_ms_btn.clicked.connect(lambda: (
+            ms_tbl.insertRow(ms_tbl.rowCount()),
+            ms_tbl.setItem(ms_tbl.rowCount()-1, 0, QTableWidgetItem("")),
+            ms_tbl.setItem(ms_tbl.rowCount()-1, 1, QTableWidgetItem(""))))
+        del_ms_btn.clicked.connect(lambda: (
+            ms_tbl.removeRow(ms_tbl.currentRow())
+            if ms_tbl.currentRow() >= 0 else None))
+        reset_ms_btn.clicked.connect(lambda: (
+            ms_tbl.setRowCount(0),
+            [ms_tbl.insertRow(r) or
+             ms_tbl.setItem(r, 0, QTableWidgetItem(p)) or
+             ms_tbl.setItem(r, 1, QTableWidgetItem(l))
+             for r, (p, l) in enumerate({
+                 "_ML1_":"INITIAL RELEASE","_ML2_":"PRE-SVP",
+                 "_ML3_":"SVP","_ML4_":"FFN"}.items())]))
+        ms_btn_row.addWidget(add_ms_btn)
+        ms_btn_row.addWidget(del_ms_btn)
+        ms_btn_row.addWidget(reset_ms_btn)
+        ms_l.addLayout(ms_btn_row)
+        ms_l.addWidget(QLabel(
+            "<small><i>Changes take effect after next Refresh.</i></small>"))
+        tabs.addTab(ms_w, "Milestones")
+
         outer.addWidget(tabs)
         btn_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -2485,6 +2639,20 @@ class PDDashboard(QMainWindow):
         self._preset_compact  = compact_set
         self._preset_standard = standard_set
         self._preset_full     = full_set
+
+        # Save milestone map
+        new_ms_map = {}
+        for r in range(ms_tbl.rowCount()):
+            p_item = ms_tbl.item(r, 0)
+            l_item = ms_tbl.item(r, 1)
+            if p_item and l_item:
+                p = p_item.text().strip()
+                l = l_item.text().strip()
+                if p and l:
+                    new_ms_map[p] = l
+        if new_ms_map:
+            self._milestone_map = new_ms_map
+            self._save_milestone_map(new_ms_map)
 
         self.apply_theme_and_spacing()
         self.refresh_view()
@@ -2667,8 +2835,27 @@ class PDDashboard(QMainWindow):
         dlg.setWindowTitle(
             f"Analytics Dashboard  "
             f"({len(fe_runs)} FE runs, {len(be_runs)} BE runs)")
-        dlg.resize(1000, 660)
+        dlg.resize(1020, 700)
         layout = QVBoxLayout(dlg)
+
+        # Filter bar -- Source and Run Type
+        filter_bar = QHBoxLayout()
+        filter_bar.addWidget(QLabel("<b>Source:</b>"))
+        src_filter = QComboBox()
+        src_filter.addItems(["ALL", "WS", "OUTFEED"])
+        src_filter.setFixedWidth(100)
+        filter_bar.addWidget(src_filter)
+        filter_bar.addSpacing(20)
+        filter_bar.addWidget(QLabel("<b>Run Type:</b>"))
+        type_filter = QComboBox()
+        type_filter.addItems(["FE + BE", "FE Only", "BE Only"])
+        type_filter.setFixedWidth(100)
+        filter_bar.addWidget(type_filter)
+        filter_bar.addStretch()
+        filter_bar.addWidget(QLabel(
+            f"<small>Total: {len(fe_runs)} FE runs, {len(be_runs)} BE runs</small>"))
+        layout.addLayout(filter_bar)
+
         tabs   = QTabWidget()
 
         # TAB 1: FE Block Summary
