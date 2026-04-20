@@ -77,6 +77,24 @@ class PDDashboard(QMainWindow):
         # -- milestone map (user-configurable in Settings > Milestones) --
         self._milestone_map = self._load_milestone_map()
 
+        # -- tapeout countdown --
+        self._tapeout_date = None
+        try:
+            td = prefs.get('UI', 'tapeout_date', fallback='')
+            if td:
+                import datetime
+                self._tapeout_date = datetime.datetime.strptime(td, '%Y-%m-%d')
+        except Exception:
+            pass
+        # Timer to update title bar countdown every hour
+        self._tapeout_timer = QTimer(self)
+        self._tapeout_timer.setInterval(3600000)  # 1 hour
+        self._tapeout_timer.timeout.connect(self._update_title)
+        self._tapeout_timer.start()
+
+        # -- run history for regression detection --
+        self._run_history = self._load_run_history()
+
         # -- color palette (rebuilt on theme change) ----------------------
         self._colors = {
             "completed":   QColor("#1b5e20"), "running":     QColor("#0d47a1"),
@@ -200,6 +218,193 @@ class PDDashboard(QMainWindow):
         return None
 
     # ------------------------------------------------------------------
+    # RUN HISTORY + REGRESSION DETECTION  (FEAT 3 + 5)
+    # ------------------------------------------------------------------
+    def _history_file(self):
+        """JSON file storing per-run completion history."""
+        try:
+            base = os.path.dirname(USER_PREFS_FILE)
+        except Exception:
+            base = os.path.expanduser("~")
+        return os.path.join(base, "run_history.json")
+
+    def _load_run_history(self):
+        """Load run history dict: {run_key: [{status, runtime, fm, vslp, ts}]}"""
+        import json
+        try:
+            with open(self._history_file(), 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def _save_run_history(self):
+        import json
+        try:
+            with open(self._history_file(), 'w') as f:
+                json.dump(self._run_history, f, indent=2)
+        except Exception:
+            pass
+
+    def _record_run_history(self, run):
+        """Record completed run metrics for regression detection."""
+        import datetime
+        if not run.get("is_comp"):
+            return
+        key = f"{run['block']}|{run['r_name']}"
+        entry = {
+            "ts":      datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "status":  run.get("fe_status", ""),
+            "runtime": run.get("info", {}).get("runtime", ""),
+            "fm_n":    run.get("st_n", ""),
+            "fm_u":    run.get("st_u", ""),
+            "vslp":    run.get("vslp_status", ""),
+            "rtl":     run.get("rtl", ""),
+        }
+        if key not in self._run_history:
+            self._run_history[key] = []
+        # Keep last 20 entries per run
+        self._run_history[key].append(entry)
+        self._run_history[key] = self._run_history[key][-20:]
+
+    def _check_regression(self, run):
+        """Compare run to previous entry. Return (has_regression, message)."""
+        key = f"{run['block']}|{run['r_name']}"
+        history = self._run_history.get(key, [])
+        if len(history) < 2:
+            return False, ""
+        prev = history[-2]
+        curr = history[-1]
+        issues = []
+        # Runtime regression: >15% increase
+        def _parse_mins(rt):
+            import re as _re
+            try:
+                m = _re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
+                if m:
+                    return int(m.group(1))*60 + int(m.group(2))
+            except Exception:
+                pass
+            return None
+        pm = _parse_mins(prev.get("runtime", ""))
+        cm = _parse_mins(curr.get("runtime", ""))
+        if pm and cm and pm > 0 and cm > pm * 1.15:
+            pct = int((cm - pm) / pm * 100)
+            issues.append(f"Runtime +{pct}% ({prev['runtime']} -> {curr['runtime']})")
+        # FM regression: PASS -> FAILS
+        if ("PASS" in prev.get("fm_n","").upper()
+                and "FAIL" in curr.get("fm_n","").upper()):
+            issues.append("FM-NONUPF regressed PASS -> FAILS")
+        if ("PASS" in prev.get("fm_u","").upper()
+                and "FAIL" in curr.get("fm_u","").upper()):
+            issues.append("FM-UPF regressed PASS -> FAILS")
+        # VSLP regression
+        def _vslp_errors(v):
+            import re as _re
+            m = _re.search(r'Error:\s*(\d+)', v or "")
+            return int(m.group(1)) if m else 0
+        pe = _vslp_errors(prev.get("vslp",""))
+        ce = _vslp_errors(curr.get("vslp",""))
+        if ce > pe and pe == 0:
+            issues.append(f"VSLP errors: 0 -> {ce}")
+        elif ce > pe * 1.5 and pe > 0:
+            issues.append(f"VSLP errors increased: {pe} -> {ce}")
+        if issues:
+            return True, " | ".join(issues)
+        return False, ""
+
+    def _get_run_history_text(self, run):
+        """Return formatted history string for inspector panel."""
+        key = f"{run['block']}|{run['r_name']}"
+        history = self._run_history.get(key, [])
+        if not history:
+            return "No history yet."
+        lines = []
+        for h in reversed(history[-5:]):
+            lines.append(f"{h['ts']}  {h['status']}  {h['runtime']}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # TAPEOUT COUNTDOWN
+    # ------------------------------------------------------------------
+    def _update_title(self):
+        import datetime
+        base = "Singularity PD | Pro Edition"
+        if self._tapeout_date:
+            delta = self._tapeout_date - datetime.datetime.now()
+            days  = delta.days
+            if days > 0:
+                self.setWindowTitle(f"{base}  [T-{days} days]")
+            elif days == 0:
+                self.setWindowTitle(f"{base}  [TAPEOUT TODAY]")
+            else:
+                self.setWindowTitle(f"{base}  [T+{abs(days)} days post-tapeout]")
+        else:
+            self.setWindowTitle(base)
+
+    # ------------------------------------------------------------------
+    # SIGN-OFF CLOSURE SCORECARD
+    # ------------------------------------------------------------------
+    def _closure_score(self, run_item):
+        """Return (score 0-6, label string) for the 6 sign-off items.
+        G=green/pass  R=red/fail  .=grey/not run"""
+        scores = []
+        labels = []
+        checks = [
+            ("FM-N",  run_item.text(7)),   # col 7 FM NONUPF
+            ("FM-U",  run_item.text(8)),   # col 8 FM UPF
+            ("VSLP",  run_item.text(9)),   # col 9 VSLP
+            ("STA",   run_item.text(20)),  # col 20 STA rpt path
+            ("IR-S",  run_item.text(10)),  # col 10 Static IR
+            ("IR-D",  run_item.text(11)),  # col 11 Dynamic IR
+        ]
+        for name, val in checks:
+            v = val.strip().upper()
+            if not v or v in ("-", "N/A", ""):
+                scores.append(0)
+                labels.append(f"{name}:?")
+            elif ("PASS" in v or "ERROR: 0" in v or "PASS" in v):
+                scores.append(2)
+                labels.append(f"{name}:OK")
+            elif ("FAIL" in v or "ERROR:" in v):
+                scores.append(1)
+                labels.append(f"{name}:FAIL")
+            else:
+                scores.append(0)
+                labels.append(f"{name}:?")
+        total_pass = sum(1 for s in scores if s == 2)
+        return total_pass, scores, labels
+
+    def _update_closure_on_item(self, item):
+        """Add closure summary to run item tooltip."""
+        if item.data(0, Qt.UserRole) in (
+                "BLOCK","MILESTONE","RTL","IGNORED_ROOT",
+                "STAGE","__PLACEHOLDER__"):
+            return
+        run = item.data(0, Qt.UserRole + 10)
+        if not run or run.get("run_type") != "FE":
+            return
+        total_pass, scores, labels = self._closure_score(item)
+        dot_chars = []
+        for s in scores:
+            if s == 2:   dot_chars.append("(OK)")
+            elif s == 1: dot_chars.append("(FAIL)")
+            else:        dot_chars.append("(?)")
+        summary = f"Closure: {total_pass}/6  " + "  ".join(labels)
+        old_tip = item.toolTip(0)
+        # Replace or append closure line
+        import re as _re
+        if "Closure:" in old_tip:
+            new_tip = _re.sub(r"Closure:.*", summary, old_tip)
+        else:
+            new_tip = old_tip + "\n" + summary
+        item.setToolTip(0, new_tip)
+        # Color the run name based on closure completeness
+        if total_pass == 6:
+            item.setForeground(0, QColor("#388e3c"))  # all green
+        elif total_pass == 0 and any(s==1 for s in scores):
+            item.setForeground(0, QColor("#d32f2f"))  # all failing
+
+    # ------------------------------------------------------------------
     # ICONS
     # ------------------------------------------------------------------
     def _create_dot_icon(self, fill, border, size=12):
@@ -262,6 +467,14 @@ class PDDashboard(QMainWindow):
         self.search.customContextMenuRequested.connect(
             self._show_search_history)
         top_layout.addWidget(self.search)
+
+        # Search result count label
+        self.search_count_lbl = QLabel("")
+        self.search_count_lbl.setFixedWidth(70)
+        self.search_count_lbl.setStyleSheet(
+            "font-size: 11px; color: #1976d2; font-weight: bold;")
+        self.search_count_lbl.setVisible(False)
+        top_layout.addWidget(self.search_count_lbl)
 
         top_layout.addStretch()
 
@@ -714,6 +927,74 @@ class PDDashboard(QMainWindow):
         QShortcut(QKeySequence("1"),      self,      lambda: self._set_col_preset(1))
         QShortcut(QKeySequence("2"),      self,      lambda: self._set_col_preset(2))
         QShortcut(QKeySequence("3"),      self,      lambda: self._set_col_preset(3))
+        # FEAT 7: Keyboard navigation between visible run items
+        QShortcut(QKeySequence("N"),      self,      self._nav_next_run)
+        QShortcut(QKeySequence("P"),      self,      self._nav_prev_run)
+        QShortcut(QKeySequence("F"),      self,      self._nav_next_failed)
+
+    def _get_visible_run_items(self):
+        """Collect all visible FE run items in tree order."""
+        items = []
+        GROUP = frozenset(("BLOCK","MILESTONE","RTL","IGNORED_ROOT",
+                           "STAGE","__PLACEHOLDER__"))
+        def collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                if child.isHidden():
+                    continue
+                nt = child.data(0, Qt.UserRole)
+                if nt in GROUP:
+                    collect(child)
+                elif nt is None:
+                    run = child.data(0, Qt.UserRole + 10)
+                    if run and run.get("run_type") == "FE":
+                        items.append(child)
+                    collect(child)
+        collect(self.tree.invisibleRootItem())
+        return items
+
+    def _nav_to_item(self, item):
+        """Select item, scroll to it, update inspector."""
+        self.tree.setCurrentItem(item)
+        self.tree.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+
+    def _nav_next_run(self):
+        """N key: navigate to next visible FE run."""
+        items = self._get_visible_run_items()
+        if not items:
+            return
+        curr = self.tree.currentItem()
+        if curr in items:
+            idx = items.index(curr)
+            self._nav_to_item(items[(idx + 1) % len(items)])
+        else:
+            self._nav_to_item(items[0])
+
+    def _nav_prev_run(self):
+        """P key: navigate to previous visible FE run."""
+        items = self._get_visible_run_items()
+        if not items:
+            return
+        curr = self.tree.currentItem()
+        if curr in items:
+            idx = items.index(curr)
+            self._nav_to_item(items[(idx - 1) % len(items)])
+        else:
+            self._nav_to_item(items[-1])
+
+    def _nav_next_failed(self):
+        """F key: jump to next FAILED/FATAL ERROR run."""
+        items = self._get_visible_run_items()
+        failed = [it for it in items
+                  if it.text(3) in ("FAILED","FATAL ERROR","INTERRUPTED")]
+        if not failed:
+            return
+        curr = self.tree.currentItem()
+        if curr in failed:
+            idx = failed.index(curr)
+            self._nav_to_item(failed[(idx + 1) % len(failed)])
+        else:
+            self._nav_to_item(failed[0])
 
     def _shortcut_open_log(self):
         item = self.tree.currentItem()
@@ -899,8 +1180,21 @@ class PDDashboard(QMainWindow):
             self.ins_lbl.setText(f"<b>RTL Release:</b> {run_name}")
             self._current_note_id = run_name
         else:
+            # FEAT 3+5: Show regression warning and history in inspector
+            run_data = item.data(0, Qt.UserRole + 10)
+            reg_msg  = item.data(0, Qt.UserRole + 30)
+            hist_txt = ""
+            if run_data:
+                hist_txt = self._get_run_history_text(run_data)
+            reg_part = (f"<br><span style='color:#f57c00'>"
+                        f"[REGRESSION] {reg_msg}</span>"
+                        if reg_msg else "")
+            hist_part = (f"<br><small><b>History:</b><br>"
+                         f"{hist_txt.replace(chr(10), '<br>')}</small>"
+                         if hist_txt and hist_txt != "No history yet." else "")
             self.ins_lbl.setText(
-                f"<b>Run:</b> {run_name}<br><b>RTL:</b> {rtl}")
+                f"<b>Run:</b> {run_name}<br><b>RTL:</b> {rtl}"
+                f"{reg_part}{hist_part}")
             self._current_note_id = f"{rtl} : {run_name}"
 
         notes      = self.global_notes.get(self._current_note_id, [])
@@ -957,6 +1251,11 @@ class PDDashboard(QMainWindow):
             item.setToolTip(22, note_text)
             if note_text:
                 item.setForeground(22, self._colors["note"])
+                # Note indicator: italic run name
+                f = item.font(0); f.setItalic(True); item.setFont(0, f)
+            else:
+                # No notes -- remove italic
+                f = item.font(0); f.setItalic(False); item.setFont(0, f)
         self._update_status_bar([])
 
     # ------------------------------------------------------------------
@@ -1162,6 +1461,14 @@ class PDDashboard(QMainWindow):
         self.tree.setEnabled(True)
         self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
         self.global_notes    = load_all_notes()
+
+        # FEAT 3+5: Record history for all completed runs
+        all_runs_for_history = (self.ws_data.get("all_runs", []) +
+                                self.out_data.get("all_runs", []))
+        for r in all_runs_for_history:
+            if r.get("run_type") == "FE" and r.get("is_comp"):
+                self._record_run_history(r)
+        self._save_run_history()
 
         self._rebuild_filter_dropdowns()
         self._restore_filter_state()
@@ -1574,8 +1881,32 @@ class PDDashboard(QMainWindow):
             save_mail_users_config(all_owners)
 
         QApplication.processEvents()
+        # FEAT 1: Update closure scores and FEAT 3: regression warnings
+        def _apply_closure(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                self._update_closure_on_item(child)
+                # FEAT 3: regression detection
+                run = child.data(0, Qt.UserRole + 10)
+                if run and run.get("run_type") == "FE" and run.get("is_comp"):
+                    has_reg, msg = self._check_regression(run)
+                    if has_reg:
+                        # Add regression warning to tooltip
+                        old_tip = child.toolTip(0)
+                        child.setToolTip(
+                            0, old_tip + f"\n[REGRESSION] {msg}")
+                        # Amber color on run name
+                        child.setForeground(0, QColor("#f57c00"))
+                        # Store regression flag for inspector
+                        child.setData(0, Qt.UserRole + 30, msg)
+                _apply_closure(child)
+        _apply_closure(self.tree.invisibleRootItem())
+
         self.refresh_view()
-        QTimer.singleShot(50, self._expand_to_rtl_level)
+        # Auto-expand to RTL level on first load only
+        if not hasattr(self, '_auto_expanded_once'):
+            self._auto_expanded_once = True
+            QTimer.singleShot(50, self._expand_to_rtl_level)
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -1604,6 +1935,12 @@ class PDDashboard(QMainWindow):
             child.setText(22, note_text)
             child.setToolTip(22, note_text)
             child.setForeground(22, self._colors["note"])
+            # FEAT 5: Visual note indicator -- italic run name
+            f = child.font(0)
+            f.setItalic(True)
+            child.setFont(0, f)
+            child.setToolTip(0, (child.toolTip(0) or "") +
+                             "\n[Has shared notes]")
 
         tooltip_text = (
             f"Run: {r_name}\n"
@@ -1739,7 +2076,9 @@ class PDDashboard(QMainWindow):
         for stage in be_run.get("stages", []):
             s_item = CustomTreeItem(be_item)
             s_item.setData(0, Qt.UserRole, "STAGE")
-            s_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            s_item.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+            s_item.setCheckState(0, Qt.Unchecked)
             s_item.setText(0, stage.get("name", ""))
             s_item.setText(7,  f"NONUPF - {stage.get('st_n', '')}")
             s_item.setText(8,  f"UPF - {stage.get('st_u', '')}")
@@ -1924,6 +2263,15 @@ class PDDashboard(QMainWindow):
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
         QApplication.processEvents()
+        # FEAT 6: Show search result count when search is active
+        if raw_query:
+            fe_visible = sum(1 for r in visible_runs
+                             if r.get("run_type") == "FE")
+            self.search_count_lbl.setText(f"{fe_visible} found")
+            self.search_count_lbl.setVisible(True)
+        else:
+            self.search_count_lbl.setVisible(False)
+
         self._update_status_bar(visible_runs)
         self.on_tree_selection_changed()
 
@@ -2431,6 +2779,23 @@ class PDDashboard(QMainWindow):
         ist_cb.setChecked(self.convert_to_ist)
         gen_l.addRow("", ist_cb)
 
+        # Tapeout date
+        from PyQt5.QtWidgets import QDateEdit
+        from PyQt5.QtCore import QDate
+        gen_l.addRow(QLabel("--- Tapeout ---"))
+        tapeout_edit = QDateEdit()
+        tapeout_edit.setDisplayFormat("yyyy-MM-dd")
+        tapeout_edit.setCalendarPopup(True)
+        if self._tapeout_date:
+            td = self._tapeout_date
+            tapeout_edit.setDate(QDate(td.year, td.month, td.day))
+        else:
+            tapeout_edit.setDate(QDate.currentDate().addDays(30))
+        tapeout_clear = QCheckBox("Set tapeout date (shows T-N countdown in title)")
+        tapeout_clear.setChecked(self._tapeout_date is not None)
+        gen_l.addRow("Tapeout Date:", tapeout_edit)
+        gen_l.addRow("", tapeout_clear)
+
         hide_blk_cb = QCheckBox("Hide Block grouping level in tree")
         hide_blk_cb.setChecked(self.hide_block_nodes)
         gen_l.addRow("", hide_blk_cb)
@@ -2622,6 +2987,18 @@ class PDDashboard(QMainWindow):
         self.convert_to_ist     = ist_cb.isChecked()
         self.hide_block_nodes   = hide_blk_cb.isChecked()
 
+        # Save tapeout date
+        import datetime
+        if tapeout_clear.isChecked():
+            qd = tapeout_edit.date()
+            self._tapeout_date = datetime.datetime(qd.year(), qd.month(), qd.day())
+            prefs.set('UI', 'tapeout_date',
+                      self._tapeout_date.strftime('%Y-%m-%d'))
+        else:
+            self._tapeout_date = None
+            prefs.set('UI', 'tapeout_date', '')
+        self._update_title()
+
         # Apply column presets
         new_presets = [{}, {}, {}]
         for r, (name, idx) in enumerate(zip(col_names, col_indices)):
@@ -2705,7 +3082,15 @@ class PDDashboard(QMainWindow):
                 self, "QoR Compare",
                 "Please check at least 2 runs first.")
             return
-        script = QOR_SUMMARY_SCRIPT
+        try:
+            script = QOR_SUMMARY_SCRIPT
+        except NameError:
+            QMessageBox.warning(
+                self, "QoR Compare",
+                "QOR_SUMMARY_SCRIPT is not defined in config.py.\n"
+                "Please add it to config.py:\n\n"
+                "QOR_SUMMARY_SCRIPT = '/path/to/summary.py'")
+            return
         if not os.path.exists(script):
             QMessageBox.warning(
                 self, "QoR Compare", f"Script not found:\n{script}")
@@ -2725,7 +3110,16 @@ class PDDashboard(QMainWindow):
     def _run_single_stage_qor(self, item, b_name, r_rtl, base_run):
         stage_name = item.text(0)
         stage_path = item.text(21)
-        script = QOR_SUMMARY_SCRIPT
+        # QOR_SUMMARY_SCRIPT may not be defined in config for all projects
+        try:
+            script = QOR_SUMMARY_SCRIPT
+        except NameError:
+            QMessageBox.warning(
+                self, "QoR",
+                "QOR_SUMMARY_SCRIPT is not defined in config.py.\n"
+                "Please add it to config.py:\n\n"
+                "QOR_SUMMARY_SCRIPT = '/path/to/summary.py'")
+            return
         if not os.path.exists(script):
             QMessageBox.warning(
                 self, "QoR", f"Script not found:\n{script}")
