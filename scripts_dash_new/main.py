@@ -1420,8 +1420,16 @@ class PDDashboard(QMainWindow):
                     r = run["r_name"]
                     r = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', r)
                     clean_be = r[:-3] if r.endswith("-BE") else r
-                    # Match by block + name only (no source check)
-                    if (c.data(0, Qt.UserRole + 2) == run["block"]
+                    # Match by source + block + name
+                    # WS BE/innovus attaches to WS FE only
+                    # OUTFEED BE attaches to OUTFEED FE only
+                    fe_source = c.text(2).strip()
+                    be_source = run["source"]
+                    source_ok = (fe_source == be_source
+                                 or fe_source == ""
+                                 or be_source == "")
+                    if (source_ok
+                            and c.data(0, Qt.UserRole + 2) == run["block"]
                             and (clean_be == fe_base
                                  or clean_be.startswith(fe_base + "_")
                                  or clean_be.startswith(fe_base + "-")
@@ -2632,6 +2640,18 @@ class PDDashboard(QMainWindow):
             if p in seen_paths:
                 continue
             seen_paths.add(p)
+            # Ensure block field is populated -- fall back to path extraction
+            if not r.get("block"):
+                # Try to extract block from path:
+                # .../IMPLEMENTATION/S5K2P5SP/SOC/BLK_CMU/fc/run-FE
+                m = re.search(r'/SOC/([^/]+)/', p)
+                if not m:
+                    # Try without SOC level:
+                    # .../IMPLEMENTATION/PROJ/BLK_CMU/fc/run-FE
+                    m = re.search(r'/IMPLEMENTATION/[^/]+/([^/]+)/', p)
+                if m:
+                    r = dict(r)  # copy so we don't mutate original
+                    r["block"] = m.group(1)
             if r.get("run_type") == "FE":
                 fe_runs.append(r)
             else:
@@ -2686,7 +2706,7 @@ class PDDashboard(QMainWindow):
         t1.setEditTriggers(QTableWidget.NoEditTriggers)
         t1.setAlternatingRowColors(True)
         t1.verticalHeader().setVisible(False)
-        t1.setSortingEnabled(True)
+        t1.setSortingEnabled(False)  # enable AFTER insert to avoid row misalignment
 
         for blk, s in sorted(blk_stats.items()):
             row = t1.rowCount(); t1.insertRow(row)
@@ -2707,6 +2727,7 @@ class PDDashboard(QMainWindow):
                 if c == 4 and str(v) not in ("0","N/A"):
                     it.setForeground(QColor("#1976d2"))
                 t1.setItem(row, c, it)
+        t1.setSortingEnabled(True)
         tabs.addTab(t1, f"FE Block Summary ({len(fe_runs)} runs)")
 
         # TAB 2: BE Stage Summary
@@ -2745,7 +2766,7 @@ class PDDashboard(QMainWindow):
         t2.setEditTriggers(QTableWidget.NoEditTriggers)
         t2.setAlternatingRowColors(True)
         t2.verticalHeader().setVisible(False)
-        t2.setSortingEnabled(True)
+        t2.setSortingEnabled(False)
 
         for (blk, grp), s in sorted(stage_stats.items()):
             row = t2.rowCount(); t2.insertRow(row)
@@ -2768,6 +2789,7 @@ class PDDashboard(QMainWindow):
             "eco01_abcd + eco01_xyz both appear under eco01. "
             "Avg runtime uses only stages where runtime data is available."
             "</i></small>")
+        t2.setSortingEnabled(True)
         w2 = QWidget(); l2 = QVBoxLayout(w2)
         l2.setContentsMargins(0, 0, 0, 0)
         l2.addWidget(t2); l2.addWidget(note)
@@ -2804,7 +2826,7 @@ class PDDashboard(QMainWindow):
         t3.setEditTriggers(QTableWidget.NoEditTriggers)
         t3.setAlternatingRowColors(True)
         t3.verticalHeader().setVisible(False)
-        t3.setSortingEnabled(True)
+        t3.setSortingEnabled(False)
 
         for rtl in sorted(set(rtl_fe) | set(rtl_be)):
             fe = rtl_fe.get(rtl, dict(total=0, comp=0, fail=0))
@@ -2821,6 +2843,7 @@ class PDDashboard(QMainWindow):
                 if c in (2, 5) and str(v) != "0":
                     it.setForeground(QColor("#388e3c"))
                 t3.setItem(row, c, it)
+        t3.setSortingEnabled(True)
         tabs.addTab(t3, "RTL Release Summary")
 
         # TAB 4: WS vs OUTFEED
@@ -2906,6 +2929,14 @@ class PDDashboard(QMainWindow):
             p = r.get("path", "")
             if p not in seen:
                 seen.add(p)
+                # Ensure block is populated
+                if not r.get("block"):
+                    m = re.search(r'/SOC/([^/]+)/', p)
+                    if not m:
+                        m = re.search(r'/IMPLEMENTATION/[^/]+/([^/]+)/', p)
+                    if m:
+                        r = dict(r)
+                        r["block"] = m.group(1)
                 all_runs.append(r)
 
         if not all_runs:
@@ -2975,7 +3006,7 @@ class PDDashboard(QMainWindow):
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
         tbl.verticalHeader().setVisible(False)
-        tbl.setSortingEnabled(True)
+        tbl.setSortingEnabled(False)  # enable after insert
 
         for owner, s in sorted(
                 stats.items(),
@@ -3001,6 +3032,7 @@ class PDDashboard(QMainWindow):
                     it.setForeground(QColor("#1976d2"))
                 tbl.setItem(row, c, it)
 
+        tbl.setSortingEnabled(True)
         layout.addWidget(tbl)
         hint = QLabel(
             "Double-click any row to filter tree to that engineer's runs.")
