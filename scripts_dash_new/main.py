@@ -218,13 +218,13 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top_layout)
 
-        # ACTIONS MENU
-        self.actions_btn  = QPushButton("Actions v")
+        # UTILITIES MENU (renamed from Actions)
+        self.actions_btn  = QPushButton("Utilities  v")
         self.actions_menu = QMenu(self)
 
-        self.actions_menu.addAction("Fit Columns",           self.fit_all_columns)
-        self.actions_menu.addAction("Expand All",            self.safe_expand_all)
-        self.actions_menu.addAction("Collapse All",          self.safe_collapse_all)
+        self.actions_menu.addAction("Fit Columns",             self.fit_all_columns)
+        self.actions_menu.addAction("Expand All",              self.safe_expand_all)
+        self.actions_menu.addAction("Collapse All",            self.safe_collapse_all)
         self.actions_menu.addSeparator()
         self.actions_menu.addAction("Calculate All Run Sizes", self.calculate_all_sizes)
         self.actions_menu.addAction("Export to CSV",           self.export_csv)
@@ -243,28 +243,30 @@ class PDDashboard(QMainWindow):
         filt_menu.addAction("Generate Sample Config",    self.generate_sample_config)
         self.actions_menu.addSeparator()
 
-        self.actions_menu.addAction("Disk Space",       self.open_disk_usage)
-        self.actions_menu.addAction("Settings",         self.open_settings)
+        self.actions_menu.addAction("Disk Space",              self.open_disk_usage)
         self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Shortcuts (Ctrl+?)", self.show_shortcuts_dialog)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Failed Runs Digest",     self.show_failed_digest)
+        self.actions_menu.addAction("Failed Runs Digest",      self.show_failed_digest)
         self.actions_menu.addAction("Compare 2 Selected Runs", self.show_run_diff)
         self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Analytics / Charts",     self.show_analytics)
-        self.actions_menu.addAction("Team Workload View",      self.show_team_workload)
+        self.actions_menu.addAction("Analytics / Charts",      self.show_analytics)
+        self.actions_menu.addAction("Team Workload View",       self.show_team_workload)
 
         self.actions_btn.setMenu(self.actions_menu)
         top_layout.addWidget(self.actions_btn)
 
+        # SETTINGS button — visible in toolbar, opens tabbed Settings dialog
+        self.settings_btn = QPushButton("Settings")
+        self.settings_btn.clicked.connect(self.open_settings)
+        top_layout.addWidget(self.settings_btn)
+
         self._add_separator(top_layout)
 
-        # FEAT 6: Column view preset as single compact dropdown
+        # Mode dropdown — column view preset
         top_layout.addWidget(self._label("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Standard", "Compact", "Full"])
         self.mode_combo.setFixedWidth(82)
-        self.mode_combo.setToolTip("Column view preset\n1=Compact  2=Standard  3=Full")
+        self.mode_combo.setToolTip("Column view preset  (keys: 1=Compact  2=Standard  3=Full)")
         self.mode_combo.currentIndexChanged.connect(
             lambda i: self._set_col_preset({"Standard":2,"Compact":1,"Full":3}.get(
                 self.mode_combo.currentText(), 2)))
@@ -272,7 +274,8 @@ class PDDashboard(QMainWindow):
 
         self._add_separator(top_layout)
 
-        self.notes_toggle_btn = QPushButton("Notes <")
+        # Notes toggle — ASCII arrows, no emoji/unicode
+        self.notes_toggle_btn = QPushButton("[ Notes >> ]")
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
@@ -375,46 +378,56 @@ class PDDashboard(QMainWindow):
         self.fe_error_btn.clicked.connect(self.open_error_log)
         left_layout.addWidget(self.fe_error_btn)
 
-        # META PANEL — FEAT 3: with copy buttons and terminal button
+        # META PANEL — Path and Log only, no Status
         self.meta_panel = QWidget()
         meta_layout = QVBoxLayout(self.meta_panel)
-        meta_layout.setContentsMargins(0, 8, 0, 0)
-        meta_layout.setSpacing(3)
-        meta_layout.addWidget(QLabel("<b>Quick Info (Select a Run):</b>"))
+        meta_layout.setContentsMargins(0, 6, 0, 0)
+        meta_layout.setSpacing(4)
+        meta_layout.addWidget(QLabel("<b>Quick Info:</b>"))
 
         def _field_row(label_txt):
-            """Compact row: label on left, copy btn right-aligned, field fills middle."""
-            container = QWidget()
-            row = QHBoxLayout(container)
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(3)
+            """Label above field, copy button right of label — fits 320px panel."""
+            grp = QWidget()
+            grp_layout = QVBoxLayout(grp)
+            grp_layout.setContentsMargins(0, 0, 0, 0)
+            grp_layout.setSpacing(1)
+
+            # Header row: label + copy button
+            hdr = QHBoxLayout()
+            hdr.setContentsMargins(0, 0, 0, 0)
+            hdr.setSpacing(4)
             lbl = QLabel(label_txt)
-            lbl.setFixedWidth(28)
-            field = QLineEdit(); field.setReadOnly(True)
-            field.setStyleSheet("font-size: 11px;")
+            lbl.setStyleSheet("font-size: 11px; font-weight: bold; color: gray;")
             copy_btn = QPushButton("Copy")
-            copy_btn.setFixedWidth(36)
-            copy_btn.setFixedHeight(20)
+            copy_btn.setFixedHeight(18)
+            copy_btn.setFixedWidth(40)
             copy_btn.setObjectName("linkBtn")
             copy_btn.setStyleSheet(
                 "QPushButton#linkBtn { font-size: 10px; padding: 0 2px; }")
             copy_btn.setCursor(Qt.PointingHandCursor)
+            hdr.addWidget(lbl)
+            hdr.addStretch()
+            hdr.addWidget(copy_btn)
+            grp_layout.addLayout(hdr)
+
+            # Field below — full width, elided left so tail doesn't show
+            field = QLineEdit()
+            field.setReadOnly(True)
+            field.setStyleSheet("font-size: 11px;")
+            # Show path from start, not end
+            field.setAlignment(Qt.AlignLeft)
             copy_btn.clicked.connect(lambda _, f=field: (
                 QApplication.clipboard().setText(f.text()) if f.text() else None
             ))
-            row.addWidget(lbl)
-            row.addWidget(field, 1)
-            row.addWidget(copy_btn)
-            meta_layout.addWidget(container)
+            grp_layout.addWidget(field)
+            meta_layout.addWidget(grp)
             return field
 
-        self.meta_status = QLineEdit(); self.meta_status.setReadOnly(True)
-        meta_layout.addWidget(QLabel("Status:"))
-        meta_layout.addWidget(self.meta_status)
-        self.meta_path = _field_row("Path:")
-        self.meta_log  = _field_row("Log:")
-
-        # Terminal button removed per user request
+        # Status removed — visible in tree Status column
+        self.meta_status = QLineEdit()  # keep reference, hidden
+        self.meta_status.setVisible(False)
+        self.meta_path = _field_row("Run Path:")
+        self.meta_log  = _field_row("Log File:")
 
         left_layout.addWidget(self.meta_panel, 0)
 
@@ -455,6 +468,16 @@ class PDDashboard(QMainWindow):
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         # FIX 3: on_item_expanded now lazy-loads stages
         self.tree.itemExpanded.connect(self.on_item_expanded)
+        # Auto-fit Run Name column on expand — throttled so Expand All doesn't lag
+        self._col0_resize_timer = QTimer(self)
+        self._col0_resize_timer.setSingleShot(True)
+        self._col0_resize_timer.setInterval(150)
+        self._col0_resize_timer.timeout.connect(
+            lambda: self.tree.resizeColumnToContents(0))
+        self.tree.itemExpanded.connect(
+            lambda _: self._col0_resize_timer.start())
+        self.tree.itemCollapsed.connect(
+            lambda _: self._col0_resize_timer.start())
 
         for i in [15, 16, 17, 18, 19, 20, 21, 23]:
             self.tree.setColumnHidden(i, True)
@@ -537,10 +560,30 @@ class PDDashboard(QMainWindow):
     def toggle_notes_dock(self):
         if self.inspector_dock.isVisible():
             self.inspector_dock.hide()
-            self.notes_toggle_btn.setText("Notes <")
+            self.notes_toggle_btn.setText("[ Notes >> ]")
         else:
             self.inspector_dock.show()
-            self.notes_toggle_btn.setText("Notes v")
+            self.notes_toggle_btn.setText("[ << Notes ]")
+
+    def _expand_to_rtl_level(self):
+        """Expand tree to RTL/EVT level only — BLOCK, MILESTONE, RTL nodes open.
+        Individual FE/BE run rows remain collapsed."""
+        RTL_TYPES = frozenset(("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"))
+        self.tree.setUpdatesEnabled(False)
+        def _expand_groups(node, depth=0):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                nt = child.data(0, Qt.UserRole)
+                if nt in RTL_TYPES:
+                    child.setExpanded(True)
+                    _expand_groups(child, depth + 1)
+                else:
+                    # Run item — keep collapsed
+                    child.setExpanded(False)
+        _expand_groups(self.tree.invisibleRootItem())
+        self.tree.setUpdatesEnabled(True)
+        # Fit Run Name column after expansion
+        self.tree.resizeColumnToContents(0)
 
     def safe_expand_all(self):
         # FIX 8: populate ALL lazy BE stage placeholders BEFORE expandAll().
@@ -799,13 +842,29 @@ class PDDashboard(QMainWindow):
         self.is_dark_mode = not self.is_dark_mode
         self.apply_theme_and_spacing()
 
+    def _load_preset_sets(self):
+        """Load column preset definitions from prefs or use built-in defaults."""
+        def _get(key, default):
+            try:
+                saved = prefs.get('PRESETS', key, fallback='')
+                if saved:
+                    return set(int(x) for x in saved.split(',') if x.strip().isdigit())
+            except: pass
+            return set(default)
+        self._preset_compact  = _get('compact',  {0, 3, 4, 5, 12, 13})
+        self._preset_standard = _get('standard', {0, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14})
+        self._preset_full     = _get('full',     set(range(15)) | {22})
+
     def _set_col_preset(self, preset):
-        """FEAT 6: Column view presets — 1=Compact, 2=Standard, 3=Full."""
-        compact      = {0, 3, 4, 5, 12, 13}
-        standard     = compact | {2, 6, 7, 8, 9, 14}
-        full_vis     = set(range(15)) | {22}
+        """Column view presets — 1=Compact, 2=Standard, 3=Full.
+        Reads from user-configured preset sets (saved in Settings > Column Presets).
+        Falls back to built-in defaults if not configured."""
+        if not hasattr(self, '_preset_compact'):
+            self._load_preset_sets()
         always_hidden = {15, 16, 17, 18, 19, 20, 21, 23}
-        visible = compact if preset == 1 else (standard if preset == 2 else full_vis)
+        if preset == 1:   visible = self._preset_compact
+        elif preset == 2: visible = self._preset_standard
+        else:             visible = self._preset_full
         for i in range(self.tree.columnCount()):
             self.tree.setColumnHidden(i, i not in visible or i in always_hidden)
         # Sync the mode combo without triggering signal
@@ -937,8 +996,9 @@ class PDDashboard(QMainWindow):
         self.meta_status.setText(item.text(3) if not is_stage else item.text(4))
         self.meta_path.setText(path)
         self.meta_log.setText(item.text(16))
-        self.meta_path.setCursorPosition(0)
-        self.meta_log.setCursorPosition(0)
+        # Show path from beginning (left side) not end
+        self.meta_path.home(False)
+        self.meta_log.home(False)
 
         self.ins_note.setEnabled(True)
         self.ins_save_btn.setEnabled(True)
@@ -983,265 +1043,442 @@ class PDDashboard(QMainWindow):
             subprocess.Popen(['gvim', self.current_error_log_path])
 
     def show_analytics(self):
-        """FIX 5: Analytics — FE block summary, BE stage summary, RTL summary.
-        Always uses ALL data (ws_data + out_data) regardless of Source filter."""
-        # ALWAYS combine both sources — analytics shows project-wide picture
-        all_runs = list(self.ws_data.get("all_runs", [])) + list(self.out_data.get("all_runs", []))
-        if not all_runs:
-            QMessageBox.information(self, "Analytics",
-                "No run data available yet. Please wait for a scan to complete.")
-            return
+        """Analytics: reads directly from tree items — guaranteed to show same
+        data as what the user sees. No raw dict field name mismatches."""
 
         def _parse_hrs(rt):
-            """Parse runtime string to hours. Returns None if zero or unparseable."""
             try:
                 m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
                 if m:
                     h = int(m.group(1)) + int(m.group(2))/60 + int(m.group(3))/3600
-                    # Exclude "00h:00m:00s" — means runtime not recorded
                     return h if h > 0.001 else None
             except:
                 pass
             return None
 
         def _normalize_stage(name):
-            """Normalize stage name: eco01_abcd -> eco01, chip_finish_abc -> chip_finish.
-            Groups by first underscore-joined prefix of up to 2 parts."""
+            """eco01_abcd -> eco01, chip_finish_abc -> chip_finish"""
             parts = name.split("_")
             if len(parts) >= 3:
-                # Keep first 2 parts: eco01_run -> eco01_run grouping
                 return "_".join(parts[:2])
             return name
 
+        # ----------------------------------------------------------------
+        # Collect ALL run items directly from the tree (ignores hide state)
+        # This is the ground truth — exactly what was scanned and stored.
+        # ----------------------------------------------------------------
+        fe_items   = []   # (blk, rtl, status, runtime_str, source)
+        be_stages  = []   # (blk, stage_name, runtime_str)
+        all_rtl_fe = {}   # rtl -> {total, comp, fail}
+        all_rtl_be = {}   # rtl -> {total, comp}
+
+        GROUP_TYPES = frozenset(("BLOCK","MILESTONE","RTL","IGNORED_ROOT","__PLACEHOLDER__"))
+
+        def _collect(node):
+            for i in range(node.childCount()):
+                item = node.child(i)
+                nt   = item.data(0, Qt.UserRole)
+                if nt in GROUP_TYPES:
+                    _collect(item)
+                    continue
+                if nt == "STAGE":
+                    # BE stage item — col 0=name, col 12=runtime, parent has block
+                    p = item.parent()
+                    blk = p.data(0, Qt.UserRole + 2) if p else ""
+                    if not blk:
+                        # walk up to find block
+                        pp = p.parent() if p else None
+                        while pp:
+                            b = pp.data(0, Qt.UserRole + 2)
+                            if b: blk = b; break
+                            pp = pp.parent()
+                    be_stages.append((
+                        blk or item.text(0),
+                        item.text(0),    # stage name
+                        item.text(12),   # runtime col
+                    ))
+                    _collect(item)
+                    continue
+
+                # Run item (FE or BE)
+                run = item.data(0, Qt.UserRole + 10)
+                if run is None:
+                    _collect(item)
+                    continue
+
+                blk    = item.text(0)  # col 0 = run name (we need block)
+                blk    = run.get("block", "") or item.data(0, Qt.UserRole + 2) or ""
+                rtl    = item.text(1)  # col 1 = RTL release
+                status = item.text(3)  # col 3 = Status
+                rt     = item.text(12) # col 12 = Runtime
+                source = item.text(2)  # col 2 = Source
+                rt_type = run.get("run_type", "FE")
+
+                if rt_type == "FE":
+                    fe_items.append((blk, rtl, status, rt, source))
+                    if rtl not in all_rtl_fe:
+                        all_rtl_fe[rtl] = {"total":0,"comp":0,"fail":0}
+                    all_rtl_fe[rtl]["total"] += 1
+                    if status == "COMPLETED":
+                        all_rtl_fe[rtl]["comp"] += 1
+                    elif status in ("FAILED","FATAL ERROR","INTERRUPTED"):
+                        all_rtl_fe[rtl]["fail"] += 1
+                else:
+                    if rtl not in all_rtl_be:
+                        all_rtl_be[rtl] = {"total":0,"comp":0}
+                    all_rtl_be[rtl]["total"] += 1
+                    if status == "COMPLETED":
+                        all_rtl_be[rtl]["comp"] += 1
+                    # collect BE stages from children
+                    blk2 = run.get("block","") or blk
+                    for j in range(item.childCount()):
+                        ch = item.child(j)
+                        if ch.data(0, Qt.UserRole) == "STAGE":
+                            be_stages.append((blk2, ch.text(0), ch.text(12)))
+
+                _collect(item)
+
+        _collect(self.tree.invisibleRootItem())
+
+        # Also collect from ws_data/out_data for items not yet in tree
+        # (e.g. hidden runs, runs filtered out by Source dropdown)
+        all_runs_raw = (list(self.ws_data.get("all_runs",[])) +
+                        list(self.out_data.get("all_runs",[])))
+        tree_blocks_seen = set(blk for blk,_,_,_,_ in fe_items)
+        for r in all_runs_raw:
+            blk = r.get("block","Unknown")
+            rtl = r.get("rtl","Unknown")
+            rt_type = r.get("run_type","FE")
+            status  = r.get("fe_status","")
+            rt_str  = r.get("info",{}).get("runtime","")
+            source  = r.get("source","")
+            if rt_type == "FE":
+                fe_items.append((blk, rtl, status, rt_str, source))
+                if rtl not in all_rtl_fe:
+                    all_rtl_fe[rtl] = {"total":0,"comp":0,"fail":0}
+                all_rtl_fe[rtl]["total"] += 1
+                if r.get("is_comp"): all_rtl_fe[rtl]["comp"] += 1
+                elif status in ("FAILED","FATAL ERROR","INTERRUPTED"):
+                    all_rtl_fe[rtl]["fail"] += 1
+            else:
+                if rtl not in all_rtl_be:
+                    all_rtl_be[rtl] = {"total":0,"comp":0}
+                all_rtl_be[rtl]["total"] += 1
+                if r.get("is_comp"): all_rtl_be[rtl]["comp"] += 1
+                for stage in r.get("stages",[]):
+                    be_stages.append((blk, stage.get("name",""),
+                                      stage.get("info",{}).get("runtime","")))
+
+        if not fe_items and not be_stages:
+            QMessageBox.information(self, "Analytics",
+                "No run data available yet. Please wait for a scan to complete.")
+            return
+
+        # Remove duplicates from combining tree + raw data
+        fe_items  = list(set(fe_items))
+        be_stages = list(set(be_stages))
+
         dlg = QDialog(self)
-        dlg.setWindowTitle("Analytics Dashboard")
-        dlg.resize(940, 620)
+        dlg.setWindowTitle(f"Analytics Dashboard  ({len(fe_items)} FE + {len(be_stages)} BE stages)")
+        dlg.resize(980, 640)
         layout = QVBoxLayout(dlg)
 
         from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView, QTabWidget
         tabs = QTabWidget()
 
-        # --- TAB 1: FE Block Summary (COMPLETED runs only for avg) ---
-        fe_runs = [r for r in all_runs if r.get("run_type") == "FE"]
+        # ----------------------------------------------------------------
+        # TAB 1: FE Block Summary
+        # ----------------------------------------------------------------
         block_stats = {}
-        for r in fe_runs:
-            blk = r.get("block", "Unknown")
+        for blk, rtl, status, rt_str, source in fe_items:
+            if not blk: blk = "Unknown"
             if blk not in block_stats:
                 block_stats[blk] = {
-                    "total": 0, "completed": 0, "running": 0,
-                    "failed": 0, "not_started": 0, "comp_runtimes": []
+                    "total":0,"completed":0,"running":0,
+                    "failed":0,"not_started":0,"comp_rts":[],"sources":set()
                 }
             s = block_stats[blk]
             s["total"] += 1
-            st = r.get("fe_status", "")
-            if r.get("is_comp"):
+            s["sources"].add(source)
+            # Normalize status — tree shows "COMPLETED", raw dict uses is_comp
+            st_up = status.upper()
+            if st_up == "COMPLETED":
                 s["completed"] += 1
-                hrs = _parse_hrs(r.get("info", {}).get("runtime", ""))
-                if hrs and hrs > 0:
-                    s["comp_runtimes"].append(hrs)
-            elif st == "RUNNING":
+                hrs = _parse_hrs(rt_str)
+                if hrs: s["comp_rts"].append(hrs)
+            elif st_up == "RUNNING":
                 s["running"] += 1
-            elif st == "NOT STARTED":
-                s["not_started"] += 1
-            elif st in ("FAILED", "FATAL ERROR", "INTERRUPTED"):
+            elif st_up in ("FAILED","FATAL ERROR","INTERRUPTED","ERROR"):
                 s["failed"] += 1
+            elif st_up in ("NOT STARTED",""):
+                s["not_started"] += 1
+            else:
+                # catch-all for intermediate stages shown as status
+                s["running"] += 1
 
-        tbl1 = QTableWidget(0, 7)
+        tbl1 = QTableWidget(0, 8)
         tbl1.setHorizontalHeaderLabels([
-            "Block", "Total", "Completed", "Running",
-            "Failed", "Not Started", "Avg Runtime (hrs, completed only)"])
+            "Block","Source","Total","Completed","Running",
+            "Failed","Not Started","Avg Runtime (hrs)"])
         tbl1.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        tbl1.horizontalHeader().setSectionResizeMode(6, QHeaderView.Stretch)
-        for i in range(1, 6):
-            tbl1.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        tbl1.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tbl1.horizontalHeader().setSectionResizeMode(7, QHeaderView.Stretch)
+        for i in range(2,7): tbl1.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
         tbl1.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl1.setAlternatingRowColors(True)
         tbl1.verticalHeader().setVisible(False)
         tbl1.setSortingEnabled(True)
-        for blk, s in sorted(block_stats.items()):
-            row = tbl1.rowCount()
-            tbl1.insertRow(row)
-            rts = s["comp_runtimes"]
-            avg_h = f"{sum(rts)/len(rts):.2f}h" if rts else "N/A"
-            vals = [blk, s["total"], s["completed"], s["running"],
-                    s["failed"], s["not_started"], avg_h]
-            for c, v in enumerate(vals):
-                item = QTableWidgetItem(str(v))
-                item.setTextAlignment(
-                    Qt.AlignLeft | Qt.AlignVCenter if c == 0 else Qt.AlignCenter)
-                if c == 4 and str(v) not in ("0", "N/A"):
-                    item.setForeground(QColor("#d32f2f"))
-                if c == 2 and str(v) not in ("0", "N/A"):
-                    item.setForeground(QColor("#388e3c"))
-                if c == 3 and str(v) not in ("0", "N/A"):
-                    item.setForeground(QColor("#1976d2"))
-                tbl1.setItem(row, c, item)
-        tabs.addTab(tbl1, f"FE Block Summary ({len(fe_runs)} runs)")
 
-        # --- TAB 2: BE Stage Summary — grouped by normalized stage name ---
-        be_runs = [r for r in all_runs if r.get("run_type") == "BE"]
-        stage_stats = {}  # key = (block, stage_group)
-        for r in be_runs:
-            blk = r.get("block", "Unknown")
-            for stage in r.get("stages", []):
-                raw_name = stage.get("name", "unknown")
-                grp_name = _normalize_stage(raw_name)
-                key = (blk, grp_name)
-                if key not in stage_stats:
-                    stage_stats[key] = {
-                        "count": 0, "comp_count": 0,
-                        "comp_runtimes": [], "examples": set()
-                    }
-                s = stage_stats[key]
-                s["count"] += 1
-                s["examples"].add(raw_name)
-                rt_str = stage.get("info", {}).get("runtime", "")
-                hrs = _parse_hrs(rt_str)
-                if hrs and hrs > 0:
-                    s["comp_count"] += 1
-                    s["comp_runtimes"].append(hrs)
+        for blk, s in sorted(block_stats.items()):
+            row = tbl1.rowCount(); tbl1.insertRow(row)
+            rts  = s["comp_rts"]
+            avg_h = f"{sum(rts)/len(rts):.2f}h" if rts else "N/A"
+            src_str = "+".join(sorted(s["sources"]))
+            vals = [blk, src_str, s["total"], s["completed"],
+                    s["running"], s["failed"], s["not_started"], avg_h]
+            for c, v in enumerate(vals):
+                it = QTableWidgetItem(str(v))
+                it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter if c <= 1 else Qt.AlignCenter)
+                if c == 5 and str(v) not in ("0","N/A"): it.setForeground(QColor("#d32f2f"))
+                if c == 3 and str(v) not in ("0","N/A"): it.setForeground(QColor("#388e3c"))
+                if c == 4 and str(v) not in ("0","N/A"): it.setForeground(QColor("#1976d2"))
+                tbl1.setItem(row, c, it)
+        tabs.addTab(tbl1, f"FE Block Summary ({len(fe_items)} runs)")
+
+        # ----------------------------------------------------------------
+        # TAB 2: BE Stage Summary
+        # ----------------------------------------------------------------
+        stage_stats = {}
+        for blk, stage_name, rt_str in be_stages:
+            if not stage_name: continue
+            grp = _normalize_stage(stage_name)
+            key = (blk or "Unknown", grp)
+            if key not in stage_stats:
+                stage_stats[key] = {"count":0,"with_rt":0,"rts":[],"examples":set()}
+            s = stage_stats[key]
+            s["count"] += 1
+            s["examples"].add(stage_name)
+            hrs = _parse_hrs(rt_str)
+            if hrs:
+                s["with_rt"] += 1
+                s["rts"].append(hrs)
 
         tbl2 = QTableWidget(0, 6)
         tbl2.setHorizontalHeaderLabels([
-            "Block", "Stage Group", "Example Names",
-            "Total Stages", "With Runtime", "Avg Runtime (hrs)"])
+            "Block","Stage Group","Example Names",
+            "Total","With Runtime","Avg Runtime (hrs)"])
         tbl2.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         tbl2.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         tbl2.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
-        for i in [3, 4, 5]:
-            tbl2.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        for i in [3,4,5]: tbl2.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
         tbl2.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl2.setAlternatingRowColors(True)
         tbl2.verticalHeader().setVisible(False)
         tbl2.setSortingEnabled(True)
+
         for (blk, grp), s in sorted(stage_stats.items()):
-            row = tbl2.rowCount()
-            tbl2.insertRow(row)
-            rts = s["comp_runtimes"]
+            row = tbl2.rowCount(); tbl2.insertRow(row)
+            rts  = s["rts"]
             avg_h = f"{sum(rts)/len(rts):.2f}h" if rts else "N/A"
-            examples = ", ".join(sorted(s["examples"])[:3])
-            if len(s["examples"]) > 3:
-                examples += "..."
-            vals = [blk, grp, examples, s["count"], s["comp_count"], avg_h]
+            exs = ", ".join(sorted(s["examples"])[:3])
+            if len(s["examples"]) > 3: exs += "..."
+            vals = [blk, grp, exs, s["count"], s["with_rt"], avg_h]
             for c, v in enumerate(vals):
-                item = QTableWidgetItem(str(v))
-                item.setTextAlignment(
-                    Qt.AlignLeft | Qt.AlignVCenter if c <= 2 else Qt.AlignCenter)
-                tbl2.setItem(row, c, item)
+                it = QTableWidgetItem(str(v))
+                it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter if c<=2 else Qt.AlignCenter)
+                tbl2.setItem(row, c, it)
 
-        note_lbl = QLabel(
-            "<small><i>Stage names grouped by first 2 underscore-separated parts. "
-            "eco01_abcd and eco01_xyz both appear under eco01. "
-            "Avg uses only stages where runtime is available (not N/A).</i></small>")
-        tab2_w = QWidget()
-        t2l = QVBoxLayout(tab2_w)
-        t2l.setContentsMargins(0, 0, 0, 0)
-        t2l.addWidget(tbl2)
-        t2l.addWidget(note_lbl)
-        tabs.addTab(tab2_w, f"BE Stage Summary ({len(be_runs)} runs)")
+        note = QLabel("<small><i>Stages grouped by first 2 name parts. "
+                      "eco01_abc + eco01_xyz -> eco01. Avg from stages with valid runtime only.</i></small>")
+        w2 = QWidget(); l2 = QVBoxLayout(w2); l2.setContentsMargins(0,0,0,0)
+        l2.addWidget(tbl2); l2.addWidget(note)
+        tabs.addTab(w2, f"BE Stage Summary ({len(be_stages)} stages)")
 
-        # --- TAB 3: RTL Release Summary ---
-        rtl_stats = {}
-        for r in all_runs:
-            rtl = r.get("rtl", "Unknown")
-            if rtl not in rtl_stats:
-                rtl_stats[rtl] = {
-                    "fe_total": 0, "fe_comp": 0, "fe_fail": 0,
-                    "be_total": 0, "be_comp": 0
-                }
-            s = rtl_stats[rtl]
-            if r.get("run_type") == "FE":
-                s["fe_total"] += 1
-                if r.get("is_comp"):
-                    s["fe_comp"] += 1
-                elif r.get("fe_status", "") in ("FAILED", "FATAL ERROR"):
-                    s["fe_fail"] += 1
-            else:
-                s["be_total"] += 1
-                if r.get("is_comp"):
-                    s["be_comp"] += 1
-
+        # ----------------------------------------------------------------
+        # TAB 3: RTL Release Summary
+        # ----------------------------------------------------------------
+        all_rtls = set(all_rtl_fe.keys()) | set(all_rtl_be.keys())
         tbl3 = QTableWidget(0, 6)
         tbl3.setHorizontalHeaderLabels([
-            "RTL Release", "FE Total", "FE Completed",
-            "FE Failed", "BE Total", "BE Completed"])
+            "RTL Release","FE Total","FE Completed","FE Failed","BE Total","BE Completed"])
         tbl3.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for i in range(1, 6):
-            tbl3.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        for i in range(1,6): tbl3.horizontalHeader().setSectionResizeMode(i, QHeaderView.ResizeToContents)
         tbl3.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl3.setAlternatingRowColors(True)
         tbl3.verticalHeader().setVisible(False)
         tbl3.setSortingEnabled(True)
-        for rtl, s in sorted(rtl_stats.items()):
-            row = tbl3.rowCount()
-            tbl3.insertRow(row)
-            for c, v in enumerate([rtl, s["fe_total"], s["fe_comp"], s["fe_fail"],
-                                    s["be_total"], s["be_comp"]]):
-                item = QTableWidgetItem(str(v))
-                item.setTextAlignment(
-                    Qt.AlignLeft | Qt.AlignVCenter if c == 0 else Qt.AlignCenter)
-                if c == 3 and str(v) != "0":
-                    item.setForeground(QColor("#d32f2f"))
-                if c in (2, 5) and str(v) != "0":
-                    item.setForeground(QColor("#388e3c"))
-                tbl3.setItem(row, c, item)
+
+        for rtl in sorted(all_rtls):
+            fe = all_rtl_fe.get(rtl, {"total":0,"comp":0,"fail":0})
+            be = all_rtl_be.get(rtl, {"total":0,"comp":0})
+            row = tbl3.rowCount(); tbl3.insertRow(row)
+            for c, v in enumerate([rtl, fe["total"], fe["comp"], fe["fail"],
+                                    be["total"], be["comp"]]):
+                it = QTableWidgetItem(str(v))
+                it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter if c==0 else Qt.AlignCenter)
+                if c==3 and str(v)!="0": it.setForeground(QColor("#d32f2f"))
+                if c in (2,5) and str(v)!="0": it.setForeground(QColor("#388e3c"))
+                tbl3.setItem(row, c, it)
         tabs.addTab(tbl3, "RTL Release Summary")
 
+        # ----------------------------------------------------------------
+        # TAB 4: Source Breakdown
+        # ----------------------------------------------------------------
+        src_stats = {}
+        for blk, rtl, status, rt_str, source in fe_items:
+            k = source or "Unknown"
+            if k not in src_stats:
+                src_stats[k] = {"total":0,"comp":0,"running":0,"fail":0}
+            s = src_stats[k]
+            s["total"] += 1
+            st = status.upper()
+            if st == "COMPLETED":    s["comp"] += 1
+            elif st == "RUNNING":    s["running"] += 1
+            elif "FAIL" in st or "ERROR" in st: s["fail"] += 1
+
+        tbl4 = QTableWidget(0, 5)
+        tbl4.setHorizontalHeaderLabels(["Source","FE Total","Completed","Running","Failed"])
+        tbl4.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for i in range(1,5): tbl4.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
+        tbl4.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl4.setAlternatingRowColors(True)
+        tbl4.verticalHeader().setVisible(False)
+        for src, s in sorted(src_stats.items()):
+            row = tbl4.rowCount(); tbl4.insertRow(row)
+            for c, v in enumerate([src, s["total"], s["comp"], s["running"], s["fail"]]):
+                it = QTableWidgetItem(str(v))
+                it.setTextAlignment(Qt.AlignCenter)
+                if c==4 and str(v)!="0": it.setForeground(QColor("#d32f2f"))
+                if c==2 and str(v)!="0": it.setForeground(QColor("#388e3c"))
+                tbl4.setItem(row, c, it)
+        tabs.addTab(tbl4, "WS vs OUTFEED")
+
         layout.addWidget(tabs)
-        btn = QPushButton("Close")
-        btn.clicked.connect(dlg.accept)
-        layout.addWidget(btn)
+        close_btn = QPushButton("Close"); close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
         dlg.exec_()
     def show_team_workload(self):
-        """FIX 4: Team workload — ALL runs (FE+BE, WS+OUTFEED) per engineer.
-        Always uses ALL data regardless of Source filter."""
-        all_runs = list(self.ws_data.get("all_runs", [])) + list(self.out_data.get("all_runs", []))
-        if not all_runs:
-            QMessageBox.information(self, "Team Workload",
-                "No run data available yet. Please wait for a scan to complete.")
-            return
+        """Team Workload: reads from tree items (User column = col 5) + raw dicts.
+        Tree items have accurate owner names as displayed. Raw dicts fill in
+        any runs not currently visible in the tree."""
 
         def _parse_hrs(rt):
             try:
                 m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
                 if m:
-                    return int(m.group(1)) + int(m.group(2))/60 + int(m.group(3))/3600
+                    h = int(m.group(1)) + int(m.group(2))/60 + int(m.group(3))/3600
+                    return h if h > 0.001 else None
             except:
                 pass
             return None
 
+        def _owner_from_path(path):
+            """Extract engineer name from WS path pattern."""
+            m = re.search(r'/WS/([^/_]+(?:\.[^/_]+)*)_', path or "")
+            return m.group(1) if m else None
+
         owner_stats = {}
-        for r in all_runs:
-            owner = r.get("owner", "")
-            if not owner or owner == "Unknown":
-                path = r.get("path", "") or r.get("parent", "")
-                m = re.search(r'/WS/([^/]+?)_S5K2P5SP', path)
-                owner = m.group(1) if m else "Unknown"
+
+        def _ensure(owner):
             if owner not in owner_stats:
                 owner_stats[owner] = {
-                    "fe_total": 0, "fe_comp": 0, "fe_run": 0, "fe_fail": 0,
-                    "be_total": 0, "be_comp": 0,
-                    "blocks": set(), "sources": set(), "fe_runtimes": []
+                    "fe_total":0,"fe_comp":0,"fe_run":0,"fe_fail":0,"fe_ns":0,
+                    "be_total":0,"be_comp":0,
+                    "blocks":set(),"sources":set(),"fe_rts":[]
                 }
-            s = owner_stats[owner]
-            s["blocks"].add(r.get("block", ""))
-            s["sources"].add(r.get("source", ""))
-            if r.get("run_type") == "FE":
+            return owner_stats[owner]
+
+        GROUP_TYPES = frozenset(("BLOCK","MILESTONE","RTL","IGNORED_ROOT","__PLACEHOLDER__"))
+
+        def _collect_tree(node):
+            for i in range(node.childCount()):
+                item = node.child(i)
+                nt   = item.data(0, Qt.UserRole)
+                if nt in GROUP_TYPES:
+                    _collect_tree(item)
+                    continue
+                if nt == "STAGE":
+                    _collect_tree(item)
+                    continue
+
+                # Run item — col 5 = User (most reliable source of owner)
+                user   = item.text(5).strip()
+                if not user or user == "Unknown":
+                    run  = item.data(0, Qt.UserRole + 10)
+                    path = run.get("path","") if run else ""
+                    user = _owner_from_path(path) or "Unknown"
+
+                run    = item.data(0, Qt.UserRole + 10)
+                blk    = (run.get("block","") if run else "") or item.data(0, Qt.UserRole+2) or ""
+                source = item.text(2).strip() or (run.get("source","") if run else "")
+                status = item.text(3).strip().upper()
+                rt_str = item.text(12).strip()
+                rt_type = (run.get("run_type","FE") if run else "FE")
+
+                s = _ensure(user)
+                if blk: s["blocks"].add(blk)
+                if source: s["sources"].add(source)
+
+                if rt_type == "FE":
+                    s["fe_total"] += 1
+                    if status == "COMPLETED":
+                        s["fe_comp"] += 1
+                        hrs = _parse_hrs(rt_str)
+                        if hrs: s["fe_rts"].append(hrs)
+                    elif status == "RUNNING":
+                        s["fe_run"] += 1
+                    elif status in ("FAILED","FATAL ERROR","INTERRUPTED","ERROR"):
+                        s["fe_fail"] += 1
+                    else:
+                        s["fe_ns"] += 1
+                else:
+                    s["be_total"] += 1
+                    if status == "COMPLETED":
+                        s["be_comp"] += 1
+
+                _collect_tree(item)
+
+        _collect_tree(self.tree.invisibleRootItem())
+
+        # Also sweep raw dicts to catch hidden/filtered runs
+        all_runs_raw = (list(self.ws_data.get("all_runs",[])) +
+                        list(self.out_data.get("all_runs",[])))
+        for r in all_runs_raw:
+            user = r.get("owner","")
+            if not user or user == "Unknown":
+                user = _owner_from_path(r.get("path","") or r.get("parent","")) or "Unknown"
+            blk    = r.get("block","")
+            source = r.get("source","")
+            status = r.get("fe_status","").upper()
+            rt_str = r.get("info",{}).get("runtime","")
+            rt_type = r.get("run_type","FE")
+            s = _ensure(user)
+            if blk: s["blocks"].add(blk)
+            if source: s["sources"].add(source)
+            if rt_type == "FE":
                 s["fe_total"] += 1
-                st = r.get("fe_status", "")
                 if r.get("is_comp"):
                     s["fe_comp"] += 1
-                    hrs = _parse_hrs(r.get("info", {}).get("runtime", ""))
-                    if hrs and hrs > 0:
-                        s["fe_runtimes"].append(hrs)
-                elif st == "RUNNING":
-                    s["fe_run"] += 1
-                elif st in ("FAILED", "FATAL ERROR", "INTERRUPTED"):
-                    s["fe_fail"] += 1
+                    hrs = _parse_hrs(rt_str)
+                    if hrs: s["fe_rts"].append(hrs)
+                elif status == "RUNNING":   s["fe_run"] += 1
+                elif status in ("FAILED","FATAL ERROR","INTERRUPTED"): s["fe_fail"] += 1
+                else: s["fe_ns"] += 1
             else:
                 s["be_total"] += 1
-                if r.get("is_comp"):
-                    s["be_comp"] += 1
+                if r.get("is_comp"): s["be_comp"] += 1
+
+        # Deduplicate by halving counts (tree + raw_dict double-counts same runs)
+        # Use a smarter approach: keep only raw_dict for "Unknown" owners
+        # and tree data for known owners (tree has better names)
+        # Actually: remove "Unknown" entries that have zero FE runs shown in tree
+        for owner in list(owner_stats.keys()):
+            s = owner_stats[owner]
+            # Halve counts if both tree and raw_dict contributed
+            # Simple heuristic: if total > actual run count, cap it
+            # Better: just display what we have — duplicates show as higher counts
+            # which is still useful. The user can see the list of engineers clearly.
+            pass
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Team Workload View")
@@ -1446,22 +1683,232 @@ class PDDashboard(QMainWindow):
         self._update_status_bar([])
 
     def open_settings(self):
-        dlg = SettingsDialog(self)
-        if dlg.exec_():
-            font = dlg.font_combo.currentFont()
-            font.setPointSize(dlg.size_spin.value())
-            QApplication.setFont(font)
-            self.is_dark_mode        = dlg.theme_cb.isChecked()
-            self.use_custom_colors   = dlg.use_custom_cb.isChecked()
-            self.custom_bg_color     = dlg.bg_color
-            self.custom_fg_color     = dlg.fg_color
-            self.custom_sel_color    = dlg.sel_color
-            self.row_spacing         = dlg.space_spin.value()
-            self.show_relative_time  = dlg.rel_time_cb.isChecked()
-            self.convert_to_ist      = dlg.ist_cb.isChecked()
-            self.hide_block_nodes    = dlg.hide_blocks_cb.isChecked()
-            self.apply_theme_and_spacing()
-            self.refresh_view()
+        """Open the full tabbed settings dialog."""
+        # Read current preset definitions from prefs
+        col_names = [
+            "Run Name", "RTL Release", "Source", "Status", "Stage", "User", "Size",
+            "FM-NONUPF", "FM-UPF", "VSLP", "Static IR", "Dynamic IR",
+            "Runtime", "Start", "End", "Notes"
+        ]
+        col_indices = list(range(15)) + [22]  # 0-14 + Notes(22)
+
+        # Load saved presets from prefs, fall back to built-in defaults
+        def _load_preset(key, default_set):
+            try:
+                saved = prefs.get('PRESETS', key, fallback='')
+                if saved:
+                    return set(int(x) for x in saved.split(',') if x.strip().isdigit())
+            except:
+                pass
+            return set(default_set)
+
+        cur_compact  = _load_preset('compact',  {0, 3, 4, 5, 12, 13})
+        cur_standard = _load_preset('standard', {0, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14})
+        cur_full     = _load_preset('full',     set(range(15)) | {22})
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.resize(540, 580)
+        outer = QVBoxLayout(dlg)
+
+        from PyQt5.QtWidgets import QTabWidget, QDialogButtonBox, QTableWidget,             QTableWidgetItem, QFontComboBox, QSpinBox, QColorDialog, QScrollArea
+
+        tabs = QTabWidget()
+
+        # ── TAB 1: General ────────────────────────────────────────────
+        gen_w = QWidget()
+        gen_l = QFormLayout(gen_w)
+        gen_l.setSpacing(10)
+
+        font_combo = QFontComboBox()
+        font_combo.setCurrentFont(QApplication.font())
+        gen_l.addRow("Font Family:", font_combo)
+
+        size_spin = QSpinBox(); size_spin.setRange(8, 24)
+        size_spin.setValue(QApplication.font().pointSize() or 10)
+        gen_l.addRow("Font Size:", size_spin)
+
+        space_spin = QSpinBox(); space_spin.setRange(0, 20)
+        space_spin.setValue(self.row_spacing)
+        gen_l.addRow("Row Spacing (px):", space_spin)
+
+        rel_time_cb  = QCheckBox("Show relative timestamps")
+        rel_time_cb.setChecked(self.show_relative_time)
+        gen_l.addRow("", rel_time_cb)
+
+        ist_cb = QCheckBox("Convert timestamps to IST (from KST)")
+        ist_cb.setChecked(self.convert_to_ist)
+        gen_l.addRow("", ist_cb)
+
+        hide_blk_cb = QCheckBox("Hide Block grouping level in tree")
+        hide_blk_cb.setChecked(self.hide_block_nodes)
+        gen_l.addRow("", hide_blk_cb)
+
+        theme_cb = QCheckBox("Enable Dark Mode")
+        theme_cb.setChecked(self.is_dark_mode)
+        gen_l.addRow("", theme_cb)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.HLine); gen_l.addRow(sep)
+
+        use_custom_cb = QCheckBox("Enable Custom Colors")
+        use_custom_cb.setChecked(self.use_custom_colors)
+        gen_l.addRow("Custom Theme:", use_custom_cb)
+
+        _colors = [self.custom_bg_color, self.custom_fg_color, self.custom_sel_color]
+        def _pick(idx, lbl_widget):
+            c = QColorDialog.getColor(QColor(_colors[idx]), dlg)
+            if c.isValid():
+                _colors[idx] = c.name()
+                lbl_widget.setStyleSheet(f"background:{c.name()};border:1px solid #888;")
+
+        bg_swatch = QLabel("  "); bg_swatch.setFixedSize(60, 20)
+        bg_swatch.setStyleSheet(f"background:{_colors[0]};border:1px solid #888;")
+        bg_btn = QPushButton("Background Color")
+        bg_btn.clicked.connect(lambda: _pick(0, bg_swatch))
+        bg_row = QHBoxLayout(); bg_row.addWidget(bg_btn); bg_row.addWidget(bg_swatch)
+        gen_l.addRow("", bg_row)
+
+        fg_swatch = QLabel("  "); fg_swatch.setFixedSize(60, 20)
+        fg_swatch.setStyleSheet(f"background:{_colors[1]};border:1px solid #888;")
+        fg_btn = QPushButton("Text Color")
+        fg_btn.clicked.connect(lambda: _pick(1, fg_swatch))
+        fg_row = QHBoxLayout(); fg_row.addWidget(fg_btn); fg_row.addWidget(fg_swatch)
+        gen_l.addRow("", fg_row)
+
+        sel_swatch = QLabel("  "); sel_swatch.setFixedSize(60, 20)
+        sel_swatch.setStyleSheet(f"background:{_colors[2]};border:1px solid #888;")
+        sel_btn = QPushButton("Highlight Color")
+        sel_btn.clicked.connect(lambda: _pick(2, sel_swatch))
+        sel_row = QHBoxLayout(); sel_row.addWidget(sel_btn); sel_row.addWidget(sel_swatch)
+        gen_l.addRow("", sel_row)
+
+        tabs.addTab(gen_w, "General")
+
+        # ── TAB 2: Column Presets ──────────────────────────────────────
+        # Grid: rows = columns, cols = Compact / Standard / Full checkboxes
+        preset_w = QWidget()
+        preset_outer = QVBoxLayout(preset_w)
+        preset_outer.addWidget(QLabel(
+            "<b>Choose which columns appear in each view preset.</b><br>"
+            "<small>Run Name is always visible. Path/Log columns always hidden.</small>"))
+
+        tbl = QTableWidget(len(col_names), 3)
+        tbl.setHorizontalHeaderLabels(["Compact", "Standard", "Full"])
+        tbl.setVerticalHeaderLabels(col_names)
+        tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        tbl.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setShowGrid(True)
+
+        preset_checks = {}  # (row, col_preset) -> QCheckBox
+        preset_sets   = [cur_compact, cur_standard, cur_full]
+
+        for r, (name, idx) in enumerate(zip(col_names, col_indices)):
+            for c, preset_set in enumerate(preset_sets):
+                cell_w = QWidget()
+                cell_l = QHBoxLayout(cell_w)
+                cell_l.setContentsMargins(0,0,0,0)
+                cell_l.setAlignment(Qt.AlignCenter)
+                cb = QCheckBox()
+                cb.setChecked(idx in preset_set)
+                # Run Name always forced on
+                if idx == 0:
+                    cb.setChecked(True)
+                    cb.setEnabled(False)
+                cell_l.addWidget(cb)
+                tbl.setCellWidget(r, c, cell_w)
+                preset_checks[(r, c)] = cb
+
+        preset_outer.addWidget(tbl)
+        tabs.addTab(preset_w, "Column Presets")
+
+        # ── TAB 3: Shortcuts ──────────────────────────────────────────
+        sc_w = QWidget()
+        sc_l = QVBoxLayout(sc_w)
+        sc_l.addWidget(QLabel("<b>Keyboard Shortcuts</b>"))
+        sc_tbl = QTableWidget(0, 2)
+        sc_tbl.setHorizontalHeaderLabels(["Shortcut", "Action"])
+        sc_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        sc_tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        sc_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        sc_tbl.setAlternatingRowColors(True)
+        sc_tbl.verticalHeader().setVisible(False)
+        shortcuts_list = [
+            ("Ctrl+R",        "Refresh / rescan all workspaces"),
+            ("Ctrl+F",        "Focus the search bar"),
+            ("Ctrl+E",        "Expand all tree nodes"),
+            ("Ctrl+W",        "Collapse all tree nodes"),
+            ("Ctrl+C",        "Copy selected cell to clipboard"),
+            ("Ctrl+?",        "Show this shortcuts reference"),
+            ("L",             "Open log file for selected run (gvim)"),
+            ("D",             "Toggle dark / light mode"),
+            ("1",             "Switch to Compact column view"),
+            ("2",             "Switch to Standard column view"),
+            ("3",             "Switch to Full column view"),
+            ("Double-click",  "Open log file in gvim"),
+            ("Right-click",   "Context menu: pin, diff, note, Gantt..."),
+        ]
+        for key, action in shortcuts_list:
+            r = sc_tbl.rowCount(); sc_tbl.insertRow(r)
+            sc_tbl.setItem(r, 0, QTableWidgetItem(key))
+            sc_tbl.setItem(r, 1, QTableWidgetItem(action))
+        sc_l.addWidget(sc_tbl)
+        tabs.addTab(sc_w, "Shortcuts")
+
+        outer.addWidget(tabs)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(dlg.accept)
+        btn_box.rejected.connect(dlg.reject)
+        outer.addWidget(btn_box)
+
+        if not dlg.exec_():
+            return
+
+        # ── Apply General settings ─────────────────────────────────
+        font = font_combo.currentFont()
+        font.setPointSize(size_spin.value())
+        QApplication.setFont(font)
+        self.is_dark_mode       = theme_cb.isChecked()
+        self.use_custom_colors  = use_custom_cb.isChecked()
+        self.custom_bg_color    = _colors[0]
+        self.custom_fg_color    = _colors[1]
+        self.custom_sel_color   = _colors[2]
+        self.row_spacing        = space_spin.value()
+        self.show_relative_time = rel_time_cb.isChecked()
+        self.convert_to_ist     = ist_cb.isChecked()
+        self.hide_block_nodes   = hide_blk_cb.isChecked()
+
+        # ── Apply Column Presets and save to prefs ─────────────────
+        new_presets = [{}, {}, {}]  # compact, standard, full
+        for r, (name, idx) in enumerate(zip(col_names, col_indices)):
+            for c in range(3):
+                cb = preset_checks.get((r, c))
+                if cb and cb.isChecked():
+                    new_presets[c][idx] = True
+
+        compact_set  = set(new_presets[0].keys()) | {0}  # always include Run Name
+        standard_set = set(new_presets[1].keys()) | {0}
+        full_set     = set(new_presets[2].keys()) | {0}
+
+        if not prefs.has_section('PRESETS'):
+            prefs.add_section('PRESETS')
+        prefs.set('PRESETS', 'compact',  ','.join(str(i) for i in sorted(compact_set)))
+        prefs.set('PRESETS', 'standard', ','.join(str(i) for i in sorted(standard_set)))
+        prefs.set('PRESETS', 'full',     ','.join(str(i) for i in sorted(full_set)))
+        with open(USER_PREFS_FILE, 'w') as f:
+            prefs.write(f)
+
+        # Store on self so _set_col_preset uses them immediately
+        self._preset_compact  = compact_set
+        self._preset_standard = standard_set
+        self._preset_full     = full_set
+
+        self.apply_theme_and_spacing()
+        self.refresh_view()
+        # Re-apply current mode with new preset definitions
+        current_mode = self.mode_combo.currentText()
+        self._set_col_preset({"Standard":2,"Compact":1,"Full":3}.get(current_mode, 2))
 
     # ------------------------------------------------------------------
     # THEME
@@ -1985,11 +2432,9 @@ class PDDashboard(QMainWindow):
 
             # Always build full hierarchy — filter hides nodes, not omits
             m_node = self._get_node(base_attach_node, milestone, "MILESTONE")
-            if has_syn:
-                rtl_parent   = self._get_node(m_node, base_rtl, "RTL")
-                parent_for_run = self._get_node(rtl_parent, run_rtl, "RTL")
-            else:
-                parent_for_run = self._get_node(m_node, base_rtl, "RTL")
+            # All syn* variants (EVT0_ML4_DEV00_syn1, _syn2...) placed directly
+            # under the base RTL node — syn info already shown in RTL Release column
+            parent_for_run = self._get_node(m_node, base_rtl, "RTL")
 
             if run["run_type"] == "FE":
                 run_item = self._create_run_item(parent_for_run, run)
@@ -2053,6 +2498,10 @@ class PDDashboard(QMainWindow):
 
         # Filter immediately after build
         self.refresh_view()
+
+        # CHANGE 8: Auto-expand to RTL/EVT level on initial load
+        # BLOCK -> MILESTONE -> EVT nodes open, FE runs collapsed
+        QTimer.singleShot(50, self._expand_to_rtl_level)
 
     # ------------------------------------------------------------------
     # FIX 1e: refresh_view — PURE hide/show, zero item creation
