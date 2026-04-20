@@ -10,7 +10,7 @@ from utils import *
 
 
 # ===========================================================================
-# BatchSizeWorker — calculates folder sizes for multiple items in background
+# BatchSizeWorker -- calculates folder sizes for multiple items in background
 # ===========================================================================
 class BatchSizeWorker(QThread):
     size_calculated = pyqtSignal(str, str)
@@ -71,7 +71,7 @@ class BatchSizeWorker(QThread):
 
 
 # ===========================================================================
-# SingleSizeWorker — calculates folder size for one item on demand
+# SingleSizeWorker -- calculates folder size for one item on demand
 # ===========================================================================
 class SingleSizeWorker(QThread):
     result = pyqtSignal(object, str)
@@ -123,7 +123,7 @@ class SingleSizeWorker(QThread):
 
 
 # ===========================================================================
-# DiskScannerWorker — scans workspace/outfeed disk usage in background
+# DiskScannerWorker -- scans workspace/outfeed disk usage in background
 # ===========================================================================
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
@@ -197,7 +197,7 @@ class DiskScannerWorker(QThread):
 
 
 # ===========================================================================
-# ScannerWorker — main workspace/outfeed scanner
+# ScannerWorker -- main workspace/outfeed scanner
 # FIX 5: IR scan runs in PARALLEL with workspace scans via concurrent.futures
 # ===========================================================================
 class ScannerWorker(QThread):
@@ -206,7 +206,7 @@ class ScannerWorker(QThread):
     status_update   = pyqtSignal(str)
 
     # -----------------------------------------------------------------------
-    # IR directory scanner — called as a parallel future inside run()
+    # IR directory scanner -- called as a parallel future inside run()
     # -----------------------------------------------------------------------
     def scan_ir_dir(self):
         ir_data    = {}
@@ -322,7 +322,7 @@ class ScannerWorker(QThread):
         return tasks, releases_found
 
     # -----------------------------------------------------------------------
-    # Main run — FIX 5: IR scan launched in parallel with workspace scans
+    # Main run -- FIX 5: IR scan launched in parallel with workspace scans
     # -----------------------------------------------------------------------
     def run(self):
         clear_path_cache()
@@ -400,7 +400,7 @@ class ScannerWorker(QThread):
         self.status_update.emit("Processing run data and parsing reports...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
 
-            # FIX 5: submit IR scan immediately — runs alongside workspace processing
+            # FIX 5: submit IR scan immediately -- runs alongside workspace processing
             ir_future = executor.submit(self.scan_ir_dir)
 
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
@@ -434,12 +434,12 @@ class ScannerWorker(QThread):
                     pass
 
                 completed_tasks += 1
-                # Throttle UI updates — emit every 20 tasks to avoid flooding event loop
+                # Throttle UI updates -- emit every 20 tasks to avoid flooding event loop
                 if completed_tasks % 20 == 0 or completed_tasks == total_tasks:
                     self.progress_update.emit(completed_tasks, total_tasks)
                     self.status_update.emit(f"Processing runs... ({completed_tasks}/{total_tasks})")
 
-            # Collect IR results — usually already done by now since it ran in parallel
+            # Collect IR results -- usually already done by now since it ran in parallel
             try:
                 ir_data = ir_future.result()
             except:
@@ -515,10 +515,16 @@ class ScannerWorker(QThread):
                     continue
 
                 if source == "WS":
+                    # WS PNR structure (from PnrFileDb in file.py):
+                    # reports -> {rd}/reports/{stage}/
+                    # log     -> {rd}/{stage}/logs/{stage}.log
+                    # stage_path -> {rd}/outputs/{stage}
                     rpt        = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
-                    log        = os.path.join(rd, "logs",    f"{step_name}.log")
+                    log        = os.path.join(rd, step_name, "logs",    f"{step_name}.log")
                     stage_path = os.path.join(rd, "outputs", step_name)
                 else:
+                    # OUTFEED PNR structure (s_dir = rd/step_name):
+                    # log -> {s_dir}/logs/{stage}.log
                     rpt        = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
                     log        = os.path.join(s_dir, "logs",    f"{step_name}.log")
                     stage_path = os.path.join(rd,    step_name)
@@ -579,3 +585,54 @@ class ScannerWorker(QThread):
                 data_obj["releases"][base] = []
             if path not in data_obj["releases"][base]:
                 data_obj["releases"][base].append(path)
+
+
+# ===========================================================================
+# QoR WORKER -- calls summary.py as subprocess, opens HTML output in Firefox
+# summary.py call signature: python3 summary.py <dir1> <dir2> ...
+# It auto-detects FE vs BE from directory names ("FE" or "BE" in path).
+# ===========================================================================
+class QoRWorker(QThread):
+    finished = pyqtSignal(str)  # emits path to HTML output file, or ""
+
+    def __init__(self, script_path, run_dirs):
+        super().__init__()
+        self.script_path = script_path
+        self.run_dirs    = run_dirs  # list of FE/BE run directories
+
+    def run(self):
+        try:
+            # summary.py outputs to qor_metrices/summary_<date>.html
+            # Run from the script's directory so relative paths work
+            script_dir = os.path.dirname(os.path.abspath(self.script_path))
+            cmd = ["python3", self.script_path] + self.run_dirs
+            result = subprocess.run(
+                cmd,
+                cwd=script_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300
+            )
+            output = result.stdout.decode("utf-8", errors="ignore")
+            # summary.py prints: [Info]: Refer to output html file: <path>
+            html_path = ""
+            for line in output.splitlines():
+                if "Refer to output html file" in line or ".html" in line:
+                    parts = line.split(":")
+                    for p in parts:
+                        p = p.strip()
+                        if p.endswith(".html"):
+                            html_path = p
+                            break
+                        if ".html" in p:
+                            idx = p.find(".html")
+                            html_path = p[:idx + 5].strip()
+                            break
+                if html_path:
+                    break
+            # If not absolute, make it relative to script_dir
+            if html_path and not os.path.isabs(html_path):
+                html_path = os.path.join(script_dir, html_path)
+            self.finished.emit(html_path if (html_path and os.path.exists(html_path)) else "")
+        except Exception as e:
+            self.finished.emit("")
