@@ -701,201 +701,182 @@ class DiskUsageDialog(QDialog):
 
 
 class QoRSummaryDialog(QDialog):
-    """Shows extracted QoR metrics for a run or PNR stage in a table."""
+    """QoR summary matching Image 1 layout: rows like R2R Setup, Total Area etc."""
 
     def __init__(self, run_name, metrics, is_dark, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"QoR Summary: {run_name}")
-        self.resize(680, 700)
+        self.setWindowTitle("QoR Summary: " + str(run_name))
+        self.resize(600, 750)
         layout = QVBoxLayout(self)
 
         # Header
-        hdr = QLabel(f"<b>{run_name}</b>")
-        f = hdr.font(); f.setPointSize(11); hdr.setFont(f)
+        hdr = QLabel("<b>" + str(run_name) + "</b>")
+        hf  = hdr.font(); hf.setPointSize(11); hdr.setFont(hf)
         hdr.setAlignment(Qt.AlignCenter)
+        hdr_bg = "#1565c0" if is_dark else "#2196f3"
+        hdr.setStyleSheet(
+            "background:" + hdr_bg + "; color:white; padding:8px; border-radius:4px;")
         layout.addWidget(hdr)
 
-        # Scrollable table area
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        inner = QWidget()
-        inner_layout = QVBoxLayout(inner)
-        inner_layout.setSpacing(8)
+        # Build rows matching Image 1
+        area  = metrics.get("area",       {})
+        cong  = metrics.get("congestion", {})
+        power = metrics.get("power",      {})
 
-        def _section(title, rows):
-            """rows = list of (metric_name, value_str)"""
-            if not rows:
-                return
-            sec_lbl = QLabel(f"<b>{title}</b>")
-            sec_lbl.setStyleSheet(
-                "background: #1976d2; color: white; padding: 4px 8px;"
-                if not is_dark else
-                "background: #2f65ca; color: white; padding: 4px 8px;")
-            inner_layout.addWidget(sec_lbl)
+        def _v(d, *keys):
+            for k in keys:
+                v = d.get(k)
+                if v and v != "-":
+                    return str(v)
+            return "-"
 
-            tbl = QTableWidget(len(rows), 2)
-            tbl.setHorizontalHeaderLabels(["Metric", "Value"])
-            tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-            tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-            tbl.verticalHeader().setVisible(False)
-            tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-            tbl.setAlternatingRowColors(True)
-            tbl.setSelectionBehavior(QTableWidget.SelectRows)
-            tbl.setSortingEnabled(False)
+        # LVT/RVT/HVT inst and area strings
+        vth      = area.get("vth", {})
+        lvt_inst = _v(vth.get("LVT", {}), "inst")
+        rvt_inst = _v(vth.get("RVT", {}), "inst")
+        hvt_inst = _v(vth.get("HVT", {}), "inst")
+        lvt_area = _v(vth.get("LVT", {}), "area")
+        rvt_area = _v(vth.get("RVT", {}), "area")
+        hvt_area = _v(vth.get("HVT", {}), "area")
 
-            for r, (metric, val) in enumerate(rows):
-                m_item = QTableWidgetItem(metric)
-                v_item = QTableWidgetItem(str(val))
+        def _pct_str(*pairs):
+            parts = [f"{n}:{v}%" for n, v in pairs if v != "-"]
+            return "/".join(parts) if parts else "-"
+
+        cong_both = _v(cong, "cong_both")
+        cong_v    = _v(cong, "cong_v")
+        cong_h    = _v(cong, "cong_h")
+        cong_str  = (f"{cong_both}%/{cong_v}%/{cong_h}%"
+                     if cong_both != "-" else "-")
+
+        leak_mw = _v(power, "leakage_mw")
+        dyn_mw  = _v(power, "dynamic_mw")
+        pwr_str = f"{leak_mw}/{dyn_mw}"
+
+        # Util string: total/std_cell_only
+        util_total = _v(area, "total_util")
+        util_sc    = _v(area, "std_cell_only_util")
+        util_str   = f"{util_total}/{util_sc}"
+
+        rows = [
+            # (label,                          value,                      is_section)
+            ("Timing",                         None,                       True),
+            ("R2R (Setup)  WNS/TNS/FEPs",     metrics.get("r2r_setup","-"), False),
+            ("R2R (Hold)   WNS/TNS/FEPs",     metrics.get("r2r_hold",  "-"), False),
+            ("Area",                            None,                       True),
+            ("Total Area",                     _v(area,"total_area"),       False),
+            ("Std Cell Area",                  _v(area,"std_cell_area_total",
+                                                      "std_cell_area"),     False),
+            ("Memory Area",                    _v(area,"memory_area"),      False),
+            ("Macro Area (Inc. Mem)",          _v(area,"macro_area"),       False),
+            ("Instance Count",                 _v(area,"instance_count",
+                                                   "total_count"),          False),
+            ("Physical",                       None,                        True),
+            ("LVT*/RVT* Inst",                f"{lvt_inst}/{rvt_inst}",    False),
+            ("LVT*/RVT* Area",                f"{lvt_area}/{rvt_area}",    False),
+            ("Congestion (Both/V/H Dir)",      cong_str,                    False),
+            ("StdCell/StdCell Only Util",      util_str,                    False),
+            ("Quality",                        None,                        True),
+            ("MBIT Ratio",
+             _v(metrics,"mbit") + ("%" if _v(metrics,"mbit") != "-" else ""),
+             False),
+            ("CGC Ratio",
+             _v(metrics,"cgc_pct") + ("%" if _v(metrics,"cgc_pct") != "-" else ""),
+             False),
+            ("Power",                          None,                        True),
+            ("Leakage/Dynamic Power (mW)",     pwr_str,                     False),
+            ("DRC Errors",                     metrics.get("drc_errors","-"),False),
+            ("Runtime",                        metrics.get("runtime","-"),  False),
+        ]
+
+        # Table
+        tbl = QTableWidget(0, 2)
+        tbl.setHorizontalHeaderLabels(["Metric", "Value"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+        tbl.setSelectionBehavior(QTableWidget.SelectRows)
+
+        sec_bg  = "#1565c0" if is_dark else "#bbdefb"
+        sec_fg  = "white"   if is_dark else "#0d47a1"
+        neg_fg  = "#ef5350" if is_dark else "#c62828"
+        zero_fg = "#66bb6a" if is_dark else "#2e7d32"
+
+        for label, val, is_sec in rows:
+            r = tbl.rowCount()
+            tbl.insertRow(r)
+
+            if is_sec:
+                # Section header row spanning both cols
+                sec_item = QTableWidgetItem(label)
+                sec_item.setBackground(QColor(sec_bg))
+                sec_item.setForeground(QColor(sec_fg))
+                f2 = sec_item.font(); f2.setBold(True); sec_item.setFont(f2)
+                tbl.setItem(r, 0, sec_item)
+                tbl.setItem(r, 1, QTableWidgetItem(""))
+                tbl.item(r, 1).setBackground(QColor(sec_bg))
+                tbl.setRowHeight(r, 24)
+            else:
+                m_item = QTableWidgetItem("  " + str(label))
+                v_item = QTableWidgetItem(str(val) if val else "-")
                 v_item.setTextAlignment(Qt.AlignCenter)
-                # Color negative timing values red
+                # Color negative timing values
                 try:
-                    if float(val) < 0:
-                        v_item.setForeground(
-                            QColor("#e57373" if is_dark else "#d32f2f"))
-                    elif float(val) == 0.0:
-                        v_item.setForeground(
-                            QColor("#81c784" if is_dark else "#388e3c"))
+                    fv = float(str(val).split("/")[0])
+                    if fv < 0:
+                        v_item.setForeground(QColor(neg_fg))
+                    elif fv == 0.0:
+                        v_item.setForeground(QColor(zero_fg))
                 except Exception:
                     pass
                 tbl.setItem(r, 0, m_item)
                 tbl.setItem(r, 1, v_item)
 
-            tbl.setFixedHeight(min(36 * len(rows) + 30, 300))
-            inner_layout.addWidget(tbl)
+        layout.addWidget(tbl, 1)
 
-        # ---- Build sections from metrics dict ----
-        # TIMING
-        timing_rows = []
-        tim = metrics.get("timing", {})
-        if isinstance(tim, dict):
-            for scenario, groups in tim.items():
-                if isinstance(groups, dict):
-                    for grp, vals in groups.items():
-                        if isinstance(vals, dict):
-                            wns = vals.get("wns", "-")
-                            tns = vals.get("tns", "-")
-                            nvp = vals.get("nvp", "-")
-                            timing_rows.append(
-                                (f"{scenario} | {grp} WNS", wns))
-                            timing_rows.append(
-                                (f"{scenario} | {grp} TNS", tns))
-                            timing_rows.append(
-                                (f"{scenario} | {grp} NVP", nvp))
-        # Fallback simple WNS/TNS
-        if not timing_rows:
-            if "wns_setup" in metrics:
-                timing_rows.append(("WNS (Setup)", metrics["wns_setup"]))
-            if "wns_hold"  in metrics:
-                timing_rows.append(("WNS (Hold)",  metrics["wns_hold"]))
-        _section("Timing (WNS / TNS / NVP)", timing_rows)
-
-        # AREA
-        area = metrics.get("area", {})
-        area_rows = []
-        for key, label in [
-                ("total_area",           "Total Cell Area"),
-                ("std_cell_area",        "Std Cell Area"),
-                ("combinational_area",   "Combinational Area"),
-                ("noncombinational_area","Non-Combinational Area"),
-                ("macro_area",           "Macro Area"),
-                ("memory_area",          "Memory Area"),
-                ("buf_area",             "Buf/Inv Area"),
-                ("total_count",          "Total Instance Count"),
-                ("reg_count",            "Register Count"),
-                ("macro_count",          "Macro Count"),
-                ("buf_count",            "Buf/Inv Count"),
-                ("core_area",            "Core Area"),
-        ]:
-            if key in area and area[key] not in ("-", "", None):
-                area_rows.append((label, area[key]))
-        _section("Area", area_rows)
-
-        # UTILIZATION
-        util_rows = []
-        for key, label in [
-                ("total_util",          "Total Utilization (%)"),
-                ("std_cell_only_util",  "Std Cell Only Util (%)"),
-        ]:
-            if key in area and area[key] not in ("-", "", None):
-                util_rows.append((label, area[key]))
-        _section("Utilization", util_rows)
-
-        # CONGESTION
-        cong = metrics.get("congestion", {})
-        cong_rows = []
-        for key, label in [
-                ("cong_both", "Both Dirs Overflow (%)"),
-                ("cong_h",    "H Dir Overflow (%)"),
-                ("cong_v",    "V Dir Overflow (%)"),
-        ]:
-            if key in cong:
-                cong_rows.append((label, cong[key]))
-        _section("Congestion", cong_rows)
-
-        # VTH DISTRIBUTION
-        vth = area.get("vth", {})
-        vth_rows = []
-        for vth_type, vals in sorted(vth.items()):
-            if isinstance(vals, dict):
-                vth_rows.append(
-                    (f"{vth_type} Inst %", vals.get("inst", "-")))
-                vth_rows.append(
-                    (f"{vth_type} Area %", vals.get("area", "-")))
-        _section("VTH Distribution", vth_rows)
-
-        # POWER
-        pwr = metrics.get("power", {})
-        pwr_rows = []
-        for key, label in [
-                ("dynamic_mw", "Dynamic Power"),
-                ("leakage_mw", "Leakage Power"),
-        ]:
-            if key in pwr:
-                pwr_rows.append((label, pwr[key]))
-        _section("Power", pwr_rows)
-
-        # QUALITY
-        qual_rows = []
-        if "cgc" in metrics.get("timing", {}):
-            qual_rows.append(("CGC Ratio", metrics["timing"]["cgc"]))
-        if "cgc" in metrics:
-            qual_rows.append(("CGC Ratio", metrics["cgc"]))
-        if "mbit" in area:
-            qual_rows.append(("MBIT Ratio", area["mbit"]))
-        saif = metrics.get("saif", {})
-        if "saif_port" in saif:
-            qual_rows.append(("SAIF Port Ann. %", saif["saif_port"]))
-        if "drc_errors" in metrics:
-            qual_rows.append(("DRC Errors (log)", metrics["drc_errors"]))
-        drc = metrics.get("drc", {})
-        if "drc_count" in drc:
-            qual_rows.append(("DRC Count (rpt)", drc["drc_count"]))
-        if "shorts" in drc:
-            qual_rows.append(("Shorts", drc["shorts"]))
-        if "tool_version" in metrics.get("timing", {}):
-            qual_rows.append(("Tool Version", metrics["timing"]["tool_version"]))
-        _section("Quality / Misc", qual_rows)
-
-        if not any([timing_rows, area_rows, util_rows, cong_rows,
-                    vth_rows, pwr_rows, qual_rows]):
-            inner_layout.addWidget(QLabel(
-                "<i>No metrics available for this run.<br>"
-                "Run must be COMPLETED and reports must exist.</i>"))
-
-        inner_layout.addStretch()
-        scroll.setWidget(inner)
-        layout.addWidget(scroll, 1)
+        # Show timing scenarios if available
+        timing_raw = metrics.get("timing_raw", {})
+        scenarios  = timing_raw.get("timing", {}) if timing_raw else {}
+        if scenarios:
+            sc_lbl = QLabel("<b>Timing Detail (per scenario)</b>")
+            sc_lbl.setStyleSheet("padding-top:6px;")
+            layout.addWidget(sc_lbl)
+            sc_tbl = QTableWidget(0, 4)
+            sc_tbl.setHorizontalHeaderLabels(
+                ["Scenario", "Path Group/Type", "WNS", "TNS"])
+            sc_tbl.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.Stretch)
+            sc_tbl.horizontalHeader().setSectionResizeMode(
+                1, QHeaderView.ResizeToContents)
+            sc_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            sc_tbl.setAlternatingRowColors(True)
+            sc_tbl.verticalHeader().setVisible(False)
+            sc_tbl.setMaximumHeight(180)
+            for sce, grps in sorted(scenarios.items()):
+                for grp_key, vals in sorted(grps.items()):
+                    r2 = sc_tbl.rowCount(); sc_tbl.insertRow(r2)
+                    sc_tbl.setItem(r2, 0, QTableWidgetItem(sce))
+                    sc_tbl.setItem(r2, 1, QTableWidgetItem(grp_key))
+                    wv = QTableWidgetItem(vals.get("wns", "-"))
+                    wv.setTextAlignment(Qt.AlignCenter)
+                    try:
+                        if float(vals.get("wns","0")) < 0:
+                            wv.setForeground(QColor(neg_fg))
+                    except Exception:
+                        pass
+                    sc_tbl.setItem(r2, 2, wv)
+                    tv2 = QTableWidgetItem(vals.get("tns", "-"))
+                    tv2.setTextAlignment(Qt.AlignCenter)
+                    sc_tbl.setItem(r2, 3, tv2)
+            layout.addWidget(sc_tbl)
 
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
 
-
-# ---------------------------------------------------------------------------
-# QoRWorker -- inline here so it is always available even if workers.py
-# import has issues
-# ---------------------------------------------------------------------------
 class QoRWorker(QThread):
     finished = pyqtSignal(str)
 
@@ -939,6 +920,203 @@ class QoRWorker(QThread):
                 else "")
         except Exception:
             self.finished.emit("")
+
+class BlockSummaryDialog(QDialog):
+    """Cross-block synthesis summary table matching Image 2.
+    One row per block, latest completed FE run for each block.
+    Columns: BLK Name | MBIT% | CG% | Instance Count | Std Area |
+             Gate Count | VT (L/R/H) Area | Timing WNS/TNS/FEPs | Runtime | Run Tag
+    """
+
+    HEADERS = [
+        "BLK Name", "MBIT%", "CG%", "Instance\nCount",
+        "Std Area\n(um2)", "Gate\nCount",
+        "VT (L/R/H)\nArea%", "Timing\nWNS/TNS/FEPs",
+        "Runtime", "Run Tag"
+    ]
+
+    def __init__(self, rtl_label, block_runs, is_dark, parent=None):
+        """block_runs: list of dicts with block metrics already extracted."""
+        super().__init__(parent)
+        self.setWindowTitle("Block Summary: " + str(rtl_label))
+        self.resize(1100, 450)
+        self.is_dark = is_dark
+        layout = QVBoxLayout(self)
+
+        # Header
+        hdr = QLabel(
+            "<b>" + str(rtl_label) + " -- Synthesis Summary</b>")
+        hf = hdr.font(); hf.setPointSize(11); hdr.setFont(hf)
+        hdr.setAlignment(Qt.AlignCenter)
+        layout.addWidget(hdr)
+
+        # Status label
+        self.status_lbl = QLabel(
+            "Loading metrics... (this may take 10-30 seconds)")
+        self.status_lbl.setStyleSheet("color: #1976d2; font-style: italic;")
+        layout.addWidget(self.status_lbl)
+
+        # Table
+        self.tbl = QTableWidget(0, len(self.HEADERS))
+        self.tbl.setHorizontalHeaderLabels(self.HEADERS)
+        self.tbl.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeToContents)
+        self.tbl.horizontalHeader().setSectionResizeMode(
+            7, QHeaderView.Stretch)
+        for c in range(1, len(self.HEADERS)):
+            if c != 7:
+                self.tbl.horizontalHeader().setSectionResizeMode(
+                    c, QHeaderView.ResizeToContents)
+        self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSortingEnabled(True)
+        layout.addWidget(self.tbl, 1)
+
+        btn_row = QHBoxLayout()
+        export_btn = QPushButton("Export CSV")
+        export_btn.clicked.connect(self._export_csv)
+        close_btn  = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(export_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self.neg_fg  = QColor("#ef5350" if is_dark else "#c62828")
+        self.zero_fg = QColor("#66bb6a" if is_dark else "#2e7d32")
+        self.pos_fg  = QColor("#66bb6a" if is_dark else "#2e7d32")
+
+        # Store run data for background loading
+        self._block_runs = block_runs  # list of (blk, run_path, run_name, runtime, source)
+        self._rows_ready = []
+        QTimer.singleShot(100, self._start_loading)
+
+    def _start_loading(self):
+        """Launch MetricWorker for each block run sequentially via timer."""
+        self._pending = list(self._block_runs)
+        self._load_next()
+
+    def _load_next(self):
+        if not self._pending:
+            self.status_lbl.setText(
+                "Done. " + str(self.tbl.rowCount()) + " blocks loaded.")
+            return
+        blk, run_path, run_name, runtime, source = self._pending.pop(0)
+        self.status_lbl.setText(
+            "Loading " + blk + "... (" +
+            str(len(self._block_runs) - len(self._pending)) +
+            "/" + str(len(self._block_runs)) + ")")
+        from workers import MetricWorker
+        w = MetricWorker(run_path, blk, "FE", source)
+        w.finished.connect(
+            lambda m, b=blk, rn=run_name, rt=runtime: self._on_row_done(b, rn, rt, m))
+        w.start()
+        self._active_worker = w
+
+    def _on_row_done(self, blk, run_name, runtime, metrics):
+        self._add_row(blk, run_name, runtime, metrics)
+        QTimer.singleShot(50, self._load_next)
+
+    def _add_row(self, blk, run_name, runtime, metrics):
+        area  = metrics.get("area", {})
+        cong  = metrics.get("congestion", {})
+
+        def _v(*keys):
+            for k in keys:
+                v = area.get(k) or metrics.get(k)
+                if v and str(v).strip() not in ("-", ""):
+                    return str(v)
+            return "-"
+
+        # MBIT
+        mbit = _v("mbit") or metrics.get("mbit", "-")
+        if mbit != "-" and not mbit.endswith("%"):
+            try:
+                mbit = f"{float(mbit):.2f}%"
+            except Exception:
+                pass
+
+        # CGC
+        cgc = metrics.get("cgc_pct", "-")
+        if cgc != "-" and not cgc.endswith("%"):
+            cgc = cgc + "%"
+
+        # Instance count
+        inst = _v("instance_count", "total_count")
+
+        # Std Area
+        std_area = _v("std_cell_area_total", "std_cell_area")
+
+        # Gate count (approx: std_area / 0.2419 from Image 2 header)
+        try:
+            gc = f"{float(std_area) / 0.2419:.0f}"
+        except Exception:
+            gc = "-"
+
+        # VTH
+        vth      = area.get("vth", {})
+        lvt_area = vth.get("LVT", {}).get("area", "-")
+        rvt_area = vth.get("RVT", {}).get("area", "-")
+        hvt_area = vth.get("HVT", {}).get("area", "-")
+        vth_str  = f"{lvt_area}/{rvt_area}/{hvt_area}"
+
+        # Timing
+        wns = metrics.get("worst_wns", "-")
+        tns = metrics.get("worst_tns", "-")
+        nvp = metrics.get("worst_nvp", "-")
+        timing_str = f"{wns}/{tns}/{nvp}"
+
+        vals = [blk, mbit, cgc, inst, std_area, gc,
+                vth_str, timing_str, runtime, run_name]
+
+        self.tbl.setSortingEnabled(False)
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+
+        for c, val in enumerate(vals):
+            item = QTableWidgetItem(str(val) if val else "-")
+            item.setTextAlignment(Qt.AlignCenter)
+            if c == 0:
+                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                f2 = item.font(); f2.setBold(True); item.setFont(f2)
+            if c == 7:  # timing
+                try:
+                    wv = float(str(val).split("/")[0])
+                    if wv < 0:
+                        item.setForeground(self.neg_fg)
+                    elif wv == 0.0:
+                        item.setForeground(self.zero_fg)
+                    else:
+                        item.setForeground(self.pos_fg)
+                except Exception:
+                    pass
+            self.tbl.setItem(r, c, item)
+
+        self.tbl.setSortingEnabled(True)
+
+    def _export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Block Summary", "block_summary.csv",
+            "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            import csv as _csv
+            with open(path, "w", newline="") as f:
+                w = _csv.writer(f)
+                hdrs = [self.tbl.horizontalHeaderItem(c).text().replace("\n", " ")
+                        for c in range(self.tbl.columnCount())]
+                w.writerow(hdrs)
+                for r in range(self.tbl.rowCount()):
+                    row = [self.tbl.item(r, c).text()
+                           if self.tbl.item(r, c) else ""
+                           for c in range(self.tbl.columnCount())]
+                    w.writerow(row)
+            QMessageBox.information(self, "Export", "Saved to " + path)
+        except Exception as e:
+            QMessageBox.warning(self, "Export Error", str(e))
+
 
 class PDDashboard(QMainWindow):
 
@@ -1541,6 +1719,8 @@ class PDDashboard(QMainWindow):
         self.actions_menu.addAction("Calculate All Run Sizes", self.calculate_all_sizes)
         self.actions_menu.addAction("Export to CSV",           self.export_csv)
         self.actions_menu.addAction("Compare QoR",             self.run_qor_comparison)
+        self.actions_menu.addSeparator()
+        self.actions_menu.addAction("Block Summary Table",     self.open_block_summary)
         self.actions_menu.addSeparator()
 
         mail_menu = self.actions_menu.addMenu("Send Mail...")
@@ -3672,6 +3852,43 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CSV EXPORT
     # ------------------------------------------------------------------
+    def open_block_summary(self):
+        """Open BlockSummaryDialog for current RTL/view."""
+        # Collect latest completed FE run per block from current tree view
+        block_runs = []
+        seen_blocks = set()
+        root = self.tree.invisibleRootItem()
+
+        def _collect(node):
+            nt = node.data(0, Qt.UserRole)
+            if nt not in ("BLOCK","MILESTONE","RTL","IGNORED_ROOT",
+                          "STAGE","__PLACEHOLDER__") and node.text(3) == "COMPLETED":
+                blk  = node.data(0, Qt.UserRole + 2)
+                path = node.text(15)
+                name = node.text(0)
+                rt   = node.text(12)
+                src  = node.text(2)
+                if blk and blk not in seen_blocks and path and path != "N/A":
+                    seen_blocks.add(blk)
+                    block_runs.append((blk, path, name, rt, src))
+            for i in range(node.childCount()):
+                _collect(node.child(i))
+        _collect(root)
+
+        if not block_runs:
+            QMessageBox.information(
+                self, "Block Summary",
+                "No completed FE runs visible in current view.\n"
+                "Select an RTL release and make sure completed runs are shown.")
+            return
+
+        rtl_label = self.rel_combo.currentText()
+        dark = (self.is_dark_mode
+                or (self.use_custom_colors
+                    and self.custom_bg_color < "#888888"))
+        dlg = BlockSummaryDialog(rtl_label, block_runs, dark, self)
+        dlg.exec_()
+
     def export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
             self, "Export to CSV", "dashboard_export.csv",
