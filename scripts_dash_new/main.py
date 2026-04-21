@@ -1255,6 +1255,66 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # PIN ICONS -- apply/refresh without full rebuild
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # ON-DEMAND METRIC EXTRACTION (MetricWorker)
+    # ------------------------------------------------------------------
+    def _launch_metric_worker(self, item):
+        """Start MetricWorker for the selected run or stage item.
+        Shows a progress dialog while running, then opens QoRSummaryDialog."""
+        run_path  = item.text(15)
+        run_name  = item.text(0)
+        is_stage  = item.data(0, Qt.UserRole) == "STAGE"
+        source    = item.text(2)
+        dark      = (self.is_dark_mode
+                     or (self.use_custom_colors
+                         and self.custom_bg_color < "#888888"))
+
+        if not run_path or run_path == "N/A":
+            QMessageBox.information(
+                self, "QoR Summary", "No path available for this item.")
+            return
+
+        if is_stage:
+            stage_name = item.text(0)
+            # run_path for stage is the stage dir -- we need BE run dir
+            parent = item.parent()
+            be_run_path = parent.text(15) if parent else run_path
+            run_type = "BE"
+            actual_path = be_run_path
+        else:
+            stage_name  = None
+            run_type    = "FE"
+            actual_path = run_path
+
+        # Show progress indicator in status bar
+        self.status_bar.showMessage(
+            f"Extracting QoR metrics for {run_name}...")
+        self.setEnabled(False)
+
+        self._metric_worker = MetricWorker(
+            actual_path, item.data(0, Qt.UserRole + 2) or "",
+            run_type, source, stage_name)
+        self._metric_item_name = run_name
+        self._metric_dark      = dark
+        self._metric_worker.finished.connect(self._on_metric_done)
+        self._metric_worker.start()
+
+    def _on_metric_done(self, metrics):
+        """Called when MetricWorker finishes -- show the summary dialog."""
+        self.setEnabled(True)
+        self.status_bar.clearMessage()
+
+        if "_error" in metrics:
+            err_msg = str(metrics.get("_error", "Unknown"))
+            QMessageBox.warning(
+                self, "QoR Summary",
+                "Error extracting metrics:\n" + err_msg)
+
+        dlg = QoRSummaryDialog(
+            self._metric_item_name, metrics,
+            self._metric_dark, self)
+        dlg.exec_()
+
     def _apply_pin_icons(self):
         """Walk all tree items and set/clear pin icons from self.user_pins.
         Called after any pin change so icons appear immediately."""
@@ -3008,8 +3068,6 @@ class PDDashboard(QMainWindow):
             child.setForeground(
                 2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
 
-        # Store metrics dict for QoR summary dialog
-        child.setData(0, Qt.UserRole + 10, run.get("metrics", {}))
         return child
 
     # ------------------------------------------------------------------
@@ -3054,8 +3112,7 @@ class PDDashboard(QMainWindow):
             s_item.setText(20, stage.get("sta_rpt_path",  "N/A"))
             s_item.setText(21, stage.get("qor_path",      "N/A"))
 
-            # Store stage metrics for QoR summary dialog
-            s_item.setData(0, Qt.UserRole + 10, stage.get("metrics", {}))
+
 
             self._apply_fm_color(s_item, 7, s_item.text(7))
             self._apply_fm_color(s_item, 8, s_item.text(8))
@@ -3427,16 +3484,9 @@ class PDDashboard(QMainWindow):
         if not res:
             return
 
-        # Show QoR Summary dialog
+        # Show QoR Summary -- launch MetricWorker on demand
         if qor_sum_act and res == qor_sum_act:
-            metrics = item.data(0, Qt.UserRole + 10) or {}
-            run_name = item.text(0)
-            dlg = QoRSummaryDialog(
-                run_name, metrics,
-                self.is_dark_mode or (self.use_custom_colors
-                                      and self.custom_bg_color < "#888888"),
-                self)
-            dlg.exec_()
+            self._launch_metric_worker(item)
             return
 
         # Handle copy actions
