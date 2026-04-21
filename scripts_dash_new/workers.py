@@ -1,16 +1,232 @@
 import os
-import glob
 import re
-import subprocess
+import glob
 import pwd
+import subprocess
 import concurrent.futures
+import threading
+import datetime
+import getpass
+
 from PyQt5.QtCore import QThread, pyqtSignal
-from config import *
-from utils import *
+
+try:
+    from metric_extract import extract_fe_metrics, extract_pnr_stage_metrics
+    _METRICS_AVAILABLE = True
+except ImportError:
+    _METRICS_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Lazy constant resolution -- these are defined in main.py at module level
+# and available in the process globals by the time workers are started.
+# ---------------------------------------------------------------------------
+def _g(name, default=""):
+    import builtins
+    return getattr(builtins, name,
+           globals().get(name, default))
+
+def _BASE_WS_FE():   return _g("_BASE_WS_FE()")
+def _BASE_WS_BE():   return _g("_BASE_WS_BE()")
+def _BASE_OUTFEED(): return _g("BASE_OUTFEED_DIR")
+def _BASE_IR():      return _g("_BASE_IR()", "")
+def _PROJECT():      return _g("_PROJECT()", "S5K2P5SP")
+def _PNR_TOOLS():    return _g("_PNR_TOOLS()", "fc innovus")
+
+
+# ---------------------------------------------------------------------------
+# Path / file utilities (self-contained copies so workers.py has no deps)
+# ---------------------------------------------------------------------------
+_path_cache      = {}
+_path_cache_lock = threading.Lock()
+
+def cached_exists(path):
+    with _path_cache_lock:
+        if path in _path_cache:
+            return _path_cache[path]
+    result = os.path.exists(path)
+    with _path_cache_lock:
+        _path_cache[path] = result
+    return result
+
+def clear_path_cache():
+    with _path_cache_lock:
+        _path_cache.clear()
+
+def prefetch_path_cache(paths):
+    unique = [p for p in set(paths) if p]
+    if not unique:
+        return
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(30, len(unique))) as ex:
+        results = list(ex.map(os.path.exists, unique))
+    with _path_cache_lock:
+        for p, r in zip(unique, results):
+            _path_cache[p] = r
+
+def get_owner(path):
+    if not path or not cached_exists(path):
+        return "Unknown"
+    try:
+        return pwd.getpwuid(os.stat(path).st_uid).pw_name
+    except Exception:
+        return "Unknown"
+
+def normalize_rtl(rtl_str):
+    pfx = _PROJECT()
+    if rtl_str and rtl_str.startswith("EVT"):
+        return f"{pfx}_{rtl_str}"
+    return rtl_str
+
+def get_milestone_label(rtl_str):
+    """Returns milestone string or None."""
+    _map = _g("_MILESTONE_MAP_GLOBAL", None)
+    if _map:
+        for tag, label in _map.items():
+            if tag in rtl_str:
+                return label
+    if "_ML1_" in rtl_str: return "INITIAL RELEASE"
+    if "_ML2_" in rtl_str: return "PRE-SVP"
+    if "_ML3_" in rtl_str: return "SVP"
+    if "_ML4_" in rtl_str: return "FFN"
+    return None
+
+def get_dynamic_evt_path(rtl_tag, block_name):
+    m = re.search(r"(EVT\d+_ML\d+_DEV\d+)", str(rtl_tag))
+    if not m:
+        return ""
+    return os.path.join(_BASE_OUTFEED(), block_name, m.group(1))
+
+def extract_rtl(run_dir):
+    f = glob.glob(os.path.join(
+        run_dir, "reports", "dump_variables.user_defined.*.rpt"))
+    if not f:
+        return "Unknown"
+    try:
+        with open(f[0], "r") as fh:
+            for line in fh:
+                m = re.search('\\s*all\\s*=\\s*"(.*?)"', line)
+                if m:
+                    return normalize_rtl(m.group(1))
+    except Exception:
+        pass
+    return "Unknown"
+
+def format_log_date(date_str):
+    m = re.search(
+        r"([A-Z][a-z]{2})\s+([A-Z][a-z]{2})\s+(\d+)\s+"
+        r"(\d{2}:\d{2}:\d{2})\s+(\d{4})", str(date_str))
+    if m:
+        return (f"{m.group(1)} {m.group(2)} {m.group(3)}, "
+                f"{m.group(5)} - {m.group(4)}")
+    return str(date_str).strip()
+
+def parse_runtime_rpt(file_path):
+    d = {"start": "N/A", "end": "N/A",
+         "runtime": "00h:00m:00s", "last_stage": "N/A"}
+    if not cached_exists(file_path):
+        return d
+    try:
+        with open(file_path, "r") as f:
+            for line in f:
+                if "TOTAL_START" in line and "Load :" in line:
+                    d["start"] = format_log_date(
+                        line.split("Load :")[-1].strip())
+                m = re.search(r"TimeStamp\s*:\s*(\S+)", line)
+                if m and m.group(1) not in ("TOTAL", "TOTAL_START"):
+                    d["last_stage"] = m.group(1)
+                if "TimeStamp : TOTAL" in line and "TOTAL_START" not in line:
+                    rt = re.search(
+                        r"Total\s*:\s*(\d+)h:(\d+)m:(\d+)s", line)
+                    if rt:
+                        d["runtime"] = (f"{int(rt.group(1)):02}h:"
+                                        f"{int(rt.group(2)):02}m:"
+                                        f"{int(rt.group(3)):02}s")
+                    if "Load :" in line:
+                        d["end"] = format_log_date(
+                            line.split("Load :")[-1].strip())
+    except Exception:
+        pass
+    return d
+
+def parse_pnr_runtime_rpt(file_path):
+    d = {"start": "N/A", "end": "N/A",
+         "runtime": "00h:00m:00s", "last_stage": "N/A"}
+    if not cached_exists(file_path):
+        return d
+    months = ["Jan","Feb","Mar","Apr","May","Jun",
+              "Jul","Aug","Sep","Oct","Nov","Dec"]
+    try:
+        first_ts = last_ts = final_time_str = None
+        with open(file_path, "r") as f:
+            for line in f:
+                ts = re.search(
+                    r"(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})", line)
+                tm = re.findall(
+                    r"(\d+)d:(\d+)h:(\d+)m:(\d+)s", line)
+                if ts and tm:
+                    if not first_ts:
+                        first_ts = ts
+                    last_ts = ts
+                    t = tm[1] if len(tm) > 1 else tm[0]
+                    d2, h2, mn, sc = map(int, t)
+                    final_time_str = (f"{d2*24+h2:02}h:"
+                                      f"{mn:02}m:{sc:02}s")
+        if first_ts:
+            y, mo, dy, H, M = first_ts.groups()
+            d["start"] = (f"{months[int(mo)-1]} {int(dy):02d}, "
+                           f"{y} - {H}:{M}")
+        if last_ts:
+            y, mo, dy, H, M = last_ts.groups()
+            d["end"] = (f"{months[int(mo)-1]} {int(dy):02d}, "
+                         f"{y} - {H}:{M}")
+        if final_time_str:
+            d["runtime"] = final_time_str
+    except Exception:
+        pass
+    return d
+
+def get_fm_info(report_path):
+    if not report_path or not cached_exists(report_path):
+        return "N/A"
+    try:
+        with open(report_path, "r") as f:
+            for line in f:
+                if "No failing compare points" in line:
+                    return "PASS"
+                m = re.search(r"(\d+)\s+Failing compare points", line)
+                if m:
+                    return f"{m.group(1)} FAILS"
+    except Exception:
+        pass
+    return "ERR"
+
+def get_vslp_info(report_path):
+    if not report_path or not cached_exists(report_path):
+        return "N/A"
+    try:
+        with open(report_path, "r") as f:
+            in_summary = False
+            for line in f:
+                if "Management Summary" in line:
+                    in_summary = True
+                    continue
+                if in_summary and line.strip().startswith("Total"):
+                    parts = line.strip().split()
+                    if len(parts) >= 3:
+                        return f"Error: {parts[1]}, Warning: {parts[2]}"
+                    break
+    except Exception:
+        pass
+    return "Not Found"
+try:
+    from metric_extract import extract_fe_metrics, extract_pnr_stage_metrics
+    _METRICS_AVAILABLE = True
+except ImportError:
+    _METRICS_AVAILABLE = False
 
 
 # ===========================================================================
-# BatchSizeWorker — calculates folder sizes for multiple items in background
+# BatchSizeWorker -- calculates folder sizes for multiple items in background
 # ===========================================================================
 class BatchSizeWorker(QThread):
     size_calculated = pyqtSignal(str, str)
@@ -71,7 +287,7 @@ class BatchSizeWorker(QThread):
 
 
 # ===========================================================================
-# SingleSizeWorker — calculates folder size for one item on demand
+# SingleSizeWorker -- calculates folder size for one item on demand
 # ===========================================================================
 class SingleSizeWorker(QThread):
     result = pyqtSignal(object, str)
@@ -123,7 +339,7 @@ class SingleSizeWorker(QThread):
 
 
 # ===========================================================================
-# DiskScannerWorker — scans workspace/outfeed disk usage in background
+# DiskScannerWorker -- scans workspace/outfeed disk usage in background
 # ===========================================================================
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
@@ -154,14 +370,18 @@ class DiskScannerWorker(QThread):
     def run(self):
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
 
-        outfeed_targets = glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*", "fc", "*"))
-        outfeed_targets.extend(glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*", "innovus", "*")))
+        # Structure A: outfeed/{BLOCK}/EVT*/fc/*
+        outfeed_targets = glob.glob(os.path.join(_BASE_OUTFEED(), "*", "EVT*", "fc", "*"))
+        outfeed_targets.extend(glob.glob(os.path.join(_BASE_OUTFEED(), "*", "EVT*", "innovus", "*")))
+        # Structure B: outfeed/{EVT_LABEL}/fc/run-name/run-name-FE
+        outfeed_targets.extend(glob.glob(os.path.join(_BASE_OUTFEED(), "*EVT*", "fc", "*")))
+        outfeed_targets.extend(glob.glob(os.path.join(_BASE_OUTFEED(), "*EVT*", "fc", "*", "*")))
         if not outfeed_targets:
-            outfeed_targets = glob.glob(os.path.join(BASE_OUTFEED_DIR, "*", "EVT*"))
+            outfeed_targets = glob.glob(os.path.join(_BASE_OUTFEED(), "*"))
 
         targets_map = {
-            "WS (FE)": glob.glob(os.path.join(BASE_WS_FE_DIR, "*")),
-            "WS (BE)": glob.glob(os.path.join(BASE_WS_BE_DIR, "*")),
+            "WS (FE)": glob.glob(os.path.join(_BASE_WS_FE(), "*")),
+            "WS (BE)": glob.glob(os.path.join(_BASE_WS_BE(), "*")),
             "OUTFEED":  outfeed_targets,
         }
 
@@ -197,21 +417,31 @@ class DiskScannerWorker(QThread):
 
 
 # ===========================================================================
-# ScannerWorker — main workspace/outfeed scanner
+# ScannerWorker -- main workspace/outfeed scanner
 # FIX 5: IR scan runs in PARALLEL with workspace scans via concurrent.futures
 # ===========================================================================
+def _find_report(rpt_dir, prefix, ext='.rpt'):
+    """Find report matching prefix.BLOCKNAME.TIMESTAMP.rpt using glob.
+    Report names like: check_timing.BLK_ISP2.20260416_1628.rpt
+    Returns the most recently modified match, or None."""
+    hits = glob.glob(os.path.join(rpt_dir, f"{prefix}.*{ext}"))
+    if hits:
+        return sorted(hits, key=os.path.getmtime)[-1]
+    return None
+
+
 class ScannerWorker(QThread):
     finished        = pyqtSignal(dict, dict, dict, dict)
     progress_update = pyqtSignal(int, int)
     status_update   = pyqtSignal(str)
 
     # -----------------------------------------------------------------------
-    # IR directory scanner — called as a parallel future inside run()
+    # IR directory scanner -- called as a parallel future inside run()
     # -----------------------------------------------------------------------
     def scan_ir_dir(self):
         ir_data    = {}
-        target_lef = f"{PROJECT_PREFIX}.lef.list"
-        ir_dirs    = BASE_IR_DIR.split()
+        target_lef = f"{_PROJECT()}.lef.list"
+        ir_dirs    = _BASE_IR().split()
 
         for ir_base in ir_dirs:
             if not os.path.exists(ir_base):
@@ -307,7 +537,7 @@ class ScannerWorker(QThread):
 
         for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
             ent_name = os.path.basename(ent_path)
-            if ws_base == BASE_WS_FE_DIR:
+            if ws_base == _BASE_WS_FE():
                 for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
                     tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
             if "fc" in tools_to_scan:
@@ -322,7 +552,7 @@ class ScannerWorker(QThread):
         return tasks, releases_found
 
     # -----------------------------------------------------------------------
-    # Main run — FIX 5: IR scan launched in parallel with workspace scans
+    # Main run -- FIX 5: IR scan launched in parallel with workspace scans
     # -----------------------------------------------------------------------
     def run(self):
         clear_path_cache()
@@ -333,13 +563,13 @@ class ScannerWorker(QThread):
         scan_stats = {"ws": 0, "outfeed": 0, "blocks": {}, "fc": 0, "innovus": 0}
 
         tasks          = []
-        tools_to_scan  = PNR_TOOL_NAMES.split()
+        tools_to_scan  = _PNR_TOOLS().split()
 
         # --- Workspace discovery (parallel) ---
         disc_max_w = min(20, (os.cpu_count() or 4) * 4)
         disc_futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=disc_max_w) as disc_ex:
-            for ws_base in [BASE_WS_FE_DIR, BASE_WS_BE_DIR]:
+            for ws_base in [_BASE_WS_FE(), _BASE_WS_BE()]:
                 if not os.path.exists(ws_base):
                     continue
                 try:
@@ -363,24 +593,64 @@ class ScannerWorker(QThread):
 
         # --- Outfeed discovery ---
         self.status_update.emit("Discovering OUTFEED directories...")
-        if os.path.exists(BASE_OUTFEED_DIR):
-            for ent_name in os.listdir(BASE_OUTFEED_DIR):
-                ent_path = os.path.join(BASE_OUTFEED_DIR, ent_name)
+        if os.path.exists(_BASE_OUTFEED()):
+            for ent_name in os.listdir(_BASE_OUTFEED()):
+                ent_path = os.path.join(_BASE_OUTFEED(), ent_name)
                 if not os.path.isdir(ent_path):
                     continue
-                for evt_dir in glob.glob(os.path.join(ent_path, "EVT*")):
-                    phys_evt = os.path.basename(evt_dir)
-                    for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
-                        tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
+
+                # Detect outfeed structure:
+                # Structure A: outfeed/{BLOCK}/{EVT_LABEL}/fc/.../run-FE
+                # Structure B: outfeed/{EVT_LABEL}/fc/run-name/run-name-FE
+                #              (your actual: S5K2P5SP_EVT0_ML4_DEV00/fc/run/run-FE)
+
+                # Structure A: ent_name is a block, look for EVT* subdirs
+                evt_dirs_a = glob.glob(os.path.join(ent_path, "EVT*"))
+
+                # Structure B: ent_name itself looks like an EVT label
+                # (contains EVT or matches PROJECT_EVT pattern)
+                import re as _re
+                is_evt_label = bool(_re.search(r"EVT\d+", ent_name))
+
+                if evt_dirs_a:
+                    # Structure A
+                    for evt_dir in evt_dirs_a:
+                        phys_evt = os.path.basename(evt_dir)
+                        blk_name = ent_name
+                        for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
+                            tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
+                        if "fc" in tools_to_scan:
+                            be_runs = (glob.glob(os.path.join(evt_dir, "fc", "*-BE")) +
+                                       glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE")))
+                            for rd in be_runs:
+                                tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                        if "innovus" in tools_to_scan:
+                            for rd in glob.glob(os.path.join(evt_dir, "innovus", "*")):
+                                if os.path.isdir(rd):
+                                    tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+
+                elif is_evt_label:
+                    # Structure B: outfeed/S5K2P5SP_EVT0_ML4_DEV00/fc/run-name/run-name-FE
+                    phys_evt = ent_name  # e.g. S5K2P5SP_EVT0_ML4_DEV00
+                    for rd in glob.glob(os.path.join(ent_path, "fc", "*", "*-FE")):
+                        # Block name: extract from run dir name
+                        # run-name-FE parent dir is the "run group" folder
+                        # We derive block from the run name itself later
+                        blk_name = "UNKNOWN"
+                        tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
+                    # Also check direct *-FE (no subdirectory level)
+                    for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
+                        blk_name = "UNKNOWN"
+                        tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
                     if "fc" in tools_to_scan:
-                        be_runs = (glob.glob(os.path.join(evt_dir, "fc", "*-BE")) +
-                                   glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE")))
+                        be_runs = (glob.glob(os.path.join(ent_path, "fc", "*-BE")) +
+                                   glob.glob(os.path.join(ent_path, "fc", "*", "*-BE")))
                         for rd in be_runs:
-                            tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                            tasks.append(("UNKNOWN", rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
                     if "innovus" in tools_to_scan:
-                        for rd in glob.glob(os.path.join(evt_dir, "innovus", "*")):
+                        for rd in glob.glob(os.path.join(ent_path, "innovus", "*")):
                             if os.path.isdir(rd):
-                                tasks.append((ent_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                                tasks.append(("UNKNOWN", rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
         # --- Prefetch path cache ---
         paths_to_prefetch = []
@@ -400,7 +670,7 @@ class ScannerWorker(QThread):
         self.status_update.emit("Processing run data and parsing reports...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
 
-            # FIX 5: submit IR scan immediately — runs alongside workspace processing
+            # FIX 5: submit IR scan immediately -- runs alongside workspace processing
             ir_future = executor.submit(self.scan_ir_dir)
 
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
@@ -434,12 +704,12 @@ class ScannerWorker(QThread):
                     pass
 
                 completed_tasks += 1
-                # Throttle UI updates — emit every 20 tasks to avoid flooding event loop
+                # Throttle UI updates -- emit every 20 tasks to avoid flooding event loop
                 if completed_tasks % 20 == 0 or completed_tasks == total_tasks:
                     self.progress_update.emit(completed_tasks, total_tasks)
                     self.status_update.emit(f"Processing runs... ({completed_tasks}/{total_tasks})")
 
-            # Collect IR results — usually already done by now since it ran in parallel
+            # Collect IR results -- usually already done by now since it ran in parallel
             try:
                 ir_data = ir_future.result()
             except:
@@ -455,7 +725,8 @@ class ScannerWorker(QThread):
         if source == "OUTFEED":
             rtl = self._resolve_outfeed_rtl(rd, phys_evt)
         else:
-            rtl = extract_rtl(rd) if run_type == "BE" else base_rtl
+            per_run_rtl = extract_rtl(rd)
+            rtl = per_run_rtl if (per_run_rtl and per_run_rtl != "Unknown") else base_rtl
             if rtl == "Unknown":
                 rtl = base_rtl
         return self._process_run(b_name, rd, parent_path, rtl, source, run_type)
@@ -472,6 +743,25 @@ class ScannerWorker(QThread):
         r_name       = os.path.basename(rd)
         clean_run    = r_name.replace("-FE", "").replace("-BE", "")
         clean_be_run = re.sub(r'^EVT\d+_ML\d+_DEV\d+(_syn\d+)?_', '', r_name)
+
+        # For OUTFEED Structure B, b_name may be "UNKNOWN"
+        # Try to derive it from the reports directory (cell_usage.summary.{BLOCK}.*.rpt)
+        if b_name == "UNKNOWN" and source == "OUTFEED":
+            rpt_dir = os.path.join(rd, "reports")
+            cu_hits = glob.glob(os.path.join(rpt_dir, "cell_usage.summary.*.rpt"))
+            if cu_hits:
+                # Filename: cell_usage.summary.BLK_ISP.20260416_1633.rpt
+                fname = os.path.basename(cu_hits[0])
+                parts = fname.split(".")
+                # parts[2] is the block name (BLK_ISP)
+                if len(parts) >= 4 and parts[2].startswith("BLK"):
+                    b_name = parts[2]
+            # Fallback: derive from run name prefix before milestone tag
+            if b_name == "UNKNOWN":
+                m_blk = re.search(r"(BLK_[A-Z0-9]+)", r_name.upper())
+                if m_blk:
+                    b_name = m_blk.group(1)
+
         evt_base     = get_dynamic_evt_path(rtl, b_name)
         owner        = get_owner(rd)
 
@@ -514,10 +804,16 @@ class ScannerWorker(QThread):
                     continue
 
                 if source == "WS":
+                    # WS PNR structure (from PnrFileDb in file.py):
+                    # reports -> {rd}/reports/{stage}/
+                    # log     -> {rd}/{stage}/logs/{stage}.log
+                    # stage_path -> {rd}/outputs/{stage}
                     rpt        = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
-                    log        = os.path.join(rd, "logs",    f"{step_name}.log")
+                    log        = os.path.join(rd, step_name, "logs",    f"{step_name}.log")
                     stage_path = os.path.join(rd, "outputs", step_name)
                 else:
+                    # OUTFEED PNR structure (s_dir = rd/step_name):
+                    # log -> {s_dir}/logs/{stage}.log
                     rpt        = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
                     log        = os.path.join(s_dir, "logs",    f"{step_name}.log")
                     stage_path = os.path.join(rd,    step_name)
@@ -546,6 +842,22 @@ class ScannerWorker(QThread):
                     "stage_path":    stage_path,
                 })
 
+        # Extract QoR metrics (FE: completed only; BE: per stage)
+        metrics = {}
+        if _METRICS_AVAILABLE:
+            try:
+                if run_type == "FE" and is_comp:
+                    metrics = extract_fe_metrics(rd, b_name)
+                elif run_type == "BE":
+                    for stg in stages:
+                        try:
+                            stg["metrics"] = extract_pnr_stage_metrics(
+                                rd, stg["name"], source)
+                        except Exception:
+                            stg["metrics"] = {}
+            except Exception:
+                pass
+
         return {
             "block":        b_name,
             "path":         rd,
@@ -565,6 +877,7 @@ class ScannerWorker(QThread):
             "fm_n_path":    fm_n,
             "fm_u_path":    fm_u,
             "vslp_rpt_path": vslp_rpt,
+            "metrics":      metrics,
         }
 
     def _map_release(self, data_obj, rtl_str, path):
@@ -578,3 +891,55 @@ class ScannerWorker(QThread):
                 data_obj["releases"][base] = []
             if path not in data_obj["releases"][base]:
                 data_obj["releases"][base].append(path)
+
+
+# ===========================================================================
+# QoR WORKER -- calls summary.py as subprocess, opens HTML output in Firefox
+# summary.py call signature: python3 summary.py <dir1> <dir2> ...
+# It auto-detects FE vs BE from directory names ("FE" or "BE" in path).
+# ===========================================================================
+class QoRWorker(QThread):
+    finished = pyqtSignal(str)  # emits path to HTML output file, or ""
+
+    def __init__(self, script_path, run_dirs, python_bin="python3.6"):
+        super().__init__()
+        self.script_path = script_path
+        self.run_dirs    = run_dirs
+        self.python_bin  = python_bin
+
+    def run(self):
+        try:
+            # summary.py outputs to qor_metrices/summary_<date>.html
+            # Run from the script's directory so relative paths work
+            script_dir = os.path.dirname(os.path.abspath(self.script_path))
+            cmd = [self.python_bin, self.script_path] + self.run_dirs
+            result = subprocess.run(
+                cmd,
+                cwd=script_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=300
+            )
+            output = result.stdout.decode("utf-8", errors="ignore")
+            # summary.py prints: [Info]: Refer to output html file: <path>
+            html_path = ""
+            for line in output.splitlines():
+                if "Refer to output html file" in line or ".html" in line:
+                    parts = line.split(":")
+                    for p in parts:
+                        p = p.strip()
+                        if p.endswith(".html"):
+                            html_path = p
+                            break
+                        if ".html" in p:
+                            idx = p.find(".html")
+                            html_path = p[:idx + 5].strip()
+                            break
+                if html_path:
+                    break
+            # If not absolute, make it relative to script_dir
+            if html_path and not os.path.isabs(html_path):
+                html_path = os.path.join(script_dir, html_path)
+            self.finished.emit(html_path if (html_path and os.path.exists(html_path)) else "")
+        except Exception as e:
+            self.finished.emit("")
