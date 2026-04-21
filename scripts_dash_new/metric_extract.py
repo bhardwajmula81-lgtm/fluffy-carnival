@@ -1,7 +1,8 @@
+# -*- coding: ascii -*-
 # metric_extract.py
-# Self-contained report parsers -- same logic as summary.py ecosystem.
-# No external deps: pure Python re + glob + os.
-# All regex from metric.py / prc.py / qor.py in the summary scripts.
+# Self-contained QoR metric parsers.
+# Reads same report files as summary.py -- no external dependencies.
+# Report naming: {prefix}.{BLOCK}.{TIMESTAMP}.rpt
 
 import os
 import re
@@ -13,11 +14,19 @@ import glob
 # ---------------------------------------------------------------------------
 
 def _find_rpt(rpt_dir, prefix, ext=".rpt"):
-    """Find latest report matching prefix.*.rpt (handles BLK+timestamp suffix)."""
+    """Find latest report matching prefix.*.rpt in rpt_dir.
+    Handles: cell_usage.summary.BLK_ISP2.20260416_1628.rpt
+             qor.BLK_ISP2.20260416_1628.rpt
+             report_power_info.mission.ssp_*.compile_opt.*.rpt
+    """
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
-    hits = (glob.glob(os.path.join(rpt_dir, prefix + ".*" + ext)) +
-            glob.glob(os.path.join(rpt_dir, prefix + ext)))
+    # Try with explicit ext
+    hits = glob.glob(os.path.join(rpt_dir, prefix + ".*" + ext))
+    if not hits:
+        # Try without assuming extension position
+        hits = glob.glob(os.path.join(rpt_dir, prefix + ".*"))
+        hits = [h for h in hits if not h.endswith(".log")]
     return sorted(hits, key=os.path.getmtime)[-1] if hits else None
 
 
@@ -31,427 +40,428 @@ def _read(path):
         return ""
 
 
+def _dash(val):
+    """Return '-' if val is empty/None, else val as string."""
+    if val is None or str(val).strip() in ("", "-"):
+        return "-"
+    return str(val).strip()
+
+
 # ---------------------------------------------------------------------------
-# AREA / UTILIZATION / VTH  (cell_usage.summary.{top}.*.rpt)
+# AREA / UTILIZATION / VTH
+# File: cell_usage.summary.{BLOCK}.{TIMESTAMP}.rpt
 # ---------------------------------------------------------------------------
-
-_A = {
-    "total_area":       re.compile(r"^Total cell area:\s+(\S+)", re.M),
-    "combinational":    re.compile(r"^Combinational area:\s+(\S+)", re.M),
-    "reg_area":         re.compile(r"^Noncombinational area:\s+(\S+)", re.M),
-    "macro_area":       re.compile(r"^Macro/Black Box area:\s+(\S+)", re.M),
-    "buf_area":         re.compile(r"^Buf/Inv area:\s+(\S+)", re.M),
-    "total_count":      re.compile(r"^Number of cells:\s+(\S+)", re.M),
-    "reg_count":        re.compile(r"^Number of sequential cells:\s+(\S+)", re.M),
-    "macro_count":      re.compile(r"^Number of macros/black boxes:\s+(\S+)", re.M),
-    "buf_count":        re.compile(r"^Number of buf/inv:\s+(\S+)", re.M),
-    "total_util":       re.compile(r"^\s*Total utilization\s*:\s*(\S+)", re.M),
-    "std_cell_util":    re.compile(r"^\s*Standard cell only utilization\s*:\s*(\S+)", re.M),
-    "memory_util":      re.compile(r"^\s*Memory utilization\s*:\s*(\S+)", re.M),
-    "core_area":        re.compile(r"^\s*core_area\s*:\s*(\S+)", re.M),
-    "std_cell_area":    re.compile(r"^\s*std_cell_area\s*:\s*(\S+)", re.M),
-    "memory_area":      re.compile(r"^\s*Memory\s+area\s*:\s*(\S+)", re.M),
-    "mbit":             re.compile(r"^Flip-flop cells banking ratio\s+(\S+)", re.M),
-}
-
-_VTH_HDR  = re.compile(r"Cell Usage by Vth", re.I)
-_VTH_ROW  = re.compile(
-    r"^\s*(\S+)\s+\|\s+([\d.]+)%\s+\|\s+(\d+)\s+\|\s+\S+\s+([\d.]+)%\s+(\d+)", re.M)
-
 
 def parse_cell_usage(path):
+    """Returns dict with area, util, vth keys matching Image 1 fields."""
     txt = _read(path)
     if not txt:
         return {}
     m = {}
-    for key, pat in _A.items():
+
+    pats = {
+        "total_area":            re.compile(r"^Total cell area:\s+(\S+)", re.M),
+        "std_cell_area":         re.compile(r"^Combinational area:\s+(\S+)", re.M),
+        "noncomb_area":          re.compile(r"^Noncombinational area:\s+(\S+)", re.M),
+        "macro_area":            re.compile(r"^Macro/Black Box area:\s+(\S+)", re.M),
+        "buf_area":              re.compile(r"^Buf/Inv area:\s+(\S+)", re.M),
+        "total_count":           re.compile(r"^Number of cells:\s+(\S+)", re.M),
+        "total_util":            re.compile(
+            r"^\s*Total utilization\s*:\s*(\S+)", re.M),
+        "std_cell_only_util":    re.compile(
+            r"^\s*Standard cell only utilization\s*:\s*(\S+)", re.M),
+        "memory_util":           re.compile(
+            r"^\s*Memory utilization\s*:\s*(\S+)", re.M),
+        "mbit":                  re.compile(
+            r"^Flip-flop cells banking ratio\s+(\S+)", re.M),
+    }
+    for key, pat in pats.items():
         hit = pat.search(txt)
         if hit:
             m[key] = hit.group(1).strip()
 
+    # Instance count and Gate count from utilization section
+    inst_hit = re.search(r"^\s*(\d+)\s+instances", txt, re.M)
+    if inst_hit:
+        m["instance_count"] = inst_hit.group(1)
+
+    # Std Cell Area = combinational + noncombinational (shown as "Std Cell Area" in HTML)
+    try:
+        sc = float(m.get("std_cell_area", 0)) + float(m.get("noncomb_area", 0))
+        m["std_cell_area_total"] = f"{sc:.4f}"
+    except Exception:
+        pass
+
+    # Memory area
+    mem_hit = re.search(r"^Memory utilization\s*:\s*\S+\s+\S+\s+(\S+)", txt, re.M)
+    if mem_hit:
+        m["memory_area"] = mem_hit.group(1)
+
     # VTH distribution
-    if _VTH_HDR.search(txt):
-        vth = {}
-        for row in _VTH_ROW.finditer(txt):
-            vth_name = row.group(1).split("_")[0]  # LVT / HVT / RVT
-            vth[vth_name] = {
-                "inst_pct": row.group(2),
-                "inst_cnt": row.group(3),
-                "area_pct": row.group(4),
-                "area_cnt": row.group(5),
-            }
-        if vth:
-            m["vth"] = vth
+    vth = {}
+    # Look for Cell Usage by Vth section
+    vth_section = re.search(r"Cell Usage by Vth(.*?)(?=^\s*$|\Z)",
+                             txt, re.M | re.S)
+    if vth_section:
+        vth_block = vth_section.group(1)
+        # Pattern: VTH_TYPE | inst_pct | count | area | area_pct | ...
+        vth_row = re.compile(
+            r"^\s*(\S+)\s+\|\s+(\S+)\s+\|\s+\d+\s+\|\s+\S+\s+(\S+)",
+            re.M)
+        for row in vth_row.finditer(vth_block):
+            vtype = row.group(1).split("_")[0]  # LVT, HVT, RVT etc
+            inst_pct = row.group(2)
+            area_pct = row.group(3)
+            vth[vtype] = {"inst": inst_pct, "area": area_pct}
+    if vth:
+        m["vth"] = vth
+
+    # CGC from check_timing or qor (set separately)
     return m
 
 
 # ---------------------------------------------------------------------------
-# CGC  (check_timing.{top}.*.rpt  or  qor.{top}.*.rpt)
+# QOR / TIMING
+# File: qor.{BLOCK}.{TIMESTAMP}.rpt
 # ---------------------------------------------------------------------------
 
-_CGC_RE     = re.compile(
-    r"Number of Gated registers\s+\|\s*(\d+)\s+\((\S+)\)", re.M)
-_TOOLCGC_RE = re.compile(
-    r"Number of Tool-Inserted Gated registers\s+\|\s*(\d+)\s+\((\S+)\)", re.M)
-
-
-def parse_cgc(path):
+def parse_qor_rpt(path):
+    """Returns dict with timing per scenario and misc QoR values.
+    Matches Image 1: R2R Setup WNS/TNS/NVP, R2R Hold WNS/TNS/NVP."""
     txt = _read(path)
+    if not txt:
+        return {}
     m = {}
-    hit = _CGC_RE.search(txt)
-    if hit:
-        m["cgc_count"] = hit.group(1)
-        m["cgc_ratio"] = hit.group(2)
-    hit = _TOOLCGC_RE.search(txt)
-    if hit:
-        m["tool_cgc_count"] = hit.group(1)
-        m["tool_cgc_ratio"] = hit.group(2)
+
+    # Tool version
+    tv = re.search(r"^Version:\s*(\S+)", txt, re.M)
+    if tv:
+        m["tool_version"] = tv.group(1)
+
+    # CGC ratio
+    cgc = re.search(
+        r"Number of Gated registers\s+\|?\s*\|\s*(\d+\s*\(\s*\S+\))", txt, re.M)
+    if cgc:
+        m["cgc"] = cgc.group(1).strip()
+    # Simpler CGC %
+    cgc2 = re.search(r"Number of Gated registers.*?(\d+\.\d+)%", txt, re.M)
+    if cgc2:
+        m["cgc_pct"] = cgc2.group(1)
+
+    # MBIT from qor.rpt
+    mbit = re.search(r"Flip-flop cells banking ratio\s+(\S+)", txt, re.M)
+    if mbit:
+        m["mbit"] = mbit.group(1)
+
+    # Parse timing blocks: scenario -> path_group -> {wns, tns, nvp}
+    scenarios = {}
+    lines = txt.splitlines()
+    n = len(lines)
+    i = 0
+    cur_scenario = "default"
+    cur_type = "setup"
+
+    # Regex patterns
+    scenario_re   = re.compile(r"^Scenario\s*[:\s]+['\"]?(\S+?)['\"]?\s*$")
+    setup_sec_re  = re.compile(r"^Setup violations\s*$")
+    hold_sec_re   = re.compile(r"^Hold violations\s*$")
+    grp_re        = re.compile(r"^Timing Path Group\s*[:\s]+['\"]?(\S+?)['\"]?\s*$")
+    wns_setup_re  = re.compile(r"^Worst Negative Slack\s*:\s*(\S+)")
+    wns_hold_re   = re.compile(r"^Worst Hold Violation\s*:\s*(\S+)")
+    tns_re        = re.compile(r"Total Negative Slack\s*:\s*(\S+)")
+    nvp_re        = re.compile(r"Number of Violating Paths\s*:\s*(\S+)")
+    no_viol_re    = re.compile(r"^No setup violations found")
+    global_set_re = re.compile(r"^report_global_timing\s+setup")
+    global_hld_re = re.compile(r"^report_global_timing\s+hold")
+
+    while i < n:
+        line = lines[i].rstrip()
+
+        sm = scenario_re.match(line)
+        if sm:
+            cur_scenario = sm.group(1)
+            if cur_scenario not in scenarios:
+                scenarios[cur_scenario] = {}
+            i += 1; continue
+
+        if setup_sec_re.match(line):
+            cur_type = "setup"; i += 1; continue
+        if hold_sec_re.match(line):
+            cur_type = "hold"; i += 1; continue
+
+        gm = grp_re.match(line)
+        if gm:
+            grp = gm.group(1)
+            wns = tns = nvp = "-"
+            for j in range(i + 1, min(i + 15, n)):
+                l = lines[j]
+                w = wns_setup_re.match(l) or wns_hold_re.match(l)
+                if w:
+                    wns = w.group(1)
+                t = tns_re.search(l)
+                if t:
+                    tns = t.group(1)
+                v = nvp_re.search(l)
+                if v:
+                    nvp = v.group(1)
+            key = grp + "/" + cur_type
+            if cur_scenario not in scenarios:
+                scenarios[cur_scenario] = {}
+            scenarios[cur_scenario][key] = {
+                "wns": wns, "tns": tns, "nvp": nvp}
+            i += 1; continue
+
+        if no_viol_re.match(line):
+            grp = "REG2REG"
+            key = grp + "/" + cur_type
+            if cur_scenario not in scenarios:
+                scenarios[cur_scenario] = {}
+            scenarios[cur_scenario][key] = {
+                "wns": "0.0000", "tns": "0.0000", "nvp": "0"}
+            i += 1; continue
+
+        # Global timing (REG2REG, IN2REG etc) for summary report
+        if global_set_re.match(line) or global_hld_re.match(line):
+            g_type = "setup" if "setup" in line else "hold"
+            cur_type = g_type
+
+        i += 1
+
+    if scenarios:
+        m["timing"] = scenarios
+
+    # Extract R2R setup/hold for Image 1 display
+    # Look for REG2REG in all scenarios
+    r2r_setup = r2r_hold = None
+    for sce, grps in scenarios.items():
+        for grp_key, vals in grps.items():
+            if "REG2REG" in grp_key and "setup" in grp_key:
+                w = vals.get("wns", "-")
+                t = vals.get("tns", "-")
+                v = vals.get("nvp", "-")
+                r2r_setup = f"{w}/{t}/{v}"
+            if "REG2REG" in grp_key and "hold" in grp_key:
+                w = vals.get("wns", "-")
+                t = vals.get("tns", "-")
+                v = vals.get("nvp", "-")
+                r2r_hold = f"{w}/{t}/{v}"
+    if r2r_setup:
+        m["r2r_setup"] = r2r_setup
+    if r2r_hold:
+        m["r2r_hold"] = r2r_hold
+
+    # Worst scenario timing (for Image 2 summary table)
+    worst_setup_wns = None
+    for sce, grps in scenarios.items():
+        for grp_key, vals in grps.items():
+            if "REG2REG" in grp_key and "setup" in grp_key:
+                try:
+                    wv = float(vals.get("wns", "0"))
+                    if worst_setup_wns is None or wv < worst_setup_wns:
+                        worst_setup_wns = wv
+                        m["worst_scenario"] = sce
+                        m["worst_wns"] = vals.get("wns", "-")
+                        m["worst_tns"] = vals.get("tns", "-")
+                        m["worst_nvp"] = vals.get("nvp", "-")
+                except Exception:
+                    pass
+
     return m
 
 
 # ---------------------------------------------------------------------------
-# CONGESTION  (clock_gating_info.mission.rpt or congestion.{top}.*.rpt)
+# CONGESTION
+# File: congestion.{BLOCK}.{TIMESTAMP}.rpt  OR
+#       clock_gating_info.mission.rpt
 # ---------------------------------------------------------------------------
-
-_CONG_BOTH = re.compile(
-    r"Both\s+Dirs\s*\|?\s*[\d.]+\s*\|\s*[\d.]+\s*\|\s*([\d.]+)\s*%", re.M)
-_CONG_H    = re.compile(
-    r"^H\s+routing\s*\|?\s*[\d.]+\s*\|\s*[\d.]+\s*\|\s*([\d.]+)\s*%", re.M)
-_CONG_V    = re.compile(
-    r"^V\s+routing\s*\|?\s*[\d.]+\s*\|\s*[\d.]+\s*\|\s*([\d.]+)\s*%", re.M)
-
 
 def parse_congestion(path):
     txt = _read(path)
     if not txt:
         return {}
     m = {}
-    hit = _CONG_BOTH.search(txt)
-    if hit: m["cong_both"] = hit.group(1) + "%"
-    hit = _CONG_H.search(txt)
-    if hit: m["cong_h"]    = hit.group(1) + "%"
-    hit = _CONG_V.search(txt)
-    if hit: m["cong_v"]    = hit.group(1) + "%"
+    both = re.search(r"Both Dirs.*?(\d+\.\d+)%.*?(\d+\.\d+)%.*?(\d+\.\d+)%",
+                     txt, re.S)
+    if both:
+        m["cong_both"] = both.group(1)
+        m["cong_v"]    = both.group(2)
+        m["cong_h"]    = both.group(3)
+    # Alt pattern
+    h = re.search(r"H routing.*?(\d+\.\d+)%", txt)
+    v = re.search(r"V routing.*?(\d+\.\d+)%", txt)
+    if h and "cong_h" not in m:
+        m["cong_h"] = h.group(1)
+    if v and "cong_v" not in m:
+        m["cong_v"] = v.group(1)
     return m
 
 
 # ---------------------------------------------------------------------------
-# QOR TIMING  (qor.{top}.*.rpt  or  {stage}.qor.rpt)
-# Parses per-scenario WNS/TNS/NVP for setup and hold
-# Logic mirrors qor.py in the summary ecosystem
+# POWER
+# File: report_power_info.mission.{SCENARIO}.compile_opt.{TIMESTAMP}.rpt
 # ---------------------------------------------------------------------------
 
-_SCN_RE    = re.compile(r"^Scenario\s*['\s:]+(\S+?)[']\s*$", re.M)
-_GRP_RE    = re.compile(r"^Timing Path Group\s*['\s:]+(\S+?)[']\s*$", re.M)
-_WNS_S_RE  = re.compile(r"Worst\s+Negative\s+Slack\s*:\s*([-\d.]+)", re.M)
-_WNS_H_RE  = re.compile(r"Worst\s+Hold\s+Violation\s*:\s*([-\d.]+)", re.M)
-_TNS_RE    = re.compile(r"Total\s+Negative\s+Slack\s*:\s*([-\d.]+)", re.M)
-_NVP_RE    = re.compile(r"Number\s+of\s+Violating\s+(?:Paths|Points)\s*:\s*(\d+)", re.M)
-_SETUP_SEC = re.compile(r"^Setup violations\s*$", re.M)
-_HOLD_SEC  = re.compile(r"^Hold violations\s*$", re.M)
-_NO_VIO    = re.compile(r"No setup violations found", re.M)
-_TOOLV_RE  = re.compile(r"^Version:\s*(\S+)", re.M)
+def parse_power(rpt_dir):
+    """Find power report -- handles the mission scenario naming."""
+    m = {}
+    # Pattern: report_power_info.mission.*.compile_opt.*.rpt
+    hits = glob.glob(os.path.join(
+        rpt_dir, "report_power_info.mission.*.rpt"))
+    if not hits:
+        hits = glob.glob(os.path.join(
+            rpt_dir, "report_power_info.*.rpt"))
+    if not hits:
+        return m
+    # Use most recently modified
+    path = sorted(hits, key=os.path.getmtime)[-1]
+    txt = _read(path)
+    if not txt:
+        return m
 
-# Global timing (report_global_timing section)
-_GSETUP_RE = re.compile(r"Setup violations\s*$.*?REG2REG.*?WNS\s*:\s*([-\d.]+)", re.S)
-_GHOLD_RE  = re.compile(r"Hold violations\s*$.*?REG2REG.*?WNS\s*:\s*([-\d.]+)", re.S)
+    dyn = re.search(
+        r"Total Dynamic Power\s*=\s*(\S+)\s*\((\w+)\)", txt)
+    if dyn:
+        try:
+            val  = float(dyn.group(1))
+            unit = dyn.group(2)
+            conv = {"uW": 1e-3, "nW": 1e-6, "mW": 1.0}
+            m["dynamic_mw"] = f"{val * conv.get(unit, 1.0):.4f}"
+        except Exception:
+            m["dynamic_mw"] = dyn.group(1)
+
+    leak = re.search(r"Cell Leakage Power\s*=\s*(\S+)\s*\((\w+)\)", txt)
+    if leak:
+        try:
+            val  = float(leak.group(1))
+            unit = leak.group(2)
+            conv = {"uW": 1e-3, "nW": 1e-6, "mW": 1.0}
+            m["leakage_mw"] = f"{val * conv.get(unit, 1.0):.4f}"
+        except Exception:
+            m["leakage_mw"] = leak.group(1)
+
+    # Scenario name from filename
+    fname = os.path.basename(path)
+    sce_m = re.search(r"report_power_info\.mission\.(.+?)\.compile_opt", fname)
+    if sce_m:
+        m["power_scenario"] = sce_m.group(1)
+    return m
 
 
-def parse_qor_rpt(path):
-    """Parse qor report. Returns dict with:
-      tool_version, timing{scenario: {grp/type: {wns,tns,nvp}}},
-      r2r_setup, r2r_hold, cgc_ratio, mbit"""
+# ---------------------------------------------------------------------------
+# DRC
+# ---------------------------------------------------------------------------
+
+def parse_drc_from_log(log_path):
+    count = 0
+    txt = _read(log_path)
+    if not txt:
+        return "-"
+    for line in txt.splitlines():
+        if line.startswith("Error:"):
+            count += 1
+    return str(count) if count > 0 else "0"
+
+
+def parse_pnr_drc(rpt_dir, stage):
+    path = _find_rpt(rpt_dir, stage + ".physical_all_sum")
+    if not path:
+        path = _find_rpt(rpt_dir, stage + ".drc")
     txt = _read(path)
     if not txt:
         return {}
     m = {}
-
-    hit = _TOOLV_RE.search(txt)
-    if hit: m["tool_version"] = hit.group(1)
-
-    # CGC / MBIT from qor.rpt
-    cgc = parse_cgc(path)
-    m.update(cgc)
-    mbit_hit = re.search(r"Flip-flop cells banking ratio\s+([\d.]+)", txt, re.M)
-    if mbit_hit: m["mbit"] = mbit_hit.group(1)
-
-    # Parse timing blocks
-    # Strategy: split by "Scenario" lines, parse each block
-    scenarios = {}
-    lines = txt.splitlines()
-    n = len(lines)
-    i = 0
-    cur_scn  = "default"
-    cur_grp  = "REG2REG"
-    cur_type = "setup"   # setup | hold
-
-    while i < n:
-        line = lines[i].rstrip()
-
-        # Scenario header
-        sm = re.match(r"^Scenario\s+'([^']+)'", line)
-        if sm:
-            cur_scn = sm.group(1)
-            if cur_scn not in scenarios:
-                scenarios[cur_scn] = {}
-            i += 1; continue
-
-        # Section type
-        if re.match(r"^Setup violations\s*$", line):
-            cur_type = "setup"; i += 1; continue
-        if re.match(r"^Hold violations\s*$", line):
-            cur_type = "hold"; i += 1; continue
-
-        # No violation
-        if re.match(r"No setup violations found", line):
-            key = f"{cur_grp}/{cur_type}"
-            scenarios.setdefault(cur_scn, {})[key] = {
-                "wns": "0.000", "tns": "0.000", "nvp": "0"}
-            i += 1; continue
-
-        # Timing Path Group
-        gm = re.match(r"^Timing Path Group\s+'([^']+)'", line)
-        if gm:
-            cur_grp = gm.group(1)
-            # Scan ahead up to 12 lines for WNS/TNS/NVP
-            wns = tns = nvp = "-"
-            for j in range(i + 1, min(i + 12, n)):
-                l2 = lines[j]
-                if re.search(r"Worst Negative Slack", l2):
-                    hit2 = re.search(r"([-\d.]+)\s*$", l2)
-                    if hit2: wns = hit2.group(1)
-                if re.search(r"Worst Hold Violation", l2):
-                    hit2 = re.search(r"([-\d.]+)\s*$", l2)
-                    if hit2: wns = hit2.group(1)
-                if re.search(r"Total Negative Slack", l2):
-                    hit2 = re.search(r"([-\d.]+)\s*$", l2)
-                    if hit2: tns = hit2.group(1)
-                if re.search(r"Number of Violating", l2):
-                    hit2 = re.search(r"(\d+)\s*$", l2)
-                    if hit2: nvp = hit2.group(1)
-            key = f"{cur_grp}/{cur_type}"
-            scenarios.setdefault(cur_scn, {})[key] = {
-                "wns": wns, "tns": tns, "nvp": nvp}
-            i += 1; continue
-
-        i += 1
-
-    if scenarios:
-        m["timing"] = scenarios
-        # Extract summary R2R setup/hold (worst across all scenarios)
-        all_wns_s = []
-        all_wns_h = []
-        for scn_data in scenarios.values():
-            for key, td in scn_data.items():
-                try:
-                    v = float(td["wns"])
-                    if "setup" in key: all_wns_s.append(v)
-                    if "hold"  in key: all_wns_h.append(v)
-                except Exception:
-                    pass
-        if all_wns_s: m["r2r_wns_setup"] = f"{min(all_wns_s):.4f}"
-        if all_wns_h: m["r2r_wns_hold"]  = f"{min(all_wns_h):.4f}"
-
-        # TNS summary
-        all_tns = []
-        for scn_data in scenarios.values():
-            for key, td in scn_data.items():
-                if "setup" in key:
-                    try: all_tns.append(float(td["tns"]))
-                    except Exception: pass
-        if all_tns: m["r2r_tns_setup"] = f"{sum(all_tns):.4f}"
-
+    hit = re.search(r"Total number of DRCs\s*=\s*(\d+)", txt)
+    if hit:
+        m["drc_count"] = hit.group(1)
+    hit = re.search(r"Short\s*=?\s*(\d+)", txt)
+    if hit:
+        m["shorts"] = hit.group(1)
     return m
 
 
 # ---------------------------------------------------------------------------
-# DRC  (compile_opt.log  or  {stage}.physical_all_sum)
-# ---------------------------------------------------------------------------
-
-def parse_drc_from_log(log_path):
-    txt = _read(log_path)
-    if not txt: return "-"
-    count = sum(1 for l in txt.splitlines() if l.startswith("Error:"))
-    return str(count)
-
-
-def parse_pnr_drc(rpt_dir, stage):
-    """Parse physical DRC from stage reports."""
-    m = {}
-    # Try multiple file patterns
-    for prefix in (f"{stage}.physical_all_sum", f"{stage}.drc",
-                   "physical_all_sum", "drc"):
-        path = _find_rpt(rpt_dir, prefix) or _find_rpt(rpt_dir, prefix, "")
-        txt  = _read(path)
-        if not txt: continue
-        hit = re.search(r"Total number of DRCs\s*=\s*(\d+)", txt)
-        if hit: m["drc_count"] = hit.group(1)
-        hit = re.search(r"Short\s*[s]?\s*=\s*(\d+)", txt, re.I)
-        if hit: m["shorts"] = hit.group(1)
-        if m: break
-    return m
-
-
-# ---------------------------------------------------------------------------
-# POWER  (report_power_info.ff.rpt  /  report_power_info.ss.rpt)
-# ---------------------------------------------------------------------------
-
-_DPOWER_RE = re.compile(
-    r"Total Dynamic Power\s*=\s*([\d.]+)\s*\((\w+)\)", re.M)
-_LPOWER_RE = re.compile(
-    r"Cell Leakage Power\s*=\s*([\d.]+)\s*\((\w+)\)", re.M)
-
-
-def _to_mw(val, unit):
-    try:
-        v = float(val)
-        return v * {"uW": 1e-3, "nW": 1e-6, "mW": 1.0}.get(unit, 1.0)
-    except Exception:
-        return None
-
-
-def parse_power(rpt_dir):
-    m = {}
-    for fname, dkey, lkey in [
-            ("report_power_info.ff", "dynamic_mw", None),
-            ("report_power_info.ss", None, "leakage_mw")]:
-        path = _find_rpt(rpt_dir, fname)
-        txt  = _read(path)
-        if not txt: continue
-        if dkey:
-            hit = _DPOWER_RE.search(txt)
-            if hit:
-                v = _to_mw(hit.group(1), hit.group(2))
-                if v is not None: m[dkey] = f"{v:.3f} mW"
-        if lkey:
-            hit = _LPOWER_RE.search(txt)
-            if hit:
-                v = _to_mw(hit.group(1), hit.group(2))
-                if v is not None: m[lkey] = f"{v:.3f} mW"
-    return m
-
-
-# ---------------------------------------------------------------------------
-# SAIF ANNOTATION  (report_power_info.ff.rpt)
-# ---------------------------------------------------------------------------
-
-def parse_saif(rpt_dir):
-    for fname in ("report_power_info.ff", "report_power_info"):
-        path = _find_rpt(rpt_dir, fname)
-        txt  = _read(path)
-        if not txt: continue
-        hit = re.search(r"seq\s*:\s*([\d.]+)%", txt, re.I)
-        if hit: return {"saif_seq": hit.group(1) + "%"}
-        hit = re.search(r"port\s*:\s*([\d.]+)%", txt, re.I)
-        if hit: return {"saif_port": hit.group(1) + "%"}
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# RUNTIME  (already in workers.py -- just re-exported here for completeness)
-# ---------------------------------------------------------------------------
-
-def parse_runtime(rpt_dir):
-    """Extract total runtime string from runtime.V2.rpt."""
-    path = os.path.join(rpt_dir, "..", "reports", "runtime.V2.rpt")
-    if not os.path.exists(path):
-        path = os.path.join(rpt_dir, "reports", "runtime.V2.rpt")
-    txt = _read(path)
-    if not txt: return "-"
-    hit = re.search(
-        r"TimeStamp\s*:\s*TOTAL\b.*?Total\s*:\s*(\d+h:\d+m:\d+s)", txt, re.S)
-    return hit.group(1) if hit else "-"
-
-
-# ---------------------------------------------------------------------------
-# MAIN: extract_fe_metrics(run_dir, block_name)
+# MAIN ENTRY POINTS
 # ---------------------------------------------------------------------------
 
 def extract_fe_metrics(run_dir, block_name):
-    """Extract all FE/synth metrics for a completed run.
-    run_dir  = absolute path to the *-FE directory
-    Returns flat dict of all metrics."""
+    """Extract all FE synthesis metrics for a completed run.
+    Called on-demand (MetricWorker) -- NOT during scan."""
     rpt_dir = os.path.join(run_dir, "reports")
-    result  = {}
+    result  = {
+        "block":   block_name,
+        "run_dir": run_dir,
+        "run_name": os.path.basename(run_dir),
+    }
 
-    # -- Area / Util / VTH  (cell_usage.summary.BLK.*.rpt) --
-    cu = _find_rpt(rpt_dir, "cell_usage.summary")
-    if cu:
-        result.update(parse_cell_usage(cu))
+    # Area + util + VTH
+    cu_path = _find_rpt(rpt_dir, "cell_usage.summary")
+    if cu_path:
+        area_data = parse_cell_usage(cu_path)
+        result["area"] = area_data
+    else:
+        result["area"] = {}
 
-    # -- Timing QoR  (qor.BLK.*.rpt) --
-    qr = _find_rpt(rpt_dir, "qor")
-    if qr:
-        result.update(parse_qor_rpt(qr))
+    # Timing (qor.{BLOCK}.{TIMESTAMP}.rpt)
+    qor_path = _find_rpt(rpt_dir, "qor")
+    if qor_path:
+        qor_data = parse_qor_rpt(qor_path)
+        result["timing_raw"] = qor_data
+        # R2R for display
+        result["r2r_setup"] = qor_data.get("r2r_setup", "-")
+        result["r2r_hold"]  = qor_data.get("r2r_hold",  "-")
+        result["mbit"]      = qor_data.get("mbit", result["area"].get("mbit", "-"))
+        result["cgc_pct"]   = qor_data.get("cgc_pct", "-")
+        result["worst_scenario"] = qor_data.get("worst_scenario", "-")
+        result["worst_wns"]      = qor_data.get("worst_wns", "-")
+        result["worst_tns"]      = qor_data.get("worst_tns", "-")
+        result["worst_nvp"]      = qor_data.get("worst_nvp", "-")
+    else:
+        result["r2r_setup"] = "-"
+        result["r2r_hold"]  = "-"
+        result["mbit"]      = "-"
+        result["cgc_pct"]   = "-"
 
-    # -- CGC ratio  (check_timing.BLK.*.rpt) --
-    ct = _find_rpt(rpt_dir, "check_timing")
-    if ct:
-        result.update(parse_cgc(ct))
+    # Congestion
+    cong_path = _find_rpt(rpt_dir, "congestion")
+    if not cong_path:
+        cong_path = _find_rpt(rpt_dir, "clock_gating_info.mission")
+    if cong_path:
+        result["congestion"] = parse_congestion(cong_path)
+    else:
+        result["congestion"] = {}
 
-    # -- Congestion  (clock_gating_info.mission.rpt) --
-    cg = os.path.join(rpt_dir, "clock_gating_info.mission.rpt")
-    if not os.path.exists(cg):
-        cg = _find_rpt(rpt_dir, "congestion")
-    cong = parse_congestion(cg) if cg else {}
-    result.update(cong)
+    # Power (mission scenario report)
+    result["power"] = parse_power(rpt_dir)
 
-    # -- DRC from log --
+    # DRC from compile log
     log = os.path.join(run_dir, "logs", "compile_opt.log")
     result["drc_errors"] = parse_drc_from_log(log)
-
-    # -- Power --
-    result.update(parse_power(rpt_dir))
-
-    # -- SAIF --
-    result.update(parse_saif(rpt_dir))
 
     return result
 
 
-# ---------------------------------------------------------------------------
-# MAIN: extract_pnr_stage_metrics(run_dir, stage_name, source)
-# ---------------------------------------------------------------------------
-
 def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
-    """Extract metrics for one PNR stage.
-    run_dir    = BE run directory
-    stage_name = e.g. place_opt, route_opt, clock_opt_psyn
-    source     = WS or OUTFEED"""
-    result = {}
-
-    # Report dir path differs by source
+    """Extract PNR stage metrics on demand."""
+    result = {"stage": stage_name, "run_dir": run_dir}
     if source == "WS":
         rpt_dir = os.path.join(run_dir, "reports", stage_name)
     else:
         rpt_dir = os.path.join(run_dir, stage_name, "reports", stage_name)
 
-    # -- Timing QoR  ({stage}.qor.rpt) --
-    qr = _find_rpt(rpt_dir, f"{stage_name}.qor")
-    if not qr:
-        qr = _find_rpt(rpt_dir, "qor")
-    if qr:
-        result.update(parse_qor_rpt(qr))
+    qor_path = _find_rpt(rpt_dir, stage_name + ".qor")
+    if not qor_path:
+        qor_path = _find_rpt(rpt_dir, "qor")
+    if qor_path:
+        qor_data = parse_qor_rpt(qor_path)
+        result["timing_raw"] = qor_data
+        result["r2r_setup"]  = qor_data.get("r2r_setup", "-")
+        result["r2r_hold"]   = qor_data.get("r2r_hold",  "-")
 
-    # -- Global timing summary  ({stage}.qor_sum.rpt) --
-    qsum = _find_rpt(rpt_dir, f"{stage_name}.qor_sum")
-    if qsum:
-        qs = parse_qor_rpt(qsum)
-        # prefix keys so they don't overwrite per-scenario data
-        for k, v in qs.items():
-            result[f"global_{k}"] = v
+    result["drc"] = parse_pnr_drc(rpt_dir, stage_name)
 
-    # -- DRC physical --
-    result.update(parse_pnr_drc(rpt_dir, stage_name))
-
-    # -- Area  ({stage}.qor.rpt also has area in PNR) --
-    # qor_area from cell utilization in pnr qor
-    cu = _find_rpt(rpt_dir, f"{stage_name}.physical_all_sum")
-    if cu:
-        txt = _read(cu)
-        hit = re.search(r"Total\s+cell\s+area\s*:\s*([\d.]+)", txt)
-        if hit: result["total_area"] = hit.group(1)
-        hit = re.search(r"Standard\s+cell\s+only.*?:\s*([\d.]+)", txt, re.S)
-        if hit: result["std_cell_area"] = hit.group(1)
+    # Area from qor_area report
+    qa_path = _find_rpt(rpt_dir, stage_name + ".qor_sum")
+    if qa_path:
+        result["area"] = parse_qor_rpt(qa_path)
 
     return result
