@@ -192,8 +192,16 @@ def _send_mail_via_util(dlg):
     except Exception as e:
         QMessageBox.warning(None, "Mail Error", str(e))
 
-from config import *
-from utils import *
+# config.py and utils.py: if you have your own versions, they will be imported.
+# All constants and utilities are also defined self-contained in this file.
+try:
+    from config import *
+except ImportError:
+    pass
+try:
+    from utils import *
+except ImportError:
+    pass
 from workers import *
 from widgets import *
 # dialogs inlined directly in main.py
@@ -821,6 +829,56 @@ class QoRSummaryDialog(QDialog):
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
+
+
+
+# ---------------------------------------------------------------------------
+# QoRWorker -- inline here so it is always available even if workers.py
+# import has issues
+# ---------------------------------------------------------------------------
+class QoRWorker(QThread):
+    finished = pyqtSignal(str)
+
+    def __init__(self, script_path, run_dirs, python_bin="python3.6"):
+        super().__init__()
+        self.script_path = script_path
+        self.run_dirs    = run_dirs
+        self.python_bin  = python_bin
+
+    def run(self):
+        try:
+            script_dir = os.path.dirname(os.path.abspath(self.script_path))
+            cmd = [self.python_bin, self.script_path] + self.run_dirs
+            result = subprocess.run(
+                cmd, cwd=script_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=600)
+            output = result.stdout.decode("utf-8", errors="ignore")
+            html_path = ""
+            for line in output.splitlines():
+                if ".html" in line:
+                    for part in line.split():
+                        if part.endswith(".html"):
+                            html_path = part
+                            break
+                    if html_path:
+                        break
+            if html_path and not os.path.isabs(html_path):
+                html_path = os.path.join(script_dir, html_path)
+            # Also search qor_metrices/ in script dir
+            if not html_path or not os.path.exists(html_path):
+                import glob as _g
+                hits = _g.glob(os.path.join(
+                    script_dir, "qor_metrices", "**", "*.html"),
+                    recursive=True)
+                if hits:
+                    html_path = sorted(hits, key=os.path.getmtime)[-1]
+            self.finished.emit(
+                html_path if (html_path and os.path.exists(html_path))
+                else "")
+        except Exception:
+            self.finished.emit("")
 
 class PDDashboard(QMainWindow):
 
