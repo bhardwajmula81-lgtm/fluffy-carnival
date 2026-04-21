@@ -522,3 +522,123 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
         result["drc"] = drc
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# STANDALONE DEBUG -- run this file directly to diagnose a run:
+# python3.6 metric_extract.py /path/to/run-FE BLK_ISP2
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Usage: python3.6 metric_extract.py /path/to/run-FE [BLOCK_NAME]")
+        sys.exit(1)
+
+    run_dir    = sys.argv[1]
+    block_name = sys.argv[2] if len(sys.argv) > 2 else "UNKNOWN"
+    rpt_dir    = os.path.join(run_dir, "reports")
+
+    print("=" * 60)
+    print(f"run_dir : {run_dir}")
+    print(f"rpt_dir : {rpt_dir}")
+    print(f"block   : {block_name}")
+    print("=" * 60)
+
+    # Check rpt_dir exists
+    if not os.path.isdir(rpt_dir):
+        print(f"ERROR: rpt_dir does not exist: {rpt_dir}")
+        sys.exit(1)
+
+    # Show all .rpt files found
+    all_rpts = glob.glob(os.path.join(rpt_dir, "*.rpt"))
+    print(f"\nAll .rpt files in rpt_dir ({len(all_rpts)} found):")
+    for r in sorted(all_rpts):
+        print(f"  {os.path.basename(r)}")
+
+    print()
+
+    # Check each expected file
+    checks = [
+        ("cell_usage.summary", "AREA/UTIL/VTH/MBIT"),
+        ("qor",                "TIMING WNS/TNS/NVP"),
+        ("check_timing",       "CGC RATIO"),
+        ("congestion",         "CONGESTION"),
+        ("clock_gating_info.mission", "CONGESTION (fallback)"),
+        ("report_power_info.mission", "POWER"),
+    ]
+    found_files = {}
+    for prefix, desc in checks:
+        hit = _find_rpt(rpt_dir, prefix)
+        status = f"FOUND: {os.path.basename(hit)}" if hit else "NOT FOUND"
+        print(f"  [{desc:30s}] {status}")
+        if hit:
+            found_files[prefix] = hit
+
+    log = os.path.join(run_dir, "logs", "compile_opt.log")
+    log_status = "FOUND" if os.path.exists(log) else "NOT FOUND"
+    print(f"  [{'DRC from compile_opt.log':30s}] {log_status}")
+    print()
+
+    # Actually extract and show results
+    print("EXTRACTING METRICS...")
+    metrics = extract_fe_metrics(run_dir, block_name)
+
+    area  = metrics.get("area", {})
+    cong  = metrics.get("congestion", {})
+    power = metrics.get("power", {})
+
+    print()
+    print("AREA:")
+    for k in ["total_area","std_cell_area","combinational_area",
+              "reg_area","macro_area","memory_area","buf_area",
+              "total_count","instance_count","gate_count",
+              "total_util","std_cell_only_util","mbit"]:
+        v = area.get(k, "(not found)")
+        print(f"  {k:30s} = {v}")
+
+    print()
+    print("VTH:")
+    vth = area.get("vth", {})
+    if vth:
+        for vtype in sorted(vth.get("inst", {}).keys()):
+            inst = vth["inst"].get(vtype, "-")
+            ar   = vth.get("area", {}).get(vtype, "-")
+            print(f"  {vtype}: inst={inst}  area={ar}")
+    else:
+        print("  (not found)")
+
+    print()
+    print("TIMING:")
+    print(f"  r2r_setup = {metrics.get('r2r_setup', '(not found)')}")
+    print(f"  r2r_hold  = {metrics.get('r2r_hold',  '(not found)')}")
+    print(f"  worst_wns = {metrics.get('worst_wns', '(not found)')}")
+    print(f"  worst_tns = {metrics.get('worst_tns', '(not found)')}")
+    print(f"  worst_nvp = {metrics.get('worst_nvp', '(not found)')}")
+    timing = metrics.get("timing_raw", {}).get("timing", {})
+    if timing:
+        for sce, grps in sorted(timing.items())[:3]:
+            for grp, vals in sorted(grps.items()):
+                print(f"    {sce} | {grp}: "
+                      f"WNS={vals.get('wns','-')} "
+                      f"TNS={vals.get('tns','-')} "
+                      f"NVP={vals.get('nvp','-')}")
+
+    print()
+    print("CGC:")
+    print(f"  cgc = {metrics.get('cgc', '(not found)')}")
+
+    print()
+    print("CONGESTION:")
+    print(f"  overall = {cong.get('overall', '(not found)')}")
+    print(f"  H       = {cong.get('H', '(not found)')}")
+    print(f"  V       = {cong.get('V', '(not found)')}")
+
+    print()
+    print("POWER:")
+    print(f"  dynamic_mw = {power.get('dynamic_mw', '(not found)')}")
+    print(f"  leakage_mw = {power.get('leakage_mw', '(not found)')}")
+
+    print()
+    print("DRC:")
+    print(f"  drc_errors = {metrics.get('drc_errors', '(not found)')}")
