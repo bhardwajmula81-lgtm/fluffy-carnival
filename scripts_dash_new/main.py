@@ -922,38 +922,42 @@ class QoRWorker(QThread):
             self.finished.emit("")
 
 class BlockSummaryDialog(QDialog):
-    """Cross-block synthesis summary table matching Image 2.
-    One row per block, latest completed FE run for each block.
-    Columns: BLK Name | MBIT% | CG% | Instance Count | Std Area |
-             Gate Count | VT (L/R/H) Area | Timing WNS/TNS/FEPs | Runtime | Run Tag
-    """
+    """Block synthesis summary table -- Image 2 style.
+    One row per selected run. User clicks Generate to start loading."""
 
     HEADERS = [
-        "BLK Name", "MBIT%", "CG%", "Instance\nCount",
-        "Std Area\n(um2)", "Gate\nCount",
-        "VT (L/R/H)\nArea%", "Timing\nWNS/TNS/FEPs",
-        "Runtime", "Run Tag"
+        "BLK Name", "Run Name", "MBIT%", "CG%",
+        "Instance Count", "Std Area (um2)", "Gate Count",
+        "VT L/R/H Area%", "Timing WNS/TNS/FEPs",
+        "Runtime"
     ]
 
-    def __init__(self, rtl_label, block_runs, is_dark, parent=None):
-        """block_runs: list of dicts with block metrics already extracted."""
+    def __init__(self, rtl_label, run_list, is_dark, parent=None):
+        """run_list: list of (blk, run_path, run_name, runtime, source)"""
         super().__init__(parent)
         self.setWindowTitle("Block Summary: " + str(rtl_label))
-        self.resize(1100, 450)
-        self.is_dark = is_dark
+        self.resize(1150, 500)
+        self.is_dark   = is_dark
+        self._run_list = run_list
+        self._pending  = []
+        self._active_worker = None
+
         layout = QVBoxLayout(self)
 
         # Header
-        hdr = QLabel(
-            "<b>" + str(rtl_label) + " -- Synthesis Summary</b>")
-        hf = hdr.font(); hf.setPointSize(11); hdr.setFont(hf)
+        hdr = QLabel("<b>" + str(rtl_label) + " -- Synthesis Summary</b>")
+        hf  = hdr.font(); hf.setPointSize(11); hdr.setFont(hf)
         hdr.setAlignment(Qt.AlignCenter)
         layout.addWidget(hdr)
 
-        # Status label
-        self.status_lbl = QLabel(
-            "Loading metrics... (this may take 10-30 seconds)")
-        self.status_lbl.setStyleSheet("color: #1976d2; font-style: italic;")
+        # Info + status
+        info = QLabel(str(len(run_list)) +
+                      " run(s) selected. Click Generate to extract metrics.")
+        info.setStyleSheet("color: #1976d2;")
+        layout.addWidget(info)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color: #e65100; font-style: italic;")
         layout.addWidget(self.status_lbl)
 
         # Table
@@ -962,9 +966,11 @@ class BlockSummaryDialog(QDialog):
         self.tbl.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeToContents)
         self.tbl.horizontalHeader().setSectionResizeMode(
-            7, QHeaderView.Stretch)
-        for c in range(1, len(self.HEADERS)):
-            if c != 7:
+            1, QHeaderView.Stretch)
+        self.tbl.horizontalHeader().setSectionResizeMode(
+            8, QHeaderView.ResizeToContents)
+        for c in range(2, len(self.HEADERS)):
+            if c not in (1, 8):
                 self.tbl.horizontalHeader().setSectionResizeMode(
                     c, QHeaderView.ResizeToContents)
         self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -973,102 +979,137 @@ class BlockSummaryDialog(QDialog):
         self.tbl.setSortingEnabled(True)
         layout.addWidget(self.tbl, 1)
 
+        # Buttons
         btn_row = QHBoxLayout()
+        self.gen_btn = QPushButton("Generate Table")
+        self.gen_btn.setStyleSheet(
+            "QPushButton { background:#1976d2; color:white; "
+            "font-weight:bold; padding:6px 18px; border-radius:4px; }"
+            "QPushButton:disabled { background:#888; }")
+        self.gen_btn.clicked.connect(self._start_loading)
+        btn_row.addWidget(self.gen_btn)
+
+        self.prog = QProgressBar()
+        self.prog.setRange(0, len(run_list))
+        self.prog.setValue(0)
+        self.prog.setVisible(False)
+        btn_row.addWidget(self.prog, 1)
+
         export_btn = QPushButton("Export CSV")
         export_btn.clicked.connect(self._export_csv)
-        close_btn  = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
         btn_row.addWidget(export_btn)
-        btn_row.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
         layout.addLayout(btn_row)
 
         self.neg_fg  = QColor("#ef5350" if is_dark else "#c62828")
         self.zero_fg = QColor("#66bb6a" if is_dark else "#2e7d32")
         self.pos_fg  = QColor("#66bb6a" if is_dark else "#2e7d32")
-
-        # Store run data for background loading
-        self._block_runs = block_runs  # list of (blk, run_path, run_name, runtime, source)
-        self._rows_ready = []
-        QTimer.singleShot(100, self._start_loading)
+        self._done_count = 0
 
     def _start_loading(self):
-        """Launch MetricWorker for each block run sequentially via timer."""
-        self._pending = list(self._block_runs)
+        if not self._run_list:
+            return
+        self.gen_btn.setEnabled(False)
+        self.tbl.setRowCount(0)
+        self._done_count = 0
+        self._pending = list(self._run_list)
+        self.prog.setValue(0)
+        self.prog.setVisible(True)
+        self.status_lbl.setText(
+            "Loading 1/" + str(len(self._run_list)) + "...")
         self._load_next()
 
     def _load_next(self):
         if not self._pending:
             self.status_lbl.setText(
-                "Done. " + str(self.tbl.rowCount()) + " blocks loaded.")
+                "Done. " + str(self.tbl.rowCount()) + " rows loaded.")
+            self.prog.setVisible(False)
+            self.gen_btn.setEnabled(True)
             return
         blk, run_path, run_name, runtime, source = self._pending.pop(0)
         self.status_lbl.setText(
-            "Loading " + blk + "... (" +
-            str(len(self._block_runs) - len(self._pending)) +
-            "/" + str(len(self._block_runs)) + ")")
-        from workers import MetricWorker
-        w = MetricWorker(run_path, blk, "FE", source)
-        w.finished.connect(
-            lambda m, b=blk, rn=run_name, rt=runtime: self._on_row_done(b, rn, rt, m))
-        w.start()
-        self._active_worker = w
+            "Loading " + blk + " (" + run_name + ")... " +
+            str(self._done_count + 1) + "/" + str(len(self._run_list)))
+        try:
+            from workers import MetricWorker
+            w = MetricWorker(run_path, blk, "FE", source)
+            w.finished.connect(
+                lambda m, b=blk, rn=run_name, rt=runtime:
+                self._on_row_done(b, rn, rt, m))
+            w.start()
+            self._active_worker = w
+        except Exception as e:
+            self._add_row(blk, run_name, runtime, {})
+            self._done_count += 1
+            self.prog.setValue(self._done_count)
+            QTimer.singleShot(10, self._load_next)
 
     def _on_row_done(self, blk, run_name, runtime, metrics):
         self._add_row(blk, run_name, runtime, metrics)
-        QTimer.singleShot(50, self._load_next)
+        self._done_count += 1
+        self.prog.setValue(self._done_count)
+        QTimer.singleShot(10, self._load_next)
 
     def _add_row(self, blk, run_name, runtime, metrics):
         area  = metrics.get("area", {})
         cong  = metrics.get("congestion", {})
 
         def _v(*keys):
-            for k in keys:
-                v = area.get(k) or metrics.get(k)
-                if v and str(v).strip() not in ("-", ""):
-                    return str(v)
+            for src in [area, metrics]:
+                for k in keys:
+                    v = src.get(k)
+                    if v and str(v).strip() not in ("-", ""):
+                        return str(v)
             return "-"
 
         # MBIT
-        mbit = _v("mbit") or metrics.get("mbit", "-")
-        if mbit != "-" and not mbit.endswith("%"):
+        mbit = metrics.get("mbit", area.get("mbit", "-"))
+        if mbit != "-":
             try:
-                mbit = f"{float(mbit):.2f}%"
+                mbit = f"{float(str(mbit).rstrip('%')):.2f}%"
             except Exception:
                 pass
 
         # CGC
-        cgc = metrics.get("cgc_pct", "-")
-        if cgc != "-" and not cgc.endswith("%"):
-            cgc = cgc + "%"
+        cgc = metrics.get("cgc", "-")
+        if cgc != "-":
+            pct = re.search(r"(\d+\.?\d*)%", str(cgc))
+            cgc = pct.group(1) + "%" if pct else cgc
 
         # Instance count
         inst = _v("instance_count", "total_count")
 
-        # Std Area
-        std_area = _v("std_cell_area_total", "std_cell_area")
+        # Std Cell Area (as shown in Image 1)
+        std_area = _v("std_cell_area", "combinational_area")
 
-        # Gate count (approx: std_area / 0.2419 from Image 2 header)
-        try:
-            gc = f"{float(std_area) / 0.2419:.0f}"
-        except Exception:
-            gc = "-"
+        # Gate Count
+        gc = _v("gate_count")
+        if gc == "-":
+            try:
+                gc = str(int(float(std_area) / 0.2419))
+            except Exception:
+                gc = "-"
 
         # VTH
-        vth      = area.get("vth", {})
-        lvt_area = vth.get("LVT", {}).get("area", "-")
-        rvt_area = vth.get("RVT", {}).get("area", "-")
-        hvt_area = vth.get("HVT", {}).get("area", "-")
-        vth_str  = f"{lvt_area}/{rvt_area}/{hvt_area}"
+        vth = area.get("vth", {})
+        inst_d = vth.get("inst", {})
+        area_d = vth.get("area", {})
+        lvt = area_d.get("LVT", "-")
+        rvt = area_d.get("RVT", "-")
+        hvt = area_d.get("HVT", "-")
+        vth_str = lvt + "/" + rvt + "/" + hvt
 
         # Timing
         wns = metrics.get("worst_wns", "-")
         tns = metrics.get("worst_tns", "-")
         nvp = metrics.get("worst_nvp", "-")
-        timing_str = f"{wns}/{tns}/{nvp}"
+        timing_str = wns + "/" + tns + "/" + nvp
 
-        vals = [blk, mbit, cgc, inst, std_area, gc,
-                vth_str, timing_str, runtime, run_name]
+        vals = [blk, run_name, mbit, cgc, inst, std_area,
+                gc, vth_str, timing_str, runtime]
 
         self.tbl.setSortingEnabled(False)
         r = self.tbl.rowCount()
@@ -1077,10 +1118,11 @@ class BlockSummaryDialog(QDialog):
         for c, val in enumerate(vals):
             item = QTableWidgetItem(str(val) if val else "-")
             item.setTextAlignment(Qt.AlignCenter)
-            if c == 0:
+            if c in (0, 1):
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                f2 = item.font(); f2.setBold(True); item.setFont(f2)
-            if c == 7:  # timing
+                if c == 0:
+                    f2 = item.font(); f2.setBold(True); item.setFont(f2)
+            if c == 8:  # timing
                 try:
                     wv = float(str(val).split("/")[0])
                     if wv < 0:
@@ -1092,30 +1134,34 @@ class BlockSummaryDialog(QDialog):
                 except Exception:
                     pass
             self.tbl.setItem(r, c, item)
-
         self.tbl.setSortingEnabled(True)
 
     def _export_csv(self):
+        if self.tbl.rowCount() == 0:
+            QMessageBox.information(
+                self, "Export", "No data yet. Click Generate first.")
+            return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export Block Summary", "block_summary.csv",
-            "CSV Files (*.csv)")
+            self, "Export", "block_summary.csv", "CSV Files (*.csv)")
         if not path:
             return
         try:
             import csv as _csv
             with open(path, "w", newline="") as f:
                 w = _csv.writer(f)
-                hdrs = [self.tbl.horizontalHeaderItem(c).text().replace("\n", " ")
-                        for c in range(self.tbl.columnCount())]
+                hdrs = [
+                    self.tbl.horizontalHeaderItem(c).text()
+                    for c in range(self.tbl.columnCount())]
                 w.writerow(hdrs)
                 for r in range(self.tbl.rowCount()):
-                    row = [self.tbl.item(r, c).text()
-                           if self.tbl.item(r, c) else ""
-                           for c in range(self.tbl.columnCount())]
+                    row = [
+                        self.tbl.item(r, c).text()
+                        if self.tbl.item(r, c) else ""
+                        for c in range(self.tbl.columnCount())]
                     w.writerow(row)
-            QMessageBox.information(self, "Export", "Saved to " + path)
+            QMessageBox.information(self, "Export", "Saved: " + path)
         except Exception as e:
-            QMessageBox.warning(self, "Export Error", str(e))
+            QMessageBox.warning(self, "Error", str(e))
 
 
 class PDDashboard(QMainWindow):
@@ -3853,40 +3899,42 @@ class PDDashboard(QMainWindow):
     # CSV EXPORT
     # ------------------------------------------------------------------
     def open_block_summary(self):
-        """Open BlockSummaryDialog for current RTL/view."""
-        # Collect latest completed FE run per block from current tree view
-        block_runs = []
-        seen_blocks = set()
+        """Open BlockSummaryDialog using CHECKED runs from the tree.
+        User must check runs first using the checkboxes in col 0."""
+        run_list = []
         root = self.tree.invisibleRootItem()
 
         def _collect(node):
             nt = node.data(0, Qt.UserRole)
-            if nt not in ("BLOCK","MILESTONE","RTL","IGNORED_ROOT",
-                          "STAGE","__PLACEHOLDER__") and node.text(3) == "COMPLETED":
-                blk  = node.data(0, Qt.UserRole + 2)
+            # Only FE run items that are checked
+            if (nt not in ("BLOCK", "MILESTONE", "RTL",
+                           "IGNORED_ROOT", "STAGE", "__PLACEHOLDER__")
+                    and node.checkState(0) == Qt.Checked
+                    and node.text(2) in ("WS", "OUTFEED", "")
+                    and "FE" in node.text(0)):
+                blk  = node.data(0, Qt.UserRole + 2) or "UNKNOWN"
                 path = node.text(15)
                 name = node.text(0)
                 rt   = node.text(12)
                 src  = node.text(2)
-                if blk and blk not in seen_blocks and path and path != "N/A":
-                    seen_blocks.add(blk)
-                    block_runs.append((blk, path, name, rt, src))
+                if path and path != "N/A":
+                    run_list.append((blk, path, name, rt, src))
             for i in range(node.childCount()):
                 _collect(node.child(i))
         _collect(root)
 
-        if not block_runs:
+        if not run_list:
             QMessageBox.information(
                 self, "Block Summary",
-                "No completed FE runs visible in current view.\n"
-                "Select an RTL release and make sure completed runs are shown.")
+                "Please check (tick) the FE runs you want to include\n"
+                "in the summary table, then click Block Summary Table.")
             return
 
         rtl_label = self.rel_combo.currentText()
         dark = (self.is_dark_mode
                 or (self.use_custom_colors
                     and self.custom_bg_color < "#888888"))
-        dlg = BlockSummaryDialog(rtl_label, block_runs, dark, self)
+        dlg = BlockSummaryDialog(rtl_label, run_list, dark, self)
         dlg.exec_()
 
     def export_csv(self):
