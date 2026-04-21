@@ -25,12 +25,12 @@ def _g(name, default=""):
     return getattr(builtins, name,
            globals().get(name, default))
 
-def _BASE_WS_FE():   return _g("_BASE_WS_FE()")
-def _BASE_WS_BE():   return _g("_BASE_WS_BE()")
+def _BASE_WS_FE():   return _g("BASE_WS_FE_DIR")
+def _BASE_WS_BE():   return _g("BASE_WS_BE_DIR")
 def _BASE_OUTFEED(): return _g("BASE_OUTFEED_DIR")
-def _BASE_IR():      return _g("_BASE_IR()", "")
-def _PROJECT():      return _g("_PROJECT()", "S5K2P5SP")
-def _PNR_TOOLS():    return _g("_PNR_TOOLS()", "fc innovus")
+def _BASE_IR():      return _g("BASE_IR_DIR", "")
+def _PROJECT():      return _g("PROJECT_PREFIX", "S5K2P5SP")
+def _PNR_TOOLS():    return _g("PNR_TOOL_NAMES", "fc innovus")
 
 
 # ---------------------------------------------------------------------------
