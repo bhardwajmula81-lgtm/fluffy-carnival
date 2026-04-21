@@ -8,7 +8,16 @@ import sys
 import fnmatch
 import subprocess
 import csv
+import json
+import pwd
+import math
+import time
+import shutil
+import threading
+import datetime
 import getpass
+import configparser
+import concurrent.futures
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -37,12 +46,20 @@ def _load_project_config():
     cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "project_config.ini")
     defaults = {
+        'PROJECT': {
+            'PROJECT_PREFIX':   'S5K2P5SP',
+            'BASE_WS_FE_DIR':   '/user/s5k2p5sx.fe1/s5k2p5sp/WS',
+            'BASE_WS_BE_DIR':   '/user/s5k2p5sp.be1/s5k2p5sp/WS',
+            'BASE_OUTFEED_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/outfeed',
+            'BASE_IR_DIR':      '/user/s5k2p5sx.be1/LAYOUT/IR',
+        },
         'TOOLS': {
-            'SUMMARY_SCRIPT': '',
-            'FIREFOX_PATH':   '/usr/bin/firefox',
-            'MAIL_UTIL':      '/user/vwpmailsystem/MAIL/send_mail_for_rhel7',
-            'USER_INFO_UTIL': '/usr/local/bin/user_info',
-            'PYTHON_BIN':     'python3.6',
+            'PNR_TOOL_NAMES':  'fc innovus',
+            'SUMMARY_SCRIPT':  '',
+            'FIREFOX_PATH':    '/usr/bin/firefox',
+            'MAIL_UTIL':       '/user/vwpmailsystem/MAIL/send_mail_for_rhel7',
+            'USER_INFO_UTIL':  '/usr/local/bin/user_info',
+            'PYTHON_BIN':      'python3.6',
         }
     }
     if os.path.exists(cfg_file):
@@ -82,6 +99,38 @@ FIREFOX_PATH   = _proj_cfg.get('TOOLS', 'FIREFOX_PATH',   fallback='/usr/bin/fir
 USER_INFO_UTIL = _proj_cfg.get('TOOLS', 'USER_INFO_UTIL', fallback='/usr/local/bin/user_info')
 _PYTHON_BIN    = _proj_cfg.get('TOOLS', 'PYTHON_BIN',     fallback='python3.6')
 _SUMMARY_SCRIPT = _proj_cfg.get('TOOLS', 'SUMMARY_SCRIPT', fallback='')
+
+# Project paths -- defined here so they are available even without config.py
+SCRIPT_DIR       = os.path.dirname(os.path.abspath(__file__))
+USER_PREFS_FILE  = os.path.join(SCRIPT_DIR, 'user_prefs.ini')
+NOTES_DIR        = os.path.join(SCRIPT_DIR, 'dashboard_notes')
+PROJECT_PREFIX   = _proj_cfg.get('PROJECT', 'PROJECT_PREFIX',   fallback='S5K2P5SP')
+BASE_WS_FE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_FE_DIR',   fallback='')
+BASE_WS_BE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_BE_DIR',   fallback='')
+BASE_OUTFEED_DIR = _proj_cfg.get('PROJECT', 'BASE_OUTFEED_DIR', fallback='')
+BASE_IR_DIR      = _proj_cfg.get('PROJECT', 'BASE_IR_DIR',      fallback='')
+PNR_TOOL_NAMES   = _proj_cfg.get('TOOLS',   'PNR_TOOL_NAMES',   fallback='fc innovus')
+
+# Load user preferences
+prefs = configparser.ConfigParser()
+if os.path.exists(USER_PREFS_FILE):
+    prefs.read(USER_PREFS_FILE)
+
+# Ensure notes dir exists
+if not os.path.exists(NOTES_DIR):
+    try:
+        os.makedirs(NOTES_DIR)
+    except Exception:
+        pass
+
+# Expose constants to builtins so workers.py lazy-resolution works
+import builtins as _bt
+_bt.BASE_WS_FE_DIR   = BASE_WS_FE_DIR
+_bt.BASE_WS_BE_DIR   = BASE_WS_BE_DIR
+_bt.BASE_OUTFEED_DIR = BASE_OUTFEED_DIR
+_bt.BASE_IR_DIR      = BASE_IR_DIR
+_bt.PROJECT_PREFIX   = PROJECT_PREFIX
+_bt.PNR_TOOL_NAMES   = PNR_TOOL_NAMES
 
 
 def _get_user_email(username):
@@ -202,8 +251,19 @@ try:
     from utils import *
 except ImportError:
     pass
-from workers import *
-from widgets import *
+try:
+    from workers import *
+except Exception as _e:
+    print(f"[ERROR] Failed to import workers.py: {_e}")
+    import traceback; traceback.print_exc()
+    sys.exit(1)
+
+try:
+    from widgets import *
+except Exception as _e:
+    print(f"[ERROR] Failed to import widgets.py: {_e}")
+    import traceback; traceback.print_exc()
+    sys.exit(1)
 # dialogs inlined directly in main.py
 
 
