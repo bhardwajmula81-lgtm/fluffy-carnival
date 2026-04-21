@@ -1,4 +1,4 @@
-# -*- coding: ascii -*-
+  # -*- coding: ascii -*-
 # metric_extract.py
 # Exact regex patterns from metric.py, prc.py, implementation.py in summary scripts.
 # Self-contained -- no external deps. Pure Python re/glob/os.
