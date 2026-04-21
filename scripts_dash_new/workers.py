@@ -943,3 +943,4 @@ class QoRWorker(QThread):
             self.finished.emit(html_path if (html_path and os.path.exists(html_path)) else "")
         except Exception as e:
             self.finished.emit("")
+ 
