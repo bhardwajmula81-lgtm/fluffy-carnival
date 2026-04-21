@@ -595,17 +595,18 @@ class ScannerWorker(QThread):
 class QoRWorker(QThread):
     finished = pyqtSignal(str)  # emits path to HTML output file, or ""
 
-    def __init__(self, script_path, run_dirs):
+    def __init__(self, script_path, run_dirs, python_bin="python3.6"):
         super().__init__()
         self.script_path = script_path
-        self.run_dirs    = run_dirs  # list of FE/BE run directories
+        self.run_dirs    = run_dirs
+        self.python_bin  = python_bin
 
     def run(self):
         try:
             # summary.py outputs to qor_metrices/summary_<date>.html
             # Run from the script's directory so relative paths work
             script_dir = os.path.dirname(os.path.abspath(self.script_path))
-            cmd = ["python3", self.script_path] + self.run_dirs
+            cmd = [self.python_bin, self.script_path] + self.run_dirs
             result = subprocess.run(
                 cmd,
                 cwd=script_dir,
