@@ -26,12 +26,287 @@ from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QBrush,
                          QPainter, QPen, QPixmap, QIcon)
 
+# ===========================================================================
+# CONFIG + MAIL HELPERS (module-level, loaded once at startup)
+# ===========================================================================
+
+def _load_project_config():
+    """Load project_config.ini if present, else use hardcoded defaults."""
+    import configparser as _cp
+    cfg = _cp.ConfigParser()
+    cfg_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "project_config.ini")
+    defaults = {
+        'TOOLS': {
+            'SUMMARY_SCRIPT': '',
+            'FIREFOX_PATH':   '/usr/bin/firefox',
+            'MAIL_UTIL':      '/user/vwpmailsystem/MAIL/send_mail_for_rhel7',
+            'USER_INFO_UTIL': '/usr/local/bin/user_info',
+            'PYTHON_BIN':     'python3.6',
+        }
+    }
+    if os.path.exists(cfg_file):
+        cfg.read(cfg_file)
+    else:
+        cfg.read_dict(defaults)
+        try:
+            with open(cfg_file, 'w') as f:
+                cfg.write(f)
+        except Exception:
+            pass
+    return cfg
+
+def _load_mail_config():
+    import configparser as _cp
+    mc = _cp.ConfigParser()
+    mc_file = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "mail_users.ini")
+    if not os.path.exists(mc_file):
+        mc.read_dict({'PERMANENT_MEMBERS': {'always_to': '',
+                                             'always_cc': ''},
+                       'KNOWN_USERS':       {'users': ''}})
+        try:
+            with open(mc_file, 'w') as f:
+                mc.write(f)
+        except Exception:
+            pass
+    else:
+        mc.read(mc_file)
+    return mc, mc_file
+
+_proj_cfg   = _load_project_config()
+mail_config, _MAIL_USERS_FILE = _load_mail_config()
+
+MAIL_UTIL      = _proj_cfg.get('TOOLS', 'MAIL_UTIL',      fallback='')
+FIREFOX_PATH   = _proj_cfg.get('TOOLS', 'FIREFOX_PATH',   fallback='/usr/bin/firefox')
+USER_INFO_UTIL = _proj_cfg.get('TOOLS', 'USER_INFO_UTIL', fallback='/usr/local/bin/user_info')
+_PYTHON_BIN    = _proj_cfg.get('TOOLS', 'PYTHON_BIN',     fallback='python3.6')
+_SUMMARY_SCRIPT = _proj_cfg.get('TOOLS', 'SUMMARY_SCRIPT', fallback='')
+
+
+def _get_user_email(username):
+    username = username.strip()
+    if not username or username == "Unknown": return ""
+    if "@" in username: return username
+    try:
+        res = subprocess.check_output(
+            [USER_INFO_UTIL, '-a', username],
+            stderr=subprocess.DEVNULL).decode('utf-8')
+        m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', res)
+        if m: return m.group(0)
+    except Exception:
+        pass
+    return f"{username}@samsung.com"
+
+
+def _get_all_known_mail_users():
+    try:
+        mail_config.read(_MAIL_USERS_FILE)
+        s = mail_config.get('KNOWN_USERS', 'users', fallback='')
+        return sorted(set(u.strip() for u in s.split(',') if u.strip()))
+    except Exception:
+        return []
+
+
+def _save_mail_users(new_users):
+    try:
+        existing = set(_get_all_known_mail_users())
+        existing.update(new_users)
+        if not mail_config.has_section('KNOWN_USERS'):
+            mail_config.add_section('KNOWN_USERS')
+        mail_config.set('KNOWN_USERS', 'users',
+                         ', '.join(sorted(existing)))
+        with open(_MAIL_USERS_FILE, 'w') as f:
+            mail_config.write(f)
+    except Exception:
+        pass
+
+
+def _send_mail_via_util(dlg):
+    """Fire MAIL_UTIL subprocess from an AdvancedMailDialog."""
+    if not MAIL_UTIL:
+        QMessageBox.warning(
+            None, "Mail Not Configured",
+            "MAIL_UTIL is not set.\n"
+            "Add it to project_config.ini:\n\n"
+            "MAIL_UTIL = /user/vwpmailsystem/MAIL/send_mail_for_rhel7")
+        return
+    subject  = dlg.subject_input.text().strip()
+    body     = dlg.body_input.toPlainText()
+    to_list  = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
+    cc_list  = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+    sender   = _get_user_email(getpass.getuser()) or f"{getpass.getuser()}@samsung.com"
+    all_recip = ",".join(set(to_list + cc_list))
+    if not all_recip:
+        QMessageBox.warning(None, "No Recipients",
+                             "Please add at least one email address in To or CC.")
+        return
+    cmd = [MAIL_UTIL,
+           "-to", all_recip,
+           "-sd", sender,
+           "-s",  subject,
+           "-c",  body,
+           "-fm", "text"]
+    for att in dlg.attachments:
+        cmd.extend(["-a", att])
+    try:
+        subprocess.Popen(cmd)
+        QMessageBox.information(None, "Mail Sent", "Email triggered successfully.")
+    except Exception as e:
+        QMessageBox.warning(None, "Mail Error", str(e))
+
 from config import *
 from utils import *
 from workers import *
 from widgets import *
 # dialogs inlined directly in main.py
 
+
+
+# ===========================================================================
+# MAIL HELPERS
+# ===========================================================================
+
+class MultiCompleterLineEdit(QLineEdit):
+    """Comma-separated username input with auto-complete."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._completer = QCompleter()
+        self._completer.setWidget(self)
+        self._completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.activated.connect(self._insert_completion)
+        self.words = []
+
+    def set_words(self, words):
+        self.words = words
+        from PyQt5.QtCore import QStringListModel
+        self._completer.setModel(QStringListModel(words, self._completer))
+
+    def _insert_completion(self, completion):
+        text = self.text()
+        parts = text.split(',')
+        base = ','.join(parts[:-1])
+        self.setText((base + ', ' if base else '') + completion + ', ')
+
+    def keyPressEvent(self, e):
+        if self._completer.popup().isVisible():
+            if e.key() in (Qt.Key_Enter, Qt.Key_Return):
+                e.ignore(); return
+        super().keyPressEvent(e)
+        current_word = self.text().split(',')[-1].strip()
+        if current_word:
+            self._completer.setCompletionPrefix(current_word)
+            if self._completer.completionCount() > 0:
+                cr = self.cursorRect()
+                cr.setWidth(
+                    self._completer.popup().sizeHintForColumn(0)
+                    + self._completer.popup().verticalScrollBar().sizeHint().width())
+                self._completer.complete(cr)
+            else:
+                self._completer.popup().hide()
+        else:
+            self._completer.popup().hide()
+
+
+class AdvancedMailDialog(QDialog):
+    """Full mail compose dialog with To/CC/Subject/Body/Attachments."""
+    def __init__(self, default_subject, default_body,
+                 all_users, prefill_to="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Send Email")
+        self.resize(720, 560)
+        self.attachments = []
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.to_input = MultiCompleterLineEdit()
+        self.to_input.set_words(all_users)
+        self.cc_input = MultiCompleterLineEdit()
+        self.cc_input.set_words(all_users)
+
+        # Pre-fill from mail_config permanent members
+        try:
+            always_to = mail_config.get(
+                'PERMANENT_MEMBERS', 'always_to', fallback='').strip()
+            always_cc = mail_config.get(
+                'PERMANENT_MEMBERS', 'always_cc', fallback='').strip()
+            final_to = always_to
+            if prefill_to:
+                final_to = (always_to + ', ' if always_to else '') + prefill_to
+            if final_to:
+                self.to_input.setText(
+                    final_to + (', ' if not final_to.endswith(',') else ' '))
+            if always_cc:
+                self.cc_input.setText(
+                    always_cc + (', ' if not always_cc.endswith(',') else ' '))
+        except Exception:
+            pass
+
+        self.subject_input = QLineEdit(default_subject)
+        form.addRow("<b>To:</b>", self.to_input)
+        form.addRow("<b>CC:</b>", self.cc_input)
+        form.addRow("<b>Subject:</b>", self.subject_input)
+        layout.addLayout(form)
+
+        # Attachments row
+        att_row = QHBoxLayout()
+        att_row.addWidget(QLabel("<b>Attachments:</b>"))
+        self.attach_lbl = QLabel("None")
+        self.attach_lbl.setStyleSheet("color: #1976d2;")
+        att_row.addWidget(self.attach_lbl)
+        att_row.addStretch()
+        qor_btn = QPushButton("Attach Latest QoR Report")
+        qor_btn.clicked.connect(self._attach_qor)
+        browse_btn = QPushButton("Browse Files...")
+        browse_btn.clicked.connect(self._browse_files)
+        att_row.addWidget(qor_btn)
+        att_row.addWidget(browse_btn)
+        layout.addLayout(att_row)
+
+        self.body_input = QTextEdit()
+        self.body_input.setPlainText(default_body)
+        layout.addWidget(self.body_input, 1)
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.button(QDialogButtonBox.Ok).setText("Send Mail")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def _update_attach_lbl(self):
+        if not self.attachments:
+            self.attach_lbl.setText("None")
+        else:
+            names = ", ".join(os.path.basename(p) for p in self.attachments)
+            self.attach_lbl.setText(
+                f"{len(self.attachments)} file(s): {names}")
+
+    def _attach_qor(self):
+        # Find latest QoR HTML in qor_metrices/
+        import glob as _glob
+        hits = _glob.glob(
+            os.path.join(os.getcwd(), "qor_metrices", "**", "*.html"),
+            recursive=True)
+        if hits:
+            latest = sorted(hits, key=os.path.getmtime)[-1]
+            if latest not in self.attachments:
+                self.attachments.append(latest)
+                self._update_attach_lbl()
+        else:
+            QMessageBox.warning(
+                self, "Not Found",
+                "No QoR HTML found in qor_metrices/.")
+
+    def _browse_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Attachments", "", "All Files (*)")
+        for f in files:
+            if f not in self.attachments:
+                self.attachments.append(f)
+        if files:
+            self._update_attach_lbl()
 
 
 # ===========================================================================
@@ -252,6 +527,7 @@ class PDDashboard(QMainWindow):
         self._setup_shortcuts()
         self.apply_theme_and_spacing()
         QTimer.singleShot(50, self.start_fs_scan)
+        QTimer.singleShot(500, self.start_bg_disk_scan)  # start disk scan after UI ready
 
     # ------------------------------------------------------------------
     # CLOSE
@@ -2015,7 +2291,7 @@ class PDDashboard(QMainWindow):
             if r.get("owner") and r["owner"] != "Unknown":
                 all_owners.add(r["owner"])
         if all_owners:
-            save_mail_users_config(all_owners)
+            _save_mail_users(all_owners)
 
         QApplication.processEvents()
         self.refresh_view()
@@ -3229,62 +3505,101 @@ class PDDashboard(QMainWindow):
     # DISK USAGE
     # ------------------------------------------------------------------
     def open_disk_usage(self):
-        if not hasattr(self, '_disk_data') or not self._disk_data:
+        data = getattr(self, "_disk_data", None)
+        if not data:
             QMessageBox.information(
                 self, "Disk Space",
-                "Disk scan not yet complete. Please wait or press Refresh.")
+                "Disk scan not yet complete. Please wait a moment and try again.")
             return
-        dlg = DiskUsageDialog(self._disk_data, self.is_dark_mode, self)
+        dlg = DiskUsageDialog(data, self.is_dark_mode, self)
         dlg.exec_()
 
     def start_bg_disk_scan(self, force=False):
         if (not force and hasattr(self, '_disk_scan_worker')
                 and self._disk_scan_worker.isRunning()):
             return
+        # Disable disk button while scanning
+        if hasattr(self, 'disk_btn'):
+            self.disk_btn.setEnabled(False)
+            self.disk_btn.setText("Scanning Disk...")
         self._disk_scan_worker = DiskScannerWorker()
-        self._disk_scan_worker.finished.connect(self._on_disk_scan_done)
+        # DiskScannerWorker uses finished_scan signal
+        sig = getattr(self._disk_scan_worker, "finished_scan", None)
+        if sig is None:
+            sig = self._disk_scan_worker.finished
+        sig.connect(self._on_bg_disk_scan_finished)
         self._disk_scan_worker.start()
 
-    def _on_disk_scan_done(self, data):
+    def _on_bg_disk_scan_finished(self, data):
         self._disk_data = data
+        # Re-enable disk button
+        if hasattr(self, 'disk_btn'):
+            self.disk_btn.setEnabled(True)
+            self.disk_btn.setText("Disk Space")
 
     # ------------------------------------------------------------------
     # QoR
     # ------------------------------------------------------------------
     def run_qor_comparison(self):
-        checked_paths = [
-            item.text(15)
-            for item in self._iter_checked_items()
-            if item.text(15) and item.text(15) != "N/A"]
-        if len(checked_paths) < 2:
+        """Run summary.py on checked runs then open HTML in Firefox."""
+        # Collect checked run paths -- normalize trailing slash
+        sel = []
+        for item in self._iter_checked_items():
+            path = item.text(15)
+            if not path or path == "N/A":
+                continue
+            if item.text(2) == "OUTFEED":
+                path = os.path.dirname(path)
+            if not path.endswith("/"):
+                path += "/"
+            sel.append(path)
+
+        if len(sel) < 2:
             QMessageBox.information(
                 self, "QoR Compare",
-                "Please check at least 2 runs first.")
+                "Please check at least 2 runs first.\n"
+                "(Check boxes in the Run Name column)")
             return
+
+        # Resolve script path: Settings > QoR Script > prefs > _SUMMARY_SCRIPT
+        script = ""
         try:
             script = QOR_SUMMARY_SCRIPT
         except NameError:
+            pass
+        if not script:
+            script = prefs.get('QOR', 'script_path', fallback='') or _SUMMARY_SCRIPT
+        if not script or not os.path.exists(script):
             QMessageBox.warning(
                 self, "QoR Compare",
-                "QOR_SUMMARY_SCRIPT is not defined in config.py.\n"
-                "Please add it to config.py:\n\n"
-                "QOR_SUMMARY_SCRIPT = '/path/to/summary.py'")
+                "summary.py path not set.\n"
+                "Go to Settings > QoR Script tab and browse to summary.py.")
             return
-        if not os.path.exists(script):
-            QMessageBox.warning(
-                self, "QoR Compare", f"Script not found:\n{script}")
-            return
-        worker = QoRWorker(script, checked_paths)
+
+        python_bin = _PYTHON_BIN
+        # Run synchronously in a background thread via QoRWorker
+        worker = QoRWorker(script, sel, python_bin)
         worker.finished.connect(self._on_qor_done)
         worker.start()
         self._qor_worker = worker
 
     def _on_qor_done(self, html_path):
         if html_path and os.path.exists(html_path):
-            subprocess.Popen(['firefox', html_path])
+            subprocess.Popen([FIREFOX_PATH, html_path])
         else:
-            QMessageBox.warning(
-                self, "QoR Compare", "QoR script did not produce output.")
+            # Also try finding latest in qor_metrices/
+            import glob as _glob
+            hits = _glob.glob(
+                os.path.join(os.getcwd(), "qor_metrices", "**", "*.html"),
+                recursive=True)
+            if hits:
+                latest = sorted(hits, key=os.path.getmtime)[-1]
+                subprocess.Popen([FIREFOX_PATH, latest])
+            else:
+                QMessageBox.warning(
+                    self, "QoR Compare",
+                    "QoR script ran but no HTML output found.\n"
+                    "Check terminal output for errors.")
 
     def _run_single_stage_qor(self, item, b_name, r_rtl, base_run):
         """Run QoR summary for a single PNR stage.
@@ -3337,92 +3652,81 @@ class PDDashboard(QMainWindow):
     # MAIL
     # ------------------------------------------------------------------
     def send_cleanup_mail_action(self):
+        """Collect checked runs, group by owner, compose cleanup mail."""
         checked = self._iter_checked_items()
         if not checked:
             QMessageBox.information(self, "Cleanup Mail",
                                     "Please check some runs first.")
             return
-        paths = [c.text(15) for c in checked
-                 if c.text(15) and c.text(15) != "N/A"
-                 and self.user_pins.get(c.text(15)) != "golden"]
-        if not paths:
+
+        # Build owner -> [(path, size)] mapping, skip golden pins
+        user_runs = {}
+        for c in checked:
+            path  = c.text(15)
+            owner = c.text(5)
+            size  = c.text(6) if c.text(6) not in ("-","N/A","Calc...","") else "?"
+            if not path or path == "N/A":
+                continue
+            if self.user_pins.get(path) == "golden":
+                continue
+            if not owner or owner == "Unknown":
+                owner = "Unknown"
+            if owner not in user_runs:
+                user_runs[owner] = []
+            user_runs[owner].append((path, size))
+
+        if not user_runs:
             QMessageBox.information(self, "Cleanup Mail",
                                     "No non-golden runs selected.")
             return
-        # Simple inline cleanup mail dialog
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"Cleanup Mail ({len(paths)} runs)")
-        dlg.resize(700, 400)
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel(f"<b>Runs to clean ({len(paths)}):</b>"))
-        txt = QTextEdit()
-        txt.setReadOnly(True)
-        txt.setPlainText("\n".join(paths))
-        layout.addWidget(txt)
-        subj = QLineEdit(f"Cleanup Request: {len(paths)} runs")
-        layout.addWidget(QLabel("<b>Subject:</b>"))
-        layout.addWidget(subj)
-        body = QTextEdit()
-        body.setPlainText(
-            f"Hi,\n\nPlease clean up the following {len(paths)} run directories:\n\n"
-            + "\n".join(paths)
-            + "\n\nThank you.")
-        layout.addWidget(QLabel("<b>Body:</b>"))
-        layout.addWidget(body, 1)
-        btn_row = QHBoxLayout()
-        copy_btn = QPushButton("Copy to Clipboard")
-        close_btn = QPushButton("Close")
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(
-            f"Subject: {subj.text()}\n\n{body.toPlainText()}"))
-        close_btn.clicked.connect(dlg.accept)
-        btn_row.addWidget(copy_btn); btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-        dlg.exec_()
+
+        # Build body with path + size
+        body_lines = [
+            "Hi,",
+            "",
+            "Please remove these runs as they are consuming disk space:",
+            ""]
+        for owner, items in sorted(user_runs.items()):
+            body_lines.append(f"Owner: {owner}")
+            for path, sz in items:
+                body_lines.append(f"  {path}  [{sz}]")
+            body_lines.append("")
+        body_lines.append("Thank you.")
+
+        # Pre-fill To with owner emails
+        owner_emails = []
+        for owner in user_runs:
+            if owner != "Unknown":
+                e = _get_user_email(owner)
+                if e:
+                    owner_emails.append(e)
+
+        all_known = _get_all_known_mail_users()
+        dlg = AdvancedMailDialog(
+            "Action Required: Please clean up disk space runs",
+            "\n".join(body_lines),
+            all_known,
+            ", ".join(owner_emails),
+            self)
+
+        if dlg.exec_():
+            _send_mail_via_util(dlg)
 
     def send_qor_mail_action(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Send QoR Mail")
-        dlg.resize(600, 300)
-        layout = QVBoxLayout(dlg)
-        layout.addWidget(QLabel("Attach the QoR HTML report and send:"))
-        subj = QLineEdit("QoR Summary Report")
-        body = QTextEdit()
-        body.setPlainText("Hi,\n\nPlease find the QoR summary report attached.\n\nThank you.")
-        layout.addWidget(QLabel("<b>Subject:</b>"))
-        layout.addWidget(subj)
-        layout.addWidget(QLabel("<b>Body:</b>"))
-        layout.addWidget(body, 1)
-        btn_row = QHBoxLayout()
-        copy_btn = QPushButton("Copy to Clipboard")
-        close_btn = QPushButton("Close")
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(
-            f"Subject: {subj.text()}\n\n{body.toPlainText()}"))
-        close_btn.clicked.connect(dlg.accept)
-        btn_row.addWidget(copy_btn); btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-        dlg.exec_()
+        all_known = _get_all_known_mail_users()
+        dlg = AdvancedMailDialog(
+            "Latest Compare QoR Report",
+            "Hi Team,\n\nPlease find the attached latest QoR Report.\n\nRegards",
+            all_known, "", self)
+        dlg._attach_qor()  # auto-attach latest report
+        if dlg.exec_():
+            _send_mail_via_util(dlg)
 
     def send_custom_mail_action(self):
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Send Custom Mail")
-        dlg.resize(600, 350)
-        layout = QVBoxLayout(dlg)
-        subj = QLineEdit("PD Dashboard Update")
-        body = QTextEdit()
-        body.setPlainText("Hi,\n\n\n\nThank you.")
-        layout.addWidget(QLabel("<b>Subject:</b>"))
-        layout.addWidget(subj)
-        layout.addWidget(QLabel("<b>Body:</b>"))
-        layout.addWidget(body, 1)
-        btn_row = QHBoxLayout()
-        copy_btn = QPushButton("Copy to Clipboard")
-        close_btn = QPushButton("Close")
-        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(
-            f"Subject: {subj.text()}\n\n{body.toPlainText()}"))
-        close_btn.clicked.connect(dlg.accept)
-        btn_row.addWidget(copy_btn); btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
-        dlg.exec_()
+        all_known = _get_all_known_mail_users()
+        dlg = AdvancedMailDialog("", "", all_known, "", self)
+        if dlg.exec_():
+            _send_mail_via_util(dlg)
 
     # ------------------------------------------------------------------
     # ANALYTICS
