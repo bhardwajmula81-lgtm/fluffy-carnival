@@ -842,21 +842,9 @@ class ScannerWorker(QThread):
                     "stage_path":    stage_path,
                 })
 
-        # Extract QoR metrics (FE: completed only; BE: per stage)
-        metrics = {}
-        if _METRICS_AVAILABLE:
-            try:
-                if run_type == "FE" and is_comp:
-                    metrics = extract_fe_metrics(rd, b_name)
-                elif run_type == "BE":
-                    for stg in stages:
-                        try:
-                            stg["metrics"] = extract_pnr_stage_metrics(
-                                rd, stg["name"], source)
-                        except Exception:
-                            stg["metrics"] = {}
-            except Exception:
-                pass
+        # Metrics are NOT extracted during scan (too slow).
+        # They are extracted on-demand when user clicks "Show QoR Summary".
+        # See MetricWorker in this file.
 
         return {
             "block":        b_name,
@@ -877,7 +865,6 @@ class ScannerWorker(QThread):
             "fm_n_path":    fm_n,
             "fm_u_path":    fm_u,
             "vslp_rpt_path": vslp_rpt,
-            "metrics":      metrics,
         }
 
     def _map_release(self, data_obj, rtl_str, path):
@@ -898,6 +885,38 @@ class ScannerWorker(QThread):
 # summary.py call signature: python3 summary.py <dir1> <dir2> ...
 # It auto-detects FE vs BE from directory names ("FE" or "BE" in path).
 # ===========================================================================
+# ===========================================================================
+# MetricWorker -- extracts QoR metrics ON DEMAND for a single run/stage
+# Called only when user right-clicks and selects "Show QoR Summary"
+# Never runs during the main scan, so scan stays fast.
+# ===========================================================================
+class MetricWorker(QThread):
+    finished = pyqtSignal(dict)  # emits metrics dict when done
+
+    def __init__(self, run_path, b_name, run_type, source,
+                 stage_name=None):
+        super().__init__()
+        self.run_path   = run_path
+        self.b_name     = b_name
+        self.run_type   = run_type
+        self.source     = source
+        self.stage_name = stage_name  # None for FE, stage name for BE
+
+    def run(self):
+        if not _METRICS_AVAILABLE:
+            self.finished.emit({})
+            return
+        try:
+            if self.run_type == "FE":
+                m = extract_fe_metrics(self.run_path, self.b_name)
+            else:
+                m = extract_pnr_stage_metrics(
+                    self.run_path, self.stage_name, self.source)
+            self.finished.emit(m)
+        except Exception as e:
+            self.finished.emit({"_error": str(e)})
+
+
 class QoRWorker(QThread):
     finished = pyqtSignal(str)  # emits path to HTML output file, or ""
 
@@ -943,4 +962,3 @@ class QoRWorker(QThread):
             self.finished.emit(html_path if (html_path and os.path.exists(html_path)) else "")
         except Exception as e:
             self.finished.emit("")
- 
