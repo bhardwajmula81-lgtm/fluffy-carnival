@@ -21,7 +21,8 @@ from PyQt5.QtWidgets import (
     QSpinBox, QColorDialog, QTabWidget, QTableWidget,
     QTableWidgetItem, QScrollArea, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread
+from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate
+from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QBrush,
                          QPainter, QPen, QPixmap, QIcon)
 
@@ -29,8 +30,99 @@ from config import *
 from utils import *
 from workers import *
 from widgets import *
-from dialogs import *
+# dialogs inlined directly in main.py
 
+
+
+# ===========================================================================
+# INLINE DIALOG CLASSES (replaces dialogs.py dependency)
+# ===========================================================================
+
+class EditNoteDialog(QDialog):
+    def __init__(self, current_note, note_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Edit Note: {note_id[:50]}")
+        self.resize(500, 250)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"<b>Note for:</b> {note_id}"))
+        self._edit = QTextEdit()
+        self._edit.setPlainText(current_note or "")
+        layout.addWidget(self._edit)
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_text(self):
+        return self._edit.toPlainText().strip()
+
+
+class FilterDialog(QDialog):
+    def __init__(self, col_name, all_values, active_values, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Filter: {col_name}")
+        self.resize(300, 400)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"<b>Select values to show:</b>"))
+        btn_row = QHBoxLayout()
+        all_btn  = QPushButton("All")
+        none_btn = QPushButton("None")
+        btn_row.addWidget(all_btn); btn_row.addWidget(none_btn)
+        layout.addLayout(btn_row)
+        self._checks = {}
+        scroll = QScrollArea(); scroll.setWidgetResizable(True)
+        inner = QWidget(); inner_layout = QVBoxLayout(inner)
+        for val in sorted(all_values):
+            cb = QCheckBox(str(val))
+            cb.setChecked(val in active_values)
+            inner_layout.addWidget(cb)
+            self._checks[val] = cb
+        inner_layout.addStretch()
+        scroll.setWidget(inner)
+        layout.addWidget(scroll, 1)
+        all_btn.clicked.connect(lambda: [c.setChecked(True)
+                                         for c in self._checks.values()])
+        none_btn.clicked.connect(lambda: [c.setChecked(False)
+                                          for c in self._checks.values()])
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_selected(self):
+        return {v for v, cb in self._checks.items() if cb.isChecked()}
+
+
+class DiskUsageDialog(QDialog):
+    def __init__(self, disk_data, is_dark, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Disk Space Usage")
+        self.resize(700, 450)
+        layout = QVBoxLayout(self)
+        if not disk_data:
+            layout.addWidget(QLabel("No disk data available."))
+        else:
+            tbl = QTableWidget(0, 3)
+            tbl.setHorizontalHeaderLabels(["Path", "Size", "Owner"])
+            tbl.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.Stretch)
+            tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            tbl.setAlternatingRowColors(True)
+            tbl.verticalHeader().setVisible(False)
+            for item in sorted(disk_data,
+                                key=lambda x: x.get('bytes', 0),
+                                reverse=True)[:200]:
+                row = tbl.rowCount(); tbl.insertRow(row)
+                tbl.setItem(row, 0, QTableWidgetItem(
+                    item.get('path', '')))
+                tbl.setItem(row, 1, QTableWidgetItem(
+                    item.get('size', '')))
+                tbl.setItem(row, 2, QTableWidgetItem(
+                    item.get('owner', '')))
+            layout.addWidget(tbl)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
 
 class PDDashboard(QMainWindow):
 
@@ -76,6 +168,15 @@ class PDDashboard(QMainWindow):
 
         # -- milestone map (user-configurable in Settings > Milestones) --
         self._milestone_map = self._load_milestone_map()
+
+        # -- load QoR script path from prefs if not in config.py --
+        try:
+            _ = QOR_SUMMARY_SCRIPT  # already defined in config.py
+        except NameError:
+            import builtins
+            saved_qor = prefs.get('QOR', 'script_path', fallback='')
+            if saved_qor:
+                builtins.QOR_SUMMARY_SCRIPT = saved_qor
 
         # -- tapeout countdown --
         self._tapeout_date = None
@@ -1218,20 +1319,13 @@ class PDDashboard(QMainWindow):
             # FEAT 3+5: Show regression warning and history in inspector
             run_data = item.data(0, Qt.UserRole + 10)
             reg_msg  = item.data(0, Qt.UserRole + 30)
-            hist_txt = ""
-            if run_data and self._run_history:
-                hist_txt = self._get_run_history_text(run_data)
             reg_part = (
                 f"<br><span style='color:#f57c00'>"
-                f"[!] {reg_msg}</span>"
+                f"[!] Regression: {reg_msg}</span>"
                 if reg_msg else "")
-            hist_part = (
-                f"<br><small><b>History (last 5):</b><br>"
-                + hist_txt.replace("\n", "<br>") + "</small>"
-                if hist_txt and hist_txt != "No history yet." else "")
             self.ins_lbl.setText(
                 f"<b>Run:</b> {run_name}<br><b>RTL:</b> {rtl}"
-                f"{reg_part}{hist_part}")
+                f"{reg_part}")
             self._current_note_id = f"{rtl} : {run_name}"
 
         notes      = self.global_notes.get(self._current_note_id, [])
@@ -2258,7 +2352,10 @@ class PDDashboard(QMainWindow):
             if node_type == "__PLACEHOLDER__":
                 item.setHidden(True)
                 return False
-            if node_type in _GROUP_TYPES:
+            # Group nodes (BLOCK, MILESTONE, RTL, IGNORED_ROOT) recurse
+            # into children. Also handles hide_block_nodes=True where
+            # MILESTONE nodes sit directly under root with no BLOCK parent.
+            if node_type in _GROUP_TYPES or node_type == "MILESTONE":
                 any_visible = False
                 for i in range(item.childCount()):
                     if _update_visibility(item.child(i)):
@@ -2808,10 +2905,9 @@ class PDDashboard(QMainWindow):
         gen_l.addRow("", ist_cb)
 
         # Tapeout date
-        from PyQt5.QtWidgets import QDateEdit
-        from PyQt5.QtCore import QDate
+        # QDateEdit imported at module level as _QDateEditImport
         gen_l.addRow(QLabel("--- Tapeout ---"))
-        tapeout_edit = QDateEdit()
+        tapeout_edit = _QDateEditImport()
         tapeout_edit.setDisplayFormat("yyyy-MM-dd")
         tapeout_edit.setCalendarPopup(True)
         if self._tapeout_date:
@@ -2991,6 +3087,40 @@ class PDDashboard(QMainWindow):
             "<small><i>Changes take effect after next Refresh.</i></small>"))
         tabs.addTab(ms_w, "Milestones")
 
+        # -- QoR Script tab --
+        qor_w = QWidget()
+        qor_l = QFormLayout(qor_w)
+        qor_l.setSpacing(10)
+        qor_l.addRow(QLabel(
+            "<b>QoR Summary Script Path</b><br>"
+            "<small>Path to summary.py used for QoR comparison.<br>"
+            "Set this to use the Compare QoR feature.</small>"))
+        qor_script_edit = QLineEdit()
+        try:
+            qor_script_edit.setText(QOR_SUMMARY_SCRIPT)
+        except NameError:
+            saved_qor = prefs.get('QOR', 'script_path', fallback='')
+            qor_script_edit.setText(saved_qor)
+        qor_script_edit.setPlaceholderText(
+            "/user/scripts/summary/summary.py")
+        browse_btn = QPushButton("Browse...")
+        def _browse_qor():
+            p, _ = QFileDialog.getOpenFileName(
+                dlg, "Select summary.py", "",
+                "Python Files (*.py)")
+            if p:
+                qor_script_edit.setText(p)
+        browse_btn.clicked.connect(_browse_qor)
+        row_qor = QHBoxLayout()
+        row_qor.addWidget(qor_script_edit, 1)
+        row_qor.addWidget(browse_btn)
+        qor_l.addRow("summary.py path:", row_qor)
+        qor_l.addWidget(QLabel(
+            "<small><i>Saved to user_prefs.ini. "
+            "Also add QOR_SUMMARY_SCRIPT = '...' to config.py "
+            "to make it permanent.</i></small>"))
+        tabs.addTab(qor_w, "QoR Script")
+
         outer.addWidget(tabs)
         btn_box = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -3002,6 +3132,7 @@ class PDDashboard(QMainWindow):
             return
 
         # Apply general settings
+        _need_rebuild = False  # set True below if tree structure changes
         font = font_combo.currentFont()
         font.setPointSize(size_spin.value())
         QApplication.setFont(font)
@@ -3011,9 +3142,15 @@ class PDDashboard(QMainWindow):
         self.custom_fg_color    = _colors[1]
         self.custom_sel_color   = _colors[2]
         self.row_spacing        = space_spin.value()
+        old_rel_time = self.show_relative_time
+        old_ist      = self.convert_to_ist
         self.show_relative_time = rel_time_cb.isChecked()
         self.convert_to_ist     = ist_cb.isChecked()
+        if old_rel_time != self.show_relative_time or old_ist != self.convert_to_ist:
+            _need_rebuild = True  # timestamps baked at item creation time
+        old_hide_blk = self.hide_block_nodes
         self.hide_block_nodes   = hide_blk_cb.isChecked()
+        _need_rebuild = (old_hide_blk != self.hide_block_nodes)
 
         # Save tapeout date
         import datetime
@@ -3054,6 +3191,16 @@ class PDDashboard(QMainWindow):
         self._preset_standard = standard_set
         self._preset_full     = full_set
 
+        # Save QoR script path
+        qor_path_val = qor_script_edit.text().strip()
+        if not prefs.has_section('QOR'):
+            prefs.add_section('QOR')
+        prefs.set('QOR', 'script_path', qor_path_val)
+        if qor_path_val:
+            # Inject into module globals so try/except in run_qor finds it
+            import builtins
+            builtins.QOR_SUMMARY_SCRIPT = qor_path_val
+
         # Save milestone map
         new_ms_map = {}
         for r in range(ms_tbl.rowCount()):
@@ -3069,7 +3216,11 @@ class PDDashboard(QMainWindow):
             self._save_milestone_map(new_ms_map)
 
         self.apply_theme_and_spacing()
-        self.refresh_view()
+        if _need_rebuild:
+            # hide_block_nodes changed -- must rebuild tree structure
+            QTimer.singleShot(50, self._build_tree)
+        else:
+            self.refresh_view()
         current_mode = self.mode_combo.currentText()
         self._set_col_preset(
             {"Standard": 2, "Compact": 1, "Full": 3}.get(current_mode, 2))
@@ -3198,15 +3349,79 @@ class PDDashboard(QMainWindow):
             QMessageBox.information(self, "Cleanup Mail",
                                     "No non-golden runs selected.")
             return
-        dlg = CleanupMailDialog(paths, self)
+        # Simple inline cleanup mail dialog
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Cleanup Mail ({len(paths)} runs)")
+        dlg.resize(700, 400)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel(f"<b>Runs to clean ({len(paths)}):</b>"))
+        txt = QTextEdit()
+        txt.setReadOnly(True)
+        txt.setPlainText("\n".join(paths))
+        layout.addWidget(txt)
+        subj = QLineEdit(f"Cleanup Request: {len(paths)} runs")
+        layout.addWidget(QLabel("<b>Subject:</b>"))
+        layout.addWidget(subj)
+        body = QTextEdit()
+        body.setPlainText(
+            f"Hi,\n\nPlease clean up the following {len(paths)} run directories:\n\n"
+            + "\n".join(paths)
+            + "\n\nThank you.")
+        layout.addWidget(QLabel("<b>Body:</b>"))
+        layout.addWidget(body, 1)
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy to Clipboard")
+        close_btn = QPushButton("Close")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(
+            f"Subject: {subj.text()}\n\n{body.toPlainText()}"))
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(copy_btn); btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
         dlg.exec_()
 
     def send_qor_mail_action(self):
-        dlg = QoRMailDialog(self)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Send QoR Mail")
+        dlg.resize(600, 300)
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Attach the QoR HTML report and send:"))
+        subj = QLineEdit("QoR Summary Report")
+        body = QTextEdit()
+        body.setPlainText("Hi,\n\nPlease find the QoR summary report attached.\n\nThank you.")
+        layout.addWidget(QLabel("<b>Subject:</b>"))
+        layout.addWidget(subj)
+        layout.addWidget(QLabel("<b>Body:</b>"))
+        layout.addWidget(body, 1)
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy to Clipboard")
+        close_btn = QPushButton("Close")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(
+            f"Subject: {subj.text()}\n\n{body.toPlainText()}"))
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(copy_btn); btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
         dlg.exec_()
 
     def send_custom_mail_action(self):
-        dlg = CustomMailDialog(self)
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Send Custom Mail")
+        dlg.resize(600, 350)
+        layout = QVBoxLayout(dlg)
+        subj = QLineEdit("PD Dashboard Update")
+        body = QTextEdit()
+        body.setPlainText("Hi,\n\n\n\nThank you.")
+        layout.addWidget(QLabel("<b>Subject:</b>"))
+        layout.addWidget(subj)
+        layout.addWidget(QLabel("<b>Body:</b>"))
+        layout.addWidget(body, 1)
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy to Clipboard")
+        close_btn = QPushButton("Close")
+        copy_btn.clicked.connect(lambda: QApplication.clipboard().setText(
+            f"Subject: {subj.text()}\n\n{body.toPlainText()}"))
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(copy_btn); btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
         dlg.exec_()
 
     # ------------------------------------------------------------------
