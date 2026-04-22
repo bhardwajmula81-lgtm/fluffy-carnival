@@ -1,27 +1,26 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
-# Pure extraction. NO deep globbing. Exact nested dictionary structure restored.
+# Perfectly synchronized to the PyQt5 dashboard's dictionary expectations.
+# Strictly searches inside the run/reports directory as requested.
 
 import os
 import re
 import glob
 
 # ===========================================================================
-# STRICT FILE DISCOVERY (No deep globbing, exact folder only)
+# STRICT FILE DISCOVERY (No recursive searching)
 # ===========================================================================
 def _find_rpt(rpt_dir, prefix):
     """
     Looks ONLY in the provided rpt_dir. 
-    Matches exactly the pattern from your images: prefix.BLOCK.TIMESTAMP.rpt
+    Matches exactly the pattern: prefix.*.rpt (e.g. area.BLK_ISP2.123.rpt)
     """
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
 
-    # Matches files like area.BLK_ISP2.20260416_1633.rpt
     pattern = os.path.join(rpt_dir, f"{prefix}.*.rpt")
     hits = glob.glob(pattern)
     
-    # Fallback just in case it doesn't have .rpt extension
     if not hits:
         pattern = os.path.join(rpt_dir, f"{prefix}*")
         hits = glob.glob(pattern)
@@ -99,7 +98,8 @@ def parse_qor_rpt(filepath):
 def parse_area(filepath):
     result = {
         "total_area": "-", "combinational_area": "-", "reg_area": "-",
-        "macro_area": "-", "buf_area": "-", "total_count": "-"
+        "macro_area": "-", "buf_area": "-", "total_count": "-",
+        "std_cell_area": "-", "memory_area": "-"
     }
     if not filepath or not os.path.exists(filepath): return result
     try:
@@ -119,17 +119,31 @@ def parse_area(filepath):
 
                 m_buf = re.search(r'Buf/Inv.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_buf and result["buf_area"] == "-": result["buf_area"] = m_buf.group(1)
+
+                # Explicitly match exactly the terms you provided:
+                m_inst = re.search(r'Instance count.*?[:|=]\s*(\d+)', line, re.IGNORECASE)
+                if m_inst: result["total_count"] = m_inst.group(1)
+
+                m_std = re.search(r'(?:std|standard)\s*cell\s*area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_std: result["std_cell_area"] = m_std.group(1)
+
+                m_mem = re.search(r'memory\s*area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mem: result["memory_area"] = m_mem.group(1)
     except: pass
     return result
 
 def parse_vth_from_cell_usage(filepath):
-    result = {"vth_raw": {}, "vth_totals": {}, "total_cells": 0}
+    result = {"vth_raw": {}, "vth_totals": {}, "total_cells": 0, "instance_count": "-"}
     if not filepath or not os.path.exists(filepath): return result
 
     in_target_block = False
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
+                # Catch instance count here too just in case
+                m_inst = re.search(r'Instance count.*?[:|=]\s*(\d+)', line, re.IGNORECASE)
+                if m_inst: result["instance_count"] = m_inst.group(1)
+
                 if "total cells:" in line.lower() or "total standard cells:" in line.lower():
                     result["vth_raw"].clear()
                     result["total_cells"] = 0
@@ -168,17 +182,27 @@ def parse_power(filepath):
     return result
 
 def parse_utilization(filepath):
-    result = {"total_util": "-", "std_cell_only_util": "-", "memory_util": "-"}
+    result = {"total_util": "-", "std_cell_only_util": "-", "memory_util": "-", "std_cell_area": "-", "memory_area": "-"}
     if not filepath or not os.path.exists(filepath): return result
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
+                # Percentage rows
                 m_tot = re.search(r'Total Utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_tot: result["total_util"] = m_tot.group(1)
-                m_std = re.search(r'Standard cell only.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_std: result["std_cell_only_util"] = m_std.group(1)
-                m_mem = re.search(r'Memory utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_mem: result["memory_util"] = m_mem.group(1)
+                
+                m_std_pct = re.search(r'Standard cell only.*?[:\|]\s*([-\.\d]+)\s*%', line, re.IGNORECASE)
+                if m_std_pct: result["std_cell_only_util"] = m_std_pct.group(1)
+                
+                m_mem_pct = re.search(r'Memory utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mem_pct: result["memory_util"] = m_mem_pct.group(1)
+
+                # Area rows
+                m_std_area = re.search(r'Standard cell.*?area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_std_area and "%" not in line: result["std_cell_area"] = m_std_area.group(1)
+
+                m_mem_area = re.search(r'Memory area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mem_area and "%" not in line: result["memory_area"] = m_mem_area.group(1)
     except: pass
     return result
 
@@ -192,43 +216,91 @@ def parse_clock_gating(filepath):
     except: pass
     return "-"
 
+def parse_congestion(filepath):
+    result = {"max_h": "-", "max_v": "-"}
+    if not filepath or not os.path.exists(filepath): return result
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                m_mh = re.search(r'Max H routing congestion.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mh: result["max_h"] = m_mh.group(1)
+                m_mv = re.search(r'Max V routing congestion.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mv: result["max_v"] = m_mv.group(1)
+    except: pass
+    return result
+
 # ===========================================================================
-# MAIN EXTRACTION WRAPPERS (Strictly Nested output)
+# MAIN EXTRACTION WRAPPERS (Strictly UI Mapped)
 # ===========================================================================
 def extract_fe_metrics(run_dir, source="WS"):
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
 
-    # 1. Timing (QoR)
+    # 1. TIMING (UI expects these at ROOT level)
     qor_path = _find_rpt(rpt_dir, "qor")
-    result.update(parse_qor_rpt(qor_path))
+    qor_data = parse_qor_rpt(qor_path)
+    result["r2r_setup"] = qor_data.get("r2r_setup", "-")
+    result["r2r_hold"] = qor_data.get("r2r_hold", "-")
+    result["mbit"] = qor_data.get("mbit", "-")
+    result["tool_version"] = qor_data.get("tool_version", "-")
+    result["scenarios"] = qor_data.get("scenarios", {"setup": {}, "hold": {}})
 
-    # 2. Area
+    # 2. CGC (UI expects at ROOT level)
+    cgc_path = _find_rpt(rpt_dir, "clock_gating_info")
+    result["cgc"] = parse_clock_gating(cgc_path)
+
+    # 3. AREA (UI expects as nested 'area' dict)
     area_path = _find_rpt(rpt_dir, "area")
-    result["area"] = parse_area(area_path)
-    
-    # 3. Cell Usage / VTH (Matches exactly your image: cell_usage.summary)
+    area_data = parse_area(area_path)
+    result["area"] = area_data
+
+    # 4. UTILIZATION (UI expects as nested 'util' dict)
+    util_path = _find_rpt(rpt_dir, "utilization")
+    util_data = parse_utilization(util_path)
+    result["util"] = util_data
+
+    # --- CROSS POLLINATION (To guarantee the UI finds std_cell_area & memory_area) ---
+    if result["area"].get("std_cell_area", "-") == "-":
+        if util_data.get("std_cell_area", "-") != "-":
+            result["area"]["std_cell_area"] = util_data["std_cell_area"]
+        else:
+            result["area"]["std_cell_area"] = area_data.get("combinational_area", "-")
+            
+    if result["util"].get("std_cell_area", "-") == "-":
+        result["util"]["std_cell_area"] = result["area"]["std_cell_area"]
+
+    if result["area"].get("memory_area", "-") == "-":
+        if util_data.get("memory_area", "-") != "-":
+            result["area"]["memory_area"] = util_data["memory_area"]
+        else:
+            result["area"]["memory_area"] = area_data.get("macro_area", "-")
+            
+    if result["util"].get("memory_area", "-") == "-":
+        result["util"]["memory_area"] = result["area"]["memory_area"]
+    # ---------------------------------------------------------------------------------
+
+    # 5. VTH & CELL COUNT
     cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
     if not cell_path: cell_path = _find_rpt(rpt_dir, "cell_usage")
     vth_data = parse_vth_from_cell_usage(cell_path)
     
-    # UI requires these exact keys for VTH pie charts
+    # UI expects vth_raw and vth_totals at the ROOT level for the Pie Chart
     result["vth_raw"] = vth_data.get("vth_raw", {})
     result["vth_totals"] = vth_data.get("vth_totals", {})
-    if vth_data.get("total_cells", 0) > 0:
-        result["area"]["total_count"] = str(vth_data["total_cells"])
 
-    # 4. Power
+    # UI expects the total_count inside the AREA table (1109038)
+    if result["area"].get("total_count", "-") == "-":
+        if vth_data.get("instance_count", "-") != "-":
+            result["area"]["total_count"] = vth_data["instance_count"]
+        elif vth_data.get("total_cells", 0) > 0:
+            result["area"]["total_count"] = str(vth_data["total_cells"])
+
+    # 6. POWER & CONGESTION
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
 
-    # 5. Utilization
-    util_path = _find_rpt(rpt_dir, "utilization")
-    result["util"] = parse_utilization(util_path)
-
-    # 6. CGC (Matches exactly your image: clock_gating_info)
-    cgc_path = _find_rpt(rpt_dir, "clock_gating_info")
-    result["cgc"] = parse_clock_gating(cgc_path)
+    cong_path = _find_rpt(rpt_dir, "congestion")
+    result["congestion"] = parse_congestion(cong_path)
 
     return result
 
@@ -241,27 +313,60 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
         rpt_dir = os.path.join(run_dir, stage_name, "reports", stage_name)
 
     qor_path = _find_rpt(rpt_dir, "qor")
-    result.update(parse_qor_rpt(qor_path))
+    qor_data = parse_qor_rpt(qor_path)
+    result["r2r_setup"] = qor_data.get("r2r_setup", "-")
+    result["r2r_hold"] = qor_data.get("r2r_hold", "-")
+    result["mbit"] = qor_data.get("mbit", "-")
+    result["tool_version"] = qor_data.get("tool_version", "-")
+    result["scenarios"] = qor_data.get("scenarios", {"setup": {}, "hold": {}})
+
+    cgc_path = _find_rpt(rpt_dir, "clock_gating_info")
+    result["cgc"] = parse_clock_gating(cgc_path)
 
     area_path = _find_rpt(rpt_dir, "area")
-    result["area"] = parse_area(area_path)
-    
+    area_data = parse_area(area_path)
+    result["area"] = area_data
+
+    util_path = _find_rpt(rpt_dir, "utilization")
+    util_data = parse_utilization(util_path)
+    result["util"] = util_data
+
+    # CROSS POLLINATION
+    if result["area"].get("std_cell_area", "-") == "-":
+        if util_data.get("std_cell_area", "-") != "-":
+            result["area"]["std_cell_area"] = util_data["std_cell_area"]
+        else:
+            result["area"]["std_cell_area"] = area_data.get("combinational_area", "-")
+            
+    if result["util"].get("std_cell_area", "-") == "-":
+        result["util"]["std_cell_area"] = result["area"]["std_cell_area"]
+
+    if result["area"].get("memory_area", "-") == "-":
+        if util_data.get("memory_area", "-") != "-":
+            result["area"]["memory_area"] = util_data["memory_area"]
+        else:
+            result["area"]["memory_area"] = area_data.get("macro_area", "-")
+            
+    if result["util"].get("memory_area", "-") == "-":
+        result["util"]["memory_area"] = result["area"]["memory_area"]
+
     cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
     if not cell_path: cell_path = _find_rpt(rpt_dir, "cell_usage")
     vth_data = parse_vth_from_cell_usage(cell_path)
     
     result["vth_raw"] = vth_data.get("vth_raw", {})
     result["vth_totals"] = vth_data.get("vth_totals", {})
-    if vth_data.get("total_cells", 0) > 0:
-        result["area"]["total_count"] = str(vth_data["total_cells"])
+
+    if result["area"].get("total_count", "-") == "-":
+        if vth_data.get("instance_count", "-") != "-":
+            result["area"]["total_count"] = vth_data["instance_count"]
+        elif vth_data.get("total_cells", 0) > 0:
+            result["area"]["total_count"] = str(vth_data["total_cells"])
 
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
 
-    util_path = _find_rpt(rpt_dir, "utilization")
-    result["util"] = parse_utilization(util_path)
-
-    cgc_path = _find_rpt(rpt_dir, "clock_gating_info")
-    result["cgc"] = parse_clock_gating(cgc_path)
+    cong_path = _find_rpt(rpt_dir, "congestion")
+    result["congestion"] = parse_congestion(cong_path)
 
     return result
