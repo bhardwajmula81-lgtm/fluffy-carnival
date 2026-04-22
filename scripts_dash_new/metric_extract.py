@@ -1,43 +1,41 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
 # Fully native QoR metric parser. Replaces external summary.py calls.
-# Extracts advanced scenario timing, Vth distributions, clock latency, and area.
+# UI-Synchronized: Keys exactly match PyQt5 expected dictionary bindings.
 
 import os
 import re
 import glob
 
 # ===========================================================================
-# FILE DISCOVERY HELPER
+# AGGRESSIVE FILE DISCOVERY HELPER
 # ===========================================================================
 def _find_rpt(rpt_dir, search_string):
     """
-    Hunts down a report file robustly using recursive deep-search.
-    Bypasses subdirectory barriers.
+    Hunts down a report file using multi-depth searching.
+    Guarantees file is found whether in base dir or hidden in subfolders.
     """
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
 
+    # Check 4 different pathing variations to defeat NFS hiding
+    patterns = [
+        os.path.join(rpt_dir, f"{search_string}.*.rpt"),
+        os.path.join(rpt_dir, f"*{search_string}*.rpt"),
+        os.path.join(rpt_dir, "**", f"{search_string}.*.rpt"),
+        os.path.join(rpt_dir, "**", f"*{search_string}*.rpt")
+    ]
+    
     hits = []
-    # Primary deep search
-    if "*" in search_string:
-        pattern = os.path.join(rpt_dir, "**", search_string)
-        hits = glob.glob(pattern, recursive=True)
-    else:
-        pattern = os.path.join(rpt_dir, "**", f"{search_string}.*.rpt")
-        hits = glob.glob(pattern, recursive=True)
-        
-    # Fallback deep search
-    if not hits and "*" not in search_string:
-        pattern = os.path.join(rpt_dir, "**", f"*{search_string}*")
-        hits = glob.glob(pattern, recursive=True)
+    for p in patterns:
+        hits.extend(glob.glob(p, recursive=True))
 
-    # Standard processing applied
-    valid_files = [f for f in hits if os.path.isfile(f) and not f.endswith(".log")]
+    valid_files = [f for f in set(hits) if os.path.isfile(f) and not f.endswith(".log")]
 
     if not valid_files:
         return None
 
+    # Return the newest file
     return sorted(valid_files, key=os.path.getmtime)[-1]
 
 # ===========================================================================
@@ -45,7 +43,8 @@ def _find_rpt(rpt_dir, search_string):
 # ===========================================================================
 def parse_qor_rpt(filepath):
     result = {
-        "runtime": "-", "r2r_setup": "-", "r2r_hold": "-",
+        "runtime": "-", "r2r_setup": "-", "setup_wns": "-", 
+        "r2r_hold": "-", "hold_wns": "-", "setup_tns": "-", "hold_tns": "-",
         "mbit": "-", "tool_version": "-",
         "scenarios": {"setup": {}, "hold": {}}
     }
@@ -59,17 +58,25 @@ def parse_qor_rpt(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
+                # Global Matchers
                 m_rt = re.search(r'Design\s*(?:\(Setup\))?\s*WNS:\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_rt: result["r2r_setup"] = m_rt.group(1)
+                if m_rt and result["r2r_setup"] == "-": 
+                    result["r2r_setup"] = m_rt.group(1)
+                    result["setup_wns"] = m_rt.group(1)
 
                 m_rh = re.search(r'Design\s*\(Hold\)\s*WNS:\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_rh: result["r2r_hold"] = m_rh.group(1)
+                if m_rh and result["r2r_hold"] == "-": 
+                    result["r2r_hold"] = m_rh.group(1)
+                    result["hold_wns"] = m_rh.group(1)
 
                 m_v = re.search(r'Version:\s+(\S+)', line, re.IGNORECASE)
                 if m_v: result["tool_version"] = m_v.group(1)
 
+                # Scenario Mode Tracking
                 m_scen = re.search(r'Scenarios?:\s*(\S+)', line, re.IGNORECASE)
-                if m_scen: current_scen = m_scen.group(1)
+                if m_scen: 
+                    current_scen = m_scen.group(1)
+                    current_mode = "setup" # Reset mode for new scenario
 
                 m_pg = re.search(r'Timing Path Group\s+\'?([^\'\s]+)\'?', line, re.IGNORECASE)
                 if m_pg: current_pg = m_pg.group(1)
@@ -84,6 +91,7 @@ def parse_qor_rpt(filepath):
                 if current_pg not in result["scenarios"][current_mode][current_scen]:
                     result["scenarios"][current_mode][current_scen][current_pg] = {'wns': '-', 'tns': '-', 'nvp': '-', 'levels': '-'}
 
+                # Dictionary Population
                 m_wns = re.search(r'(?:WNS|Worst\s+[sS]etup\s+Violation|Worst\s+[hH]old\s+Violation|Critical\s+Path\s+Slack)\s*[:\|]\s*([-\.\d]+)', line)
                 if m_wns and "Design" not in line:
                     result["scenarios"][current_mode][current_scen][current_pg]['wns'] = m_wns.group(1)
@@ -127,29 +135,37 @@ def parse_latency_skew(filepath):
     return result
 
 def parse_area(filepath):
+    # Expanded keys to ensure the UI finds what it needs
     result = {
         "total_area": "-", "combinational_area": "-", "reg_area": "-",
-        "macro_area": "-", "buf_area": "-"
+        "macro_area": "-", "buf_area": "-", "comb_area": "-", "seq_area": "-",
+        "buf_inv_area": "-", "total_count": "-"
     }
     if not filepath or not os.path.exists(filepath): 
         return result
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                m_tot = re.search(r'Total cell area:\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_tot: result["total_area"] = m_tot.group(1)
+                m_tot = re.search(r'Total cell area\s*[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_tot and result["total_area"] == "-": result["total_area"] = m_tot.group(1)
 
-                m_comb = re.search(r'Combinational area:\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_comb: result["combinational_area"] = m_comb.group(1)
+                m_comb = re.search(r'Combinational\s*(?:cell)?\s*area\s*[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_comb and result["combinational_area"] == "-": 
+                    result["combinational_area"] = m_comb.group(1)
+                    result["comb_area"] = m_comb.group(1)
 
-                m_reg = re.search(r'Noncombinational area:\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_reg: result["reg_area"] = m_reg.group(1)
+                m_reg = re.search(r'Noncombinational\s*(?:cell)?\s*area\s*[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_reg and result["reg_area"] == "-": 
+                    result["reg_area"] = m_reg.group(1)
+                    result["seq_area"] = m_reg.group(1)
 
-                m_mac = re.search(r'Macro/Black Box area:\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_mac: result["macro_area"] = m_mac.group(1)
+                m_mac = re.search(r'Macro/Black\s+Box\s+area\s*[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mac and result["macro_area"] == "-": result["macro_area"] = m_mac.group(1)
 
-                m_buf = re.search(r'Buf/Inv area:\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_buf: result["buf_area"] = m_buf.group(1)
+                m_buf = re.search(r'Buf/Inv\s+area\s*[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_buf and result["buf_area"] == "-": 
+                    result["buf_area"] = m_buf.group(1)
+                    result["buf_inv_area"] = m_buf.group(1)
     except: 
         pass
     return result
@@ -217,7 +233,8 @@ def parse_congestion(filepath):
     return result
 
 def parse_utilization(filepath):
-    result = {"total_util": "-", "std_cell_util": "-", "memory_util": "-"}
+    # Renamed UI keys to match expected dashboard format
+    result = {"total_util": "-", "std_cell_only_util": "-", "memory_util": "-"}
     if not filepath or not os.path.exists(filepath): return result
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -225,7 +242,7 @@ def parse_utilization(filepath):
                 m_tot = re.search(r'Total Utilization\s*[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_tot: result["total_util"] = m_tot.group(1)
                 m_std = re.search(r'Standard cell only utilization\s*[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_std: result["std_cell_util"] = m_std.group(1)
+                if m_std: result["std_cell_only_util"] = m_std.group(1)
                 m_mem = re.search(r'Memory utilization\s*[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_mem: result["memory_util"] = m_mem.group(1)
     except: pass
@@ -259,30 +276,44 @@ def extract_fe_metrics(run_dir, source="WS"):
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
 
+    # Timing
     qor_path = _find_rpt(rpt_dir, "qor")
     result.update(parse_qor_rpt(qor_path))
 
+    # Area
     area_path = _find_rpt(rpt_dir, "area")
     result["area"] = parse_area(area_path)
     
+    # VTH (UI expects this to be updated into the ROOT, not nested inside "vth")
     cell_path = _find_rpt(rpt_dir, "cell_usage")
-    result["vth"] = parse_vth_from_cell_usage(cell_path)
+    vth_data = parse_vth_from_cell_usage(cell_path)
+    result.update(vth_data) 
+    
+    # UI expects total_count to be inside the Area dictionary
+    if "total_cells" in vth_data:
+        result["area"]["total_count"] = vth_data["total_cells"]
 
+    # Power
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
 
+    # Congestion
     cong_path = _find_rpt(rpt_dir, "congestion")
     result["congestion"] = parse_congestion(cong_path)
 
+    # Clock
     clk_path = _find_rpt(rpt_dir, "clock")
     result["clock"] = parse_latency_skew(clk_path)
 
+    # Utilization (UI expects "util")
     util_path = _find_rpt(rpt_dir, "utilization")
-    result["utilization"] = parse_utilization(util_path)
+    result["util"] = parse_utilization(util_path)
 
+    # CGC (UI expects "cgc")
     cgc_path = _find_rpt(rpt_dir, "clock_gating")
-    result["cgc_pct"] = parse_clock_gating(cgc_path)
+    result["cgc"] = parse_clock_gating(cgc_path)
 
+    # DRC
     log = os.path.join(run_dir, "logs", "compile_opt.log")
     result["drc_errors"] = parse_drc_from_log(log)
 
@@ -305,7 +336,10 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     result["area"] = parse_area(area_path)
     
     cell_path = _find_rpt(rpt_dir, "cell_usage")
-    result["vth"] = parse_vth_from_cell_usage(cell_path)
+    vth_data = parse_vth_from_cell_usage(cell_path)
+    result.update(vth_data)
+    if "total_cells" in vth_data:
+        result["area"]["total_count"] = vth_data["total_cells"]
 
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
@@ -317,10 +351,10 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     result["clock"] = parse_latency_skew(clk_path)
 
     util_path = _find_rpt(rpt_dir, "utilization")
-    result["utilization"] = parse_utilization(util_path)
+    result["util"] = parse_utilization(util_path)
 
     cgc_path = _find_rpt(rpt_dir, "clock_gating")
-    result["cgc_pct"] = parse_clock_gating(cgc_path)
+    result["cgc"] = parse_clock_gating(cgc_path)
 
     result["drc_errors"] = parse_drc_from_log(log)
 
