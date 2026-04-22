@@ -1,14 +1,14 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
-# Perfectly synchronized to the PyQt5 dashboard's dictionary expectations.
-# Strictly searches inside the run/reports directory as requested.
+# Strictly searches local reports folder. NO recursive searching.
+# Accurately maps utilization area and instance counts directly to the UI.
 
 import os
 import re
 import glob
 
 # ===========================================================================
-# STRICT FILE DISCOVERY (No recursive searching)
+# STRICT FILE DISCOVERY 
 # ===========================================================================
 def _find_rpt(rpt_dir, prefix):
     """
@@ -98,8 +98,7 @@ def parse_qor_rpt(filepath):
 def parse_area(filepath):
     result = {
         "total_area": "-", "combinational_area": "-", "reg_area": "-",
-        "macro_area": "-", "buf_area": "-", "total_count": "-",
-        "std_cell_area": "-", "memory_area": "-"
+        "macro_area": "-", "buf_area": "-"
     }
     if not filepath or not os.path.exists(filepath): return result
     try:
@@ -108,31 +107,50 @@ def parse_area(filepath):
                 m_tot = re.search(r'Total cell area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_tot and result["total_area"] == "-": result["total_area"] = m_tot.group(1)
 
-                m_comb = re.search(r'Combinational.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                m_comb = re.search(r'Combinational area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_comb and result["combinational_area"] == "-": result["combinational_area"] = m_comb.group(1)
 
-                m_reg = re.search(r'Noncombinational.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                m_reg = re.search(r'Noncombinational area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_reg and result["reg_area"] == "-": result["reg_area"] = m_reg.group(1)
 
-                m_mac = re.search(r'Macro/Black\s+Box.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                m_mac = re.search(r'Macro/Black\s+Box area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_mac and result["macro_area"] == "-": result["macro_area"] = m_mac.group(1)
 
-                m_buf = re.search(r'Buf/Inv.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
+                m_buf = re.search(r'Buf/Inv area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_buf and result["buf_area"] == "-": result["buf_area"] = m_buf.group(1)
+    except: pass
+    return result
 
-                # Explicitly match exactly the terms you provided:
-                m_inst = re.search(r'Instance count.*?[:|=]\s*(\d+)', line, re.IGNORECASE)
-                if m_inst: result["total_count"] = m_inst.group(1)
+def parse_utilization(filepath):
+    """Parses both the percentages and the actual physical areas from utilization report."""
+    result = {"total_util": "-", "std_cell_only_util": "-", "memory_util": "-", "std_cell_area": "-", "memory_area": "-"}
+    if not filepath or not os.path.exists(filepath): return result
+    try:
+        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                # Percentage checks
+                if "utilization" in line.lower():
+                    m_tot = re.search(r'Total Utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_tot: result["total_util"] = m_tot.group(1)
+                    
+                    m_std_pct = re.search(r'Standard cell only.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_std_pct: result["std_cell_only_util"] = m_std_pct.group(1)
+                    
+                    m_mem_pct = re.search(r'Memory utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_mem_pct: result["memory_util"] = m_mem_pct.group(1)
 
-                m_std = re.search(r'(?:std|standard)\s*cell\s*area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_std: result["std_cell_area"] = m_std.group(1)
+                # Area value checks (e.g. Standard cell only area | 294313.23)
+                elif "area" in line.lower():
+                    m_std_area = re.search(r'Standard cell only area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_std_area: result["std_cell_area"] = m_std_area.group(1)
 
-                m_mem = re.search(r'memory\s*area.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_mem: result["memory_area"] = m_mem.group(1)
+                    m_mem_area = re.search(r'Memory area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_mem_area: result["memory_area"] = m_mem_area.group(1)
     except: pass
     return result
 
 def parse_vth_from_cell_usage(filepath):
+    """Pulls Instance count and VTH distribution"""
     result = {"vth_raw": {}, "vth_totals": {}, "total_cells": 0, "instance_count": "-"}
     if not filepath or not os.path.exists(filepath): return result
 
@@ -140,7 +158,7 @@ def parse_vth_from_cell_usage(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                # Catch instance count here too just in case
+                # Catch "Instance count: 1109038"
                 m_inst = re.search(r'Instance count.*?[:|=]\s*(\d+)', line, re.IGNORECASE)
                 if m_inst: result["instance_count"] = m_inst.group(1)
 
@@ -181,31 +199,6 @@ def parse_power(filepath):
     except: pass
     return result
 
-def parse_utilization(filepath):
-    result = {"total_util": "-", "std_cell_only_util": "-", "memory_util": "-", "std_cell_area": "-", "memory_area": "-"}
-    if not filepath or not os.path.exists(filepath): return result
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                # Percentage rows
-                m_tot = re.search(r'Total Utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_tot: result["total_util"] = m_tot.group(1)
-                
-                m_std_pct = re.search(r'Standard cell only.*?[:\|]\s*([-\.\d]+)\s*%', line, re.IGNORECASE)
-                if m_std_pct: result["std_cell_only_util"] = m_std_pct.group(1)
-                
-                m_mem_pct = re.search(r'Memory utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_mem_pct: result["memory_util"] = m_mem_pct.group(1)
-
-                # Area rows
-                m_std_area = re.search(r'Standard cell.*?area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_std_area and "%" not in line: result["std_cell_area"] = m_std_area.group(1)
-
-                m_mem_area = re.search(r'Memory area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_mem_area and "%" not in line: result["memory_area"] = m_mem_area.group(1)
-    except: pass
-    return result
-
 def parse_clock_gating(filepath):
     if not filepath or not os.path.exists(filepath): return "-"
     try:
@@ -230,13 +223,13 @@ def parse_congestion(filepath):
     return result
 
 # ===========================================================================
-# MAIN EXTRACTION WRAPPERS (Strictly UI Mapped)
+# MAIN EXTRACTION WRAPPERS
 # ===========================================================================
 def extract_fe_metrics(run_dir, source="WS"):
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
 
-    # 1. TIMING (UI expects these at ROOT level)
+    # 1. TIMING (ROOT Level)
     qor_path = _find_rpt(rpt_dir, "qor")
     qor_data = parse_qor_rpt(qor_path)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
@@ -245,57 +238,40 @@ def extract_fe_metrics(run_dir, source="WS"):
     result["tool_version"] = qor_data.get("tool_version", "-")
     result["scenarios"] = qor_data.get("scenarios", {"setup": {}, "hold": {}})
 
-    # 2. CGC (UI expects at ROOT level)
+    # 2. CGC (ROOT Level)
     cgc_path = _find_rpt(rpt_dir, "clock_gating_info")
     result["cgc"] = parse_clock_gating(cgc_path)
 
-    # 3. AREA (UI expects as nested 'area' dict)
+    # 3. AREA & UTILIZATION
     area_path = _find_rpt(rpt_dir, "area")
     area_data = parse_area(area_path)
-    result["area"] = area_data
+    result["area"] = area_data  # total_area, macro_area, etc.
 
-    # 4. UTILIZATION (UI expects as nested 'util' dict)
     util_path = _find_rpt(rpt_dir, "utilization")
     util_data = parse_utilization(util_path)
     result["util"] = util_data
 
-    # --- CROSS POLLINATION (To guarantee the UI finds std_cell_area & memory_area) ---
-    if result["area"].get("std_cell_area", "-") == "-":
-        if util_data.get("std_cell_area", "-") != "-":
-            result["area"]["std_cell_area"] = util_data["std_cell_area"]
-        else:
-            result["area"]["std_cell_area"] = area_data.get("combinational_area", "-")
-            
-    if result["util"].get("std_cell_area", "-") == "-":
-        result["util"]["std_cell_area"] = result["area"]["std_cell_area"]
+    # Map the Standard Cell Area and Memory Area straight from Utilization to Area Dict
+    result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
+    result["area"]["memory_area"] = util_data.get("memory_area", "-")
 
-    if result["area"].get("memory_area", "-") == "-":
-        if util_data.get("memory_area", "-") != "-":
-            result["area"]["memory_area"] = util_data["memory_area"]
-        else:
-            result["area"]["memory_area"] = area_data.get("macro_area", "-")
-            
-    if result["util"].get("memory_area", "-") == "-":
-        result["util"]["memory_area"] = result["area"]["memory_area"]
-    # ---------------------------------------------------------------------------------
-
-    # 5. VTH & CELL COUNT
+    # 4. VTH & CELL COUNT (Instance Count)
     cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
     if not cell_path: cell_path = _find_rpt(rpt_dir, "cell_usage")
     vth_data = parse_vth_from_cell_usage(cell_path)
     
-    # UI expects vth_raw and vth_totals at the ROOT level for the Pie Chart
     result["vth_raw"] = vth_data.get("vth_raw", {})
     result["vth_totals"] = vth_data.get("vth_totals", {})
 
-    # UI expects the total_count inside the AREA table (1109038)
-    if result["area"].get("total_count", "-") == "-":
-        if vth_data.get("instance_count", "-") != "-":
-            result["area"]["total_count"] = vth_data["instance_count"]
-        elif vth_data.get("total_cells", 0) > 0:
-            result["area"]["total_count"] = str(vth_data["total_cells"])
+    # Pulls "Instance count" directly and maps it to total_count for UI
+    if vth_data.get("instance_count", "-") != "-":
+        result["area"]["total_count"] = vth_data["instance_count"]
+    elif vth_data.get("total_cells", 0) > 0:
+        result["area"]["total_count"] = str(vth_data["total_cells"])
+    else:
+        result["area"]["total_count"] = "-"
 
-    # 6. POWER & CONGESTION
+    # 5. POWER & CONGESTION
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
 
@@ -331,24 +307,9 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     util_data = parse_utilization(util_path)
     result["util"] = util_data
 
-    # CROSS POLLINATION
-    if result["area"].get("std_cell_area", "-") == "-":
-        if util_data.get("std_cell_area", "-") != "-":
-            result["area"]["std_cell_area"] = util_data["std_cell_area"]
-        else:
-            result["area"]["std_cell_area"] = area_data.get("combinational_area", "-")
-            
-    if result["util"].get("std_cell_area", "-") == "-":
-        result["util"]["std_cell_area"] = result["area"]["std_cell_area"]
-
-    if result["area"].get("memory_area", "-") == "-":
-        if util_data.get("memory_area", "-") != "-":
-            result["area"]["memory_area"] = util_data["memory_area"]
-        else:
-            result["area"]["memory_area"] = area_data.get("macro_area", "-")
-            
-    if result["util"].get("memory_area", "-") == "-":
-        result["util"]["memory_area"] = result["area"]["memory_area"]
+    # Map the Standard Cell Area and Memory Area straight from Utilization to Area Dict
+    result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
+    result["area"]["memory_area"] = util_data.get("memory_area", "-")
 
     cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
     if not cell_path: cell_path = _find_rpt(rpt_dir, "cell_usage")
@@ -357,11 +318,13 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     result["vth_raw"] = vth_data.get("vth_raw", {})
     result["vth_totals"] = vth_data.get("vth_totals", {})
 
-    if result["area"].get("total_count", "-") == "-":
-        if vth_data.get("instance_count", "-") != "-":
-            result["area"]["total_count"] = vth_data["instance_count"]
-        elif vth_data.get("total_cells", 0) > 0:
-            result["area"]["total_count"] = str(vth_data["total_cells"])
+    # Pulls "Instance count" directly and maps it to total_count for UI
+    if vth_data.get("instance_count", "-") != "-":
+        result["area"]["total_count"] = vth_data["instance_count"]
+    elif vth_data.get("total_cells", 0) > 0:
+        result["area"]["total_count"] = str(vth_data["total_cells"])
+    else:
+        result["area"]["total_count"] = "-"
 
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
