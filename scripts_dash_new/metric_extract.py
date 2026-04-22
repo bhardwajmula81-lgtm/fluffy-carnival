@@ -12,43 +12,38 @@ import glob
 # ===========================================================================
 def _find_rpt(rpt_dir, search_string):
     """
-    Hunts down a report file robustly.
-    If search_string has a '*', it uses it exactly.
-    Otherwise, it assumes the project naming convention: {prefix}.*.rpt
+    Hunts down a report file robustly using recursive deep-search.
+    Bypasses subdirectory barriers.
     """
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
 
-    # Primary search
+    hits = []
+    # Primary deep search
     if "*" in search_string:
-        pattern = os.path.join(rpt_dir, search_string)
+        pattern = os.path.join(rpt_dir, "**", search_string)
+        hits = glob.glob(pattern, recursive=True)
     else:
-        pattern = os.path.join(rpt_dir, f"{search_string}.*.rpt")
+        pattern = os.path.join(rpt_dir, "**", f"{search_string}.*.rpt")
+        hits = glob.glob(pattern, recursive=True)
         
-    hits = glob.glob(pattern)
-    
-    # Fallback search (find the string anywhere in the file name)
+    # Fallback deep search
     if not hits and "*" not in search_string:
-        pattern = os.path.join(rpt_dir, f"*{search_string}*")
-        hits = glob.glob(pattern)
+        pattern = os.path.join(rpt_dir, "**", f"*{search_string}*")
+        hits = glob.glob(pattern, recursive=True)
 
-    # Ignore logs
+    # Standard processing applied
     valid_files = [f for f in hits if os.path.isfile(f) and not f.endswith(".log")]
 
     if not valid_files:
         return None
 
-    # Return the newest file if there are multiples
     return sorted(valid_files, key=os.path.getmtime)[-1]
 
 # ===========================================================================
 # ADVANCED PARSERS
 # ===========================================================================
 def parse_qor_rpt(filepath):
-    """
-    Extracts global WNS/TNS AND advanced Scenario/Path Group nested dictionaries.
-    Accounts for changing vocabulary (Critical Path Slack vs WNS).
-    """
     result = {
         "runtime": "-", "r2r_setup": "-", "r2r_hold": "-",
         "mbit": "-", "tool_version": "-",
@@ -64,7 +59,6 @@ def parse_qor_rpt(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                # 1. Global TreeView Matchers (Accounts for missing "Setup" word)
                 m_rt = re.search(r'Design\s*(?:\(Setup\))?\s*WNS:\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_rt: result["r2r_setup"] = m_rt.group(1)
 
@@ -74,26 +68,22 @@ def parse_qor_rpt(filepath):
                 m_v = re.search(r'Version:\s+(\S+)', line, re.IGNORECASE)
                 if m_v: result["tool_version"] = m_v.group(1)
 
-                # 2. Advanced Scenario / Path Group Matchers
                 m_scen = re.search(r'Scenarios?:\s*(\S+)', line, re.IGNORECASE)
                 if m_scen: current_scen = m_scen.group(1)
 
                 m_pg = re.search(r'Timing Path Group\s+\'?([^\'\s]+)\'?', line, re.IGNORECASE)
                 if m_pg: current_pg = m_pg.group(1)
 
-                # Track context (Setup vs Hold blocks)
                 if re.search(r'hold', line, re.IGNORECASE) and re.search(r'violation|slack', line, re.IGNORECASE): 
                     current_mode = "hold"
                 elif re.search(r'setup', line, re.IGNORECASE) and re.search(r'violation|slack', line, re.IGNORECASE): 
                     current_mode = "setup"
 
-                # Ensure dictionary structure exists
                 if current_scen not in result["scenarios"][current_mode]:
                     result["scenarios"][current_mode][current_scen] = {}
                 if current_pg not in result["scenarios"][current_mode][current_scen]:
                     result["scenarios"][current_mode][current_scen][current_pg] = {'wns': '-', 'tns': '-', 'nvp': '-', 'levels': '-'}
 
-                # 3. Extract Values (Robust Vocabulary)
                 m_wns = re.search(r'(?:WNS|Worst\s+[sS]etup\s+Violation|Worst\s+[hH]old\s+Violation|Critical\s+Path\s+Slack)\s*[:\|]\s*([-\.\d]+)', line)
                 if m_wns and "Design" not in line:
                     result["scenarios"][current_mode][current_scen][current_pg]['wns'] = m_wns.group(1)
@@ -110,7 +100,6 @@ def parse_qor_rpt(filepath):
                 if m_lvl:
                     result["scenarios"][current_mode][current_scen][current_pg]['levels'] = m_lvl.group(1)
 
-                # Misc QoR Matchers
                 m_mbit = re.search(r'MBIT Ratio\s*[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_mbit: result["mbit"] = m_mbit.group(1)
     except: 
@@ -119,11 +108,9 @@ def parse_qor_rpt(filepath):
     return result
 
 def parse_latency_skew(filepath):
-    """Finds Max Latency and Global Skew from clock reports."""
     result = {"max_latency": "-", "global_skew": "-"}
     if not filepath or not os.path.exists(filepath): 
         return result
-
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             lines = f.read().splitlines()
@@ -140,37 +127,34 @@ def parse_latency_skew(filepath):
     return result
 
 def parse_area(filepath):
-    """Extracts Area Metrics natively."""
     result = {
         "total_area": "-", "combinational_area": "-", "reg_area": "-",
         "macro_area": "-", "buf_area": "-"
     }
     if not filepath or not os.path.exists(filepath): 
         return result
-        
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                m_tot = re.search(r'Total cell area:\s*([-\.\d]+)', line)
+                m_tot = re.search(r'Total cell area:\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_tot: result["total_area"] = m_tot.group(1)
 
-                m_comb = re.search(r'Combinational area:\s*([-\.\d]+)', line)
+                m_comb = re.search(r'Combinational area:\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_comb: result["combinational_area"] = m_comb.group(1)
 
-                m_reg = re.search(r'Noncombinational area:\s*([-\.\d]+)', line)
+                m_reg = re.search(r'Noncombinational area:\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_reg: result["reg_area"] = m_reg.group(1)
 
-                m_mac = re.search(r'Macro/Black Box area:\s*([-\.\d]+)', line)
+                m_mac = re.search(r'Macro/Black Box area:\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_mac: result["macro_area"] = m_mac.group(1)
 
-                m_buf = re.search(r'Buf/Inv area:\s*([-\.\d]+)', line)
+                m_buf = re.search(r'Buf/Inv area:\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_buf: result["buf_area"] = m_buf.group(1)
     except: 
         pass
     return result
 
 def parse_vth_from_cell_usage(filepath):
-    """Calculates VT distributions securely (avoids double counting)."""
     result = {"vth_raw": {}, "vth_totals": {}, "total_cells": 0}
     if not filepath or not os.path.exists(filepath): 
         return result
@@ -179,8 +163,7 @@ def parse_vth_from_cell_usage(filepath):
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                # Prevent double counting: reset dict when we hit a table header
-                if "Total cells:" in line or "Total standard cells:" in line:
+                if "total cells:" in line.lower() or "total standard cells:" in line.lower():
                     result["vth_raw"].clear()
                     result["total_cells"] = 0
                     in_target_block = True
@@ -193,11 +176,9 @@ def parse_vth_from_cell_usage(filepath):
                     if m_vt and m_cnt:
                         vt_type = m_vt.group(1).upper()
                         count = int(m_cnt.group(1))
-                        # Use direct assignment to overwrite duplicates if any slip through
                         result["vth_raw"][vt_type] = count
                         result["total_cells"] += count
                     elif not line.strip() and result["total_cells"] > 0:
-                        # Stop parsing once the block is done
                         in_target_block = False
 
         if result["total_cells"] > 0:
@@ -236,7 +217,6 @@ def parse_congestion(filepath):
     return result
 
 def parse_utilization(filepath):
-    """Parses utilization percentages, accounting for | or : delimiters."""
     result = {"total_util": "-", "std_cell_util": "-", "memory_util": "-"}
     if not filepath or not os.path.exists(filepath): return result
     try:
@@ -252,7 +232,6 @@ def parse_utilization(filepath):
     return result
 
 def parse_clock_gating(filepath):
-    """Extracts CGC Ratio securely."""
     if not filepath or not os.path.exists(filepath): return "-"
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -263,7 +242,6 @@ def parse_clock_gating(filepath):
     return "-"
 
 def parse_drc_from_log(filepath):
-    """Finds maximum DRC errors directly from the compile/PNR log."""
     errors = "0"
     if not filepath or not os.path.exists(filepath): return "-"
     try:
@@ -275,32 +253,27 @@ def parse_drc_from_log(filepath):
     return errors
 
 # ===========================================================================
-# MAIN EXTRACTION WRAPPERS (Called by workers.py)
+# MAIN EXTRACTION WRAPPERS
 # ===========================================================================
 def extract_fe_metrics(run_dir, source="WS"):
-    """Pulls all Native data for a Synthesis (FE) Run. Accepts source to prevent crashes."""
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
 
-    # Timing & Scenarios
     qor_path = _find_rpt(rpt_dir, "qor")
     result.update(parse_qor_rpt(qor_path))
 
-    # Area & VTH
     area_path = _find_rpt(rpt_dir, "area")
     result["area"] = parse_area(area_path)
     
     cell_path = _find_rpt(rpt_dir, "cell_usage")
     result["vth"] = parse_vth_from_cell_usage(cell_path)
 
-    # Power & Congestion
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
 
     cong_path = _find_rpt(rpt_dir, "congestion")
     result["congestion"] = parse_congestion(cong_path)
 
-    # Clock & Utilization Additions
     clk_path = _find_rpt(rpt_dir, "clock")
     result["clock"] = parse_latency_skew(clk_path)
 
@@ -310,14 +283,12 @@ def extract_fe_metrics(run_dir, source="WS"):
     cgc_path = _find_rpt(rpt_dir, "clock_gating")
     result["cgc_pct"] = parse_clock_gating(cgc_path)
 
-    # DRC 
     log = os.path.join(run_dir, "logs", "compile_opt.log")
     result["drc_errors"] = parse_drc_from_log(log)
 
     return result
 
 def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
-    """Pulls all Native data for a specific PNR Stage."""
     result = {"stage": stage_name, "run_dir": run_dir}
     
     if source == "WS":
@@ -327,25 +298,21 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
         rpt_dir = os.path.join(run_dir, stage_name, "reports", stage_name)
         log = os.path.join(run_dir, stage_name, "logs", f"{stage_name}.log")
 
-    # Timing & Scenarios
     qor_path = _find_rpt(rpt_dir, "qor")
     result.update(parse_qor_rpt(qor_path))
 
-    # Area & VTH
     area_path = _find_rpt(rpt_dir, "area")
     result["area"] = parse_area(area_path)
     
     cell_path = _find_rpt(rpt_dir, "cell_usage")
     result["vth"] = parse_vth_from_cell_usage(cell_path)
 
-    # Power & Congestion
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
 
     cong_path = _find_rpt(rpt_dir, "congestion")
     result["congestion"] = parse_congestion(cong_path)
 
-    # Clock & Utilization Additions
     clk_path = _find_rpt(rpt_dir, "clock")
     result["clock"] = parse_latency_skew(clk_path)
 
