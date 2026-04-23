@@ -1,7 +1,7 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
 # Strictly searches local reports folder. NO recursive searching.
-# Accurately maps utilization area and instance counts directly to the UI.
+# Accurately maps REG2REG timing strings, utilization area, and instance counts.
 
 import os
 import re
@@ -13,7 +13,7 @@ import glob
 def _find_rpt(rpt_dir, prefix):
     """
     Looks ONLY in the provided rpt_dir. 
-    Matches exactly the pattern: prefix.*.rpt (e.g. area.BLK_ISP2.123.rpt)
+    Matches exactly the pattern: prefix.*.rpt (e.g. utilization.BLK.123.rpt)
     """
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
@@ -36,62 +36,66 @@ def _find_rpt(rpt_dir, prefix):
 # ADVANCED PARSERS
 # ===========================================================================
 def parse_qor_rpt(filepath):
+    """
+    Hunts for Timing Path Group 'REG2REG' and extracts: WNS / TNS / Violating Paths
+    """
     result = {
         "r2r_setup": "-", "r2r_hold": "-", "mbit": "-", "tool_version": "-",
         "scenarios": {"setup": {}, "hold": {}}
     }
     if not filepath or not os.path.exists(filepath): return result
 
-    current_scen, current_pg, current_mode = "default", "default", "setup"
+    current_mode = "setup"
+    in_reg2reg = False
+    
+    s_wns, s_tns, s_nvp = "-", "-", "-"
+    h_wns, h_tns, h_nvp = "-", "-", "-"
 
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                m_rt = re.search(r'Design.*?(?:\(Setup\))?.*?WNS.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_rt and result["r2r_setup"] == "-": result["r2r_setup"] = m_rt.group(1)
-
-                m_rh = re.search(r'Design.*?(?:\(Hold\)).*?WNS.*?[:|=]\s*([-\.\d]+)', line, re.IGNORECASE)
-                if m_rh and result["r2r_hold"] == "-": result["r2r_hold"] = m_rh.group(1)
+                # Mode tracking
+                if re.search(r'Design.*?(?:\(Hold\)).*?WNS', line, re.IGNORECASE) or (re.search(r'hold', line, re.IGNORECASE) and re.search(r'violation|slack', line, re.IGNORECASE)):
+                    current_mode = "hold"
+                elif re.search(r'Design.*?WNS', line, re.IGNORECASE) or (re.search(r'setup', line, re.IGNORECASE) and re.search(r'violation|slack', line, re.IGNORECASE)):
+                    if "Hold" not in line:
+                        current_mode = "setup"
+                
+                # Check if we are inside the REG2REG block
+                if re.search(r'Timing Path Group\s+\'?REG2REG\'?', line, re.IGNORECASE):
+                    in_reg2reg = True
+                elif re.search(r'Timing Path Group', line, re.IGNORECASE):
+                    in_reg2reg = False # Exited REG2REG group
+                
+                # Extract WNS/TNS/NVP if inside REG2REG
+                if in_reg2reg:
+                    m_wns = re.search(r'(?:Critical\s+Path\s+Slack|Worst.*?Violation).*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_wns:
+                        if current_mode == "setup": s_wns = m_wns.group(1)
+                        else: h_wns = m_wns.group(1)
+                        
+                    m_tns = re.search(r'(?:Total\s+Negative\s+Slack|Total.*?Violation).*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_tns:
+                        if current_mode == "setup": s_tns = m_tns.group(1)
+                        else: h_tns = m_tns.group(1)
+                        
+                    m_nvp = re.search(r'(?:No\.\s+of\s+)?Violating Paths.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                    if m_nvp:
+                        if current_mode == "setup": s_nvp = m_nvp.group(1)
+                        else: h_nvp = m_nvp.group(1)
 
                 m_v = re.search(r'Version.*?[:|=]\s+(\S+)', line, re.IGNORECASE)
                 if m_v: result["tool_version"] = m_v.group(1)
 
-                m_scen = re.search(r'Scenarios?.*?[:|=]\s*(\S+)', line, re.IGNORECASE)
-                if m_scen: 
-                    current_scen = m_scen.group(1)
-                    current_mode = "setup"
-
-                m_pg = re.search(r'Timing Path Group\s+\'?([^\'\s]+)\'?', line, re.IGNORECASE)
-                if m_pg: current_pg = m_pg.group(1)
-
-                if re.search(r'hold', line, re.IGNORECASE) and re.search(r'violation|slack', line, re.IGNORECASE): 
-                    current_mode = "hold"
-                elif re.search(r'setup', line, re.IGNORECASE) and re.search(r'violation|slack', line, re.IGNORECASE): 
-                    current_mode = "setup"
-
-                if current_scen not in result["scenarios"][current_mode]:
-                    result["scenarios"][current_mode][current_scen] = {}
-                if current_pg not in result["scenarios"][current_mode][current_scen]:
-                    result["scenarios"][current_mode][current_scen][current_pg] = {'wns': '-', 'tns': '-', 'nvp': '-', 'levels': '-'}
-
-                m_wns = re.search(r'(?:WNS|Worst\s+[sS]etup\s+Violation|Worst\s+[hH]old\s+Violation|Critical\s+Path\s+Slack).*?[:\|]\s*([-\.\d]+)', line)
-                if m_wns and "Design" not in line:
-                    result["scenarios"][current_mode][current_scen][current_pg]['wns'] = m_wns.group(1)
-
-                m_tns = re.search(r'(?:TNS|Total\s+Negative\s+Slack|Total\s+[sS]etup\s+Violation|Total\s+[hH]old\s+Violation).*?[:\|]\s*([-\.\d]+)', line)
-                if m_tns and "Design" not in line:
-                    result["scenarios"][current_mode][current_scen][current_pg]['tns'] = m_tns.group(1)
-
-                m_nvp = re.search(r'(?:No\.\s+of\s+)?Violating Paths.*?[:\|]\s*([-\.\d]+)', line)
-                if m_nvp:
-                    result["scenarios"][current_mode][current_scen][current_pg]['nvp'] = m_nvp.group(1)
-
-                m_lvl = re.search(r'Levels of Logic.*?[:\|]\s*([-\.\d]+)', line)
-                if m_lvl:
-                    result["scenarios"][current_mode][current_scen][current_pg]['levels'] = m_lvl.group(1)
-
                 m_mbit = re.search(r'MBIT Ratio.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
                 if m_mbit: result["mbit"] = m_mbit.group(1)
+                
+        # Format the final strings (e.g., "-0.0048/-0.0066/8")
+        if s_wns != "-" or s_tns != "-" or s_nvp != "-":
+            result["r2r_setup"] = f"{s_wns}/{s_tns}/{s_nvp}"
+        if h_wns != "-" or h_tns != "-" or h_nvp != "-":
+            result["r2r_hold"] = f"{h_wns}/{h_tns}/{h_nvp}"
+
     except: pass
     return result
 
@@ -122,46 +126,48 @@ def parse_area(filepath):
     return result
 
 def parse_utilization(filepath):
-    """Parses both the percentages and the actual physical areas from utilization report."""
-    result = {"total_util": "-", "std_cell_only_util": "-", "memory_util": "-", "std_cell_area": "-", "memory_area": "-"}
+    """
+    Parses areas, utilization percentages, AND 'Total cells (exclude IO)' cell count table.
+    """
+    result = {
+        "total_util": "-", "std_cell_only_util": "-", "memory_util": "-", 
+        "std_cell_area": "-", "memory_area": "-", "total_cells_exclude_io": "-"
+    }
     if not filepath or not os.path.exists(filepath): return result
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
                 # Percentage checks
-                if "utilization" in line.lower():
-                    m_tot = re.search(r'Total Utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                    if m_tot: result["total_util"] = m_tot.group(1)
-                    
-                    m_std_pct = re.search(r'Standard cell only.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                    if m_std_pct: result["std_cell_only_util"] = m_std_pct.group(1)
-                    
-                    m_mem_pct = re.search(r'Memory utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                    if m_mem_pct: result["memory_util"] = m_mem_pct.group(1)
+                m_tot = re.search(r'Total Utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_tot and "%" in line: result["total_util"] = m_tot.group(1)
+                
+                m_std_pct = re.search(r'Standard cell only.*?utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_std_pct and "%" in line: result["std_cell_only_util"] = m_std_pct.group(1)
+                
+                m_mem_pct = re.search(r'Memory utilization.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mem_pct and "%" in line: result["memory_util"] = m_mem_pct.group(1)
 
                 # Area value checks (e.g. Standard cell only area | 294313.23)
-                elif "area" in line.lower():
-                    m_std_area = re.search(r'Standard cell only area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                    if m_std_area: result["std_cell_area"] = m_std_area.group(1)
+                m_std_area = re.search(r'Standard cell.*?area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_std_area and "%" not in line: result["std_cell_area"] = m_std_area.group(1)
 
-                    m_mem_area = re.search(r'Memory area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
-                    if m_mem_area: result["memory_area"] = m_mem_area.group(1)
+                m_mem_area = re.search(r'Memory area.*?[:\|]\s*([-\.\d]+)', line, re.IGNORECASE)
+                if m_mem_area and "%" not in line: result["memory_area"] = m_mem_area.group(1)
+                
+                # Table Row Check: Total cells (exclude IO) | <Cell Count>
+                m_cells = re.search(r'Total cells \(exclude IO\).*?\|\s*(\d+)', line, re.IGNORECASE)
+                if m_cells: result["total_cells_exclude_io"] = m_cells.group(1)
     except: pass
     return result
 
 def parse_vth_from_cell_usage(filepath):
-    """Pulls Instance count and VTH distribution"""
-    result = {"vth_raw": {}, "vth_totals": {}, "total_cells": 0, "instance_count": "-"}
+    result = {"vth_raw": {}, "vth_totals": {}, "total_cells": 0}
     if not filepath or not os.path.exists(filepath): return result
 
     in_target_block = False
     try:
         with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                # Catch "Instance count: 1109038"
-                m_inst = re.search(r'Instance count.*?[:|=]\s*(\d+)', line, re.IGNORECASE)
-                if m_inst: result["instance_count"] = m_inst.group(1)
-
                 if "total cells:" in line.lower() or "total standard cells:" in line.lower():
                     result["vth_raw"].clear()
                     result["total_cells"] = 0
@@ -251,11 +257,17 @@ def extract_fe_metrics(run_dir, source="WS"):
     util_data = parse_utilization(util_path)
     result["util"] = util_data
 
-    # Map the Standard Cell Area and Memory Area straight from Utilization to Area Dict
+    # Map the Standard Cell Area, Memory Area, and Total Cells straight from Utilization to Area Dict
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
+    
+    # Assigning the exact cell count from the "Total cells (exclude IO)" row
+    if util_data.get("total_cells_exclude_io", "-") != "-":
+        result["area"]["total_count"] = util_data["total_cells_exclude_io"]
+    else:
+        result["area"]["total_count"] = "-"
 
-    # 4. VTH & CELL COUNT (Instance Count)
+    # 4. VTH 
     cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
     if not cell_path: cell_path = _find_rpt(rpt_dir, "cell_usage")
     vth_data = parse_vth_from_cell_usage(cell_path)
@@ -263,13 +275,9 @@ def extract_fe_metrics(run_dir, source="WS"):
     result["vth_raw"] = vth_data.get("vth_raw", {})
     result["vth_totals"] = vth_data.get("vth_totals", {})
 
-    # Pulls "Instance count" directly and maps it to total_count for UI
-    if vth_data.get("instance_count", "-") != "-":
-        result["area"]["total_count"] = vth_data["instance_count"]
-    elif vth_data.get("total_cells", 0) > 0:
+    # Fallback to cell_usage total count ONLY if utilization table missed it
+    if result["area"]["total_count"] == "-" and vth_data.get("total_cells", 0) > 0:
         result["area"]["total_count"] = str(vth_data["total_cells"])
-    else:
-        result["area"]["total_count"] = "-"
 
     # 5. POWER & CONGESTION
     power_path = _find_rpt(rpt_dir, "report_power_info")
@@ -307,9 +315,13 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     util_data = parse_utilization(util_path)
     result["util"] = util_data
 
-    # Map the Standard Cell Area and Memory Area straight from Utilization to Area Dict
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
+    
+    if util_data.get("total_cells_exclude_io", "-") != "-":
+        result["area"]["total_count"] = util_data["total_cells_exclude_io"]
+    else:
+        result["area"]["total_count"] = "-"
 
     cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
     if not cell_path: cell_path = _find_rpt(rpt_dir, "cell_usage")
@@ -318,13 +330,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     result["vth_raw"] = vth_data.get("vth_raw", {})
     result["vth_totals"] = vth_data.get("vth_totals", {})
 
-    # Pulls "Instance count" directly and maps it to total_count for UI
-    if vth_data.get("instance_count", "-") != "-":
-        result["area"]["total_count"] = vth_data["instance_count"]
-    elif vth_data.get("total_cells", 0) > 0:
+    if result["area"]["total_count"] == "-" and vth_data.get("total_cells", 0) > 0:
         result["area"]["total_count"] = str(vth_data["total_cells"])
-    else:
-        result["area"]["total_count"] = "-"
 
     power_path = _find_rpt(rpt_dir, "report_power_info")
     result["power"] = parse_power(power_path)
