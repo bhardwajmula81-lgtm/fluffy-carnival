@@ -545,8 +545,10 @@ class ScannerWorker(QThread):
                     for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
                         tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
             if "innovus" in tools_to_scan:
-                for rd in glob.glob(os.path.join(ent_path, "innovus", "EVT*_ML*_DEV*_*")):
-                    if os.path.isdir(rd):
+                # Catch all innovus run dirs -- not just EVT* named ones
+                # TOP runs (S5K2P5SP SOC level) may have different naming
+                for rd in glob.glob(os.path.join(ent_path, "innovus", "*")):
+                    if os.path.isdir(rd) and not os.path.basename(rd).startswith('.'):
                         tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
         return tasks, releases_found
