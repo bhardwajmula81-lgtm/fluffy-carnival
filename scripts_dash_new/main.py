@@ -269,6 +269,79 @@ except Exception as _e:
 
 
 # ===========================================================================
+# TIMESTAMP HELPERS
+# ===========================================================================
+
+def relative_time(time_str):
+    """Convert a timestamp string to relative time like '2h ago', '3d ago'.
+    Handles formats: 'Jan 01, 2026 - 14:30:00' and 'Apr 16, 2026 - 16:33'"""
+    if not time_str or time_str in ("-", "N/A", "Unknown"):
+        return time_str or "-"
+    try:
+        # Try parsing common formats from parse_runtime_rpt
+        import datetime as _dt
+        ts = None
+        for fmt in [
+            "%b %d, %Y - %H:%M:%S",
+            "%b %d, %Y - %H:%M",
+            "%b %d, %Y",
+        ]:
+            try:
+                ts = _dt.datetime.strptime(time_str.strip(), fmt)
+                break
+            except ValueError:
+                pass
+        if ts is None:
+            return time_str
+        now   = _dt.datetime.now()
+        delta = now - ts
+        secs  = int(delta.total_seconds())
+        if secs < 0:
+            return time_str
+        if secs < 60:
+            return f"{secs}s ago"
+        if secs < 3600:
+            return f"{secs // 60}m ago"
+        if secs < 86400:
+            return f"{secs // 3600}h ago"
+        if secs < 86400 * 7:
+            return f"{secs // 86400}d ago"
+        if secs < 86400 * 30:
+            return f"{secs // (86400*7)}w ago"
+        return f"{secs // (86400*30)}mo ago"
+    except Exception:
+        return time_str
+
+
+def convert_kst_to_ist_str(time_str):
+    """Convert KST timestamp string to IST (KST - 3h 30min).
+    KST = UTC+9, IST = UTC+5:30, difference = 3h 30min."""
+    if not time_str or time_str in ("-", "N/A", "Unknown"):
+        return time_str or "-"
+    try:
+        import datetime as _dt
+        ts = None
+        fmt_used = None
+        for fmt in [
+            "%b %d, %Y - %H:%M:%S",
+            "%b %d, %Y - %H:%M",
+            "%b %d, %Y",
+        ]:
+            try:
+                ts = _dt.datetime.strptime(time_str.strip(), fmt)
+                fmt_used = fmt
+                break
+            except ValueError:
+                pass
+        if ts is None:
+            return time_str
+        ts_ist = ts - _dt.timedelta(hours=3, minutes=30)
+        return ts_ist.strftime(fmt_used)
+    except Exception:
+        return time_str
+
+
+# ===========================================================================
 # MAIL HELPERS
 # ===========================================================================
 
@@ -1715,7 +1788,8 @@ class PDDashboard(QMainWindow):
         self.view_combo = QComboBox()
         self.view_combo.addItems([
             "All Runs", "FE Only", "BE Only",
-            "Running Only", "Failed Only", "Today's Runs"])
+            "Running Only", "Failed Only", "Today's Runs",
+            "Hide Stages"])
         self.view_combo.setFixedWidth(120)
         self.view_combo.currentIndexChanged.connect(self.refresh_view)
         top_layout.addWidget(self.view_combo)
@@ -2383,10 +2457,18 @@ class PDDashboard(QMainWindow):
             return
         if col != 0:
             return
+        # Cascade check state to stage children
+        state = item.checkState(0)
+        self.tree.blockSignals(True)
+        for i in range(item.childCount()):
+            ch = item.child(i)
+            if ch.data(0, Qt.UserRole) == "STAGE":
+                ch.setCheckState(0, state)
+        self.tree.blockSignals(False)
         path = item.text(15)
         if not path or path == "N/A":
             return
-        if item.checkState(0) == Qt.Checked:
+        if state == Qt.Checked:
             self._checked_paths.add(path)
         else:
             self._checked_paths.discard(path)
@@ -3403,6 +3485,7 @@ class PDDashboard(QMainWindow):
         _run_only    = (preset == "Running Only")
         _fail_only   = (preset == "Failed Only")
         _today_only  = (preset == "Today's Runs")
+        _hide_stages = (preset == "Hide Stages")
         _pins        = self.user_pins
         _rfc         = self.run_filter_config
         _notes       = self.global_notes
@@ -3435,6 +3518,7 @@ class PDDashboard(QMainWindow):
             rt_type = run["run_type"]
             if _fe_only  and rt_type != "FE": return False
             if _be_only  and rt_type != "BE": return False
+            if _hide_stages and rt_type == "FE": pass  # show FE runs, just hide their stages
             if _run_only and not (rt_type == "FE" and not run["is_comp"]):
                 return False
             if _fail_only:
@@ -3504,6 +3588,12 @@ class PDDashboard(QMainWindow):
                     ch = item.child(i)
                     if ch.data(0, _UR) == "__PLACEHOLDER__":
                         ch.setHidden(True)
+                    elif ch.data(0, _UR) == "STAGE":
+                        # Hide stages if "Hide Stages" preset selected
+                        if _hide_stages:
+                            ch.setHidden(True)
+                        else:
+                            ch.setHidden(not passes)
                     else:
                         ch.setHidden(not passes)
                 return passes
