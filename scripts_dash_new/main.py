@@ -809,10 +809,10 @@ class QoRSummaryDialog(QDialog):
                     return str(v)
             return "-"
 
-        # LVT/RVT combined inst/area strings from parse_cell_usage
-        vth          = metrics.get("vth", {})
-        lvt_rvt_inst = vth.get("lvt_rvt_inst", "-/-")
-        lvt_rvt_area = vth.get("lvt_rvt_area", "-/-")
+        # LVT/RVT/HVT combined inst/area strings from parse_cell_usage
+        vth              = metrics.get("vth", {})
+        lvt_rvt_hvt_inst = vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-/-"))
+        lvt_rvt_hvt_area = vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-/-"))
 
         # Congestion: cong_both already formatted as "Both%/V%/H%"
         cong_str = _v(cong, "cong_both")
@@ -837,8 +837,8 @@ class QoRSummaryDialog(QDialog):
             ("Instance Count",                 _v(area,"instance_count",
                                                    "total_count"),          False),
             ("Physical",                       None,                        True),
-            ("LVT*/RVT* Inst",                lvt_rvt_inst,                False),
-            ("LVT*/RVT* Area",                lvt_rvt_area,                False),
+            ("LVT*/RVT*/HVT* Inst",            lvt_rvt_hvt_inst,            False),
+            ("LVT*/RVT*/HVT* Area",            lvt_rvt_hvt_area,            False),
             ("Congestion (Both/V/H Dir)",      cong_str,                    False),
             ("StdCell/StdCell Only Util",      util_str,                    False),
             ("Quality",                        None,                        True),
@@ -846,8 +846,8 @@ class QoRSummaryDialog(QDialog):
             ("CGC Ratio",                      metrics.get("cgc", "-"),     False),
             ("Power",                          None,                        True),
             ("Cell Leakage Power",             pwr_str,                     False),
-            ("DRC Errors",                     metrics.get("drc_errors","-"),False),
             ("Runtime",                        metrics.get("runtime","-"),  False),
+            ("Logic Depth",                    metrics.get("logic_depth","-"), False),
         ]
 
         # Table
@@ -982,22 +982,44 @@ class QoRWorker(QThread):
         except Exception:
             self.finished.emit("")
 
+try:
+    import matplotlib
+    matplotlib.use("Qt5Agg")
+    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvas
+    from matplotlib.figure import Figure as _MplFigure
+    _MPL = True
+except ImportError:
+    _MPL = False
+
+
 class BlockSummaryDialog(QDialog):
-    """Block synthesis summary table -- Image 2 style.
-    One row per selected run. User clicks Generate to start loading."""
+    """Block synthesis summary table.
+    One row per selected run. User clicks Generate to start loading.
+    Tabs: Table | Charts (requires matplotlib)."""
 
     HEADERS = [
         "BLK Name", "Run Name", "MBIT%", "CG%",
         "Instance Count", "Std Area (um2)", "Gate Count",
-        "VT L/R/H Area%", "Timing WNS/TNS/FEPs",
+        "VT L/R/H Area%",
+        "R2R Setup (W/T/F)",
+        "R2R Hold (W/T/F)",
+        "Logic Depth",
         "Runtime"
     ]
+    # Column indices for coloring / chart reads
+    _COL_R2R_SETUP = 8
+    _COL_R2R_HOLD  = 9
 
     def __init__(self, rtl_label, run_list, is_dark, parent=None):
         """run_list: list of (blk, run_path, run_name, runtime, source)"""
         super().__init__(parent)
         self.setWindowTitle("Block Summary: " + str(rtl_label))
-        self.resize(1150, 500)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowMinimizeButtonHint)
+        self.setSizeGripEnabled(True)
+        self.resize(1400, 600)
         self.is_dark   = is_dark
         self._run_list = run_list
         self._pending  = []
@@ -1021,26 +1043,52 @@ class BlockSummaryDialog(QDialog):
         self.status_lbl.setStyleSheet("color: #e65100; font-style: italic;")
         layout.addWidget(self.status_lbl)
 
-        # Table
+        # Tab widget
+        self._tabs = QTabWidget()
+        layout.addWidget(self._tabs, 1)
+
+        # ── Tab 1: Table ────────────────────────────────────────────────
+        tab_tbl = QWidget()
+        tab_tbl_layout = QVBoxLayout(tab_tbl)
+        tab_tbl_layout.setContentsMargins(0, 0, 0, 0)
+
         self.tbl = QTableWidget(0, len(self.HEADERS))
         self.tbl.setHorizontalHeaderLabels(self.HEADERS)
-        self.tbl.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeToContents)
-        self.tbl.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.Stretch)
-        self.tbl.horizontalHeader().setSectionResizeMode(
-            8, QHeaderView.ResizeToContents)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionsMovable(True)
+        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.Stretch)
         for c in range(2, len(self.HEADERS)):
-            if c not in (1, 8):
-                self.tbl.horizontalHeader().setSectionResizeMode(
-                    c, QHeaderView.ResizeToContents)
+            if c != 1:
+                hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
         self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tbl.setAlternatingRowColors(True)
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setSortingEnabled(True)
-        layout.addWidget(self.tbl, 1)
+        tab_tbl_layout.addWidget(self.tbl)
+        self._tabs.addTab(tab_tbl, "Table")
 
-        # Buttons
+        # ── Tab 2: Charts ────────────────────────────────────────────────
+        tab_charts = QWidget()
+        tab_charts_layout = QVBoxLayout(tab_charts)
+        tab_charts_layout.setContentsMargins(4, 4, 4, 4)
+
+        if _MPL:
+            refresh_charts_btn = QPushButton("Refresh Charts")
+            refresh_charts_btn.clicked.connect(self._draw_charts)
+            tab_charts_layout.addWidget(refresh_charts_btn, 0)
+
+            self._fig = _MplFigure(figsize=(14, 7), tight_layout=True)
+            self._canvas = _FigureCanvas(self._fig)
+            tab_charts_layout.addWidget(self._canvas, 1)
+        else:
+            tab_charts_layout.addWidget(QLabel(
+                "Charts require matplotlib.\n"
+                "Install with:  pip install matplotlib"))
+
+        self._tabs.addTab(tab_charts, "Charts")
+
+        # ── Buttons ──────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         self.gen_btn = QPushButton("Generate Table")
         self.gen_btn.setStyleSheet(
@@ -1060,6 +1108,10 @@ class BlockSummaryDialog(QDialog):
         export_btn.clicked.connect(self._export_csv)
         btn_row.addWidget(export_btn)
 
+        mail_btn = QPushButton("Send as Mail")
+        mail_btn.clicked.connect(self._send_mail)
+        btn_row.addWidget(mail_btn)
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
@@ -1069,6 +1121,8 @@ class BlockSummaryDialog(QDialog):
         self.zero_fg = QColor("#66bb6a" if is_dark else "#2e7d32")
         self.pos_fg  = QColor("#66bb6a" if is_dark else "#2e7d32")
         self._done_count = 0
+
+    # ── Loading ──────────────────────────────────────────────────────────
 
     def _start_loading(self):
         if not self._run_list:
@@ -1089,6 +1143,8 @@ class BlockSummaryDialog(QDialog):
                 "Done. " + str(self.tbl.rowCount()) + " rows loaded.")
             self.prog.setVisible(False)
             self.gen_btn.setEnabled(True)
+            if _MPL:
+                self._draw_charts()
             return
         blk, run_path, run_name, runtime, source = self._pending.pop(0)
         self.status_lbl.setText(
@@ -1114,9 +1170,10 @@ class BlockSummaryDialog(QDialog):
         self.prog.setValue(self._done_count)
         QTimer.singleShot(10, self._load_next)
 
+    # ── Row builder ──────────────────────────────────────────────────────
+
     def _add_row(self, blk, run_name, runtime, metrics):
-        area  = metrics.get("area", {})
-        cong  = metrics.get("congestion", {})
+        area = metrics.get("area", {})
 
         def _v(*keys):
             for src in [area, metrics]:
@@ -1130,7 +1187,7 @@ class BlockSummaryDialog(QDialog):
         mbit = metrics.get("mbit", area.get("mbit", "-"))
         if mbit != "-":
             try:
-                mbit = f"{float(str(mbit).rstrip('%')):.2f}%"
+                mbit = "{:.2f}%".format(float(str(mbit).rstrip('%')))
             except Exception:
                 pass
 
@@ -1143,7 +1200,7 @@ class BlockSummaryDialog(QDialog):
         # Instance count
         inst = _v("instance_count", "total_count")
 
-        # Std Cell Area (as shown in Image 1)
+        # Std Cell Area
         std_area = _v("std_cell_area", "combinational_area")
 
         # Gate Count
@@ -1154,23 +1211,21 @@ class BlockSummaryDialog(QDialog):
             except Exception:
                 gc = "-"
 
-        # VTH
-        vth = area.get("vth", {})
-        inst_d = vth.get("inst", {})
-        area_d = vth.get("area", {})
-        lvt = area_d.get("LVT", "-")
-        rvt = area_d.get("RVT", "-")
-        hvt = area_d.get("HVT", "-")
-        vth_str = lvt + "/" + rvt + "/" + hvt
+        # VTH — use new flat structure from parse_cell_usage
+        vth_data = metrics.get("vth", {})
+        vth_str  = vth_data.get("lvt_rvt_hvt_area",
+                    vth_data.get("lvt_rvt_area", "-/-"))
 
-        # Timing
-        wns = metrics.get("worst_wns", "-")
-        tns = metrics.get("worst_tns", "-")
-        nvp = metrics.get("worst_nvp", "-")
-        timing_str = wns + "/" + tns + "/" + nvp
+        # R2R timing
+        r2r_setup   = metrics.get("r2r_setup",    "-")
+        r2r_hold    = metrics.get("r2r_hold",     "-")
+        logic_depth = metrics.get("logic_depth",  "-")
+
+        # Runtime: prefer fresh value from metrics over passed-in runtime arg
+        rt = metrics.get("runtime", runtime) or runtime or "-"
 
         vals = [blk, run_name, mbit, cgc, inst, std_area,
-                gc, vth_str, timing_str, runtime]
+                gc, vth_str, r2r_setup, r2r_hold, logic_depth, rt]
 
         self.tbl.setSortingEnabled(False)
         r = self.tbl.rowCount()
@@ -1183,7 +1238,8 @@ class BlockSummaryDialog(QDialog):
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 if c == 0:
                     f2 = item.font(); f2.setBold(True); item.setFont(f2)
-            if c == 8:  # timing
+            # Color R2R Setup WNS (col 8)
+            if c == self._COL_R2R_SETUP:
                 try:
                     wv = float(str(val).split("/")[0])
                     if wv < 0:
@@ -1196,6 +1252,136 @@ class BlockSummaryDialog(QDialog):
                     pass
             self.tbl.setItem(r, c, item)
         self.tbl.setSortingEnabled(True)
+
+    # ── Charts ───────────────────────────────────────────────────────────
+
+    def _draw_charts(self):
+        if not _MPL or self.tbl.rowCount() == 0:
+            return
+
+        # Gather table data
+        n = self.tbl.rowCount()
+
+        def _cell(r, c):
+            it = self.tbl.item(r, c)
+            return it.text() if it else "-"
+
+        blks       = [_cell(r, 0) for r in range(n)]
+        run_names  = [_cell(r, 1) for r in range(n)]
+        labels     = [b + "\n" + rn[:12] for b, rn in zip(blks, run_names)]
+        std_areas  = []
+        r2r_wns    = []
+        cgc_vals   = []
+        vth_lvt, vth_rvt, vth_hvt = [], [], []
+
+        for r in range(n):
+            # Std area
+            try:
+                std_areas.append(float(_cell(r, 5)))
+            except Exception:
+                std_areas.append(0.0)
+            # R2R Setup WNS
+            try:
+                r2r_wns.append(float(_cell(r, self._COL_R2R_SETUP).split("/")[0]))
+            except Exception:
+                r2r_wns.append(0.0)
+            # CGC %
+            try:
+                cgc_vals.append(float(_cell(r, 3).rstrip('%')))
+            except Exception:
+                cgc_vals.append(0.0)
+            # VTH L/R/H area%
+            vth_raw = _cell(r, 7)
+            parts = vth_raw.replace('%', '').split('/')
+            try:
+                vth_lvt.append(float(parts[0]) if len(parts) > 0 else 0.0)
+                vth_rvt.append(float(parts[1]) if len(parts) > 1 else 0.0)
+                vth_hvt.append(float(parts[2]) if len(parts) > 2 else 0.0)
+            except Exception:
+                vth_lvt.append(0.0); vth_rvt.append(0.0); vth_hvt.append(0.0)
+
+        self._fig.clear()
+        axes = self._fig.subplots(2, 2)
+        bg   = "#2b2d30" if self.is_dark else "white"
+        fg   = "#dfe1e5" if self.is_dark else "#333333"
+        self._fig.patch.set_facecolor(bg)
+        for ax in axes.flat:
+            ax.set_facecolor(bg)
+            ax.tick_params(colors=fg, labelsize=7)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(fg)
+
+        # ── Top-left: Pie — average VT area distribution ────────────────
+        ax_pie = axes[0][0]
+        avg_l = sum(vth_lvt) / n if n else 0
+        avg_r = sum(vth_rvt) / n if n else 0
+        avg_h = sum(vth_hvt) / n if n else 0
+        pie_vals  = [v for v in [avg_l, avg_r, avg_h] if v > 0]
+        pie_lbls  = [l for l, v in zip(["LVT", "RVT", "HVT"],
+                                        [avg_l, avg_r, avg_h]) if v > 0]
+        if pie_vals:
+            ax_pie.pie(pie_vals, labels=pie_lbls, autopct="%1.1f%%",
+                       colors=["#42a5f5", "#66bb6a", "#ffa726"],
+                       textprops={"color": fg, "fontsize": 8})
+        ax_pie.set_title("Avg VT Area Distribution", color=fg, fontsize=9)
+
+        # ── Top-right: Horizontal bar — Std Area per run ─────────────────
+        ax_area = axes[0][1]
+        y_pos = range(n)
+        ax_area.barh(y_pos, std_areas, color="#42a5f5", height=0.6)
+        ax_area.set_yticks(list(y_pos))
+        ax_area.set_yticklabels(labels, fontsize=6)
+        ax_area.set_xlabel("Std Area (um²)", color=fg, fontsize=8)
+        ax_area.set_title("Std Cell Area per Run", color=fg, fontsize=9)
+        ax_area.xaxis.label.set_color(fg)
+
+        # ── Bottom-left: Bar — R2R Setup WNS per run ─────────────────────
+        ax_wns = axes[1][0]
+        colors_wns = ["#ef5350" if v < 0 else "#66bb6a" for v in r2r_wns]
+        ax_wns.bar(range(n), r2r_wns, color=colors_wns, width=0.6)
+        ax_wns.set_xticks(range(n))
+        ax_wns.set_xticklabels(labels, fontsize=6, rotation=30, ha="right")
+        ax_wns.axhline(0, color=fg, linewidth=0.8, linestyle="--")
+        ax_wns.set_ylabel("WNS (ns)", color=fg, fontsize=8)
+        ax_wns.set_title("R2R Setup WNS per Run", color=fg, fontsize=9)
+        ax_wns.yaxis.label.set_color(fg)
+
+        # ── Bottom-right: Bar — CGC% per run ─────────────────────────────
+        ax_cgc = axes[1][1]
+        ax_cgc.bar(range(n), cgc_vals, color="#ffa726", width=0.6)
+        ax_cgc.set_xticks(range(n))
+        ax_cgc.set_xticklabels(labels, fontsize=6, rotation=30, ha="right")
+        ax_cgc.set_ylabel("CGC %", color=fg, fontsize=8)
+        ax_cgc.set_title("Clock Gating Ratio per Run", color=fg, fontsize=9)
+        ax_cgc.yaxis.label.set_color(fg)
+
+        self._canvas.draw()
+
+    # ── Mail ─────────────────────────────────────────────────────────────
+
+    def _send_mail(self):
+        if self.tbl.rowCount() == 0:
+            QMessageBox.information(self, "Mail", "Generate table first.")
+            return
+        lines = ["\t".join(
+            self.tbl.horizontalHeaderItem(c).text()
+            for c in range(self.tbl.columnCount())
+        )]
+        for r in range(self.tbl.rowCount()):
+            lines.append("\t".join(
+                (self.tbl.item(r, c).text() if self.tbl.item(r, c) else "")
+                for c in range(self.tbl.columnCount())
+            ))
+        body = "\n".join(lines)
+        parent = self.parent()
+        if parent and hasattr(parent, '_open_mail_compose_dialog'):
+            parent._open_mail_compose_dialog(
+                subject="Block Summary: " + self.windowTitle(),
+                body=body)
+        else:
+            QMessageBox.information(self, "Mail Body", body[:3000])
+
+    # ── Export CSV ───────────────────────────────────────────────────────
 
     def _export_csv(self):
         if self.tbl.rowCount() == 0:
