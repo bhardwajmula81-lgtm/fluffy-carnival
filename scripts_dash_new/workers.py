@@ -818,13 +818,15 @@ class ScannerWorker(QThread):
                     continue
 
                 if source == "WS":
-                    # WS PNR structure (from PnrFileDb in file.py):
-                    # reports -> {rd}/reports/{stage}/
-                    # log     -> {rd}/{stage}/logs/{stage}.log
-                    # stage_path -> {rd}/outputs/{stage}
+                    # WS PNR structure:
+                    # fc:      log -> {rd}/{stage}/logs/{stage}.log
+                    # innovus: log -> {rd}/logs/{stage}.log
                     rpt        = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
-                    log        = os.path.join(rd, step_name, "logs",    f"{step_name}.log")
                     stage_path = os.path.join(rd, "outputs", step_name)
+                    if "/innovus/" in rd.replace("\\", "/"):
+                        log = os.path.join(rd, "logs", f"{step_name}.log")
+                    else:
+                        log = os.path.join(rd, step_name, "logs", f"{step_name}.log")
                 else:
                     # OUTFEED PNR structure (s_dir = rd/step_name):
                     # log -> {s_dir}/logs/{stage}.log
@@ -844,16 +846,19 @@ class ScannerWorker(QThread):
                     "name":          step_name,
                     "rpt":           rpt,
                     "log":           log,
-                    "info":          parse_pnr_runtime_rpt(rpt),
-                    "st_n":          get_fm_info(st_fm_n_path),
-                    "st_u":          get_fm_info(st_fm_u_path),
-                    "vslp_status":   get_vslp_info(st_vslp_rpt),
+                    # Deferred: timing/FM/VSLP loaded on expand (StageDetailWorker)
+                    "info":          {"start": "-", "end": "-",
+                                      "runtime": "-", "last_stage": "-"},
+                    "st_n":          "-",
+                    "st_u":          "-",
+                    "vslp_status":   "-",
                     "fm_u_path":     st_fm_u_path,
                     "fm_n_path":     st_fm_n_path,
                     "vslp_rpt_path": st_vslp_rpt,
                     "sta_rpt_path":  sta_rpt,
                     "qor_path":      qor_path,
                     "stage_path":    stage_path,
+                    "_lazy":         True,
                 })
 
         # Metrics are NOT extracted during scan (too slow).
@@ -892,6 +897,34 @@ class ScannerWorker(QThread):
                 data_obj["releases"][base] = []
             if path not in data_obj["releases"][base]:
                 data_obj["releases"][base].append(path)
+
+
+# ===========================================================================
+# StageDetailWorker -- loads timing/FM/VSLP for all stages of ONE BE run
+# Fired when user expands a BE run node. Deferred so scan stays fast.
+# ===========================================================================
+class StageDetailWorker(QThread):
+    finished = pyqtSignal(object, list)   # (be_item_ref, enriched_stages)
+
+    def __init__(self, be_run, be_item):
+        super().__init__()
+        self.be_run  = be_run
+        self.be_item = be_item
+
+    def run(self):
+        enriched = []
+        for s in self.be_run.get("stages", []):
+            if not s.get("_lazy"):
+                enriched.append(s)
+                continue
+            s2 = dict(s)
+            s2["info"]        = parse_pnr_runtime_rpt(s["rpt"])
+            s2["st_n"]        = get_fm_info(s.get("fm_n_path", ""))
+            s2["st_u"]        = get_fm_info(s.get("fm_u_path", ""))
+            s2["vslp_status"] = get_vslp_info(s.get("vslp_rpt_path", ""))
+            s2["_lazy"]       = False
+            enriched.append(s2)
+        self.finished.emit(self.be_item, enriched)
 
 
 # ===========================================================================

@@ -52,6 +52,7 @@ def _load_project_config():
             'BASE_WS_BE_DIR':   '/user/s5k2p5sp.be1/s5k2p5sp/WS',
             'BASE_OUTFEED_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/outfeed',
             'BASE_IR_DIR':      '/user/s5k2p5sx.be1/LAYOUT/IR',
+            'BLOCKS':           '',
         },
         'TOOLS': {
             'PNR_TOOL_NAMES':  'fc innovus',
@@ -110,6 +111,8 @@ BASE_WS_BE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_BE_DIR',   fallback='')
 BASE_OUTFEED_DIR = _proj_cfg.get('PROJECT', 'BASE_OUTFEED_DIR', fallback='')
 BASE_IR_DIR      = _proj_cfg.get('PROJECT', 'BASE_IR_DIR',      fallback='')
 PNR_TOOL_NAMES   = _proj_cfg.get('TOOLS',   'PNR_TOOL_NAMES',   fallback='fc innovus')
+_blocks_raw      = _proj_cfg.get('PROJECT', 'BLOCKS',           fallback='')
+BLOCKS           = set(b.strip() for b in _blocks_raw.split(',') if b.strip())
 
 # Load user preferences
 prefs = configparser.ConfigParser()
@@ -131,6 +134,7 @@ _bt.BASE_OUTFEED_DIR = BASE_OUTFEED_DIR
 _bt.BASE_IR_DIR      = BASE_IR_DIR
 _bt.PROJECT_PREFIX   = PROJECT_PREFIX
 _bt.PNR_TOOL_NAMES   = PNR_TOOL_NAMES
+_bt.BLOCKS           = BLOCKS
 
 
 def _get_user_email(username):
@@ -282,6 +286,7 @@ def relative_time(time_str):
         import datetime as _dt
         ts = None
         for fmt in [
+            "%a %b %d, %Y - %H:%M:%S",
             "%b %d, %Y - %H:%M:%S",
             "%b %d, %Y - %H:%M",
             "%b %d, %Y",
@@ -323,6 +328,7 @@ def convert_kst_to_ist_str(time_str):
         ts = None
         fmt_used = None
         for fmt in [
+            "%a %b %d, %Y - %H:%M:%S",
             "%b %d, %Y - %H:%M:%S",
             "%b %d, %Y - %H:%M",
             "%b %d, %Y",
@@ -1265,6 +1271,7 @@ class PDDashboard(QMainWindow):
 
         # -- worker/state -------------------------------------------------
         self.size_workers           = []
+        self._stage_workers         = []
         self.item_map               = {}
         self.ignored_paths          = set()
         self._checked_paths         = set()
@@ -1612,11 +1619,53 @@ class PDDashboard(QMainWindow):
             self._metric_dark, self)
         dlg.exec_()
 
+    def _fmt_ts(self, raw):
+        """Apply IST conversion and/or relative formatting to a raw timestamp."""
+        val = raw or ""
+        if not val or val in ("-", "N/A", "Unknown"):
+            return val
+        if self.convert_to_ist:
+            val = convert_kst_to_ist_str(val)
+        if self.show_relative_time:
+            val = relative_time(val)
+        return val
+
+    def _refresh_timestamps(self):
+        """Re-apply IST/relative format to all timestamp columns using stored
+        raw values (UserRole+40/41). No tree rebuild needed."""
+        GROUP = frozenset(("BLOCK", "MILESTONE", "RTL",
+                           "IGNORED_ROOT", "STANDALONE_ROOT", "__PLACEHOLDER__"))
+        def _walk(node):
+            for i in range(node.childCount()):
+                item = node.child(i)
+                if item.data(0, Qt.UserRole) not in GROUP:
+                    s_raw = item.data(0, Qt.UserRole + 40) or ""
+                    e_raw = item.data(0, Qt.UserRole + 41) or ""
+                    item.setText(13, self._fmt_ts(s_raw))
+                    item.setText(14, self._fmt_ts(e_raw))
+                _walk(item)
+        _walk(self.tree.invisibleRootItem())
+
+    def _ensure_standalone_root(self, root):
+        """Get or create the Standalone PNR Runs top-level node."""
+        for i in range(root.childCount()):
+            if root.child(i).data(0, Qt.UserRole) == "STANDALONE_ROOT":
+                return root.child(i)
+        node = QTreeWidgetItem(root)
+        node.setText(0, "[ Standalone PNR Runs ]")
+        node.setData(0, Qt.UserRole, "STANDALONE_ROOT")
+        node.setToolTip(0, "BE/Innovus runs with no matching FE parent run")
+        node.setFlags(Qt.ItemIsEnabled)
+        f = node.font(0)
+        f.setBold(True)
+        node.setFont(0, f)
+        return node
+
     def _apply_pin_icons(self):
         """Walk all tree items and set/clear pin icons from self.user_pins.
         Called after any pin change so icons appear immediately."""
         GROUP = frozenset(("BLOCK","RTL","MILESTONE",
-                           "IGNORED_ROOT","__PLACEHOLDER__"))
+                           "IGNORED_ROOT","STANDALONE_ROOT","__PLACEHOLDER__"))
         _UR = Qt.UserRole
         def _walk(node):
             for i in range(node.childCount()):
@@ -1642,7 +1691,7 @@ class PDDashboard(QMainWindow):
         Deferred via QTimer so it doesn't block the initial tree paint.
         Only walks run items (skips group nodes) for maximum speed."""
         GROUP = frozenset(("BLOCK","MILESTONE","RTL",
-                           "IGNORED_ROOT","STAGE","__PLACEHOLDER__"))
+                           "IGNORED_ROOT","STANDALONE_ROOT","STAGE","__PLACEHOLDER__"))
         _UR   = Qt.UserRole
         _UR10 = Qt.UserRole + 10
         count = [0]
@@ -2273,7 +2322,7 @@ class PDDashboard(QMainWindow):
     def _get_visible_run_items(self):
         """Collect all visible FE run items in tree order."""
         items = []
-        GROUP = frozenset(("BLOCK","MILESTONE","RTL","IGNORED_ROOT",
+        GROUP = frozenset(("BLOCK","MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT",
                            "STAGE","__PLACEHOLDER__"))
         def collect(node):
             for i in range(node.childCount()):
@@ -2457,13 +2506,29 @@ class PDDashboard(QMainWindow):
             return
         if col != 0:
             return
-        # Cascade check state to stage children
         state = item.checkState(0)
         self.tree.blockSignals(True)
+        # Cascade to already-loaded STAGE children
         for i in range(item.childCount()):
             ch = item.child(i)
-            if ch.data(0, Qt.UserRole) == "STAGE":
+            ch_type = ch.data(0, Qt.UserRole)
+            if ch_type == "STAGE":
                 ch.setCheckState(0, state)
+            elif ch_type == "__PLACEHOLDER__":
+                # Stages not yet expanded -- force-load them now so
+                # cascade works even before user expands the BE run.
+                be_run = item.data(0, Qt.UserRole + 11)
+                if be_run:
+                    ign_root = self._ensure_ign_root(
+                        self.tree.invisibleRootItem())
+                    item.removeChild(ch)
+                    self._add_stages(item, be_run, ign_root)
+                    # Now cascade to freshly created stage children
+                    for j in range(item.childCount()):
+                        s = item.child(j)
+                        if s.data(0, Qt.UserRole) == "STAGE":
+                            s.setCheckState(0, state)
+                break
         self.tree.blockSignals(False)
         path = item.text(15)
         if not path or path == "N/A":
@@ -3073,8 +3138,9 @@ class PDDashboard(QMainWindow):
                         run["rtl"] = fe_rtl
                         break
 
-        root     = self.tree.invisibleRootItem()
-        ign_root = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
+        root            = self.tree.invisibleRootItem()
+        ign_root        = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
+        standalone_root = self._ensure_standalone_root(root)
 
         # Pre-compute base_rtl and milestone per unique RTL string
         _rtl_cache = {}
@@ -3084,6 +3150,11 @@ class PDDashboard(QMainWindow):
                 base = re.sub(r'_syn\d+$', '', rtl)
                 # Use user-configurable milestone map
                 ms   = self.get_milestone_label(base)
+                # Innovus TOP / SOC-level runs often have RTL="Unknown"
+                # because there is no dump_variables report. Assign a
+                # fallback milestone so they are not silently dropped.
+                if ms is None and ("Unknown" in rtl or not rtl.strip()):
+                    ms = "SOC / TOP"
                 _rtl_cache[rtl] = (base, base != rtl, ms)
 
         _ignored  = self.ignored_paths
@@ -3116,9 +3187,13 @@ class PDDashboard(QMainWindow):
             base_attach = (attach_root if _hide_blk
                            else self._get_node(attach_root, blk_name, "BLOCK"))
 
-            m_node = self._get_node(base_attach, milestone, "MILESTONE")
-            # All syn* variants placed directly under base RTL node
-            parent_for_run = self._get_node(m_node, base_rtl, "RTL")
+            if milestone == "SOC / TOP":
+                # No MILESTONE node for TOP/SOC innovus runs — place RTL directly under block
+                parent_for_run = self._get_node(base_attach, base_rtl, "RTL")
+            else:
+                m_node = self._get_node(base_attach, milestone, "MILESTONE")
+                # All syn* variants placed directly under base RTL node
+                parent_for_run = self._get_node(m_node, base_rtl, "RTL")
 
             if run["run_type"] == "FE":
                 run_item = self._create_run_item(parent_for_run, run)
@@ -3150,7 +3225,7 @@ class PDDashboard(QMainWindow):
                             if found:
                                 return found
                         if nt in ("STAGE","__PLACEHOLDER__","BLOCK",
-                                  "MILESTONE","RTL","IGNORED_ROOT"):
+                                  "MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT"):
                             continue
                         # FE candidate -- must be from same source
                         fe_source = c.text(2).strip()
@@ -3174,7 +3249,14 @@ class PDDashboard(QMainWindow):
                 if fe_parent is None:
                     fe_parent = _find_fe_parent(base_attach)
 
-                actual_parent = fe_parent if fe_parent else parent_for_run
+                if fe_parent is None and not is_ignored:
+                    st_base = (standalone_root if _hide_blk
+                               else self._get_node(standalone_root, blk_name, "BLOCK"))
+                    st_m   = self._get_node(st_base, milestone, "MILESTONE")
+                    st_rtl = self._get_node(st_m, base_rtl, "RTL")
+                    actual_parent = st_rtl
+                else:
+                    actual_parent = fe_parent if fe_parent else parent_for_run
                 be_item = self._create_run_item(actual_parent, run)
                 be_item.setData(0, Qt.UserRole + 10, run)
                 if run.get("stages"):
@@ -3186,11 +3268,13 @@ class PDDashboard(QMainWindow):
 
         if ign_root.childCount() == 0:
             root.removeChild(ign_root)
+        if standalone_root.childCount() == 0:
+            root.removeChild(standalone_root)
 
         # Apply pin icons
         def update_nodes(node):
             if node.data(0, Qt.UserRole) not in (
-                    "BLOCK", "RTL", "MILESTONE", "IGNORED_ROOT"):
+                    "BLOCK", "RTL", "MILESTONE", "IGNORED_ROOT", "STANDALONE_ROOT"):
                 pin_type = self.user_pins.get(node.text(15))
                 if pin_type in self.icons:
                     node.setIcon(0, self.icons[pin_type])
@@ -3299,14 +3383,10 @@ class PDDashboard(QMainWindow):
 
             start_raw = run["info"]["start"]
             end_raw   = run["info"]["end"]
-            if self.convert_to_ist:
-                start_raw = convert_kst_to_ist_str(start_raw)
-                end_raw   = convert_kst_to_ist_str(end_raw)
-            if self.show_relative_time:
-                child.setText(13, relative_time(start_raw))
-            else:
-                child.setText(13, start_raw)
-            child.setText(14, end_raw)
+            child.setData(0, Qt.UserRole + 40, start_raw)
+            child.setData(0, Qt.UserRole + 41, end_raw)
+            child.setText(13, self._fmt_ts(start_raw))
+            child.setText(14, self._fmt_ts(end_raw))
             child.setToolTip(13, start_raw)
             child.setToolTip(14, end_raw)
 
@@ -3335,8 +3415,12 @@ class PDDashboard(QMainWindow):
             for col in [6, 7, 8, 9, 10, 11]:
                 child.setText(col, "-")
             child.setText(12, run.get("info", {}).get("runtime", "-"))
-            child.setText(13, run.get("info", {}).get("start", "-"))
-            child.setText(14, run.get("info", {}).get("end", "-"))
+            be_start_raw = run.get("info", {}).get("start", "-")
+            be_end_raw   = run.get("info", {}).get("end", "-")
+            child.setData(0, Qt.UserRole + 40, be_start_raw)
+            child.setData(0, Qt.UserRole + 41, be_end_raw)
+            child.setText(13, self._fmt_ts(be_start_raw))
+            child.setText(14, self._fmt_ts(be_end_raw))
 
         child.setData(0, Qt.UserRole, "STAGE"
                       if run["run_type"] == "STAGE" else None)
@@ -3412,8 +3496,12 @@ class PDDashboard(QMainWindow):
             s_item.setText(8,  f"UPF - {stage.get('st_u', '')}")
             s_item.setText(9,  stage.get("vslp_status", ""))
             s_item.setText(12, stage.get("info", {}).get("runtime", ""))
-            s_item.setText(13, stage.get("info", {}).get("start",   ""))
-            s_item.setText(14, stage.get("info", {}).get("end",     ""))
+            s_start_raw = stage.get("info", {}).get("start", "")
+            s_end_raw   = stage.get("info", {}).get("end", "")
+            s_item.setData(0, Qt.UserRole + 40, s_start_raw)
+            s_item.setData(0, Qt.UserRole + 41, s_end_raw)
+            s_item.setText(13, self._fmt_ts(s_start_raw))
+            s_item.setText(14, self._fmt_ts(s_end_raw))
             # Col 15 = stage directory path, Col 16 = stage log file
             s_item.setText(15, stage.get("stage_path", "N/A"))
             s_item.setText(16, stage.get("log",        "N/A"))
@@ -3434,8 +3522,54 @@ class PDDashboard(QMainWindow):
                 if be_run:
                     ign_root = self._ensure_ign_root(
                         self.tree.invisibleRootItem())
+                    parent_checked = item.checkState(0) == Qt.Checked
                     item.removeChild(ph)
                     self._add_stages(item, be_run, ign_root)
+                    # Propagate parent check state to newly created stages
+                    if parent_checked:
+                        self.tree.blockSignals(True)
+                        for i in range(item.childCount()):
+                            ch = item.child(i)
+                            if ch.data(0, Qt.UserRole) == "STAGE":
+                                ch.setCheckState(0, Qt.Checked)
+                        self.tree.blockSignals(False)
+                    # Load stage timing/FM/VSLP in background if deferred
+                    if any(s.get("_lazy") for s in be_run.get("stages", [])):
+                        from workers import StageDetailWorker
+                        w = StageDetailWorker(be_run, item)
+                        w.finished.connect(self._on_stage_details_loaded)
+                        w.start()
+                        self._stage_workers.append(w)
+
+    def _on_stage_details_loaded(self, be_item, enriched_stages):
+        """Called by StageDetailWorker when stage timing/FM/VSLP is ready."""
+        be_run = be_item.data(0, Qt.UserRole + 11)
+        if be_run:
+            be_run["stages"] = enriched_stages
+        for i in range(be_item.childCount()):
+            ch = be_item.child(i)
+            if ch.data(0, Qt.UserRole) != "STAGE":
+                continue
+            sname = ch.text(0)
+            for s in enriched_stages:
+                if s["name"] == sname:
+                    s_start = s.get("info", {}).get("start", "")
+                    s_end   = s.get("info", {}).get("end", "")
+                    ch.setData(0, Qt.UserRole + 40, s_start)
+                    ch.setData(0, Qt.UserRole + 41, s_end)
+                    ch.setText(12, s.get("info", {}).get("runtime", "-"))
+                    ch.setText(13, self._fmt_ts(s_start))
+                    ch.setText(14, self._fmt_ts(s_end))
+                    ch.setText(7,  "NONUPF - " + s["st_n"])
+                    ch.setText(8,  "UPF - "    + s["st_u"])
+                    ch.setText(9,  s["vslp_status"])
+                    self._apply_fm_color(ch, 7, ch.text(7))
+                    self._apply_fm_color(ch, 8, ch.text(8))
+                    self._apply_vslp_color(ch, 9, ch.text(9))
+                    break
+        # Clean up finished workers
+        self._stage_workers = [w for w in self._stage_workers
+                               if w.isRunning()]
 
     # ------------------------------------------------------------------
     # REFRESH VIEW (pure hide/show -- zero item creation)
@@ -3556,7 +3690,7 @@ class PDDashboard(QMainWindow):
             return True
 
         _GROUP_TYPES = frozenset(
-            ("BLOCK","MILESTONE","RTL","IGNORED_ROOT"))
+            ("BLOCK","MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT"))
         _expand_when_filtered = (preset != "All Runs" or bool(raw_query))
         _UR   = Qt.UserRole
         _UR10 = Qt.UserRole + 10
@@ -3565,6 +3699,18 @@ class PDDashboard(QMainWindow):
             node_type = item.data(0, _UR)
             if node_type == "__PLACEHOLDER__":
                 item.setHidden(True)
+                return False
+            # Standalone PNR Runs: hide in FE Only / BE Only views
+            if node_type == "STANDALONE_ROOT":
+                hide_it = (_fe_only or _be_only)
+                item.setHidden(hide_it)
+                if not hide_it:
+                    any_visible = False
+                    for i in range(item.childCount()):
+                        if _update_visibility(item.child(i)):
+                            any_visible = True
+                    item.setHidden(not any_visible)
+                    return not item.isHidden()
                 return False
             # Group nodes (BLOCK, MILESTONE, RTL, IGNORED_ROOT) recurse
             # into children. Also handles hide_block_nodes=True where
@@ -3738,7 +3884,10 @@ class PDDashboard(QMainWindow):
                     "Create New Filter Config & Add Run")
             m.addSeparator()
 
-        ignore_checked_act = m.addAction("Hide All Checked Runs/Stages")
+        restore_all_act = None
+        if self.ignored_paths:
+            restore_all_act = m.addAction("Restore All Ignored Runs")
+        ignore_checked_act = m.addAction("Ignore All Checked Runs")
         m.addSeparator()
 
         ignore_act = restore_act = None
@@ -3747,7 +3896,7 @@ class PDDashboard(QMainWindow):
             if target_path in self.ignored_paths:
                 restore_act = m.addAction("Restore (Unhide)")
             else:
-                ignore_act = m.addAction("Hide/Ignore")
+                ignore_act = m.addAction("Ignore Run")
             m.addSeparator()
 
         _flags = target_item.data(0, Qt.UserRole + 20) or {}
@@ -3864,33 +4013,29 @@ class PDDashboard(QMainWindow):
                 f"Config: {os.path.basename(self.current_config_path)}")
 
         elif res == ignore_checked_act:
-            def ig(node):
-                for i in range(node.childCount()):
-                    c = node.child(i)
-                    if c.checkState(0) == Qt.Checked:
-                        p = c.text(15)
-                        if p and p != "N/A":
-                            self.ignored_paths.add(p)
-                    ig(c)
-            ig(self.tree.invisibleRootItem())
-            self.refresh_view()
+            paths_to_ignore = [p for p in self._checked_paths
+                               if p and p not in ("N/A", "")]
+            if paths_to_ignore:
+                for p in paths_to_ignore:
+                    self.ignored_paths.add(p)
+                QTimer.singleShot(50, self._build_tree)
 
         elif res == ignore_act:
-            self.ignored_paths.add(target_path)
-            item.setHidden(True)
-            parent = item.parent()
-            if parent and all(
-                    parent.child(i).isHidden()
-                    for i in range(parent.childCount())):
-                parent.setHidden(True)
+            checked_paths = list(self._checked_paths) if hasattr(self, '_checked_paths') else []
+            if checked_paths:
+                for p in checked_paths:
+                    self.ignored_paths.add(p)
+            else:
+                self.ignored_paths.add(target_path)
+            QTimer.singleShot(50, self._build_tree)
 
         elif res == restore_act:
             self.ignored_paths.discard(target_path)
-            item.setHidden(False)
-            p = item.parent()
-            while p and p.parent():
-                p.setHidden(False)
-                p = p.parent()
+            QTimer.singleShot(50, self._build_tree)
+
+        elif restore_all_act and res == restore_all_act:
+            self.ignored_paths.clear()
+            QTimer.singleShot(50, self._build_tree)
 
         elif calc_size_act and res == calc_size_act:
             item.setText(6, "Calc...")
@@ -4434,10 +4579,10 @@ class PDDashboard(QMainWindow):
         self.show_relative_time = rel_time_cb.isChecked()
         self.convert_to_ist     = ist_cb.isChecked()
         if old_rel_time != self.show_relative_time or old_ist != self.convert_to_ist:
-            _need_rebuild = True  # timestamps baked at item creation time
+            QTimer.singleShot(50, self._refresh_timestamps)
         old_hide_blk = self.hide_block_nodes
         self.hide_block_nodes   = hide_blk_cb.isChecked()
-        _need_rebuild = (old_hide_blk != self.hide_block_nodes)
+        _need_rebuild = _need_rebuild or (old_hide_blk != self.hide_block_nodes)
         self._closure_enabled   = closure_cb.isChecked()
         prefs.set('UI', 'closure_enabled',
                   'true' if self._closure_enabled else 'false')
@@ -5387,5 +5532,5 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName("Singularity PD")
     window = PDDashboard()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec_())
