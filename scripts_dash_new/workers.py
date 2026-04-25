@@ -31,6 +31,13 @@ def _BASE_OUTFEED(): return _g("BASE_OUTFEED_DIR")
 def _BASE_IR():      return _g("BASE_IR_DIR", "")
 def _PROJECT():      return _g("PROJECT_PREFIX", "S5K2P5SP")
 def _PNR_TOOLS():    return _g("PNR_TOOL_NAMES", "fc innovus")
+def _BLOCKS():
+    """Return frozenset of allowed block names, or empty frozenset (= scan all)."""
+    b = _g("BLOCKS", set())
+    if isinstance(b, (set, frozenset)):
+        return frozenset(b)
+    # If injected as a string (edge case), parse it
+    return frozenset(s.strip() for s in str(b).split(',') if s.strip())
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +770,11 @@ class ScannerWorker(QThread):
                 m_blk = re.search(r"(BLK_[A-Z0-9]+)", r_name.upper())
                 if m_blk:
                     b_name = m_blk.group(1)
+
+        # BLOCKS filter: if a whitelist is configured, skip blocks not in it
+        _allowed_blocks = _BLOCKS()
+        if _allowed_blocks and b_name not in _allowed_blocks:
+            return None
 
         evt_base     = get_dynamic_evt_path(rtl, b_name)
         owner        = get_owner(rd)
