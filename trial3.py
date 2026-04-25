@@ -283,3 +283,4 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     result["congestion"] = parse_congestion(cong_path)
 
     return result
+ 
