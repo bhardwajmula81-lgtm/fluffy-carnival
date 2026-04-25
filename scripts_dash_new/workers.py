@@ -955,10 +955,15 @@ class MetricWorker(QThread):
             return
         try:
             if self.run_type == "FE":
-                m = extract_fe_metrics(self.run_path, self.b_name)
+                m = extract_fe_metrics(
+                    self.run_path,
+                    source=self.source,
+                    block=self.b_name)
             else:
                 m = extract_pnr_stage_metrics(
-                    self.run_path, self.stage_name, self.source)
+                    self.run_path, self.stage_name,
+                    source=self.source,
+                    block=self.b_name)
             self.finished.emit(m)
         except Exception as e:
             self.finished.emit({"_error": str(e)})

@@ -809,33 +809,19 @@ class QoRSummaryDialog(QDialog):
                     return str(v)
             return "-"
 
-        # LVT/RVT/HVT inst and area strings
-        vth      = area.get("vth", {})
-        lvt_inst = _v(vth.get("LVT", {}), "inst")
-        rvt_inst = _v(vth.get("RVT", {}), "inst")
-        hvt_inst = _v(vth.get("HVT", {}), "inst")
-        lvt_area = _v(vth.get("LVT", {}), "area")
-        rvt_area = _v(vth.get("RVT", {}), "area")
-        hvt_area = _v(vth.get("HVT", {}), "area")
+        # LVT/RVT combined inst/area strings from parse_cell_usage
+        vth          = metrics.get("vth", {})
+        lvt_rvt_inst = vth.get("lvt_rvt_inst", "-/-")
+        lvt_rvt_area = vth.get("lvt_rvt_area", "-/-")
 
-        def _pct_str(*pairs):
-            parts = [f"{n}:{v}%" for n, v in pairs if v != "-"]
-            return "/".join(parts) if parts else "-"
+        # Congestion: cong_both already formatted as "Both%/V%/H%"
+        cong_str = _v(cong, "cong_both")
 
-        cong_both = _v(cong, "cong_both")
-        cong_v    = _v(cong, "cong_v")
-        cong_h    = _v(cong, "cong_h")
-        cong_str  = (f"{cong_both}%/{cong_v}%/{cong_h}%"
-                     if cong_both != "-" else "-")
+        # Power: key is "leakage", value includes unit e.g. "87.468 uW"
+        pwr_str = _v(power, "leakage")
 
-        leak_mw = _v(power, "leakage_mw")
-        dyn_mw  = _v(power, "dynamic_mw")
-        pwr_str = f"{leak_mw}/{dyn_mw}"
-
-        # Util string: total/std_cell_only
-        util_total = _v(area, "total_util")
-        util_sc    = _v(area, "std_cell_only_util")
-        util_str   = f"{util_total}/{util_sc}"
+        # Util string: from utilization report
+        util_str = _v(metrics.get("util", {}), "std_util_str", "std_util")
 
         rows = [
             # (label,                          value,                      is_section)
@@ -851,19 +837,15 @@ class QoRSummaryDialog(QDialog):
             ("Instance Count",                 _v(area,"instance_count",
                                                    "total_count"),          False),
             ("Physical",                       None,                        True),
-            ("LVT*/RVT* Inst",                f"{lvt_inst}/{rvt_inst}",    False),
-            ("LVT*/RVT* Area",                f"{lvt_area}/{rvt_area}",    False),
+            ("LVT*/RVT* Inst",                lvt_rvt_inst,                False),
+            ("LVT*/RVT* Area",                lvt_rvt_area,                False),
             ("Congestion (Both/V/H Dir)",      cong_str,                    False),
             ("StdCell/StdCell Only Util",      util_str,                    False),
             ("Quality",                        None,                        True),
-            ("MBIT Ratio",
-             _v(metrics,"mbit") + ("%" if _v(metrics,"mbit") != "-" else ""),
-             False),
-            ("CGC Ratio",
-             _v(metrics,"cgc_pct") + ("%" if _v(metrics,"cgc_pct") != "-" else ""),
-             False),
+            ("MBIT Ratio",                     _v(metrics, "mbit"),         False),
+            ("CGC Ratio",                      metrics.get("cgc", "-"),     False),
             ("Power",                          None,                        True),
-            ("Leakage/Dynamic Power (mW)",     pwr_str,                     False),
+            ("Cell Leakage Power",             pwr_str,                     False),
             ("DRC Errors",                     metrics.get("drc_errors","-"),False),
             ("Runtime",                        metrics.get("runtime","-"),  False),
         ]
