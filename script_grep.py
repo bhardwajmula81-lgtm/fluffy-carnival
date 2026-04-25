@@ -91,9 +91,11 @@ def parse_qor(file_path):
 def parse_clock_gating(file_path):
     with open(file_path, 'r') as f:
         content = f.read()
-        match = re.search(r"Number of Gated registers\s+\d+\s+\(([\d.]+)%\)", content)
+        # Added '\|' to correctly pass the table formatting
+        match = re.search(r"Number of Gated registers\s+\|\s+\d+\s+\(([\d.]+)%\)", content)
         if match:
-            print(f"CGC Ratio = {match.group(1)}%")
+            print(f"CGC Ratio : {match.group(1)}%")
+
 
 def parse_multibit(file_path):
     with open(file_path, 'r') as f:
