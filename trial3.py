@@ -1,20 +1,22 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
-# Fixed Dictionary mapping to prevent main.py crash
-# Uses exact Regex from standalone script.
+# Fixed Dictionary mapping for main.py UI crashes.
+# STRICT FILE DISCOVERY: Uses exact user-defined glob patterns (e.g. area.*.rpt)
 
 import os
 import re
 import glob
 
 # ===========================================================================
-# FILE DISCOVERY HELPER
+# STRICT FILE DISCOVERY HELPER
 # ===========================================================================
-def _find_rpt(rpt_dir, prefix):
+def _find_rpt(rpt_dir, file_pattern):
+    """Finds the latest report file matching the EXACT pattern requested."""
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
 
-    pattern = os.path.join(rpt_dir, f"*{prefix}*.rpt")
+    # Matches EXACTLY what you request: e.g., area.*.rpt
+    pattern = os.path.join(rpt_dir, file_pattern)
     hits = glob.glob(pattern)
     
     valid_files = [f for f in hits if os.path.isfile(f) and not f.endswith(".log")]
@@ -72,7 +74,6 @@ def parse_utilization(file_path):
     return result
 
 def parse_cell_usage(file_path):
-    # Wrapped in dictionary to prevent get() crashes
     result = {"lvt_rvt_inst": "-/-", "lvt_rvt_area": "-/-"}
     if not file_path or not os.path.exists(file_path): return result
     
@@ -160,7 +161,6 @@ def parse_multibit(file_path):
     return "-"
 
 def parse_congestion(file_path):
-    # Changed back to a dictionary with the specific key main.py expects
     result = {"cong_both": "-"} 
     if not file_path or not os.path.exists(file_path): return result
     try:
@@ -182,25 +182,25 @@ def extract_fe_metrics(run_dir, source="WS"):
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
 
-    qor_path = _find_rpt(rpt_dir, "qor")
+    # Pass the EXACT string matches from your script here:
+    qor_path = _find_rpt(rpt_dir, "qor.*.rpt")
     qor_data = parse_qor(qor_path)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"] = qor_data.get("r2r_hold", "-")
 
-    cgc_path = _find_rpt(rpt_dir, "clock_gating")
+    cgc_path = _find_rpt(rpt_dir, "clock_gating_info.mission.rpt")
     result["cgc"] = parse_clock_gating(cgc_path)
     
-    mbit_path = _find_rpt(rpt_dir, "multibit")
+    mbit_path = _find_rpt(rpt_dir, "multibit_banking_ratio.*.rpt")
     result["mbit"] = parse_multibit(mbit_path)
 
-    # Dictionary structures preserved for main.py
-    area_path = _find_rpt(rpt_dir, "area")
+    area_path = _find_rpt(rpt_dir, "area.*.rpt")
     area_data = parse_area(area_path)
     result["area"] = {}
     result["area"]["total_area"] = area_data.get("total_area", "-")
     result["area"]["instance_count"] = area_data.get("instance_count", "-")
     
-    util_path = _find_rpt(rpt_dir, "utilization")
+    util_path = _find_rpt(rpt_dir, "utilization.*.rpt")
     util_data = parse_utilization(util_path)
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
@@ -208,11 +208,11 @@ def extract_fe_metrics(run_dir, source="WS"):
     
     result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
-    cell_path = _find_rpt(rpt_dir, "cell_usage")
-    result["vth"] = parse_cell_usage(cell_path)  # Passed safely as dict
+    cell_path = _find_rpt(rpt_dir, "cell_usage.summary.*.rpt")
+    result["vth"] = parse_cell_usage(cell_path)  
 
-    cong_path = _find_rpt(rpt_dir, "congestion")
-    result["congestion"] = parse_congestion(cong_path)  # Passed safely as dict
+    cong_path = _find_rpt(rpt_dir, "congestion.*.rpt")
+    result["congestion"] = parse_congestion(cong_path)  
 
     return result
 
@@ -224,24 +224,25 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     else:
         rpt_dir = os.path.join(run_dir, stage_name, "reports", stage_name)
 
-    qor_path = _find_rpt(rpt_dir, "qor")
+    # Pass the EXACT string matches from your script here:
+    qor_path = _find_rpt(rpt_dir, "qor.*.rpt")
     qor_data = parse_qor(qor_path)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"] = qor_data.get("r2r_hold", "-")
 
-    cgc_path = _find_rpt(rpt_dir, "clock_gating")
+    cgc_path = _find_rpt(rpt_dir, "clock_gating_info.mission.rpt")
     result["cgc"] = parse_clock_gating(cgc_path)
     
-    mbit_path = _find_rpt(rpt_dir, "multibit")
+    mbit_path = _find_rpt(rpt_dir, "multibit_banking_ratio.*.rpt")
     result["mbit"] = parse_multibit(mbit_path)
 
-    area_path = _find_rpt(rpt_dir, "area")
+    area_path = _find_rpt(rpt_dir, "area.*.rpt")
     area_data = parse_area(area_path)
     result["area"] = {}
     result["area"]["total_area"] = area_data.get("total_area", "-")
     result["area"]["instance_count"] = area_data.get("instance_count", "-")
     
-    util_path = _find_rpt(rpt_dir, "utilization")
+    util_path = _find_rpt(rpt_dir, "utilization.*.rpt")
     util_data = parse_utilization(util_path)
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
@@ -249,10 +250,10 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     
     result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
-    cell_path = _find_rpt(rpt_dir, "cell_usage")
+    cell_path = _find_rpt(rpt_dir, "cell_usage.summary.*.rpt")
     result["vth"] = parse_cell_usage(cell_path)
 
-    cong_path = _find_rpt(rpt_dir, "congestion")
+    cong_path = _find_rpt(rpt_dir, "congestion.*.rpt")
     result["congestion"] = parse_congestion(cong_path)
 
     return result
