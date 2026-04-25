@@ -19,9 +19,10 @@ DEFAULT_CONFIG = {
     'PROJECT': {
         'PROJECT_PREFIX': 'S5K2P5SP',
         'BASE_WS_FE_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/WS',
-        'BASE_WS_BE_DIR': '/user/s5k2p5sp.be1/s5k2p5sp/WS',
+        'BASE_WS_BE_DIR': '/user/s5k2p5sx.be1/s5k2p5sp/WS',
         'BASE_OUTFEED_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/outfeed',
-        'BASE_IR_DIR': '/user/s5k2p5sx.be1/LAYOUT/IR/ /user/s5k2p5sx.be1/LAYOUT/IR2/'
+        'BASE_IR_DIR': '/user/s5k2p5sx.be1/LAYOUT/IR/ /user/s5k2p5sx.be1/LAYOUT/IR2/',
+        'BLOCKS': ''
     },
     'TOOLS': {
         'PNR_TOOL_NAMES': 'fc innovus',
@@ -47,6 +48,10 @@ BASE_WS_FE_DIR   = config.get('PROJECT', 'BASE_WS_FE_DIR', fallback='')
 BASE_WS_BE_DIR   = config.get('PROJECT', 'BASE_WS_BE_DIR', fallback='')
 BASE_OUTFEED_DIR = config.get('PROJECT', 'BASE_OUTFEED_DIR', fallback='')
 BASE_IR_DIR      = config.get('PROJECT', 'BASE_IR_DIR', fallback='')
+# BLOCKS: comma-separated whitelist of block names to scan.
+# If empty, all blocks are scanned. If set, only listed blocks are included.
+_blocks_raw      = config.get('PROJECT', 'BLOCKS', fallback='')
+BLOCKS           = set(b.strip() for b in _blocks_raw.split(',') if b.strip())
 
 PNR_TOOL_NAMES   = config.get('TOOLS', 'PNR_TOOL_NAMES', fallback='fc innovus')
 SUMMARY_SCRIPT   = config.get('TOOLS', 'SUMMARY_SCRIPT', fallback='')
