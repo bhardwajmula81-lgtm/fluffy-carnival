@@ -1,7 +1,7 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
-# Uses the user's custom, tested regex logic for exact parsing.
-# Formatted to return nested dictionaries matching the PyQt5 Dashboard.
+# Perfectly synchronized to the user's custom regex logic.
+# Returns pre-formatted strings (e.g., "WNS/TNS/NUM") to match UI table expectations.
 
 import os
 import re
@@ -15,8 +15,8 @@ def _find_rpt(rpt_dir, prefix):
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
 
-    # Matches files like area.*.rpt or utilization.*.rpt
-    pattern = os.path.join(rpt_dir, f"{prefix}*")
+    # Matches files flexibly like area.BLK.rpt or clock_gating_info.mission.rpt
+    pattern = os.path.join(rpt_dir, f"*{prefix}*.rpt")
     hits = glob.glob(pattern)
     
     valid_files = [f for f in hits if os.path.isfile(f) and not f.endswith(".log")]
@@ -24,34 +24,39 @@ def _find_rpt(rpt_dir, prefix):
     if not valid_files:
         return None
 
-    # Return the most recently modified file
     return max(valid_files, key=os.path.getmtime)
 
 # ===========================================================================
-# CUSTOM PARSERS (Adapted from user script)
+# CUSTOM PARSERS (Using exact regex from user script)
 # ===========================================================================
 def parse_area(file_path):
-    result = {"total_count": "-", "total_area": "-"}
+    result = {"total_count": "-", "instance_count": "-", "total_area": "-"}
     if not file_path or not os.path.exists(file_path): return result
     
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            cells = re.search(r"Number of cells:\s+(\d+)", content)
-            area = re.search(r"Total cell area:\s+([\d.]+)", content)
+            # \S+ guarantees we capture the exact text block just like your script
+            cells = re.search(r"Number of cells:\s+(\S+)", content)
+            area = re.search(r"Total cell area:\s+(\S+)", content)
             
-            if cells: result["total_count"] = cells.group(1)
-            if area: result["total_area"] = area.group(1)
+            if cells: 
+                result["total_count"] = cells.group(1)
+                result["instance_count"] = cells.group(1) # Backup key
+            if area: 
+                result["total_area"] = area.group(1)
     except: pass
     return result
 
 def parse_utilization(file_path):
-    result = {"std_cell_area": "-", "memory_area": "-", "macro_area": "-"}
+    result = {"std_cell_area": "-", "memory_area": "-", "macro_area": "-", "std_util_str": "-/-"}
     if not file_path or not os.path.exists(file_path): return result
     
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
+            
+            # Area metrics
             std_cell = re.search(r"^\s*std_cell\(\+headbuf\+epbuf\)\s+\d+\s+([\d.]+)", content, re.MULTILINE)
             memory = re.search(r"^\s*memory_cell\s+\d+\s+([\d.]+)", content, re.MULTILINE)
             macro = re.search(r"^\s*macro_cell\s+\d+\s+([\d.]+)", content, re.MULTILINE)
@@ -59,16 +64,28 @@ def parse_utilization(file_path):
             if std_cell: result["std_cell_area"] = std_cell.group(1)
             if memory: result["memory_area"] = memory.group(1)
             if macro: result["macro_area"] = macro.group(1)
+            
+            # StdCell/StdCell Only Util combo string
+            std_util = re.search(r"Standard cell utilization\s*:\s*([\d.]+)", content)
+            std_only = re.search(r"Standard cell only utilization\s*:\s*([\d.]+)", content)
+            
+            s_val = std_util.group(1) if std_util else "-"
+            o_val = std_only.group(1) if std_only else "-"
+            if s_val != "-" or o_val != "-":
+                result["std_util_str"] = f"{s_val}%/{o_val}%"
+                
     except: pass
     return result
 
 def parse_cell_usage(file_path):
-    result = {"vth_totals": {}}
+    result = {"lvt_rvt_inst": "-/-", "lvt_rvt_area": "-/-"}
     if not file_path or not os.path.exists(file_path): return result
     
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             lvt_inst, rvt_inst = 0.0, 0.0
+            lvt_area, rvt_area = 0.0, 0.0
+            
             lvt_keys = ["LVT", "LVT_LLP", "LVT_L30L34"]
             rvt_keys = ["RVT", "RVT_LLP", "RVT_L30L34"]
             
@@ -86,13 +103,19 @@ def parse_cell_usage(file_path):
                         vth_type = cols[1]
                         try:
                             inst_pct = float(cols[3].replace('%', ''))
-                            if vth_type in lvt_keys: lvt_inst += inst_pct
-                            elif vth_type in rvt_keys: rvt_inst += inst_pct
+                            area_pct = float(cols[5].replace('%', ''))
+                            
+                            if vth_type in lvt_keys: 
+                                lvt_inst += inst_pct
+                                lvt_area += area_pct
+                            elif vth_type in rvt_keys: 
+                                rvt_inst += inst_pct
+                                rvt_area += area_pct
                         except ValueError: pass
             
-            # Formatted exactly as expected by your dashboard
-            result["vth_totals"]["LVT*"] = f"{lvt_inst:.2f}%"
-            result["vth_totals"]["RVT*"] = f"{rvt_inst:.2f}%"
+            # Formats exactly to a single string to map directly to the UI row
+            result["lvt_rvt_inst"] = f"{lvt_inst:.2f}%/{rvt_inst:.2f}%"
+            result["lvt_rvt_area"] = f"{lvt_area:.2f}%/{rvt_area:.2f}%"
     except: pass
     return result
 
@@ -128,7 +151,7 @@ def parse_clock_gating(file_path):
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
             match = re.search(r"Number of Gated registers\s+\|\s+\d+\s+\(([\d.]+)%\)", content)
-            if match: return match.group(1)
+            if match: return f"{match.group(1)}%"
     except: pass
     return "-"
 
@@ -138,13 +161,13 @@ def parse_multibit(file_path):
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
             match = re.search(r"Flip-flop cells banking ratio \(\(C\)/\s*\(\s*A\s*\+\s*C\s*\)\):\s+([\d.]+)%", content)
-            if match: return match.group(1)
+            if match: return f"{match.group(1)}%"
     except: pass
     return "-"
 
 def parse_congestion(file_path):
-    result = {"max_h": "-", "max_v": "-", "both": "-"}
-    if not file_path or not os.path.exists(file_path): return result
+    # Expects formatted combo string: Both/V/H
+    if not file_path or not os.path.exists(file_path): return "-"
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -152,61 +175,65 @@ def parse_congestion(file_path):
             h_route = re.search(r"H routing\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%", content)
             v_route = re.search(r"V routing\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%", content)
             
-            if both: result["both"] = both.group(1)
-            if h_route: result["max_h"] = h_route.group(1)
-            if v_route: result["max_v"] = v_route.group(1)
+            if both and h_route and v_route:
+                return f"{both.group(1)}%/{v_route.group(1)}%/{h_route.group(1)}%"
     except: pass
-    return result
+    return "-"
 
 # ===========================================================================
 # MAIN DASHBOARD EXTRACTION WRAPPERS
 # ===========================================================================
 def extract_fe_metrics(run_dir, source="WS"):
-    """Called by the dashboard for FE runs."""
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
 
-    # QoR (Setup/Hold)
+    # QOR (Setup/Hold strings)
     qor_path = _find_rpt(rpt_dir, "qor")
     qor_data = parse_qor(qor_path)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"] = qor_data.get("r2r_hold", "-")
 
-    # CGC & MBIT
-    cgc_path = _find_rpt(rpt_dir, "clock_gating_info")
+    # CGC & MBIT (Strings)
+    cgc_path = _find_rpt(rpt_dir, "clock_gating")
     result["cgc"] = parse_clock_gating(cgc_path)
     
-    mbit_path = _find_rpt(rpt_dir, "multibit_banking_ratio")
+    mbit_path = _find_rpt(rpt_dir, "multibit")
     result["mbit"] = parse_multibit(mbit_path)
 
-    # Area & Instance Count
+    # AREA
     area_path = _find_rpt(rpt_dir, "area")
-    result["area"] = parse_area(area_path)
+    area_data = parse_area(area_path)
     
-    # Utilization (Std cell, memory, macro area)
+    result["area"] = {}
+    result["area"]["total_area"] = area_data.get("total_area", "-")
+    result["area"]["instance_count"] = area_data.get("instance_count", "-")
+    
+    # UTILIZATION (Std cell, memory, macro area)
     util_path = _find_rpt(rpt_dir, "utilization")
     util_data = parse_utilization(util_path)
+    
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
     result["area"]["macro_area"] = util_data.get("macro_area", "-")
+    
+    # Physical Utilization Combo
+    result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
-    # Vth Usage
-    cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
+    # CELL USAGE (VTH)
+    cell_path = _find_rpt(rpt_dir, "cell_usage")
     vth_data = parse_cell_usage(cell_path)
-    result["vth_totals"] = vth_data.get("vth_totals", {})
+    
+    # Maps exactly to UI strings
+    result["lvt_rvt_inst"] = vth_data.get("lvt_rvt_inst", "-/-")
+    result["lvt_rvt_area"] = vth_data.get("lvt_rvt_area", "-/-")
 
-    # Congestion
+    # CONGESTION (String)
     cong_path = _find_rpt(rpt_dir, "congestion")
     result["congestion"] = parse_congestion(cong_path)
-
-    # Empty stubs to prevent UI errors if it looks for these
-    result["power"] = {"total_power": "-", "leakage_power": "-"}
-    result["tool_version"] = "-"
 
     return result
 
 def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
-    """Called by the dashboard for BE runs."""
     result = {"stage": stage_name, "run_dir": run_dir}
     
     if source == "WS":
@@ -219,29 +246,35 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"] = qor_data.get("r2r_hold", "-")
 
-    cgc_path = _find_rpt(rpt_dir, "clock_gating_info")
+    cgc_path = _find_rpt(rpt_dir, "clock_gating")
     result["cgc"] = parse_clock_gating(cgc_path)
     
-    mbit_path = _find_rpt(rpt_dir, "multibit_banking_ratio")
+    mbit_path = _find_rpt(rpt_dir, "multibit")
     result["mbit"] = parse_multibit(mbit_path)
 
     area_path = _find_rpt(rpt_dir, "area")
-    result["area"] = parse_area(area_path)
+    area_data = parse_area(area_path)
+    
+    result["area"] = {}
+    result["area"]["total_area"] = area_data.get("total_area", "-")
+    result["area"]["instance_count"] = area_data.get("instance_count", "-")
     
     util_path = _find_rpt(rpt_dir, "utilization")
     util_data = parse_utilization(util_path)
+    
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
     result["area"]["macro_area"] = util_data.get("macro_area", "-")
+    
+    result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
-    cell_path = _find_rpt(rpt_dir, "cell_usage.summary")
+    cell_path = _find_rpt(rpt_dir, "cell_usage")
     vth_data = parse_cell_usage(cell_path)
-    result["vth_totals"] = vth_data.get("vth_totals", {})
+    
+    result["lvt_rvt_inst"] = vth_data.get("lvt_rvt_inst", "-/-")
+    result["lvt_rvt_area"] = vth_data.get("lvt_rvt_area", "-/-")
 
     cong_path = _find_rpt(rpt_dir, "congestion")
     result["congestion"] = parse_congestion(cong_path)
-
-    result["power"] = {"total_power": "-", "leakage_power": "-"}
-    result["tool_version"] = "-"
 
     return result
