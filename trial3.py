@@ -1,24 +1,45 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
-# Fixed Dictionary mapping for main.py UI crashes.
-# STRICT FILE DISCOVERY: Uses exact user-defined glob patterns (e.g. area.*.rpt)
+# STRICT FILE DISCOVERY: Dynamically extracts block_name from path 
+# and searches for exact files like area.{block_name}.*.rpt
 
 import os
 import re
 import glob
 
 # ===========================================================================
-# STRICT FILE DISCOVERY HELPER
+# PATH PARSING & DISCOVERY HELPERS
 # ===========================================================================
+def _get_block_name(run_dir):
+    """
+    Extracts the block name from the run directory path.
+    Example: /SOC/BLK_ISP1/fc/run_01 -> returns "BLK_ISP1"
+    """
+    parts = os.path.normpath(run_dir).split(os.sep)
+    # Scan the path for 'fc' or 'innovus' and grab the parent folder
+    for i, part in enumerate(parts):
+        if part in ["fc", "innovus"] and i > 0:
+            return parts[i-1]
+            
+    # Fallback if standard tool directories aren't found (returns 2 levels up)
+    if len(parts) >= 3:
+        return parts[-3]
+        
+    return "*" # Absolute fallback to wildcard if path is too short
+
 def _find_rpt(rpt_dir, file_pattern):
     """Finds the latest report file matching the EXACT pattern requested."""
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
 
-    # Matches EXACTLY what you request: e.g., area.*.rpt
     pattern = os.path.join(rpt_dir, file_pattern)
     hits = glob.glob(pattern)
     
+    # Fallback: if block specific name fails, try a generic wildcard just in case
+    if not hits:
+        fallback_pattern = os.path.join(rpt_dir, file_pattern.replace(file_pattern.split('.')[1], '*'))
+        hits = glob.glob(fallback_pattern)
+
     valid_files = [f for f in hits if os.path.isfile(f) and not f.endswith(".log")]
 
     if not valid_files:
@@ -181,26 +202,30 @@ def parse_congestion(file_path):
 def extract_fe_metrics(run_dir, source="WS"):
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
+    
+    # Extract the block name dynamically from the path
+    block = _get_block_name(run_dir)
 
-    # Pass the EXACT string matches from your script here:
-    qor_path = _find_rpt(rpt_dir, "qor.*.rpt")
+    # Search explicitly using the block name
+    qor_path = _find_rpt(rpt_dir, f"qor.{block}.*.rpt")
     qor_data = parse_qor(qor_path)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"] = qor_data.get("r2r_hold", "-")
 
+    # These two reports typically don't have block names in your script
     cgc_path = _find_rpt(rpt_dir, "clock_gating_info.mission.rpt")
     result["cgc"] = parse_clock_gating(cgc_path)
     
-    mbit_path = _find_rpt(rpt_dir, "multibit_banking_ratio.*.rpt")
+    mbit_path = _find_rpt(rpt_dir, f"multibit_banking_ratio.{block}.*.rpt")
     result["mbit"] = parse_multibit(mbit_path)
 
-    area_path = _find_rpt(rpt_dir, "area.*.rpt")
+    area_path = _find_rpt(rpt_dir, f"area.{block}.*.rpt")
     area_data = parse_area(area_path)
     result["area"] = {}
     result["area"]["total_area"] = area_data.get("total_area", "-")
     result["area"]["instance_count"] = area_data.get("instance_count", "-")
     
-    util_path = _find_rpt(rpt_dir, "utilization.*.rpt")
+    util_path = _find_rpt(rpt_dir, f"utilization.{block}.*.rpt")
     util_data = parse_utilization(util_path)
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
@@ -208,10 +233,10 @@ def extract_fe_metrics(run_dir, source="WS"):
     
     result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
-    cell_path = _find_rpt(rpt_dir, "cell_usage.summary.*.rpt")
+    cell_path = _find_rpt(rpt_dir, f"cell_usage.summary.{block}.*.rpt")
     result["vth"] = parse_cell_usage(cell_path)  
 
-    cong_path = _find_rpt(rpt_dir, "congestion.*.rpt")
+    cong_path = _find_rpt(rpt_dir, f"congestion.{block}.*.rpt")
     result["congestion"] = parse_congestion(cong_path)  
 
     return result
@@ -224,8 +249,9 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     else:
         rpt_dir = os.path.join(run_dir, stage_name, "reports", stage_name)
 
-    # Pass the EXACT string matches from your script here:
-    qor_path = _find_rpt(rpt_dir, "qor.*.rpt")
+    block = _get_block_name(run_dir)
+
+    qor_path = _find_rpt(rpt_dir, f"qor.{block}.*.rpt")
     qor_data = parse_qor(qor_path)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"] = qor_data.get("r2r_hold", "-")
@@ -233,16 +259,16 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     cgc_path = _find_rpt(rpt_dir, "clock_gating_info.mission.rpt")
     result["cgc"] = parse_clock_gating(cgc_path)
     
-    mbit_path = _find_rpt(rpt_dir, "multibit_banking_ratio.*.rpt")
+    mbit_path = _find_rpt(rpt_dir, f"multibit_banking_ratio.{block}.*.rpt")
     result["mbit"] = parse_multibit(mbit_path)
 
-    area_path = _find_rpt(rpt_dir, "area.*.rpt")
+    area_path = _find_rpt(rpt_dir, f"area.{block}.*.rpt")
     area_data = parse_area(area_path)
     result["area"] = {}
     result["area"]["total_area"] = area_data.get("total_area", "-")
     result["area"]["instance_count"] = area_data.get("instance_count", "-")
     
-    util_path = _find_rpt(rpt_dir, "utilization.*.rpt")
+    util_path = _find_rpt(rpt_dir, f"utilization.{block}.*.rpt")
     util_data = parse_utilization(util_path)
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
@@ -250,10 +276,10 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     
     result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
-    cell_path = _find_rpt(rpt_dir, "cell_usage.summary.*.rpt")
+    cell_path = _find_rpt(rpt_dir, f"cell_usage.summary.{block}.*.rpt")
     result["vth"] = parse_cell_usage(cell_path)
 
-    cong_path = _find_rpt(rpt_dir, "congestion.*.rpt")
+    cong_path = _find_rpt(rpt_dir, f"congestion.{block}.*.rpt")
     result["congestion"] = parse_congestion(cong_path)
 
     return result
