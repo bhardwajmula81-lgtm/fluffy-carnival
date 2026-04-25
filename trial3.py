@@ -284,3 +284,9 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
 
     return result
  
+
+
+    cell_path = _find_rpt(rpt_dir, f"cell_usage.summary.{block}.*.rpt")
+    vth_data = parse_cell_usage(cell_path)
+    result["lvt_rvt_inst"] = vth_data.get("lvt_rvt_inst", "-/-")
+    result["lvt_rvt_area"] = vth_data.get("lvt_rvt_area", "-/-")
