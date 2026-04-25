@@ -2387,8 +2387,8 @@ class PDDashboard(QMainWindow):
         item = self.tree.currentItem()
         if item:
             log = item.text(16)
-            if log and log != "N/A" and os.path.exists(log):
-                subprocess.Popen(['gvim', log])
+            if log and log not in ("N/A", ""):
+                self._open_file_or_warn(log, "Log File")
 
     def _toggle_dark_mode(self):
         self.is_dark_mode = not self.is_dark_mode
@@ -2565,7 +2565,20 @@ class PDDashboard(QMainWindow):
         path     = item.text(15)
 
         self.meta_path.setText(path)
-        self.meta_log.setText(item.text(16))
+        log_val = item.text(16)
+        if log_val and log_val not in ("N/A", ""):
+            if os.path.exists(log_val):
+                self.meta_log.setText(log_val)
+                self.meta_log.setStyleSheet("")
+                self.meta_log.setToolTip(log_val)
+            else:
+                self.meta_log.setText("Log not found: " + log_val)
+                self.meta_log.setStyleSheet("color: #c0392b; font-style: italic;")
+                self.meta_log.setToolTip("File does not exist:\n" + log_val)
+        else:
+            self.meta_log.setText(log_val or "")
+            self.meta_log.setStyleSheet("")
+            self.meta_log.setToolTip("")
         self.meta_path.home(False)
         self.meta_log.home(False)
         # Show run name in Quick Info
@@ -2630,13 +2643,21 @@ class PDDashboard(QMainWindow):
                 self.fe_error_btn.setText(f"compile_opt errors: {err_count}")
                 self.fe_error_btn.setVisible(True)
 
+    def _open_file_or_warn(self, path, label="File"):
+        """Open path in gvim, or show a non-blocking warning if it doesn't exist."""
+        if path and os.path.exists(path):
+            subprocess.Popen(['gvim', path])
+        else:
+            QMessageBox.warning(
+                self, "{} Not Found".format(label),
+                "{} does not exist:\n{}".format(label, path or "(no path)"))
+
     def on_item_double_clicked(self, item, col):
         log = item.text(16)
-        if log and log != "N/A" and os.path.exists(log):
-            subprocess.Popen(['gvim', log])
+        if log and log != "N/A":
+            self._open_file_or_warn(log, "Log File")
         elif (item.data(0, Qt.UserRole) == "STAGE"
               and item.text(15) and item.text(15) != "N/A"):
-            # Try to open the stage directory in file manager
             stage_dir = item.text(15)
             if os.path.isdir(stage_dir):
                 subprocess.Popen(['gvim', stage_dir])
@@ -3899,22 +3920,22 @@ class PDDashboard(QMainWindow):
                 ignore_act = m.addAction("Ignore Run")
             m.addSeparator()
 
-        _flags = target_item.data(0, Qt.UserRole + 20) or {}
-        def _ex(path):
-            return bool(path and path != "N/A" and cached_exists(path))
+        # Do NOT call cached_exists() here -- it blocks on NFS and makes right-click laggy.
+        # Always show relevant actions; existence is checked only when user clicks.
+        def _has(path):
+            return bool(path and path not in ("N/A", ""))
 
         calc_size_act = (m.addAction("Calculate Folder Size")
-                         if run_path and run_path != "N/A"
-                         and cached_exists(run_path) else None)
+                         if _has(run_path) else None)
         if calc_size_act: m.addSeparator()
 
-        fm_n_act    = m.addAction("Open NONUPF Formality Report") if (_flags.get('fm_n') or _ex(fm_n_path)) else None
-        fm_u_act    = m.addAction("Open UPF Formality Report")    if (_flags.get('fm_u') or _ex(fm_u_path)) else None
-        v_act       = m.addAction("Open VSLP Report")             if (_flags.get('vslp') or _ex(vslp_path)) else None
-        sta_act     = m.addAction("Open PT STA Summary")          if _ex(sta_path)  else None
-        ir_stat_act = m.addAction("Open Static IR Log")           if _ex(ir_path)   else None
-        ir_dyn_act  = m.addAction("Open Dynamic IR Log")          if (is_stage and _ex(ir_path)) else None
-        log_act     = m.addAction("Open Log File")                if (_flags.get('log') or _ex(log_path)) else None
+        fm_n_act    = m.addAction("Open NONUPF Formality Report") if _has(fm_n_path) else None
+        fm_u_act    = m.addAction("Open UPF Formality Report")    if _has(fm_u_path) else None
+        v_act       = m.addAction("Open VSLP Report")             if _has(vslp_path) else None
+        sta_act     = m.addAction("Open PT STA Summary")          if _has(sta_path)  else None
+        ir_stat_act = m.addAction("Open Static IR Log")           if _has(ir_path)   else None
+        ir_dyn_act  = m.addAction("Open Dynamic IR Log")          if (is_stage and _has(ir_path)) else None
+        log_act     = m.addAction("Open Log File")                if _has(log_path)  else None
 
         m.addSeparator()
         qor_act = None
@@ -4058,13 +4079,13 @@ class PDDashboard(QMainWindow):
                 if w in self.size_workers else None)
             worker.start()
 
-        elif fm_n_act     and res == fm_n_act:     subprocess.Popen(['gvim', fm_n_path])
-        elif fm_u_act     and res == fm_u_act:     subprocess.Popen(['gvim', fm_u_path])
-        elif v_act        and res == v_act:        subprocess.Popen(['gvim', vslp_path])
-        elif sta_act      and res == sta_act:      subprocess.Popen(['gvim', sta_path])
-        elif ir_stat_act  and res == ir_stat_act:  subprocess.Popen(['gvim', ir_path])
-        elif ir_dyn_act   and res == ir_dyn_act:   subprocess.Popen(['gvim', ir_path])
-        elif log_act      and res == log_act:      subprocess.Popen(['gvim', log_path])
+        elif fm_n_act     and res == fm_n_act:     self._open_file_or_warn(fm_n_path, "NONUPF Formality Report")
+        elif fm_u_act     and res == fm_u_act:     self._open_file_or_warn(fm_u_path, "UPF Formality Report")
+        elif v_act        and res == v_act:        self._open_file_or_warn(vslp_path, "VSLP Report")
+        elif sta_act      and res == sta_act:      self._open_file_or_warn(sta_path,  "PT STA Summary")
+        elif ir_stat_act  and res == ir_stat_act:  self._open_file_or_warn(ir_path,   "Static IR Log")
+        elif ir_dyn_act   and res == ir_dyn_act:   self._open_file_or_warn(ir_path,   "Dynamic IR Log")
+        elif log_act      and res == log_act:      self._open_file_or_warn(log_path,  "Log File")
         elif qor_act      and res == qor_act:
             self._run_single_stage_qor(item, b_name, r_rtl, base_run)
 

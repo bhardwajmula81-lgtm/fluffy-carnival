@@ -112,7 +112,7 @@ def extract_rtl(run_dir):
         with open(f[0], "r") as fh:
             for line in fh:
                 m = re.search('\\s*all\\s*=\\s*"(.*?)"', line)
-                if m:
+                if m and m.group(1).strip():   # guard: skip empty captures
                     return normalize_rtl(m.group(1))
     except Exception:
         pass
@@ -744,7 +744,7 @@ class ScannerWorker(QThread):
         rtl = extract_rtl(rd)
         if re.search(r'EVT\d+_ML\d+_DEV\d+', rtl):
             rtl = re.sub(r'EVT\d+_ML\d+_DEV\d+', phys_evt, rtl)
-        elif rtl == "Unknown":
+        elif not rtl or rtl == "Unknown":   # also catches empty-string result
             rtl = normalize_rtl(phys_evt)
         return normalize_rtl(rtl)
 

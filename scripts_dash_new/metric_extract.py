@@ -86,31 +86,24 @@ def parse_cell_usage(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             lvt_inst, rvt_inst, lvt_area, rvt_area = 0.0, 0.0, 0.0, 0.0
-            lvt_keys = ["LVT", "LVT_LLP", "LVT_L30L34"]
-            rvt_keys = ["RVT", "RVT_LLP", "RVT_L30L34"]
-            in_all_cells = False
-
             for line in f:
-                if "1-1. For all Cells" in line: in_all_cells = True
-                elif "1-2." in line: break 
-                
-                if in_all_cells and "|" in line:
-                    cols = [c.strip() for c in line.split('|')]
-                    if len(cols) >= 6:
-                        vth_type = cols[1]
+                # Match any line that has LVT or RVT tag and exactly 2 % values
+                if "LVT" in line or "RVT" in line:
+                    parts = re.findall(r"([\d.]+)%", line)
+                    if len(parts) >= 2:
                         try:
-                            inst_pct = float(cols[3].replace('%', ''))
-                            area_pct = float(cols[5].replace('%', ''))
-                            if vth_type in lvt_keys: 
-                                lvt_inst += inst_pct
-                                lvt_area += area_pct
-                            elif vth_type in rvt_keys: 
-                                rvt_inst += inst_pct
-                                rvt_area += area_pct
-                        except ValueError: pass
-            
-            result["lvt_rvt_inst"] = f"{lvt_inst:.2f}%/{rvt_inst:.2f}%"
-            result["lvt_rvt_area"] = f"{lvt_area:.2f}%/{rvt_area:.2f}%"
+                            val_inst = float(parts[0])
+                            val_area = float(parts[1])
+                            if "LVT" in line:
+                                lvt_inst += val_inst
+                                lvt_area += val_area
+                            elif "RVT" in line:
+                                rvt_inst += val_inst
+                                rvt_area += val_area
+                        except ValueError:
+                            pass
+            result["lvt_rvt_inst"] = "{:.2f}%/{:.2f}%".format(lvt_inst, rvt_inst)
+            result["lvt_rvt_area"] = "{:.2f}%/{:.2f}%".format(lvt_area, rvt_area)
     except: pass
     return result
 
@@ -121,16 +114,19 @@ def parse_qor(file_path):
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
             def get_r2r_data(section_name):
-                section = re.search(f"{section_name}.*?(?=Report :|$)", content, re.DOTALL)
+                # Find section up to the reg->reg column header
+                section = re.search(section_name + r".*?reg->reg", content, re.DOTALL)
                 if not section: return "-"
-                sec_text = section.group(0)
-                wns = re.search(r"WNS\s+([-\d.]+)\s+([-\d.]+)", sec_text)
-                tns = re.search(r"TNS\s+([-\d.]+)\s+([-\d.]+)", sec_text)
-                num = re.search(r"NUM\s+([-\d.]+)\s+([-\d.]+)", sec_text)
-                if wns and tns and num: return f"{wns.group(2)}/{tns.group(2)}/{num.group(2)}"
+                # Extract reg->reg column values for WNS, TNS, NUM
+                # Each row: "WNS   <path_col>  <reg2reg_col>"
+                data = re.findall(
+                    r"(?:WNS|TNS|NUM)\s+[-]?\d+\.?\d*\s+(-?\d+\.?\d*)",
+                    section.group(0))
+                if len(data) >= 3:
+                    return "{}/{}/{}".format(data[0], data[1], data[2])
                 return "-"
             result["r2r_setup"] = get_r2r_data("Setup violations")
-            result["r2r_hold"] = get_r2r_data("Hold violations")
+            result["r2r_hold"]  = get_r2r_data("Hold violations")
     except: pass
     return result
 
@@ -139,8 +135,9 @@ def parse_clock_gating(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            match = re.search(r"Number of Gated registers\s+\|\s+\d+\s+\(([\d.]+)%\)", content)
-            if match: return f"{match.group(1)}%"
+            # No pipe character -- format is: "Number of Gated registers  1234 (56.78%)"
+            match = re.search(r"Number of Gated registers\s+\d+\s+\(([\d.]+)%\)", content)
+            if match: return "{}%".format(match.group(1))
     except: pass
     return "-"
 
@@ -155,16 +152,37 @@ def parse_multibit(file_path):
     return "-"
 
 def parse_congestion(file_path):
-    result = {"cong_both": "-"} 
+    result = {"cong_both": "-"}
     if not file_path or not os.path.exists(file_path): return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            both = re.search(r"Both Dirs\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%", content)
-            h_route = re.search(r"H routing\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%", content)
-            v_route = re.search(r"V routing\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%", content)
-            if both and h_route and v_route:
-                result["cong_both"] = f"{both.group(1)}%/{v_route.group(1)}%/{h_route.group(1)}%"
+            # Try strict pipe-delimited format first, then relaxed whitespace format
+            _p = [
+                r"Both Dirs\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%",
+                r"Both Dirs\s+[\d.]+\s+\S+\s+([\d.]+)%",
+                r"Both\s+Dirs\s+.*?([\d.]+)%\s*$",
+            ]
+            _h = [
+                r"H routing\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%",
+                r"H routing\s+[\d.]+\s+\S+\s+([\d.]+)%",
+                r"H\s+routing\s+.*?([\d.]+)%\s*$",
+            ]
+            _v = [
+                r"V routing\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%",
+                r"V routing\s+[\d.]+\s+\S+\s+([\d.]+)%",
+                r"V\s+routing\s+.*?([\d.]+)%\s*$",
+            ]
+            def _first(pats):
+                for pat in pats:
+                    m = re.search(pat, content, re.MULTILINE)
+                    if m: return m.group(1)
+                return None
+            b = _first(_p); h = _first(_h); v = _first(_v)
+            if b and h and v:
+                result["cong_both"] = "{}%/{}%/{}%".format(b, v, h)
+            elif b:
+                result["cong_both"] = "{}%".format(b)
     except: pass
     return result
 
