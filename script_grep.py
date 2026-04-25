@@ -1,55 +1,64 @@
 import sys
 import os
 import re
-from pathlib import Path
+import glob
 
 def parse_area(file_path):
     with open(file_path, 'r') as f:
         content = f.read()
-        # regex for Number of cells and Total cell area
         cells = re.search(r"Number of cells:\s+(\d+)", content)
         area = re.search(r"Total cell area:\s+([\d.]+)", content)
         
-        print(f"--- Area Report ---")
-        if cells: print(f"Instance Count: {cells.group(1)}")
-        if area: print(f"Total Area: {area.group(1)}")
+        if cells: print(f"Instance Count : {cells.group(1)}")
+        if area: print(f"Total Area : {area.group(1)}")
 
 def parse_utilization(file_path):
     with open(file_path, 'r') as f:
         content = f.read()
-        # Capturing the AREA(um2) column
-        std_cell = re.search(r"std_cell\(\+headbuf\+epbuf\)\s+\d+\s+([\d.]+)", content)
-        memory = re.search(r"memory_cell\s+\d+\s+([\d.]+)", content)
-        macro = re.search(r"macro_cell\s+\d+\s+([\d.]+)", content)
+        # Capturing the 2nd column (AREA(um2))
+        std_cell = re.search(r"^\s*std_cell\(\+headbuf\+epbuf\)\s+\d+\s+([\d.]+)", content, re.MULTILINE)
+        memory = re.search(r"^\s*memory_cell\s+\d+\s+([\d.]+)", content, re.MULTILINE)
+        macro = re.search(r"^\s*macro_cell\s+\d+\s+([\d.]+)", content, re.MULTILINE)
         
-        print(f"--- Utilization Report ---")
-        if std_cell: print(f"Std Cell Area: {std_cell.group(1)}")
-        if memory: print(f"Memory Area: {memory.group(1)}")
-        if macro: print(f"Macro area (Inc. Mem): {macro.group(1)}")
+        if std_cell: print(f"Std Cell Area : {std_cell.group(1)}")
+        if memory: print(f"Memory Area : {memory.group(1)}")
+        if macro: print(f"Macro Area : {macro.group(1)}")
 
 def parse_cell_usage(file_path):
     with open(file_path, 'r') as f:
-        lines = f.readlines()
-        
         lvt_inst, rvt_inst = 0.0, 0.0
         lvt_area, rvt_area = 0.0, 0.0
         
-        # Regex to match the table rows and capture Inst % and Area %
-        # Example line: | LVT_LLP | 23.838% | 18.240% |
-        # We look for the float values
-        for line in lines:
-            if any(x in line for x in ["LVT", "RVT"]):
-                parts = re.findall(r"([\d.]+)%", line)
-                if len(parts) >= 2:
-                    val_inst, val_area = float(parts[0]), float(parts[1])
-                    if "LVT" in line:
-                        lvt_inst += val_inst
-                        lvt_area += val_area
-                    elif "RVT" in line:
-                        rvt_inst += val_inst
-                        rvt_area += val_area
+        lvt_keys = ["LVT", "LVT_LLP", "LVT_L30L34"]
+        rvt_keys = ["RVT", "RVT_LLP", "RVT_L30L34"]
         
-        print(f"--- Cell Usage Summary ---")
+        # Flag to only parse "1-1. For all Cells" section
+        in_all_cells = False
+
+        for line in f:
+            if "1-1. For all Cells" in line:
+                in_all_cells = True
+            elif "1-2." in line:
+                break # Stop reading after the first section
+            
+            if in_all_cells and "|" in line:
+                cols = [c.strip() for c in line.split('|')]
+                # Ensure the line has enough columns
+                if len(cols) >= 6:
+                    vth_type = cols[1]
+                    try:
+                        inst_pct = float(cols[3].replace('%', ''))
+                        area_pct = float(cols[5].replace('%', ''))
+                        
+                        if vth_type in lvt_keys:
+                            lvt_inst += inst_pct
+                            lvt_area += area_pct
+                        elif vth_type in rvt_keys:
+                            rvt_inst += inst_pct
+                            rvt_area += area_pct
+                    except ValueError:
+                        pass # Skip header/footer rows where float conversion fails
+        
         print(f"LVT*/RVT* Inst = {lvt_inst:.2f}%/{rvt_inst:.2f}%")
         print(f"LVT*/RVT* Area = {lvt_area:.2f}%/{rvt_area:.2f}%")
 
@@ -58,54 +67,86 @@ def parse_qor(file_path):
         content = f.read()
         
         def get_r2r_data(section_name):
-            # Locate section, then look for the reg->reg column
-            section = re.search(f"{section_name}.*?reg->reg", content, re.DOTALL)
+            # Extract the specific section block
+            section = re.search(f"{section_name}.*?(?=Report :|$)", content, re.DOTALL)
             if not section: return None
             
-            # Extract the column values below "reg->reg" for WNS, TNS, NUM
-            data = re.findall(r"(?:WNS|TNS|NUM)\s+[-]?[\d.]+\s+(-?[\d.]+)", section.group(0))
-            return data
+            sec_text = section.group(0)
+            
+            # The 'reg->reg' values are typically the 2nd value after the label (Total is 1st)
+            wns = re.search(r"WNS\s+([-\d.]+)\s+([-\d.]+)", sec_text)
+            tns = re.search(r"TNS\s+([-\d.]+)\s+([-\d.]+)", sec_text)
+            num = re.search(r"NUM\s+([-\d.]+)\s+([-\d.]+)", sec_text)
+            
+            if wns and tns and num:
+                return f"{wns.group(2)}/{tns.group(2)}/{num.group(2)}"
+            return None
 
         setup = get_r2r_data("Setup violations")
         hold = get_r2r_data("Hold violations")
         
-        print(f"--- QoR Report ---")
-        if setup: print(f"R2R(Setup) = {'/'.join(setup)}")
-        if hold: print(f"R2R(Hold) = {'/'.join(hold)}")
+        if setup: print(f"R2R (Setup) : {setup}")
+        if hold: print(f"R2R (Hold) : {hold}")
 
 def parse_clock_gating(file_path):
     with open(file_path, 'r') as f:
         content = f.read()
         match = re.search(r"Number of Gated registers\s+\d+\s+\(([\d.]+)%\)", content)
-        print(f"--- Clock Gating Report ---")
         if match:
             print(f"CGC Ratio = {match.group(1)}%")
+
+def parse_multibit(file_path):
+    with open(file_path, 'r') as f:
+        content = f.read()
+        match = re.search(r"Flip-flop cells banking ratio \(\(C\)/\((?:A\+C)\)\):\s+([\d.]+)%", content)
+        if match:
+            print(f"MBIT Ratio : {match.group(1)}%")
+
+def parse_congestion(file_path):
+    with open(file_path, 'r') as f:
+        content = f.read()
+        
+        both = re.search(r"Both Dirs\s+\|.*?\(.*?([\d.]+)%\)", content)
+        h_route = re.search(r"H routing\s+\|.*?\(.*?([\d.]+)%\)", content)
+        v_route = re.search(r"V routing\s+\|.*?\(.*?([\d.]+)%\)", content)
+        
+        if both and h_route and v_route:
+            # Outputting as Both/V/H Dir as requested
+            print(f"Congestion (Both/V/H Dir) : {both.group(1)}%/{v_route.group(1)}%/{h_route.group(1)}%")
 
 def main():
     if len(sys.argv) < 2:
         print("Usage: python3.6 script.py {path_of_run}")
         return
 
-    run_path = Path(sys.argv[1])
-    report_dir = run_path / "reports"
+    # Normalize paths
+    run_path = os.path.abspath(sys.argv[1])
+    report_dir = os.path.join(run_path, "reports")
 
-    if not report_dir.exists():
-        print(f"Error: {report_dir} does not exist.")
+    if not os.path.exists(report_dir):
+        print(f"Error: Directory {report_dir} does not exist.")
         return
+    
+    # Mapping report types to file patterns and their corresponding parser
+    parsers = [
+        ("area.*.rpt", parse_area),
+        ("utilization.*.rpt", parse_utilization),
+        ("cell_usage.summary.*.rpt", parse_cell_usage),
+        ("clock_gating_info.mission.rpt", parse_clock_gating),
+        ("qor.*.rpt", parse_qor),
+        ("multibit_banking_ratio.*.rpt", parse_multibit),
+        ("congestion.*.rpt", parse_congestion) # Adjust pattern if filename differs slightly
+    ]
 
-    # Map files to their specific parser
-    # Using glob to find files regardless of the block name
-    files_to_parse = {
-        "area": (list(report_dir.glob("area.*.rpt")), parse_area),
-        "utilization": (list(report_dir.glob("utilization.*.rpt")), parse_utilization),
-        "cell_usage": (list(report_dir.glob("cell_usage.summary.*.rpt")), parse_cell_usage),
-        "qor": (list(report_dir.glob("qor.*.rpt")), parse_qor),
-        "clock_gating": (list(report_dir.glob("clock_gating_info.mission.rpt")), parse_clock_gating),
-    }
-
-    for key, (files, parser) in files_to_parse.items():
-        for file in files:
-            parser(file)
+    for pattern, parser_func in parsers:
+        search_pattern = os.path.join(report_dir, pattern)
+        matching_files = glob.glob(search_pattern)
+        
+        for file in matching_files:
+            try:
+                parser_func(file)
+            except Exception as e:
+                print(f"Error parsing {file}: {e}")
 
 if __name__ == "__main__":
     main()
