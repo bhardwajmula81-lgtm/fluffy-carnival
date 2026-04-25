@@ -1,7 +1,7 @@
 # -*- coding: ascii -*-
 # metric_extract_v2.py
-# Perfectly synchronized to the user's custom regex logic.
-# Returns pre-formatted strings (e.g., "WNS/TNS/NUM") to match UI table expectations.
+# Fixed Dictionary mapping to prevent main.py crash
+# Uses exact Regex from standalone script.
 
 import os
 import re
@@ -11,11 +11,9 @@ import glob
 # FILE DISCOVERY HELPER
 # ===========================================================================
 def _find_rpt(rpt_dir, prefix):
-    """Finds the latest report file matching the prefix in the directory."""
     if not rpt_dir or not os.path.isdir(rpt_dir):
         return None
 
-    # Matches files flexibly like area.BLK.rpt or clock_gating_info.mission.rpt
     pattern = os.path.join(rpt_dir, f"*{prefix}*.rpt")
     hits = glob.glob(pattern)
     
@@ -27,7 +25,7 @@ def _find_rpt(rpt_dir, prefix):
     return max(valid_files, key=os.path.getmtime)
 
 # ===========================================================================
-# CUSTOM PARSERS (Using exact regex from user script)
+# CUSTOM PARSERS
 # ===========================================================================
 def parse_area(file_path):
     result = {"total_count": "-", "instance_count": "-", "total_area": "-"}
@@ -36,13 +34,12 @@ def parse_area(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            # \S+ guarantees we capture the exact text block just like your script
             cells = re.search(r"Number of cells:\s+(\S+)", content)
             area = re.search(r"Total cell area:\s+(\S+)", content)
             
             if cells: 
                 result["total_count"] = cells.group(1)
-                result["instance_count"] = cells.group(1) # Backup key
+                result["instance_count"] = cells.group(1) 
             if area: 
                 result["total_area"] = area.group(1)
     except: pass
@@ -56,7 +53,6 @@ def parse_utilization(file_path):
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
             
-            # Area metrics
             std_cell = re.search(r"^\s*std_cell\(\+headbuf\+epbuf\)\s+\d+\s+([\d.]+)", content, re.MULTILINE)
             memory = re.search(r"^\s*memory_cell\s+\d+\s+([\d.]+)", content, re.MULTILINE)
             macro = re.search(r"^\s*macro_cell\s+\d+\s+([\d.]+)", content, re.MULTILINE)
@@ -65,7 +61,6 @@ def parse_utilization(file_path):
             if memory: result["memory_area"] = memory.group(1)
             if macro: result["macro_area"] = macro.group(1)
             
-            # StdCell/StdCell Only Util combo string
             std_util = re.search(r"Standard cell utilization\s*:\s*([\d.]+)", content)
             std_only = re.search(r"Standard cell only utilization\s*:\s*([\d.]+)", content)
             
@@ -73,11 +68,11 @@ def parse_utilization(file_path):
             o_val = std_only.group(1) if std_only else "-"
             if s_val != "-" or o_val != "-":
                 result["std_util_str"] = f"{s_val}%/{o_val}%"
-                
     except: pass
     return result
 
 def parse_cell_usage(file_path):
+    # Wrapped in dictionary to prevent get() crashes
     result = {"lvt_rvt_inst": "-/-", "lvt_rvt_area": "-/-"}
     if not file_path or not os.path.exists(file_path): return result
     
@@ -113,7 +108,6 @@ def parse_cell_usage(file_path):
                                 rvt_area += area_pct
                         except ValueError: pass
             
-            # Formats exactly to a single string to map directly to the UI row
             result["lvt_rvt_inst"] = f"{lvt_inst:.2f}%/{rvt_inst:.2f}%"
             result["lvt_rvt_area"] = f"{lvt_area:.2f}%/{rvt_area:.2f}%"
     except: pass
@@ -166,8 +160,9 @@ def parse_multibit(file_path):
     return "-"
 
 def parse_congestion(file_path):
-    # Expects formatted combo string: Both/V/H
-    if not file_path or not os.path.exists(file_path): return "-"
+    # Changed back to a dictionary with the specific key main.py expects
+    result = {"cong_both": "-"} 
+    if not file_path or not os.path.exists(file_path): return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
@@ -176,9 +171,9 @@ def parse_congestion(file_path):
             v_route = re.search(r"V routing\s+\|\s+[\d.]+\s+\|\s+\([\s\d.]+%\)\s+\|\s+([\d.]+)%", content)
             
             if both and h_route and v_route:
-                return f"{both.group(1)}%/{v_route.group(1)}%/{h_route.group(1)}%"
+                result["cong_both"] = f"{both.group(1)}%/{v_route.group(1)}%/{h_route.group(1)}%"
     except: pass
-    return "-"
+    return result
 
 # ===========================================================================
 # MAIN DASHBOARD EXTRACTION WRAPPERS
@@ -187,49 +182,37 @@ def extract_fe_metrics(run_dir, source="WS"):
     result = {"run_dir": run_dir, "run_type": "FE"}
     rpt_dir = os.path.join(run_dir, "reports")
 
-    # QOR (Setup/Hold strings)
     qor_path = _find_rpt(rpt_dir, "qor")
     qor_data = parse_qor(qor_path)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"] = qor_data.get("r2r_hold", "-")
 
-    # CGC & MBIT (Strings)
     cgc_path = _find_rpt(rpt_dir, "clock_gating")
     result["cgc"] = parse_clock_gating(cgc_path)
     
     mbit_path = _find_rpt(rpt_dir, "multibit")
     result["mbit"] = parse_multibit(mbit_path)
 
-    # AREA
+    # Dictionary structures preserved for main.py
     area_path = _find_rpt(rpt_dir, "area")
     area_data = parse_area(area_path)
-    
     result["area"] = {}
     result["area"]["total_area"] = area_data.get("total_area", "-")
     result["area"]["instance_count"] = area_data.get("instance_count", "-")
     
-    # UTILIZATION (Std cell, memory, macro area)
     util_path = _find_rpt(rpt_dir, "utilization")
     util_data = parse_utilization(util_path)
-    
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
     result["area"]["macro_area"] = util_data.get("macro_area", "-")
     
-    # Physical Utilization Combo
     result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
-    # CELL USAGE (VTH)
     cell_path = _find_rpt(rpt_dir, "cell_usage")
-    vth_data = parse_cell_usage(cell_path)
-    
-    # Maps exactly to UI strings
-    result["lvt_rvt_inst"] = vth_data.get("lvt_rvt_inst", "-/-")
-    result["lvt_rvt_area"] = vth_data.get("lvt_rvt_area", "-/-")
+    result["vth"] = parse_cell_usage(cell_path)  # Passed safely as dict
 
-    # CONGESTION (String)
     cong_path = _find_rpt(rpt_dir, "congestion")
-    result["congestion"] = parse_congestion(cong_path)
+    result["congestion"] = parse_congestion(cong_path)  # Passed safely as dict
 
     return result
 
@@ -254,14 +237,12 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
 
     area_path = _find_rpt(rpt_dir, "area")
     area_data = parse_area(area_path)
-    
     result["area"] = {}
     result["area"]["total_area"] = area_data.get("total_area", "-")
     result["area"]["instance_count"] = area_data.get("instance_count", "-")
     
     util_path = _find_rpt(rpt_dir, "utilization")
     util_data = parse_utilization(util_path)
-    
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"] = util_data.get("memory_area", "-")
     result["area"]["macro_area"] = util_data.get("macro_area", "-")
@@ -269,10 +250,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS"):
     result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
     cell_path = _find_rpt(rpt_dir, "cell_usage")
-    vth_data = parse_cell_usage(cell_path)
-    
-    result["lvt_rvt_inst"] = vth_data.get("lvt_rvt_inst", "-/-")
-    result["lvt_rvt_area"] = vth_data.get("lvt_rvt_area", "-/-")
+    result["vth"] = parse_cell_usage(cell_path)
 
     cong_path = _find_rpt(rpt_dir, "congestion")
     result["congestion"] = parse_congestion(cong_path)
