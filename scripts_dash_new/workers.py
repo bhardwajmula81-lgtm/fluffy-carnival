@@ -236,7 +236,11 @@ except ImportError:
 # BatchSizeWorker -- calculates folder sizes for multiple items in background
 # ===========================================================================
 class BatchSizeWorker(QThread):
-    size_calculated = pyqtSignal(str, str)
+    # Batch signal: emits list[(item_id, size_str)] every 50 results
+    # instead of one signal per item — prevents flooding the main-thread event queue.
+    sizes_batch_ready = pyqtSignal(list)
+    # Keep old signal for backward-compat with any direct callers
+    size_calculated   = pyqtSignal(str, str)
 
     def __init__(self, tasks):
         super().__init__()
@@ -245,6 +249,7 @@ class BatchSizeWorker(QThread):
 
     def run(self):
         max_w = min(20, (os.cpu_count() or 4) * 4)
+        batch = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
             futures = {executor.submit(self.get_size, path): item_id
                        for item_id, path in self.tasks}
@@ -253,9 +258,16 @@ class BatchSizeWorker(QThread):
                     break
                 item_id = futures[future]
                 try:
-                    self.size_calculated.emit(item_id, future.result())
-                except:
-                    self.size_calculated.emit(item_id, "N/A")
+                    size_str = future.result()
+                except Exception:
+                    size_str = "N/A"
+                batch.append((item_id, size_str))
+                # Emit in chunks of 50 — ~10 signal deliveries vs 500
+                if len(batch) >= 50:
+                    self.sizes_batch_ready.emit(batch)
+                    batch = []
+        if batch and not self._is_cancelled:
+            self.sizes_batch_ready.emit(batch)
 
     def get_size(self, path):
         if not path or not os.path.exists(path):

@@ -1675,7 +1675,9 @@ class PDDashboard(QMainWindow):
         self._setup_shortcuts()
         self.apply_theme_and_spacing()
         QTimer.singleShot(50, self.start_fs_scan)
-        QTimer.singleShot(500, self.start_bg_disk_scan)  # start disk scan after UI ready
+        # DiskScannerWorker runs `du -sk` on NFS — extremely I/O heavy.
+        # Removed auto-start: it now only runs when user clicks "Disk Space".
+        # This eliminates NFS contention that made all post-scan clicks sluggish.
 
     # ------------------------------------------------------------------
     # CLOSE
@@ -3572,8 +3574,8 @@ class PDDashboard(QMainWindow):
                 continue
 
             _item_count += 1
-            if _item_count % 100 == 0:
-                QApplication.processEvents()
+            # processEvents removed: setUpdatesEnabled(False) is active so no
+            # visual benefit, and it lets premature size signals through mid-build.
 
             is_ignored  = run["path"] in _ignored
             attach_root = ign_root if is_ignored else root
@@ -3656,13 +3658,6 @@ class PDDashboard(QMainWindow):
                     _apply_expanded(node.child(i))
             _apply_expanded(self.tree.invisibleRootItem())
 
-        if not self._columns_fitted_once:
-            self._columns_fitted_once = True
-            self.fit_all_columns()
-        if not self._initial_size_calc_done:
-            self._initial_size_calc_done = True
-            self.calculate_all_sizes()
-
         all_owners = set()
         for r in (self.ws_data.get("all_runs", []) +
                   self.out_data.get("all_runs", [])):
@@ -3672,16 +3667,30 @@ class PDDashboard(QMainWindow):
             _save_mail_users(all_owners)
 
         self.refresh_view()
-        # Defer closure+regression scan -- runs after UI is responsive
-        # Uses QTimer so tree is fully painted before the extra pass
+
+        # --- Deferred post-build work so UI is interactive immediately ---
+        # fit_all_columns: 23-column resize is expensive on main thread;
+        # defer 100ms so tree paints first and user can interact.
+        if not self._columns_fitted_once:
+            self._columns_fitted_once = True
+            QTimer.singleShot(100, self.fit_all_columns)
+
+        # calculate_all_sizes: starts BatchSizeWorker (sends signals back).
+        # Delay 2s so the initial render+closure pass complete before
+        # size signals start arriving.
+        if not self._initial_size_calc_done:
+            self._initial_size_calc_done = True
+            QTimer.singleShot(2000, self.calculate_all_sizes)
+
+        # Closure+regression scan deferred 300ms (after fit_all_columns)
         if self._closure_enabled:
-            QTimer.singleShot(200, self._run_closure_pass)
+            QTimer.singleShot(300, self._run_closure_pass)
         # Auto-expand to RTL level on first load only
         if not hasattr(self, '_auto_expanded_once'):
             self._auto_expanded_once = True
             QTimer.singleShot(50, self._expand_to_rtl_level)
-        # Pre-warm path cache for all log paths so first click is instant
-        QTimer.singleShot(500, self._prefetch_log_paths)
+        # Pre-warm path cache 1s after build (after fit+closure settle)
+        QTimer.singleShot(1000, self._prefetch_log_paths)
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -4084,6 +4093,13 @@ class PDDashboard(QMainWindow):
             # Group nodes (BLOCK, MILESTONE, RTL, IGNORED_ROOT) recurse
             # into children. Never auto-expand — preserve user's expand state.
             if node_type in _GROUP_TYPES or node_type == "MILESTONE":
+                # Short-circuit: if this is a BLOCK node whose block is
+                # entirely excluded by the block-list filter, hide it and
+                # skip recursing all its children — big win when many blocks
+                # are unchecked (skips 70-80% of tree walk).
+                if node_type == "BLOCK" and item.text(0) not in checked_blks:
+                    item.setHidden(True)
+                    return False
                 any_visible = False
                 for i in range(item.childCount()):
                     if _update_visibility(item.child(i)):
@@ -4470,12 +4486,19 @@ class PDDashboard(QMainWindow):
         gather(self.tree.invisibleRootItem())
         if size_tasks:
             worker = BatchSizeWorker(size_tasks)
-            worker.size_calculated.connect(self.update_item_size)
+            # Use batch signal: ~10 deliveries instead of 500 individual signals
+            worker.sizes_batch_ready.connect(self._on_batch_sizes)
             self.size_workers.append(worker)
             worker.finished.connect(
                 lambda w=worker: self.size_workers.remove(w)
                 if w in self.size_workers else None)
             worker.start()
+
+    def _on_batch_sizes(self, batch):
+        """Handle a batch of (item_id, size_str) tuples from BatchSizeWorker.
+        One call per 50 results instead of one call per result — keeps UI fluid."""
+        for item_id, size_str in batch:
+            self.update_item_size(item_id, size_str)
 
     def update_item_size(self, item_id, size_str):
         item = self.item_map.get(item_id)
