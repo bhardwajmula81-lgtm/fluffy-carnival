@@ -130,7 +130,7 @@ def extract_rtl(run_dir):
     if not f:
         return "Unknown"
     try:
-        with open(f[0], "r") as fh:
+        with open(f[0], "r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
                 m = re.search('\\s*all\\s*=\\s*"(.*?)"', line)
                 if m and m.group(1).strip():   # guard: skip empty captures
@@ -154,7 +154,7 @@ def parse_runtime_rpt(file_path):
     if not cached_exists(file_path):
         return d
     try:
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if "TOTAL_START" in line and "Load :" in line:
                     d["start"] = format_log_date(
@@ -185,7 +185,7 @@ def parse_pnr_runtime_rpt(file_path):
               "Jul","Aug","Sep","Oct","Nov","Dec"]
     try:
         first_ts = last_ts = final_time_str = None
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 ts = re.search(
                     r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})", line)
@@ -220,7 +220,7 @@ def get_fm_info(report_path):
     if not report_path or not cached_exists(report_path):
         return "N/A"
     try:
-        with open(report_path, "r") as f:
+        with open(report_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if "No failing compare points" in line:
                     return "PASS"
@@ -235,7 +235,7 @@ def get_vslp_info(report_path):
     if not report_path or not cached_exists(report_path):
         return "N/A"
     try:
-        with open(report_path, "r") as f:
+        with open(report_path, "r", encoding="utf-8", errors="ignore") as f:
             in_summary = False
             for line in f:
                 if "Management Summary" in line:
@@ -615,7 +615,7 @@ class ScannerWorker(QThread):
         current_rtl = "Unknown"
         for sf in glob.glob(os.path.join(ws_path, "*.p4_sync")):
             try:
-                with open(sf, 'r') as f:
+                with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
                     lbls = re.findall(r'/([^/]+_syn\d*)\.config', f.read())
                     for l in set(lbls):
                         current_rtl = normalize_rtl(l)
@@ -834,7 +834,11 @@ class ScannerWorker(QThread):
         fm_n     = os.path.join(evt_base, "fm",   clean_run, "r2n",   "reports", f"{b_name}_r2n.failpoint.rpt")
         fm_u     = os.path.join(evt_base, "fm",   clean_run, "r2upf", "reports", f"{b_name}_r2upf.failpoint.rpt")
         vslp_rpt = os.path.join(evt_base, "vslp", clean_run, "pre",   "reports", "report_lp.rpt")
-        info     = parse_runtime_rpt(os.path.join(rd, "reports/runtime.V2.rpt"))
+        if run_type == "FE":
+            info = parse_runtime_rpt(os.path.join(rd, "reports/runtime.V2.rpt"))
+        else:
+            info = {"start": "-", "end": "-",
+                    "runtime": "-", "last_stage": "-"}
 
         is_comp   = True if source == "OUTFEED" else cached_exists(os.path.join(rd, "pass/compile_opt.pass"))
         fe_status = "RUNNING"

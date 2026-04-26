@@ -1103,31 +1103,46 @@ class _PieChartWidget(QWidget):
         self.title   = title
         self.data    = {}
         self.is_dark = False
-        self.setMinimumSize(180, 160)
+        self.setMinimumSize(260, 220)
 
     def set_data(self, data, is_dark=False):
-        self.data    = {k: v for k, v in data.items() if v > 0}
+        clean = []
+        for k, v in data.items():
+            try:
+                fv = float(v)
+            except Exception:
+                fv = 0.0
+            if fv > 0:
+                clean.append((str(k), fv))
+        clean.sort(key=lambda x: x[1], reverse=True)
+        if len(clean) > 6:
+            other = sum(v for _, v in clean[5:])
+            clean = clean[:5] + [("Other", other)]
+        self.data    = dict(clean)
         self.is_dark = is_dark
         self.update()
 
     def paintEvent(self, event):
-        import math
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         fg  = QColor("#dfe1e5" if self.is_dark else "#333333")
         bg  = QColor("#2b2d30" if self.is_dark else "#ffffff")
         p.fillRect(self.rect(), bg)
         r   = self.rect()
-        # Title
-        p.setPen(fg); p.drawText(r.adjusted(0, 4, 0, 0), Qt.AlignHCenter | Qt.AlignTop, self.title)
+        p.setPen(fg)
+        p.drawText(r.adjusted(0, 6, 0, 0),
+                   Qt.AlignHCenter | Qt.AlignTop, self.title)
         total = sum(self.data.values())
         if not total:
             p.drawText(r, Qt.AlignCenter, "No Data"); return
-        margin = 28
-        dim    = min(r.width(), r.height() - margin) - 8
+        top_margin = 28
+        legend_h = 20 * len(self.data) + 8
+        chart_h = max(80, r.height() - top_margin - legend_h)
+        dim = min(r.width() - 24, chart_h) - 6
         if dim <= 0: return
         from PyQt5.QtCore import QRectF
-        cx  = r.center().x(); cy = r.center().y() + margin // 2
+        cx  = r.center().x()
+        cy  = top_margin + dim / 2
         pie = QRectF(cx - dim/2, cy - dim/2, dim, dim)
         start = 0
         items = list(self.data.items())
@@ -1137,14 +1152,28 @@ class _PieChartWidget(QWidget):
             p.setBrush(QBrush(color))
             p.setPen(QPen(bg, 1))
             p.drawPie(pie, start, span)
-            # Small legend dot + text on right
-            lx = r.right() - 110; ly = margin + i * 16
-            p.setBrush(color); p.setPen(Qt.NoPen)
-            p.drawEllipse(lx, ly, 10, 10)
-            p.setPen(fg)
-            p.drawText(lx + 14, ly, 96, 14, Qt.AlignVCenter | Qt.AlignLeft,
-                       "{} {:.1f}%".format(label, val / total * 100))
             start += span
+        hole_dim = dim * 0.54
+        hole = QRectF(cx - hole_dim/2, cy - hole_dim/2, hole_dim, hole_dim)
+        p.setBrush(QBrush(bg))
+        p.setPen(QPen(bg, 1))
+        p.drawEllipse(hole)
+        p.setPen(fg)
+        p.drawText(hole, Qt.AlignCenter, "{:.1f}%".format(total))
+        legend_y = int(top_margin + dim + 8)
+        col_w = max(110, r.width() // 2)
+        for i, (label, val) in enumerate(items):
+            color = self._COLORS[i % len(self._COLORS)]
+            col = i % 2
+            row = i // 2
+            lx = 14 + col * col_w
+            ly = legend_y + row * 20
+            p.setBrush(color); p.setPen(Qt.NoPen)
+            p.drawEllipse(lx, ly + 4, 10, 10)
+            p.setPen(fg)
+            text = "{}  {:.1f}%".format(label, val / total * 100)
+            p.drawText(lx + 14, ly, col_w - 22, 18,
+                       Qt.AlignVCenter | Qt.AlignLeft, text)
 
 
 class _BarChartWidget(QWidget):
@@ -1213,6 +1242,115 @@ class _BarChartWidget(QWidget):
             lbl_short = lbl[:8] + ".." if fm.width(lbl) > bar_w + 12 else lbl
             p.drawText(x - 4, zero_y + 2, bar_w + 8, 32,
                        Qt.AlignHCenter | Qt.AlignTop, lbl_short)
+
+
+class _TimelineChartWidget(QWidget):
+    """Compact Gantt-style timeline for FE and PNR stage events."""
+    def __init__(self, events=None, parser=None, is_dark=False):
+        super().__init__()
+        self.events = events or []
+        self.parser = parser
+        self.is_dark = is_dark
+        self.setMinimumHeight(220)
+
+    def set_data(self, events, parser, is_dark=False):
+        self.events = events or []
+        self.parser = parser
+        self.is_dark = is_dark
+        self.update()
+
+    def _dt(self, val):
+        if self.parser:
+            try:
+                return self.parser(val)
+            except Exception:
+                return None
+        return None
+
+    def paintEvent(self, event):
+        from PyQt5.QtCore import QRectF
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
+        fg = QColor("#dfe1e5" if self.is_dark else "#263238")
+        muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
+        grid = QColor("#55585c" if self.is_dark else "#e5e7eb")
+        fe_color = QColor("#42a5f5")
+        stage_color = QColor("#66bb6a")
+        p.fillRect(self.rect(), bg)
+        r = self.rect()
+
+        spans = []
+        for ev in self.events:
+            st = self._dt(ev.get("start"))
+            en = self._dt(ev.get("end"))
+            if st and en and en >= st:
+                spans.append((ev, st, en))
+        if not spans:
+            p.setPen(fg)
+            p.drawText(r, Qt.AlignCenter, "No timestamp data available")
+            return
+
+        min_dt = min(st for _, st, _ in spans)
+        max_dt = max(en for _, _, en in spans)
+        total = max(1.0, (max_dt - min_dt).total_seconds())
+
+        left = 140
+        right = 22
+        top = 34
+        row_h = 26
+        gap = 8
+        max_rows = max(1, min(len(spans), int((r.height() - top - 28) / (row_h + gap))))
+        plot_w = max(80, r.width() - left - right)
+
+        p.setPen(fg)
+        p.drawText(8, 8, r.width() - 16, 18,
+                   Qt.AlignLeft | Qt.AlignVCenter,
+                   "Timeline overview")
+
+        for i in range(5):
+            x = left + int(plot_w * i / 4.0)
+            p.setPen(QPen(grid, 1))
+            p.drawLine(x, top - 6, x, r.height() - 28)
+            label_dt = min_dt + datetime.timedelta(seconds=total * i / 4.0)
+            p.setPen(muted)
+            p.drawText(x - 45, r.height() - 24, 90, 18,
+                       Qt.AlignCenter, label_dt.strftime("%m/%d %H:%M"))
+
+        shown = spans[:max_rows]
+        for row, (ev, st, en) in enumerate(shown):
+            y = top + row * (row_h + gap)
+            label = ev.get("name", "-")
+            if len(label) > 24:
+                label = label[:21] + "..."
+            p.setPen(fg)
+            p.drawText(8, y, left - 16, row_h,
+                       Qt.AlignRight | Qt.AlignVCenter, label)
+
+            x1 = left + int(((st - min_dt).total_seconds() / total) * plot_w)
+            x2 = left + int(((en - min_dt).total_seconds() / total) * plot_w)
+            w = max(4, x2 - x1)
+            color = fe_color if ev.get("kind") == "FE" else stage_color
+            bar = QRectF(x1, y + 4, w, row_h - 8)
+            p.setBrush(QBrush(color))
+            p.setPen(QPen(color.darker(115), 1))
+            p.drawRoundedRect(bar, 3, 3)
+
+            p.setPen(fg)
+            txt = ev.get("runtime", "-")
+            if w > 70:
+                p.drawText(bar.adjusted(4, 0, -4, 0),
+                           Qt.AlignCenter, txt)
+            else:
+                p.drawText(x2 + 4, y, 80, row_h,
+                           Qt.AlignLeft | Qt.AlignVCenter, txt)
+
+        if len(spans) > len(shown):
+            p.setPen(muted)
+            p.drawText(8, r.height() - 44, r.width() - 16, 18,
+                       Qt.AlignRight,
+                       "+{} more stage rows in table".format(
+                           len(spans) - len(shown)))
 
 
 class BlockSummaryDialog(QDialog):
@@ -3885,9 +4023,11 @@ class PDDashboard(QMainWindow):
             child.setText(4, "-")
             for col in [6, 7, 8, 9, 10, 11]:
                 child.setText(col, "-")
-            child.setText(12, run.get("info", {}).get("runtime", "-"))
-            be_start_raw = run.get("info", {}).get("start", "-")
-            be_end_raw   = run.get("info", {}).get("end", "-")
+            # BE run folders are containers only. Runtime/start/end belongs to
+            # the PNR stage rows under this item.
+            child.setText(12, "-")
+            be_start_raw = "-"
+            be_end_raw   = "-"
             child.setData(0, Qt.UserRole + 40, be_start_raw)
             child.setData(0, Qt.UserRole + 41, be_end_raw)
             child.setText(13, self._fmt_ts(be_start_raw))
@@ -4774,7 +4914,8 @@ class PDDashboard(QMainWindow):
             return
         try:
             cfg = {}
-            with open(path) as f:
+            with open(path, 'r', encoding='utf-8',
+                      errors='ignore') as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
@@ -4817,7 +4958,8 @@ class PDDashboard(QMainWindow):
     def _save_current_config(self):
         if not self.current_config_path or not self.run_filter_config:
             return
-        with open(self.current_config_path, 'w') as f:
+        with open(self.current_config_path, 'w',
+                  encoding='utf-8') as f:
             f.write("# dashboard_filter.cfg\n")
             for src, rtl_dict in self.run_filter_config.items():
                 for rtl, blk_dict in rtl_dict.items():
@@ -6042,19 +6184,12 @@ class PDDashboard(QMainWindow):
 
         for be_item in be_items:
             be_run = be_item.data(0, Qt.UserRole + 10) or {}
-            events.append({
-                "name": be_run.get("r_name", be_item.text(0)),
-                "kind": "BE",
-                "start": be_item.data(0, Qt.UserRole + 40) or be_run.get("info", {}).get("start", "-"),
-                "end": be_item.data(0, Qt.UserRole + 41) or be_run.get("info", {}).get("end", "-"),
-                "runtime": be_run.get("info", {}).get("runtime", "-"),
-            })
-
+            be_name = be_run.get("r_name", be_item.text(0))
             if be_run.get("stages"):
                 for st in be_run.get("stages", []):
                     info = self._stage_info_for_timeline(be_run, st)
                     events.append({
-                        "name": st.get("name", "-"),
+                        "name": be_name + " / " + st.get("name", "-"),
                         "kind": "STAGE",
                         "start": info.get("start", "-"),
                         "end": info.get("end", "-"),
@@ -6072,17 +6207,37 @@ class PDDashboard(QMainWindow):
             return
         dlg = QDialog(self)
         dlg.setWindowTitle("Timeline Overview: " + item.text(0))
-        dlg.resize(980, 520)
+        try:
+            avail = QApplication.desktop().availableGeometry(self)
+            dlg.resize(min(1100, int(avail.width() * 0.90)),
+                       min(720, int(avail.height() * 0.88)))
+        except Exception:
+            dlg.resize(1000, 620)
         layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(10, 10, 10, 10)
         chain = "  >  ".join(ev["name"] for ev in events[:12])
         if len(events) > 12:
             chain += "  >  ..."
-        layout.addWidget(QLabel("<b>Flow:</b> " + chain))
+        flow_lbl = QLabel("<b>Flow:</b> " + chain)
+        flow_lbl.setWordWrap(True)
+        flow_lbl.setMaximumHeight(56)
+        layout.addWidget(flow_lbl)
+
+        chart = _TimelineChartWidget(events, self._parse_dashboard_time,
+                                     self.is_dark_mode)
+        layout.addWidget(chart)
+
         tbl = QTableWidget(0, 6)
         tbl.setHorizontalHeaderLabels(["Step", "Type", "Start", "End", "Runtime", "Gap From Previous"])
         tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for c in range(1, 6):
-            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
+        tbl.setColumnWidth(1, 70)
+        tbl.setColumnWidth(2, 150)
+        tbl.setColumnWidth(3, 150)
+        tbl.setColumnWidth(4, 110)
+        tbl.setColumnWidth(5, 120)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
         prev_end = None
@@ -6171,6 +6326,18 @@ class PDDashboard(QMainWindow):
         return flat.get(key, "-")
 
     def _num(self, val):
+        s = str(val or "")
+        # Runtime strings: 00d:05h:12m:39s, 05h:12m:39s, etc.
+        if re.search(r'[dhms:]', s):
+            rt = re.search(
+                r'(?:(\d+)\s*d[: ]*)?(?:(\d+)\s*h[: ]*)?(?:(\d+)\s*m[: ]*)?(?:(\d+)\s*s)?',
+                s)
+            if rt and any(rt.groups()):
+                d = float(rt.group(1) or 0)
+                h = float(rt.group(2) or 0)
+                m = float(rt.group(3) or 0)
+                sec = float(rt.group(4) or 0)
+                return d * 24.0 + h + (m / 60.0) + (sec / 3600.0)
         m = re.search(r'-?\d+(?:\.\d+)?', str(val or ""))
         return float(m.group(0)) if m else None
 
@@ -6209,6 +6376,12 @@ class PDDashboard(QMainWindow):
             tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
+        chart = _BarChartWidget(
+            "Metric Delta % (comparison vs baseline)")
+        chart.setMinimumHeight(210)
+        chart_labels = []
+        chart_values = []
+        chart_colors = []
         for label, key in fields:
             r = tbl.rowCount(); tbl.insertRow(r)
             tbl.setItem(r, 0, QTableWidgetItem(label))
@@ -6222,7 +6395,12 @@ class PDDashboard(QMainWindow):
                     d = nums[1] - nums[0]
                     delta_txt = "{:+.4g}".format(d)
                     if nums[0] != 0:
-                        pct_txt = "{:+.2f}%".format((d / abs(nums[0])) * 100.0)
+                        pct_val = (d / abs(nums[0])) * 100.0
+                        pct_txt = "{:+.2f}%".format(pct_val)
+                        chart_labels.append(label.split()[0])
+                        chart_values.append(pct_val)
+                        chart_colors.append(
+                            QColor("#ef5350") if pct_val < 0 else QColor("#66bb6a"))
                 tbl.setItem(r, 3, QTableWidgetItem(delta_txt))
                 tbl.setItem(r, 4, QTableWidgetItem(pct_txt))
             else:
@@ -6232,8 +6410,16 @@ class PDDashboard(QMainWindow):
                     pcts = [((n - base) / abs(base)) * 100.0
                             for n in nums[1:] if n is not None]
                     if pcts:
-                        worst = "{:+.2f}%".format(max(pcts, key=lambda x: abs(x)))
+                        pct_val = max(pcts, key=lambda x: abs(x))
+                        worst = "{:+.2f}%".format(pct_val)
+                        chart_labels.append(label.split()[0])
+                        chart_values.append(pct_val)
+                        chart_colors.append(
+                            QColor("#ef5350") if pct_val < 0 else QColor("#66bb6a"))
                 tbl.setItem(r, tbl.columnCount() - 1, QTableWidgetItem(worst))
+        chart.set_data(chart_labels, chart_values,
+                       colors=chart_colors, is_dark=self.is_dark)
+        layout.addWidget(chart)
         layout.addWidget(tbl)
         btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
         layout.addWidget(btn)
