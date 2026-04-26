@@ -1985,6 +1985,38 @@ class PDDashboard(QMainWindow):
         _walk(self.tree.invisibleRootItem())
 
     # ------------------------------------------------------------------
+    # BACKGROUND LOG-PATH CACHE WARM-UP
+    # ------------------------------------------------------------------
+    def _prefetch_log_paths(self):
+        """Collect all log + error-log paths from tree items and prefetch
+        them in background threads so the first click on any item is
+        instant (no blocking NFS stat on the main thread)."""
+        paths = []
+        _GROUP = frozenset(("BLOCK","MILESTONE","RTL",
+                            "IGNORED_ROOT","STANDALONE_ROOT","__PLACEHOLDER__"))
+        _UR   = Qt.UserRole
+        _UR10 = Qt.UserRole + 10
+        def _collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                nt = child.data(0, _UR)
+                if nt not in _GROUP:
+                    lv = child.text(16)
+                    if lv and lv not in ("N/A", ""):
+                        paths.append(lv)
+                    # Also prefetch error log path for FE runs
+                    run = child.data(0, _UR10)
+                    if run and run.get("run_type") == "FE":
+                        rp = run.get("path", "")
+                        if rp and rp != "N/A":
+                            paths.append(os.path.join(
+                                rp, "logs", "compile_opt.error.log"))
+                _collect(child)
+        _collect(self.tree.invisibleRootItem())
+        if paths:
+            prefetch_path_cache(paths)
+
+    # ------------------------------------------------------------------
     # CLOSURE PASS (deferred -- runs after tree is fully painted)
     # ------------------------------------------------------------------
     def _run_closure_pass(self):
@@ -2095,6 +2127,13 @@ class PDDashboard(QMainWindow):
     # ICONS
     # ------------------------------------------------------------------
     def _create_dot_icon(self, fill, border, size=12):
+        # Cache: only 6 distinct status colors, reuse QIcon objects
+        key = (fill, border, size)
+        if not hasattr(self, '_dot_icon_cache'):
+            self._dot_icon_cache = {}
+        cached = self._dot_icon_cache.get(key)
+        if cached:
+            return cached
         px = QPixmap(size, size)
         px.fill(Qt.transparent)
         p = QPainter(px)
@@ -2103,7 +2142,9 @@ class PDDashboard(QMainWindow):
         p.setPen(QPen(QColor(border), 1.2))
         p.drawEllipse(1, 1, size - 2, size - 2)
         p.end()
-        return QIcon(px)
+        icon = QIcon(px)
+        self._dot_icon_cache[key] = icon
+        return icon
 
     # ------------------------------------------------------------------
     # UI BUILD
@@ -2871,7 +2912,8 @@ class PDDashboard(QMainWindow):
         self.meta_path.setText(path)
         log_val = item.text(16)
         if log_val and log_val not in ("N/A", ""):
-            if os.path.exists(log_val):
+            # Use cached_exists to avoid blocking NFS stat on every click
+            if cached_exists(log_val):
                 self.meta_log.setText(log_val)
                 self.meta_log.setStyleSheet("")
                 self.meta_log.setToolTip(log_val)
@@ -2927,10 +2969,21 @@ class PDDashboard(QMainWindow):
                 break
         self.ins_note.setPlainText(clean_text)
 
-        # Read pre-cached error count (zero file I/O)
+        # Lazy error count: use cached_exists to avoid blocking NFS on first click
         if len(sel) == 1 and not is_stage and path and path != "N/A":
             err_count = item.data(0, Qt.UserRole + 12)
             err_path  = os.path.join(path, "logs", "compile_opt.error.log")
+            if err_count is None:
+                # Only read if cache already has the answer (no cold NFS stat)
+                if cached_exists(err_path):
+                    try:
+                        with open(err_path, 'r',
+                                  encoding='utf-8', errors='ignore') as _ef:
+                            err_count = sum(1 for ln in _ef if ln.strip())
+                    except Exception:
+                        err_count = 0
+                    item.setData(0, Qt.UserRole + 12, err_count)
+                # else: leave as None — button stays hidden this click; shown next
             if err_count is not None:
                 self.current_error_log_path = err_path
                 dark = (self.is_dark_mode or
@@ -3471,10 +3524,10 @@ class PDDashboard(QMainWindow):
                     fe_name_from_be = r[:-3] if r.endswith('-BE') else r
                 else:
                     fe_name_from_be = r[:idx]   # everything before first _
-                for (blk, fe_base), fe_rtl in fe_info.items():
-                    if run["block"] == blk and fe_name_from_be == fe_base:
-                        run["rtl"] = fe_rtl
-                        break
+                # O(1) dict lookup instead of O(n) iteration
+                fe_rtl = fe_info.get((run["block"], fe_name_from_be))
+                if fe_rtl:
+                    run["rtl"] = fe_rtl
 
         root            = self.tree.invisibleRootItem()
         ign_root        = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
@@ -3618,7 +3671,6 @@ class PDDashboard(QMainWindow):
         if all_owners:
             _save_mail_users(all_owners)
 
-        QApplication.processEvents()
         self.refresh_view()
         # Defer closure+regression scan -- runs after UI is responsive
         # Uses QTimer so tree is fully painted before the extra pass
@@ -3628,6 +3680,8 @@ class PDDashboard(QMainWindow):
         if not hasattr(self, '_auto_expanded_once'):
             self._auto_expanded_once = True
             QTimer.singleShot(50, self._expand_to_rtl_level)
+        # Pre-warm path cache for all log paths so first click is instant
+        QTimer.singleShot(500, self._prefetch_log_paths)
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -3738,20 +3792,10 @@ class PDDashboard(QMainWindow):
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
 
-        # Pre-compute error log count at build time (zero I/O on selection)
-        err_count = None
-        if (run["run_type"] == "FE"
-                and run.get("path") and run["path"] != "N/A"):
-            err_file = os.path.join(run["path"], "logs",
-                                    "compile_opt.error.log")
-            if os.path.exists(err_file):
-                try:
-                    with open(err_file, 'r',
-                              encoding='utf-8', errors='ignore') as _ef:
-                        err_count = sum(1 for ln in _ef if ln.strip())
-                except Exception:
-                    err_count = 0
-        child.setData(0, Qt.UserRole + 12, err_count)
+        # Error log count deferred: checked lazily on first click via
+        # cached_exists (no blocking NFS stat during tree build).
+        # _prefetch_log_paths() warms the cache 500ms after build.
+        child.setData(0, Qt.UserRole + 12, None)  # sentinel: not yet checked
 
         # Pre-compute path existence flags for context menu (no NFS on right-click)
         child.setData(0, Qt.UserRole + 20, {
@@ -3995,15 +4039,21 @@ class PDDashboard(QMainWindow):
                     f"{run.get('vslp_status','')} "
                     f"{run['info']['runtime']} {run['info']['start']} "
                     f"{run['info']['end']} {notes}").lower()
-                if not fnmatch.fnmatch(combined, search_pattern):
+                # Fast path: plain substring check when no wildcards in query
+                _raw_lc = raw_query
+                if '*' not in _raw_lc:
+                    _hit = _raw_lc in combined
+                else:
+                    _hit = fnmatch.fnmatch(combined, search_pattern)
+                if not _hit:
                     if rt_type == "BE":
-                        if not any(
-                            fnmatch.fnmatch(
-                                f"{s['name']} {s['st_n']} {s['st_u']} "
-                                f"{s['vslp_status']} "
-                                f"{s['info']['runtime']}".lower(),
-                                search_pattern)
-                            for s in run.get("stages",[])):
+                        def _stage_hit(s):
+                            sc = (f"{s['name']} {s['st_n']} {s['st_u']} "
+                                  f"{s['vslp_status']} "
+                                  f"{s['info']['runtime']}").lower()
+                            return (_raw_lc in sc if '*' not in _raw_lc
+                                    else fnmatch.fnmatch(sc, search_pattern))
+                        if not any(_stage_hit(s) for s in run.get("stages",[])):
                             return False
                     else:
                         return False
@@ -4074,7 +4124,6 @@ class PDDashboard(QMainWindow):
 
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
-        QApplication.processEvents()
         # FEAT 6: Show search result count when search is active
         if raw_query:
             fe_visible = sum(1 for r in visible_runs
@@ -4084,12 +4133,7 @@ class PDDashboard(QMainWindow):
         else:
             self.search_count_lbl.setVisible(False)
 
-        # Re-apply pin icons (refresh_view only hides/shows, never touches icons)
-        if self.user_pins:
-            self._apply_pin_icons()
-
         self._update_status_bar(visible_runs)
-        self.on_tree_selection_changed()
 
     # ------------------------------------------------------------------
     # COLUMN FILTER
