@@ -18,6 +18,7 @@ import datetime
 import getpass
 import configparser
 import concurrent.futures
+import tempfile
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -49,10 +50,18 @@ def _load_project_config():
         'PROJECT': {
             'PROJECT_PREFIX':   'S5K2P5SP',
             'BASE_WS_FE_DIR':   '/user/s5k2p5sx.fe1/s5k2p5sp/WS',
-            'BASE_WS_BE_DIR':   '/user/s5k2p5sp.be1/s5k2p5sp/WS',
+            'BASE_WS_BE_DIR':   '/user/s5k2p5sx.be1/s5k2p5sp/WS',
             'BASE_OUTFEED_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/outfeed',
             'BASE_IR_DIR':      '/user/s5k2p5sx.be1/LAYOUT/IR',
             'BLOCKS':           '',
+        },
+        'PERFORMANCE': {
+            'SCAN_IR_ON_START':      'false',
+            'SCAN_OWNER_ON_START':   'false',
+            'SCAN_SIGNOFF_ON_START': 'false',
+            'AUTO_SIZE_ON_START':    'false',
+            'BACKGROUND_SIGNOFF_AFTER_SCAN': 'true',
+            'SIGNOFF_BG_WORKERS': '6',
         },
         'TOOLS': {
             'PNR_TOOL_NAMES':  'fc innovus',
@@ -111,6 +120,13 @@ BASE_WS_BE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_BE_DIR',   fallback='')
 BASE_OUTFEED_DIR = _proj_cfg.get('PROJECT', 'BASE_OUTFEED_DIR', fallback='')
 BASE_IR_DIR      = _proj_cfg.get('PROJECT', 'BASE_IR_DIR',      fallback='')
 PNR_TOOL_NAMES   = _proj_cfg.get('TOOLS',   'PNR_TOOL_NAMES',   fallback='fc innovus')
+SCAN_IR_ON_START      = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_IR_ON_START',      fallback=False)
+SCAN_OWNER_ON_START   = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_OWNER_ON_START',   fallback=False)
+SCAN_SIGNOFF_ON_START = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_SIGNOFF_ON_START', fallback=False)
+AUTO_SIZE_ON_START    = _proj_cfg.getboolean('PERFORMANCE', 'AUTO_SIZE_ON_START',    fallback=False)
+BACKGROUND_SIGNOFF_AFTER_SCAN = _proj_cfg.getboolean(
+    'PERFORMANCE', 'BACKGROUND_SIGNOFF_AFTER_SCAN', fallback=True)
+SIGNOFF_BG_WORKERS = _proj_cfg.getint('PERFORMANCE', 'SIGNOFF_BG_WORKERS', fallback=6)
 _blocks_raw      = _proj_cfg.get('PROJECT', 'BLOCKS',           fallback='')
 BLOCKS           = set(b.strip() for b in _blocks_raw.split(',') if b.strip())
 
@@ -135,6 +151,12 @@ _bt.BASE_IR_DIR      = BASE_IR_DIR
 _bt.PROJECT_PREFIX   = PROJECT_PREFIX
 _bt.PNR_TOOL_NAMES   = PNR_TOOL_NAMES
 _bt.BLOCKS           = BLOCKS
+_bt.SCAN_IR_ON_START      = SCAN_IR_ON_START
+_bt.SCAN_OWNER_ON_START   = SCAN_OWNER_ON_START
+_bt.SCAN_SIGNOFF_ON_START = SCAN_SIGNOFF_ON_START
+_bt.AUTO_SIZE_ON_START    = AUTO_SIZE_ON_START
+_bt.BACKGROUND_SIGNOFF_AFTER_SCAN = BACKGROUND_SIGNOFF_AFTER_SCAN
+_bt.SIGNOFF_BG_WORKERS = SIGNOFF_BG_WORKERS
 
 
 def _get_user_email(username):
@@ -144,12 +166,56 @@ def _get_user_email(username):
     try:
         res = subprocess.check_output(
             [USER_INFO_UTIL, '-a', username],
-            stderr=subprocess.DEVNULL).decode('utf-8')
+            stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+        # user_info output is comma-separated; email is field 9 (index 8)
+        fields = res.split(',')
+        if len(fields) >= 9:
+            email = fields[8].strip()
+            if '@' in email:
+                return email
+        # fallback: regex scan
         m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', res)
         if m: return m.group(0)
     except Exception:
         pass
-    return f"{username}@samsung.com"
+    return ""
+
+
+def _split_mail_tokens(text):
+    return [x.strip() for x in re.split(r'[,;\s]+', text or '') if x.strip()]
+
+
+def _resolve_mail_recipients(tokens):
+    resolved = []
+    unresolved = []
+    for token in tokens:
+        if "@" in token:
+            resolved.append(token)
+        else:
+            email = _get_user_email(token)
+            if email:
+                resolved.append(email)
+            else:
+                unresolved.append(token)
+    seen = set()
+    uniq = []
+    for email in resolved:
+        key = email.lower()
+        if key not in seen:
+            seen.add(key)
+            uniq.append(email)
+    return uniq, unresolved
+
+
+def _write_mail_body_file(body, fmt):
+    ext = ".html" if fmt == "html" else ".txt"
+    path = os.path.join(
+        tempfile.gettempdir(),
+        "singularity_pd_mail_{}_{}{}".format(
+            os.getpid(), int(time.time() * 1000), ext))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body or "")
+    return path
 
 
 def _get_all_known_mail_users():
@@ -222,21 +288,44 @@ def _send_mail_via_util(dlg):
             "MAIL_UTIL = /user/vwpmailsystem/MAIL/send_mail_for_rhel7")
         return
     subject  = dlg.subject_input.text().strip()
-    body     = dlg.body_input.toPlainText()
-    to_list  = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
-    cc_list  = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
+    # Prefer raw HTML body if dialog stored one (e.g. from BlockSummaryDialog._send_mail)
+    if hasattr(dlg, '_html_body') and dlg._html_body:
+        body = dlg._html_body
+        fmt  = "html"
+    else:
+        body = dlg.body_input.toPlainText()
+        fmt  = "text"
+    to_raw   = _split_mail_tokens(dlg.to_input.text())
+    cc_raw   = _split_mail_tokens(dlg.cc_input.text())
+    to_list, bad_to = _resolve_mail_recipients(to_raw)
+    cc_list, bad_cc = _resolve_mail_recipients(cc_raw)
+    unresolved = bad_to + bad_cc
+    if unresolved:
+        QMessageBox.warning(
+            None, "Mail User Lookup Failed",
+            "Could not resolve these user IDs to email addresses:\n\n" +
+            ", ".join(unresolved) +
+            "\n\nUse full email addresses or check USER_INFO_UTIL.")
+        return
     sender   = _get_user_email(getpass.getuser()) or f"{getpass.getuser()}@samsung.com"
-    all_recip = ",".join(set(to_list + cc_list))
-    if not all_recip:
+    if not to_list and not cc_list:
         QMessageBox.warning(None, "No Recipients",
                              "Please add at least one email address in To or CC.")
         return
-    cmd = [MAIL_UTIL,
-           "-to", all_recip,
-           "-sd", sender,
-           "-s",  subject,
-           "-c",  body,
-           "-fm", "text"]
+    _save_mail_users(to_raw + cc_raw + to_list + cc_list)
+    cmd = [MAIL_UTIL, "-sd", sender, "-s", subject, "-fm", fmt]
+    if fmt == "html":
+        try:
+            cmd.extend(["-f", _write_mail_body_file(body, fmt)])
+        except Exception as e:
+            QMessageBox.warning(None, "Mail Body Error", str(e))
+            return
+    else:
+        cmd.extend(["-c", body])
+    if to_list:
+        cmd.extend(["-to", ",".join(to_list)])
+    if cc_list:
+        cmd.extend(["-cc", ",".join(cc_list)])
     for att in dlg.attachments:
         cmd.extend(["-a", att])
     try:
@@ -1491,14 +1580,15 @@ class BlockSummaryDialog(QDialog):
                     self.tbl.item(r, c).text() if self.tbl.item(r, c) else "")
                 for c in range(nc)) + "</tr>")
         html.append("</table>")
-        body = "\n".join(html)
+        html_body = "\n".join(html)
         parent = self.parent()
         if parent and hasattr(parent, '_open_mail_compose_dialog'):
             parent._open_mail_compose_dialog(
                 subject="Block Summary: " + self.windowTitle(),
-                body=body)
+                body=html_body,
+                html_body=html_body)
         else:
-            QMessageBox.information(self, "Mail Body", body[:3000])
+            QMessageBox.information(self, "Mail Body", html_body[:3000])
 
     # ── Export CSV ───────────────────────────────────────────────────────
 
@@ -1560,6 +1650,10 @@ class PDDashboard(QMainWindow):
         self.size_workers           = []
         self._stage_workers         = []
         self.item_map               = {}
+        self._signoff_items_by_path  = {}
+        self._signoff_worker         = None
+        self._signoff_bg_done        = False
+        self._last_view_preset       = "All Runs"
         self.ignored_paths          = set()
         self._checked_paths         = set()
         self.current_error_log_path = None
@@ -1660,8 +1754,10 @@ class PDDashboard(QMainWindow):
         self.init_ui()
         self._setup_shortcuts()
         self.apply_theme_and_spacing()
-        QTimer.singleShot(50, self.start_fs_scan)
-        QTimer.singleShot(500, self.start_bg_disk_scan)  # start disk scan after UI ready
+        QTimer.singleShot(250, self.start_fs_scan)
+        # DiskScannerWorker runs `du -sk` on NFS — extremely I/O heavy.
+        # Removed auto-start: it now only runs when user clicks "Disk Space".
+        # This eliminates NFS contention that made all post-scan clicks sluggish.
 
     # ------------------------------------------------------------------
     # CLOSE
@@ -1749,12 +1845,17 @@ class PDDashboard(QMainWindow):
             return {}
 
     def _save_run_history(self):
-        import json
-        try:
-            with open(self._history_file(), 'w') as f:
-                json.dump(self._run_history, f, indent=2)
-        except Exception:
-            pass
+        """Save run history in a daemon thread — never block the main thread on NFS write."""
+        import json, threading
+        data = dict(self._run_history)   # shallow snapshot is safe (values are lists)
+        fp   = self._history_file()
+        def _write():
+            try:
+                with open(fp, 'w') as f:
+                    json.dump(data, f, indent=2)
+            except Exception:
+                pass
+        threading.Thread(target=_write, daemon=True).start()
 
     def _record_run_history(self, run):
         """Record completed run metrics for regression detection."""
@@ -1971,6 +2072,38 @@ class PDDashboard(QMainWindow):
         _walk(self.tree.invisibleRootItem())
 
     # ------------------------------------------------------------------
+    # BACKGROUND LOG-PATH CACHE WARM-UP
+    # ------------------------------------------------------------------
+    def _prefetch_log_paths(self):
+        """Collect all log + error-log paths from tree items and prefetch
+        them in background threads so the first click on any item is
+        instant (no blocking NFS stat on the main thread)."""
+        paths = []
+        _GROUP = frozenset(("BLOCK","MILESTONE","RTL",
+                            "IGNORED_ROOT","STANDALONE_ROOT","__PLACEHOLDER__"))
+        _UR   = Qt.UserRole
+        _UR10 = Qt.UserRole + 10
+        def _collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                nt = child.data(0, _UR)
+                if nt not in _GROUP:
+                    lv = child.text(16)
+                    if lv and lv not in ("N/A", ""):
+                        paths.append(lv)
+                    # Also prefetch error log path for FE runs
+                    run = child.data(0, _UR10)
+                    if run and run.get("run_type") == "FE":
+                        rp = run.get("path", "")
+                        if rp and rp != "N/A":
+                            paths.append(os.path.join(
+                                rp, "logs", "compile_opt.error.log"))
+                _collect(child)
+        _collect(self.tree.invisibleRootItem())
+        if paths:
+            prefetch_path_cache(paths)
+
+    # ------------------------------------------------------------------
     # CLOSURE PASS (deferred -- runs after tree is fully painted)
     # ------------------------------------------------------------------
     def _run_closure_pass(self):
@@ -2081,6 +2214,13 @@ class PDDashboard(QMainWindow):
     # ICONS
     # ------------------------------------------------------------------
     def _create_dot_icon(self, fill, border, size=12):
+        # Cache: only 6 distinct status colors, reuse QIcon objects
+        key = (fill, border, size)
+        if not hasattr(self, '_dot_icon_cache'):
+            self._dot_icon_cache = {}
+        cached = self._dot_icon_cache.get(key)
+        if cached:
+            return cached
         px = QPixmap(size, size)
         px.fill(Qt.transparent)
         p = QPainter(px)
@@ -2089,7 +2229,9 @@ class PDDashboard(QMainWindow):
         p.setPen(QPen(QColor(border), 1.2))
         p.drawEllipse(1, 1, size - 2, size - 2)
         p.end()
-        return QIcon(px)
+        icon = QIcon(px)
+        self._dot_icon_cache[key] = icon
+        return icon
 
     # ------------------------------------------------------------------
     # UI BUILD
@@ -2127,7 +2269,8 @@ class PDDashboard(QMainWindow):
             "Running Only", "Failed Only", "Today's Runs",
             "Pinned Only", "Selected Only"])
         self.view_combo.setFixedWidth(120)
-        self.view_combo.currentIndexChanged.connect(self.refresh_view)
+        self._last_view_preset = self.view_combo.currentText()
+        self.view_combo.currentIndexChanged.connect(self._on_view_changed)
         top_layout.addWidget(self.view_combo)
 
         self._add_separator(top_layout)
@@ -2194,7 +2337,10 @@ class PDDashboard(QMainWindow):
         self.actions_menu.addAction("Disk Space",              self.open_disk_usage)
         self.actions_menu.addSeparator()
         self.actions_menu.addAction("Failed Runs Digest",      self.show_failed_digest)
+        self.actions_menu.addAction("Timeline Overview",       self.show_selected_timeline_overview)
         self.actions_menu.addAction("Compare Selected Runs",   self.show_run_diff)
+        self.actions_menu.addAction("RoR Metric Diff",         self.show_ror_metric_diff)
+        self.actions_menu.addAction("Golden Benchmark",        self.show_golden_benchmark)
         self.actions_menu.addSeparator()
         self.actions_menu.addAction("Analytics / Charts",      self.show_analytics)
         self.actions_menu.addAction("Team Workload View",       self.show_team_workload)
@@ -2857,7 +3003,8 @@ class PDDashboard(QMainWindow):
         self.meta_path.setText(path)
         log_val = item.text(16)
         if log_val and log_val not in ("N/A", ""):
-            if os.path.exists(log_val):
+            # Use cached_exists to avoid blocking NFS stat on every click
+            if cached_exists(log_val):
                 self.meta_log.setText(log_val)
                 self.meta_log.setStyleSheet("")
                 self.meta_log.setToolTip(log_val)
@@ -2913,10 +3060,21 @@ class PDDashboard(QMainWindow):
                 break
         self.ins_note.setPlainText(clean_text)
 
-        # Read pre-cached error count (zero file I/O)
+        # Lazy error count: use cached_exists to avoid blocking NFS on first click
         if len(sel) == 1 and not is_stage and path and path != "N/A":
             err_count = item.data(0, Qt.UserRole + 12)
             err_path  = os.path.join(path, "logs", "compile_opt.error.log")
+            if err_count is None:
+                # Only read if cache already has the answer (no cold NFS stat)
+                if cached_exists(err_path):
+                    try:
+                        with open(err_path, 'r',
+                                  encoding='utf-8', errors='ignore') as _ef:
+                            err_count = sum(1 for ln in _ef if ln.strip())
+                    except Exception:
+                        err_count = 0
+                    item.setData(0, Qt.UserRole + 12, err_count)
+                # else: leave as None — button stays hidden this click; shown next
             if err_count is not None:
                 self.current_error_log_path = err_path
                 dark = (self.is_dark_mode or
@@ -2984,10 +3142,7 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def apply_theme_and_spacing(self):
         pad      = self.row_spacing
-        cb_style = """
-            QTreeView::indicator:checked   { background-color: #4CAF50; border: 1px solid #388E3C; image: none; }
-            QTreeView::indicator:unchecked { background-color: white;   border: 1px solid gray; }
-        """
+        cb_style = ""
         dark = (self.is_dark_mode or
                 (self.use_custom_colors and self.custom_bg_color < "#888888"))
         self._colors = {
@@ -3135,6 +3290,10 @@ class PDDashboard(QMainWindow):
                 w.cancel()
         self.size_workers.clear()
         self.item_map.clear()
+        self._signoff_bg_done = False
+        if self._signoff_worker and self._signoff_worker.isRunning():
+            if hasattr(self._signoff_worker, 'cancel'):
+                self._signoff_worker.cancel()
 
         self.prog_container.setVisible(True)
         self.prog.setRange(0, 0)
@@ -3411,6 +3570,11 @@ class PDDashboard(QMainWindow):
                 w.cancel()
         self.size_workers.clear()
         self.item_map.clear()
+        self._signoff_items_by_path.clear()
+        if self._signoff_worker and self._signoff_worker.isRunning():
+            if hasattr(self._signoff_worker, 'cancel'):
+                self._signoff_worker.cancel()
+            self._signoff_bg_done = False
 
         self._building_tree = True
 
@@ -3457,10 +3621,10 @@ class PDDashboard(QMainWindow):
                     fe_name_from_be = r[:-3] if r.endswith('-BE') else r
                 else:
                     fe_name_from_be = r[:idx]   # everything before first _
-                for (blk, fe_base), fe_rtl in fe_info.items():
-                    if run["block"] == blk and fe_name_from_be == fe_base:
-                        run["rtl"] = fe_rtl
-                        break
+                # O(1) dict lookup instead of O(n) iteration
+                fe_rtl = fe_info.get((run["block"], fe_name_from_be))
+                if fe_rtl:
+                    run["rtl"] = fe_rtl
 
         root            = self.tree.invisibleRootItem()
         ign_root        = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
@@ -3472,17 +3636,12 @@ class PDDashboard(QMainWindow):
             rtl = run["rtl"]
             if rtl not in _rtl_cache:
                 base = re.sub(r'_syn\d+$', '', rtl)
-                # Use user-configurable milestone map
                 ms   = self.get_milestone_label(base)
-                # Innovus TOP / SOC-level runs often have RTL="Unknown"
-                # because there is no dump_variables report. Assign a
-                # fallback milestone so they are not silently dropped.
-                if ms is None and ("Unknown" in rtl or not rtl.strip()):
-                    ms = "SOC / TOP"
                 _rtl_cache[rtl] = (base, base != rtl, ms)
 
         _ignored  = self.ignored_paths
         _hide_blk = self.hide_block_nodes
+        _build_be_only = (self.view_combo.currentText() == "BE Only")
 
         # CRITICAL: process FE runs first so FE tree items exist
         # before any BE/innovus run tries to find its FE parent.
@@ -3505,8 +3664,8 @@ class PDDashboard(QMainWindow):
                 continue
 
             _item_count += 1
-            if _item_count % 100 == 0:
-                QApplication.processEvents()
+            # processEvents removed: setUpdatesEnabled(False) is active so no
+            # visual benefit, and it lets premature size signals through mid-build.
 
             is_ignored  = run["path"] in _ignored
             attach_root = ign_root if is_ignored else root
@@ -3515,15 +3674,16 @@ class PDDashboard(QMainWindow):
             base_attach = (attach_root if _hide_blk
                            else self._get_node(attach_root, blk_name, "BLOCK"))
 
-            if milestone == "SOC / TOP":
-                parent_for_run = self._get_node(base_attach, base_rtl, "RTL")
-            else:
-                m_node = self._get_node(base_attach, milestone, "MILESTONE")
-                parent_for_run = self._get_node(m_node, base_rtl, "RTL")
+            m_node = self._get_node(base_attach, milestone, "MILESTONE")
+            parent_for_run = self._get_node(m_node, base_rtl, "RTL")
 
             if run["run_type"] == "FE":
+                if _build_be_only:
+                    continue
                 run_item = self._create_run_item(parent_for_run, run)
                 run_item.setData(0, Qt.UserRole + 10, run)
+                if run.get("path"):
+                    self._signoff_items_by_path[run["path"]] = run_item
                 # Register in O(1) lookup so BE runs can find this instantly
                 fe_text = run["r_name"]
                 fe_base = fe_text[:-3] if fe_text.endswith("-FE") else fe_text
@@ -3547,7 +3707,9 @@ class PDDashboard(QMainWindow):
                 fe_parent = (_fe_lookup.get((be_block, fe_name_from_be, be_source))
                              or _fe_lookup.get((be_block, fe_name_from_be, "")))
 
-                if fe_parent is None and not is_ignored:
+                if _build_be_only:
+                    actual_parent = parent_for_run
+                elif fe_parent is None and not is_ignored:
                     st_base = (standalone_root if _hide_blk
                                else self._get_node(standalone_root, blk_name, "BLOCK"))
                     st_m   = self._get_node(st_base, milestone, "MILESTONE")
@@ -3558,6 +3720,8 @@ class PDDashboard(QMainWindow):
 
                 be_item = self._create_run_item(actual_parent, run)
                 be_item.setData(0, Qt.UserRole + 10, run)
+                if run.get("path"):
+                    self._signoff_items_by_path[run["path"]] = be_item
                 if run.get("stages"):
                     ph = QTreeWidgetItem(be_item)
                     ph.setText(0, "Loading stages...")
@@ -3589,13 +3753,6 @@ class PDDashboard(QMainWindow):
                     _apply_expanded(node.child(i))
             _apply_expanded(self.tree.invisibleRootItem())
 
-        if not self._columns_fitted_once:
-            self._columns_fitted_once = True
-            self.fit_all_columns()
-        if not self._initial_size_calc_done:
-            self._initial_size_calc_done = True
-            self.calculate_all_sizes()
-
         all_owners = set()
         for r in (self.ws_data.get("all_runs", []) +
                   self.out_data.get("all_runs", [])):
@@ -3604,16 +3761,35 @@ class PDDashboard(QMainWindow):
         if all_owners:
             _save_mail_users(all_owners)
 
-        QApplication.processEvents()
         self.refresh_view()
-        # Defer closure+regression scan -- runs after UI is responsive
-        # Uses QTimer so tree is fully painted before the extra pass
+
+        # --- Deferred post-build work so UI is interactive immediately ---
+        # fit_all_columns: 23-column resize is expensive on main thread;
+        # defer 100ms so tree paints first and user can interact.
+        if not self._columns_fitted_once:
+            self._columns_fitted_once = True
+            QTimer.singleShot(100, self.fit_all_columns)
+
+        # Folder-size calculation is expensive on NFS. Run it on startup only
+        # when explicitly enabled in project_config.ini.
+        if AUTO_SIZE_ON_START and not self._initial_size_calc_done:
+            self._initial_size_calc_done = True
+            QTimer.singleShot(2000, self.calculate_all_sizes)
+
+        if (BACKGROUND_SIGNOFF_AFTER_SCAN and not SCAN_SIGNOFF_ON_START
+                and not self._signoff_bg_done):
+            QTimer.singleShot(1200, self.start_bg_signoff_scan)
+
+        # Closure+regression scan deferred 300ms (after fit_all_columns)
         if self._closure_enabled:
-            QTimer.singleShot(200, self._run_closure_pass)
+            QTimer.singleShot(300, self._run_closure_pass)
         # Auto-expand to RTL level on first load only
         if not hasattr(self, '_auto_expanded_once'):
             self._auto_expanded_once = True
             QTimer.singleShot(50, self._expand_to_rtl_level)
+        # Pre-warm log paths later so it does not compete with the FM/VSLP
+        # background scan immediately after tree build.
+        QTimer.singleShot(5000, self._prefetch_log_paths)
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -3724,28 +3900,18 @@ class PDDashboard(QMainWindow):
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
 
-        # Pre-compute error log count at build time (zero I/O on selection)
-        err_count = None
-        if (run["run_type"] == "FE"
-                and run.get("path") and run["path"] != "N/A"):
-            err_file = os.path.join(run["path"], "logs",
-                                    "compile_opt.error.log")
-            if os.path.exists(err_file):
-                try:
-                    with open(err_file, 'r',
-                              encoding='utf-8', errors='ignore') as _ef:
-                        err_count = sum(1 for ln in _ef if ln.strip())
-                except Exception:
-                    err_count = 0
-        child.setData(0, Qt.UserRole + 12, err_count)
+        # Error log count deferred: checked lazily on first click via
+        # cached_exists (no blocking NFS stat during tree build).
+        # _prefetch_log_paths() warms the cache 500ms after build.
+        child.setData(0, Qt.UserRole + 12, None)  # sentinel: not yet checked
 
         # Pre-compute path existence flags for context menu (no NFS on right-click)
         child.setData(0, Qt.UserRole + 20, {
             'run_path': bool(run.get("path") and run["path"] != "N/A"),
             'log':      bool(run.get("path") and run["path"] != "N/A"),
-            'fm_n':     cached_exists(run.get("fm_n_path", "")),
-            'fm_u':     cached_exists(run.get("fm_u_path", "")),
-            'vslp':     cached_exists(run.get("vslp_rpt_path", "")),
+            'fm_n':     bool(run.get("fm_n_path")),
+            'fm_u':     bool(run.get("fm_u_path")),
+            'vslp':     bool(run.get("vslp_rpt_path")),
         })
 
         if run["source"] == "OUTFEED":
@@ -3875,6 +4041,15 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # REFRESH VIEW (pure hide/show -- zero item creation)
     # ------------------------------------------------------------------
+    def _on_view_changed(self):
+        new_view = self.view_combo.currentText()
+        old_view = getattr(self, "_last_view_preset", "")
+        self._last_view_preset = new_view
+        if "BE Only" in (old_view, new_view) and self.ws_data:
+            QTimer.singleShot(0, self._build_tree)
+        else:
+            self.refresh_view()
+
     def refresh_view(self):
         src_mode = self.src_combo.currentText()
         sel_rtl  = self.rel_combo.currentText()
@@ -3956,8 +4131,7 @@ class PDDashboard(QMainWindow):
                     return False
             rt_type = run["run_type"]
             if _fe_only and rt_type != "FE": return False
-            # BE-only: keep FE items visible as containers for their BE children
-            if _be_only and rt_type not in ("BE", "FE"): return False
+            if _be_only and rt_type != "BE": return False
             if _run_only and not (rt_type == "FE" and not run["is_comp"]):
                 return False
             if _fail_only:
@@ -3981,15 +4155,21 @@ class PDDashboard(QMainWindow):
                     f"{run.get('vslp_status','')} "
                     f"{run['info']['runtime']} {run['info']['start']} "
                     f"{run['info']['end']} {notes}").lower()
-                if not fnmatch.fnmatch(combined, search_pattern):
+                # Fast path: plain substring check when no wildcards in query
+                _raw_lc = raw_query
+                if '*' not in _raw_lc:
+                    _hit = _raw_lc in combined
+                else:
+                    _hit = fnmatch.fnmatch(combined, search_pattern)
+                if not _hit:
                     if rt_type == "BE":
-                        if not any(
-                            fnmatch.fnmatch(
-                                f"{s['name']} {s['st_n']} {s['st_u']} "
-                                f"{s['vslp_status']} "
-                                f"{s['info']['runtime']}".lower(),
-                                search_pattern)
-                            for s in run.get("stages",[])):
+                        def _stage_hit(s):
+                            sc = (f"{s['name']} {s['st_n']} {s['st_u']} "
+                                  f"{s['vslp_status']} "
+                                  f"{s['info']['runtime']}").lower()
+                            return (_raw_lc in sc if '*' not in _raw_lc
+                                    else fnmatch.fnmatch(sc, search_pattern))
+                        if not any(_stage_hit(s) for s in run.get("stages",[])):
                             return False
                     else:
                         return False
@@ -4020,6 +4200,13 @@ class PDDashboard(QMainWindow):
             # Group nodes (BLOCK, MILESTONE, RTL, IGNORED_ROOT) recurse
             # into children. Never auto-expand — preserve user's expand state.
             if node_type in _GROUP_TYPES or node_type == "MILESTONE":
+                # Short-circuit: if this is a BLOCK node whose block is
+                # entirely excluded by the block-list filter, hide it and
+                # skip recursing all its children — big win when many blocks
+                # are unchecked (skips 70-80% of tree walk).
+                if node_type == "BLOCK" and item.text(0) not in checked_blks:
+                    item.setHidden(True)
+                    return False
                 any_visible = False
                 for i in range(item.childCount()):
                     if _update_visibility(item.child(i)):
@@ -4044,7 +4231,11 @@ class PDDashboard(QMainWindow):
                             _be_only and rt_type_run == "FE")
                         ch.setHidden(hide_stage)
                     else:
-                        ch.setHidden(not passes)
+                        # BE child run under FE item: hide when FE-only
+                        child_run = ch.data(0, _UR10)
+                        child_rt  = child_run.get("run_type") if child_run else None
+                        hide_child = not passes or (_fe_only and child_rt == "BE")
+                        ch.setHidden(hide_child)
                 return passes
 
         root = self.tree.invisibleRootItem()
@@ -4056,7 +4247,6 @@ class PDDashboard(QMainWindow):
 
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
-        QApplication.processEvents()
         # FEAT 6: Show search result count when search is active
         if raw_query:
             fe_visible = sum(1 for r in visible_runs
@@ -4066,12 +4256,7 @@ class PDDashboard(QMainWindow):
         else:
             self.search_count_lbl.setVisible(False)
 
-        # Re-apply pin icons (refresh_view only hides/shows, never touches icons)
-        if self.user_pins:
-            self._apply_pin_icons()
-
         self._update_status_bar(visible_runs)
-        self.on_tree_selection_changed()
 
     # ------------------------------------------------------------------
     # COLUMN FILTER
@@ -4153,6 +4338,7 @@ class PDDashboard(QMainWindow):
 
         act_gold = act_good = act_red = act_later = act_clear = None
         gantt_act = None
+        timeline_act = None
 
         if (run_path and run_path != "N/A") or is_stage:
             pin_menu  = m.addMenu("Pin as...")
@@ -4167,6 +4353,8 @@ class PDDashboard(QMainWindow):
                     and item.child(0).data(0, Qt.UserRole) == "STAGE"):
                 gantt_act = m.addAction("Show Timeline (Gantt Chart)")
                 m.addSeparator()
+            timeline_act = m.addAction("Run Timeline Overview")
+            m.addSeparator()
 
         edit_note_act = None; note_identifier = ""
         if run_path and run_path != "N/A" and not is_stage:
@@ -4296,6 +4484,9 @@ class PDDashboard(QMainWindow):
             dlg = GanttChartDialog(item.text(0), stages, self)
             dlg.exec_()
 
+        elif timeline_act and res == timeline_act:
+            self.show_timeline_overview(item)
+
         elif edit_note_act and res == edit_note_act:
             dlg = EditNoteDialog(item.text(22), note_identifier, self)
             if dlg.exec_():
@@ -4408,12 +4599,68 @@ class PDDashboard(QMainWindow):
         gather(self.tree.invisibleRootItem())
         if size_tasks:
             worker = BatchSizeWorker(size_tasks)
-            worker.size_calculated.connect(self.update_item_size)
+            # Use batch signal: ~10 deliveries instead of 500 individual signals
+            worker.sizes_batch_ready.connect(self._on_batch_sizes)
             self.size_workers.append(worker)
             worker.finished.connect(
                 lambda w=worker: self.size_workers.remove(w)
                 if w in self.size_workers else None)
             worker.start()
+
+    def _on_batch_sizes(self, batch):
+        """Handle a batch of (item_id, size_str) tuples from BatchSizeWorker.
+        One call per 50 results instead of one call per result — keeps UI fluid."""
+        for item_id, size_str in batch:
+            self.update_item_size(item_id, size_str)
+
+    # ------------------------------------------------------------------
+    # BACKGROUND FE SIGNOFF SCAN
+    # ------------------------------------------------------------------
+    def start_bg_signoff_scan(self):
+        if self._building_tree:
+            return
+        if self._signoff_worker and self._signoff_worker.isRunning():
+            return
+        runs = []
+        for r in (self.ws_data.get("all_runs", []) +
+                  self.out_data.get("all_runs", [])):
+            if r.get("path"):
+                runs.append(r)
+        if not runs:
+            return
+        self._signoff_bg_done = True
+        self.status_bar.showMessage(
+            "Owner/FM/VSLP background scan started for {} runs".format(len(runs)),
+            5000)
+        self._signoff_worker = SignoffStatusWorker(runs)
+        self._signoff_worker.batch_ready.connect(self._on_signoff_batch)
+        self._signoff_worker.finished.connect(self._on_signoff_finished)
+        self._signoff_worker.start()
+
+    def _on_signoff_batch(self, batch):
+        for row in batch:
+            path = row.get("path")
+            item = self._signoff_items_by_path.get(path)
+            if not item:
+                continue
+            run = item.data(0, Qt.UserRole + 10)
+            if run:
+                if row.get("owner") and row.get("owner") != "Unknown":
+                    run["owner"] = row["owner"]
+                    item.setText(5, row["owner"])
+                if run.get("run_type") == "FE":
+                    run["st_n"] = row.get("st_n", "N/A")
+                    run["st_u"] = row.get("st_u", "N/A")
+                    run["vslp_status"] = row.get("vslp_status", "N/A")
+                    item.setText(7, "NONUPF - " + row.get("st_n", "N/A"))
+                    item.setText(8, "UPF - " + row.get("st_u", "N/A"))
+                    item.setText(9, row.get("vslp_status", "N/A"))
+                    self._apply_fm_color(item, 7, item.text(7))
+                    self._apply_fm_color(item, 8, item.text(8))
+                    self._apply_vslp_color(item, 9, item.text(9))
+
+    def _on_signoff_finished(self):
+        self.status_bar.showMessage("Owner/FM/VSLP background scan finished", 5000)
 
     def update_item_size(self, item_id, size_str):
         item = self.item_map.get(item_id)
@@ -5192,11 +5439,17 @@ class PDDashboard(QMainWindow):
         if dlg.exec_():
             _send_mail_via_util(dlg)
 
-    def _open_mail_compose_dialog(self, subject="", body="", prefill_to=""):
+    def _open_mail_compose_dialog(self, subject="", body="", prefill_to="",
+                                   html_body=""):
         """Open AdvancedMailDialog pre-filled with subject/body.
-        Called by BlockSummaryDialog 'Send as Mail' button."""
+        Called by BlockSummaryDialog 'Send as Mail' button.
+        Pass html_body to send as HTML email (rendered table etc.)."""
         all_known = _get_all_known_mail_users()
-        dlg = AdvancedMailDialog(subject, body, all_known, prefill_to, self)
+        # Show rendered HTML preview in body widget; store raw HTML for sending
+        display_body = html_body if html_body else body
+        dlg = AdvancedMailDialog(subject, display_body, all_known, prefill_to, self)
+        if html_body:
+            dlg._html_body = html_body  # picked up by _send_mail_via_util
         if dlg.exec_():
             _send_mail_via_util(dlg)
 
@@ -5722,6 +5975,354 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # RUN DIFF (N runs)
     # ------------------------------------------------------------------
+    def _parse_dashboard_time(self, s):
+        if not s or s in ("-", "N/A", "Unknown"):
+            return None
+        for fmt in ("%a %b %d, %Y - %H:%M:%S",
+                    "%b %d, %Y - %H:%M:%S",
+                    "%b %d, %Y - %H:%M",
+                    "%b %d, %Y"):
+            try:
+                return datetime.datetime.strptime(str(s).strip(), fmt)
+            except Exception:
+                pass
+        return None
+
+    def _fmt_gap(self, a, b):
+        if not a or not b:
+            return "-"
+        secs = int((b - a).total_seconds())
+        sign = "-" if secs < 0 else ""
+        secs = abs(secs)
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        return "{}{:02d}h:{:02d}m".format(sign, h, m)
+
+    def _stage_info_for_timeline(self, be_run, stage):
+        info = dict(stage.get("info", {}) or {})
+        if info.get("start") not in ("", "-", "N/A", None):
+            return info
+        for cand in stage.get("_rpt_cands", [stage.get("rpt", "")]):
+            try:
+                if cand and cached_exists(cand):
+                    return parse_pnr_runtime_rpt(cand)
+            except Exception:
+                pass
+        return info
+
+    def _timeline_events_for_item(self, item):
+        node_type = item.data(0, Qt.UserRole)
+        base_item = item.parent() if node_type == "STAGE" else item
+        run = base_item.data(0, Qt.UserRole + 10)
+        if not run:
+            return []
+
+        events = []
+        fe_item = base_item.parent() if run.get("run_type") == "BE" else base_item
+        fe_run = fe_item.data(0, Qt.UserRole + 10) if fe_item else None
+
+        if fe_run and fe_run.get("run_type") == "FE":
+            events.append({
+                "name": fe_run.get("r_name", fe_item.text(0)),
+                "kind": "FE",
+                "start": fe_item.data(0, Qt.UserRole + 40) or fe_run.get("info", {}).get("start", "-"),
+                "end": fe_item.data(0, Qt.UserRole + 41) or fe_run.get("info", {}).get("end", "-"),
+                "runtime": fe_run.get("info", {}).get("runtime", "-"),
+            })
+
+        be_items = []
+        if run.get("run_type") == "BE":
+            be_items = [base_item]
+        elif run.get("run_type") == "FE":
+            for i in range(base_item.childCount()):
+                ch = base_item.child(i)
+                ch_run = ch.data(0, Qt.UserRole + 10)
+                if ch_run and ch_run.get("run_type") == "BE":
+                    be_items.append(ch)
+
+        for be_item in be_items:
+            be_run = be_item.data(0, Qt.UserRole + 10) or {}
+            events.append({
+                "name": be_run.get("r_name", be_item.text(0)),
+                "kind": "BE",
+                "start": be_item.data(0, Qt.UserRole + 40) or be_run.get("info", {}).get("start", "-"),
+                "end": be_item.data(0, Qt.UserRole + 41) or be_run.get("info", {}).get("end", "-"),
+                "runtime": be_run.get("info", {}).get("runtime", "-"),
+            })
+
+            if be_run.get("stages"):
+                for st in be_run.get("stages", []):
+                    info = self._stage_info_for_timeline(be_run, st)
+                    events.append({
+                        "name": st.get("name", "-"),
+                        "kind": "STAGE",
+                        "start": info.get("start", "-"),
+                        "end": info.get("end", "-"),
+                        "runtime": info.get("runtime", "-"),
+                    })
+
+        def _key(ev):
+            return self._parse_dashboard_time(ev.get("start")) or datetime.datetime.max
+        return sorted(events, key=_key)
+
+    def show_timeline_overview(self, item):
+        events = self._timeline_events_for_item(item)
+        if not events:
+            QMessageBox.information(self, "Timeline", "No timeline data found for this run.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Timeline Overview: " + item.text(0))
+        dlg.resize(980, 520)
+        layout = QVBoxLayout(dlg)
+        chain = "  >  ".join(ev["name"] for ev in events[:12])
+        if len(events) > 12:
+            chain += "  >  ..."
+        layout.addWidget(QLabel("<b>Flow:</b> " + chain))
+        tbl = QTableWidget(0, 6)
+        tbl.setHorizontalHeaderLabels(["Step", "Type", "Start", "End", "Runtime", "Gap From Previous"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 6):
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+        prev_end = None
+        for ev in events:
+            r = tbl.rowCount(); tbl.insertRow(r)
+            start_dt = self._parse_dashboard_time(ev.get("start"))
+            gap = self._fmt_gap(prev_end, start_dt)
+            vals = [ev.get("name", "-"), ev.get("kind", "-"),
+                    ev.get("start", "-"), ev.get("end", "-"),
+                    ev.get("runtime", "-"), gap]
+            for c, val in enumerate(vals):
+                it = QTableWidgetItem(str(val))
+                if ev.get("kind") == "FE":
+                    it.setBackground(QColor("#e3f2fd"))
+                elif ev.get("kind") == "BE":
+                    it.setBackground(QColor("#fff3e0"))
+                tbl.setItem(r, c, it)
+            prev_end = self._parse_dashboard_time(ev.get("end")) or prev_end
+        layout.addWidget(tbl)
+        btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+        dlg.exec_()
+
+    def show_selected_timeline_overview(self):
+        items = self.tree.selectedItems()
+        if not items:
+            QMessageBox.information(
+                self, "Timeline Overview",
+                "Select a FE run, BE run, or stage row first.")
+            return
+        self.show_timeline_overview(items[0])
+
+    def _checked_run_items(self):
+        items = []
+        def collect(node):
+            for i in range(node.childCount()):
+                c = node.child(i)
+                nt = c.data(0, Qt.UserRole)
+                if (c.checkState(0) == Qt.Checked
+                        and nt not in ("BLOCK","MILESTONE","RTL","IGNORED_ROOT",
+                                       "__PLACEHOLDER__")):
+                    items.append(c)
+                collect(c)
+        collect(self.tree.invisibleRootItem())
+        return items
+
+    def _metric_task_from_item(self, item):
+        nt = item.data(0, Qt.UserRole)
+        if nt == "STAGE":
+            parent = item.parent()
+            if not parent:
+                return None
+            run = parent.data(0, Qt.UserRole + 10) or {}
+            return {"name": parent.text(0) + " / " + item.text(0),
+                    "path": parent.text(15), "run_type": "BE",
+                    "stage_name": item.text(0),
+                    "source": parent.text(2), "block": parent.data(0, Qt.UserRole + 2) or ""}
+        run = item.data(0, Qt.UserRole + 10) or {}
+        if run.get("run_type") != "FE":
+            return None
+        return {"name": item.text(0), "path": item.text(15), "run_type": "FE",
+                "stage_name": None, "source": item.text(2),
+                "block": item.data(0, Qt.UserRole + 2) or ""}
+
+    def _metric_value(self, metrics, key):
+        area = metrics.get("area", {}) or {}
+        cong = metrics.get("congestion", {}) or {}
+        power = metrics.get("power", {}) or {}
+        util = metrics.get("util", {}) or {}
+        flat = {
+            "r2r_setup": metrics.get("r2r_setup", "-"),
+            "r2r_hold": metrics.get("r2r_hold", "-"),
+            "total_area": area.get("total_area", "-"),
+            "instance_count": area.get("instance_count", "-"),
+            "std_cell_area": area.get("std_cell_area", "-"),
+            "memory_area": area.get("memory_area", "-"),
+            "macro_area": area.get("macro_area", "-"),
+            "std_util": util.get("std_util_str", metrics.get("std_util_str", "-")),
+            "mbit": metrics.get("mbit", "-"),
+            "cgc": metrics.get("cgc", "-"),
+            "congestion": cong.get("cong_both", "-"),
+            "leakage": power.get("leakage", "-"),
+            "runtime": metrics.get("runtime", "-"),
+            "logic_depth": metrics.get("logic_depth", "-"),
+        }
+        return flat.get(key, "-")
+
+    def _num(self, val):
+        m = re.search(r'-?\d+(?:\.\d+)?', str(val or ""))
+        return float(m.group(0)) if m else None
+
+    def _show_metric_diff_dialog(self, title, rows, baseline_name=None):
+        fields = [
+            ("R2R Setup WNS/TNS/FEPs", "r2r_setup"),
+            ("R2R Hold WNS/TNS/FEPs", "r2r_hold"),
+            ("Total Area", "total_area"),
+            ("Instance Count", "instance_count"),
+            ("Std Cell Area", "std_cell_area"),
+            ("Memory Area", "memory_area"),
+            ("Macro Area", "macro_area"),
+            ("Std Util", "std_util"),
+            ("MBIT Ratio", "mbit"),
+            ("CGC Ratio", "cgc"),
+            ("Congestion", "congestion"),
+            ("Leakage", "leakage"),
+            ("Runtime", "runtime"),
+            ("Logic Depth", "logic_depth"),
+        ]
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        dlg.resize(1100, 650)
+        layout = QVBoxLayout(dlg)
+        names = [r.get("name", "-") for r in rows]
+        if baseline_name:
+            layout.addWidget(QLabel("<b>Baseline:</b> " + baseline_name))
+        layout.addWidget(QLabel("<b>Runs:</b> " + "  |  ".join(names)))
+        tbl = QTableWidget(0, 5 if len(rows) == 2 else len(rows) + 2)
+        if len(rows) == 2:
+            tbl.setHorizontalHeaderLabels(["Metric", names[0], names[1], "Delta", "Delta %"])
+        else:
+            tbl.setHorizontalHeaderLabels(["Metric"] + names + ["Worst Delta %"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for c in range(1, tbl.columnCount()):
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+        for label, key in fields:
+            r = tbl.rowCount(); tbl.insertRow(r)
+            tbl.setItem(r, 0, QTableWidgetItem(label))
+            vals = [self._metric_value(row.get("metrics", {}), key) for row in rows]
+            nums = [self._num(v) for v in vals]
+            for c, val in enumerate(vals):
+                tbl.setItem(r, c + 1, QTableWidgetItem(str(val)))
+            if len(rows) == 2:
+                delta_txt = pct_txt = "-"
+                if nums[0] is not None and nums[1] is not None:
+                    d = nums[1] - nums[0]
+                    delta_txt = "{:+.4g}".format(d)
+                    if nums[0] != 0:
+                        pct_txt = "{:+.2f}%".format((d / abs(nums[0])) * 100.0)
+                tbl.setItem(r, 3, QTableWidgetItem(delta_txt))
+                tbl.setItem(r, 4, QTableWidgetItem(pct_txt))
+            else:
+                base = nums[0]
+                worst = "-"
+                if base not in (None, 0):
+                    pcts = [((n - base) / abs(base)) * 100.0
+                            for n in nums[1:] if n is not None]
+                    if pcts:
+                        worst = "{:+.2f}%".format(max(pcts, key=lambda x: abs(x)))
+                tbl.setItem(r, tbl.columnCount() - 1, QTableWidgetItem(worst))
+        layout.addWidget(tbl)
+        btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn)
+        dlg.exec_()
+
+    def show_ror_metric_diff(self):
+        tasks = []
+        for item in self._checked_run_items():
+            task = self._metric_task_from_item(item)
+            if task:
+                tasks.append(task)
+        if len(tasks) != 2:
+            QMessageBox.information(
+                self, "RoR Metric Diff",
+                "Check exactly two FE runs or two stage rows for metric diff.")
+            return
+        self.status_bar.showMessage("Extracting metrics for RoR diff...")
+        self._metric_batch_worker = MetricBatchWorker(tasks)
+        self._metric_batch_worker.finished.connect(self._on_ror_metric_done)
+        self._metric_batch_worker.start()
+
+    def _on_ror_metric_done(self, rows):
+        self.status_bar.showMessage("RoR metric diff ready", 3000)
+        self._show_metric_diff_dialog("RoR Metric Diff", rows)
+
+    def _find_golden_item_for(self, target_item):
+        target_run = target_item.data(0, Qt.UserRole + 10) or {}
+        target_block = target_run.get("block") or target_item.data(0, Qt.UserRole + 2)
+        golden_path = None
+        for path, pin in self.user_pins.items():
+            if pin == "golden":
+                golden_path = path
+                break
+        found = [None]
+        def walk(node):
+            for i in range(node.childCount()):
+                c = node.child(i)
+                run = c.data(0, Qt.UserRole + 10)
+                if run and self.user_pins.get(c.text(15)) == "golden":
+                    if not found[0] or run.get("block") == target_block:
+                        found[0] = c
+                walk(c)
+        walk(self.tree.invisibleRootItem())
+        return found[0]
+
+    def show_golden_benchmark(self):
+        checked = [i for i in self._checked_run_items()
+                   if self._metric_task_from_item(i)]
+        if not checked:
+            QMessageBox.information(
+                self, "Golden Benchmark",
+                "Check one or more FE runs or stage rows to compare against the Golden Run.")
+            return
+        golden = self._find_golden_item_for(checked[0])
+        if not golden:
+            QMessageBox.information(
+                self, "Golden Benchmark",
+                "No Golden Run is pinned in the current tree. Right-click a baseline run and choose Pin as... > Golden Run.")
+            return
+        tasks = []
+        gtask = self._metric_task_from_item(golden)
+        if not gtask:
+            QMessageBox.information(
+                self, "Golden Benchmark",
+                "The pinned Golden Run is not a supported metric target. Use a FE run or stage row.")
+            return
+        gtask["name"] = "GOLDEN: " + gtask["name"]
+        tasks.append(gtask)
+        for item in checked:
+            if item.text(15) == golden.text(15):
+                continue
+            task = self._metric_task_from_item(item)
+            if task:
+                tasks.append(task)
+        if len(tasks) < 2:
+            QMessageBox.information(
+                self, "Golden Benchmark",
+                "Select at least one non-golden run to compare.")
+            return
+        self.status_bar.showMessage("Extracting metrics for golden benchmark...")
+        self._metric_batch_worker = MetricBatchWorker(tasks)
+        self._metric_batch_worker.finished.connect(self._on_golden_metric_done)
+        self._metric_batch_worker.start()
+
+    def _on_golden_metric_done(self, rows):
+        self.status_bar.showMessage("Golden benchmark ready", 3000)
+        self._show_metric_diff_dialog(
+            "Golden Benchmark", rows, baseline_name=rows[0].get("name", "Golden"))
+
     def show_run_diff(self):
         """Compare N checked runs side-by-side."""
         checked = []
