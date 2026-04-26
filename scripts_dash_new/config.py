@@ -24,6 +24,12 @@ DEFAULT_CONFIG = {
         'BASE_IR_DIR': '/user/s5k2p5sx.be1/LAYOUT/IR/ /user/s5k2p5sx.be1/LAYOUT/IR2/',
         'BLOCKS': ''
     },
+    'PERFORMANCE': {
+        'SCAN_IR_ON_START': 'false',
+        'SCAN_OWNER_ON_START': 'false',
+        'SCAN_SIGNOFF_ON_START': 'false',
+        'AUTO_SIZE_ON_START': 'false'
+    },
     'TOOLS': {
         'PNR_TOOL_NAMES': 'fc innovus',
         'SUMMARY_SCRIPT': '/user/s5k2p5sx.fe1/s5k2p5sp/WS/scripts/summary/summary.py',

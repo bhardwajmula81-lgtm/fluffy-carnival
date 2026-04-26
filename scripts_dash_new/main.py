@@ -49,10 +49,16 @@ def _load_project_config():
         'PROJECT': {
             'PROJECT_PREFIX':   'S5K2P5SP',
             'BASE_WS_FE_DIR':   '/user/s5k2p5sx.fe1/s5k2p5sp/WS',
-            'BASE_WS_BE_DIR':   '/user/s5k2p5sp.be1/s5k2p5sp/WS',
+            'BASE_WS_BE_DIR':   '/user/s5k2p5sx.be1/s5k2p5sp/WS',
             'BASE_OUTFEED_DIR': '/user/s5k2p5sx.fe1/s5k2p5sp/outfeed',
             'BASE_IR_DIR':      '/user/s5k2p5sx.be1/LAYOUT/IR',
             'BLOCKS':           '',
+        },
+        'PERFORMANCE': {
+            'SCAN_IR_ON_START':      'false',
+            'SCAN_OWNER_ON_START':   'false',
+            'SCAN_SIGNOFF_ON_START': 'false',
+            'AUTO_SIZE_ON_START':    'false',
         },
         'TOOLS': {
             'PNR_TOOL_NAMES':  'fc innovus',
@@ -111,6 +117,10 @@ BASE_WS_BE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_BE_DIR',   fallback='')
 BASE_OUTFEED_DIR = _proj_cfg.get('PROJECT', 'BASE_OUTFEED_DIR', fallback='')
 BASE_IR_DIR      = _proj_cfg.get('PROJECT', 'BASE_IR_DIR',      fallback='')
 PNR_TOOL_NAMES   = _proj_cfg.get('TOOLS',   'PNR_TOOL_NAMES',   fallback='fc innovus')
+SCAN_IR_ON_START      = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_IR_ON_START',      fallback=False)
+SCAN_OWNER_ON_START   = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_OWNER_ON_START',   fallback=False)
+SCAN_SIGNOFF_ON_START = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_SIGNOFF_ON_START', fallback=False)
+AUTO_SIZE_ON_START    = _proj_cfg.getboolean('PERFORMANCE', 'AUTO_SIZE_ON_START',    fallback=False)
 _blocks_raw      = _proj_cfg.get('PROJECT', 'BLOCKS',           fallback='')
 BLOCKS           = set(b.strip() for b in _blocks_raw.split(',') if b.strip())
 
@@ -135,6 +145,10 @@ _bt.BASE_IR_DIR      = BASE_IR_DIR
 _bt.PROJECT_PREFIX   = PROJECT_PREFIX
 _bt.PNR_TOOL_NAMES   = PNR_TOOL_NAMES
 _bt.BLOCKS           = BLOCKS
+_bt.SCAN_IR_ON_START      = SCAN_IR_ON_START
+_bt.SCAN_OWNER_ON_START   = SCAN_OWNER_ON_START
+_bt.SCAN_SIGNOFF_ON_START = SCAN_SIGNOFF_ON_START
+_bt.AUTO_SIZE_ON_START    = AUTO_SIZE_ON_START
 
 
 def _get_user_email(username):
@@ -1674,7 +1688,7 @@ class PDDashboard(QMainWindow):
         self.init_ui()
         self._setup_shortcuts()
         self.apply_theme_and_spacing()
-        QTimer.singleShot(50, self.start_fs_scan)
+        QTimer.singleShot(250, self.start_fs_scan)
         # DiskScannerWorker runs `du -sk` on NFS — extremely I/O heavy.
         # Removed auto-start: it now only runs when user clicks "Disk Space".
         # This eliminates NFS contention that made all post-scan clicks sluggish.
@@ -3546,13 +3560,7 @@ class PDDashboard(QMainWindow):
             rtl = run["rtl"]
             if rtl not in _rtl_cache:
                 base = re.sub(r'_syn\d+$', '', rtl)
-                # Use user-configurable milestone map
                 ms   = self.get_milestone_label(base)
-                # Innovus TOP / SOC-level runs often have RTL="Unknown"
-                # because there is no dump_variables report. Assign a
-                # fallback milestone so they are not silently dropped.
-                if ms is None and ("Unknown" in rtl or not rtl.strip()):
-                    ms = "SOC / TOP"
                 _rtl_cache[rtl] = (base, base != rtl, ms)
 
         _ignored  = self.ignored_paths
@@ -3589,11 +3597,8 @@ class PDDashboard(QMainWindow):
             base_attach = (attach_root if _hide_blk
                            else self._get_node(attach_root, blk_name, "BLOCK"))
 
-            if milestone == "SOC / TOP":
-                parent_for_run = self._get_node(base_attach, base_rtl, "RTL")
-            else:
-                m_node = self._get_node(base_attach, milestone, "MILESTONE")
-                parent_for_run = self._get_node(m_node, base_rtl, "RTL")
+            m_node = self._get_node(base_attach, milestone, "MILESTONE")
+            parent_for_run = self._get_node(m_node, base_rtl, "RTL")
 
             if run["run_type"] == "FE":
                 run_item = self._create_run_item(parent_for_run, run)
@@ -3680,10 +3685,9 @@ class PDDashboard(QMainWindow):
             self._columns_fitted_once = True
             QTimer.singleShot(100, self.fit_all_columns)
 
-        # calculate_all_sizes: starts BatchSizeWorker (sends signals back).
-        # Delay 2s so the initial render+closure pass complete before
-        # size signals start arriving.
-        if not self._initial_size_calc_done:
+        # Folder-size calculation is expensive on NFS. Run it on startup only
+        # when explicitly enabled in project_config.ini.
+        if AUTO_SIZE_ON_START and not self._initial_size_calc_done:
             self._initial_size_calc_done = True
             QTimer.singleShot(2000, self.calculate_all_sizes)
 
@@ -3815,9 +3819,9 @@ class PDDashboard(QMainWindow):
         child.setData(0, Qt.UserRole + 20, {
             'run_path': bool(run.get("path") and run["path"] != "N/A"),
             'log':      bool(run.get("path") and run["path"] != "N/A"),
-            'fm_n':     cached_exists(run.get("fm_n_path", "")),
-            'fm_u':     cached_exists(run.get("fm_u_path", "")),
-            'vslp':     cached_exists(run.get("vslp_rpt_path", "")),
+            'fm_n':     bool(run.get("fm_n_path")),
+            'fm_u':     bool(run.get("fm_u_path")),
+            'vslp':     bool(run.get("vslp_rpt_path")),
         })
 
         if run["source"] == "OUTFEED":

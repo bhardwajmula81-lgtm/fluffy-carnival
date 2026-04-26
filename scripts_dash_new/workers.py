@@ -31,6 +31,14 @@ def _BASE_OUTFEED(): return _g("BASE_OUTFEED_DIR")
 def _BASE_IR():      return _g("BASE_IR_DIR", "")
 def _PROJECT():      return _g("PROJECT_PREFIX", "S5K2P5SP")
 def _PNR_TOOLS():    return _g("PNR_TOOL_NAMES", "fc innovus")
+def _bool_cfg(name, default=False):
+    val = _g(name, default)
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+def _SCAN_IR_ON_START():      return _bool_cfg("SCAN_IR_ON_START", False)
+def _SCAN_OWNER_ON_START():   return _bool_cfg("SCAN_OWNER_ON_START", False)
+def _SCAN_SIGNOFF_ON_START(): return _bool_cfg("SCAN_SIGNOFF_ON_START", False)
 def _BLOCKS():
     """Return frozenset of allowed block names, or empty frozenset (= scan all)."""
     b = _g("BLOCKS", set())
@@ -102,6 +110,14 @@ def get_dynamic_evt_path(rtl_tag, block_name):
     if not m:
         return ""
     return os.path.join(_BASE_OUTFEED(), block_name, m.group(1))
+
+def get_outfeed_evt_base(run_dir):
+    """Return {BASE_OUTFEED}/{BLK}/{EVT} for an OUTFEED fc/innovus run."""
+    parts = os.path.normpath(run_dir).split(os.sep)
+    for i, part in enumerate(parts):
+        if part in ("fc", "innovus") and i >= 1:
+            return os.sep.join(parts[:i])
+    return os.path.dirname(run_dir)
 
 def extract_rtl(run_dir):
     f = glob.glob(os.path.join(
@@ -389,12 +405,9 @@ class DiskScannerWorker(QThread):
     def run(self):
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
 
-        # Structure A: outfeed/{BLOCK}/EVT*/fc/*
+        # OUTFEED: outfeed/{BLOCK}/EVT*/fc/* and innovus/*
         outfeed_targets = glob.glob(os.path.join(_BASE_OUTFEED(), "*", "EVT*", "fc", "*"))
         outfeed_targets.extend(glob.glob(os.path.join(_BASE_OUTFEED(), "*", "EVT*", "innovus", "*")))
-        # Structure B: outfeed/{EVT_LABEL}/fc/run-name/run-name-FE
-        outfeed_targets.extend(glob.glob(os.path.join(_BASE_OUTFEED(), "*EVT*", "fc", "*")))
-        outfeed_targets.extend(glob.glob(os.path.join(_BASE_OUTFEED(), "*EVT*", "fc", "*", "*")))
         if not outfeed_targets:
             outfeed_targets = glob.glob(os.path.join(_BASE_OUTFEED(), "*"))
 
@@ -620,58 +633,25 @@ class ScannerWorker(QThread):
                 if not os.path.isdir(ent_path):
                     continue
 
-                # Detect outfeed structure:
-                # Structure A: outfeed/{BLOCK}/{EVT_LABEL}/fc/.../run-FE
-                # Structure B: outfeed/{EVT_LABEL}/fc/run-name/run-name-FE
-                #              (your actual: S5K2P5SP_EVT0_ML4_DEV00/fc/run/run-FE)
-
-                # Structure A: ent_name is a block, look for EVT* subdirs
+                # Expected outfeed structure:
+                # outfeed/{BLOCK}/{EVT_LABEL}/fc/{run}/{run}-FE
+                # outfeed/{BLOCK}/{EVT_LABEL}/fc/{run}-BE
+                # outfeed/{BLOCK}/{EVT_LABEL}/innovus/{run}[-BE]
                 evt_dirs_a = glob.glob(os.path.join(ent_path, "EVT*"))
 
-                # Structure B: ent_name itself looks like an EVT label
-                # (contains EVT or matches PROJECT_EVT pattern)
-                import re as _re
-                is_evt_label = bool(_re.search(r"EVT\d+", ent_name))
-
                 if evt_dirs_a:
-                    # Structure A
                     for evt_dir in evt_dirs_a:
                         phys_evt = os.path.basename(evt_dir)
                         blk_name = ent_name
                         for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
                             tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
                         if "fc" in tools_to_scan:
-                            be_runs = (glob.glob(os.path.join(evt_dir, "fc", "*-BE")) +
-                                       glob.glob(os.path.join(evt_dir, "fc", "*", "*-BE")))
-                            for rd in be_runs:
+                            for rd in glob.glob(os.path.join(evt_dir, "fc", "*-BE")):
                                 tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
                         if "innovus" in tools_to_scan:
                             for rd in glob.glob(os.path.join(evt_dir, "innovus", "*")):
                                 if os.path.isdir(rd):
                                     tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
-
-                elif is_evt_label:
-                    # Structure B: outfeed/S5K2P5SP_EVT0_ML4_DEV00/fc/run-name/run-name-FE
-                    phys_evt = ent_name  # e.g. S5K2P5SP_EVT0_ML4_DEV00
-                    for rd in glob.glob(os.path.join(ent_path, "fc", "*", "*-FE")):
-                        # Block name: extract from run dir name
-                        # run-name-FE parent dir is the "run group" folder
-                        # We derive block from the run name itself later
-                        blk_name = "UNKNOWN"
-                        tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
-                    # Also check direct *-FE (no subdirectory level)
-                    for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
-                        blk_name = "UNKNOWN"
-                        tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
-                    if "fc" in tools_to_scan:
-                        be_runs = (glob.glob(os.path.join(ent_path, "fc", "*-BE")) +
-                                   glob.glob(os.path.join(ent_path, "fc", "*", "*-BE")))
-                        for rd in be_runs:
-                            tasks.append(("UNKNOWN", rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
-                    if "innovus" in tools_to_scan:
-                        for rd in glob.glob(os.path.join(ent_path, "innovus", "*")):
-                            if os.path.isdir(rd):
-                                tasks.append(("UNKNOWN", rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
         # --- Prefetch path cache ---
         paths_to_prefetch = []
@@ -688,11 +668,11 @@ class ScannerWorker(QThread):
         completed_tasks = 0
         max_w           = min(40, (os.cpu_count() or 4) * 6)
 
-        self.status_update.emit("Processing run data and parsing reports...")
+        self.status_update.emit("Processing run data...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
 
-            # FIX 5: submit IR scan immediately -- runs alongside workspace processing
-            ir_future = executor.submit(self.scan_ir_dir)
+            ir_future = (executor.submit(self.scan_ir_dir)
+                         if _SCAN_IR_ON_START() else None)
 
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
 
@@ -730,10 +710,12 @@ class ScannerWorker(QThread):
                     self.progress_update.emit(completed_tasks, total_tasks)
                     self.status_update.emit(f"Processing runs... ({completed_tasks}/{total_tasks})")
 
-            # Collect IR results -- usually already done by now since it ran in parallel
-            try:
-                ir_data = ir_future.result()
-            except:
+            if ir_future:
+                try:
+                    ir_data = ir_future.result()
+                except:
+                    ir_data = {}
+            else:
                 ir_data = {}
 
         self.finished.emit(ws_data, out_data, ir_data, scan_stats)
@@ -765,8 +747,8 @@ class ScannerWorker(QThread):
         clean_run    = r_name.replace("-FE", "").replace("-BE", "")
         clean_be_run = re.sub(r'^EVT\d+_ML\d+_DEV\d+(_syn\d+)?_', '', r_name)
 
-        # For OUTFEED Structure B, b_name may be "UNKNOWN"
-        # Try to derive it from the reports directory (cell_usage.summary.{BLOCK}.*.rpt)
+        # Defensive fallback for malformed or manually supplied OUTFEED paths.
+        # Normal scanning uses outfeed/{BLOCK}/{EVT_LABEL}/..., so b_name is known.
         if b_name == "UNKNOWN" and source == "OUTFEED":
             rpt_dir = os.path.join(rd, "reports")
             cu_hits = glob.glob(os.path.join(rpt_dir, "cell_usage.summary.*.rpt"))
@@ -789,7 +771,7 @@ class ScannerWorker(QThread):
             return None
 
         evt_base     = get_dynamic_evt_path(rtl, b_name)
-        owner        = get_owner(rd)
+        owner        = get_owner(rd) if _SCAN_OWNER_ON_START() else "Unknown"
 
         fm_n     = os.path.join(evt_base, "fm",   clean_run, "r2n",   "reports", f"{b_name}_r2n.failpoint.rpt")
         fm_u     = os.path.join(evt_base, "fm",   clean_run, "r2upf", "reports", f"{b_name}_r2upf.failpoint.rpt")
@@ -837,11 +819,8 @@ class ScannerWorker(QThread):
                     stage_path = os.path.join(rd, "outputs", step_name)
                     if is_fc:
                         log = os.path.join(rd, step_name, "logs", f"{step_name}.log")
-                        # fc WS: runtime.rpt may be at stage/reports/ or stage/ directly
-                        rpt_cands = [
-                            os.path.join(rd, step_name, "reports", f"{step_name}.runtime.rpt"),
-                            os.path.join(rd, step_name, f"{step_name}.runtime.rpt"),
-                        ]
+                        rpt_cands = [os.path.join(rd, "reports", step_name,
+                                                   f"{step_name}.runtime.rpt")]
                     else:
                         log       = os.path.join(rd, "logs", f"{step_name}.log")
                         rpt_cands = [os.path.join(rd, "reports", step_name,
@@ -851,17 +830,14 @@ class ScannerWorker(QThread):
                     log        = os.path.join(s_dir, "logs", f"{step_name}.log")
                     stage_path = os.path.join(rd, step_name)
                     if is_fc:
-                        # fc OUTFEED: try flat reports/ first, then nested reports/step/
-                        rpt_cands = [
-                            os.path.join(s_dir, "reports", f"{step_name}.runtime.rpt"),
-                            os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt"),
-                        ]
+                        rpt_cands = [os.path.join(s_dir, "reports", step_name,
+                                                   f"{step_name}.runtime.rpt")]
                     else:
                         rpt_cands = [os.path.join(s_dir, "reports", step_name,
                                                    f"{step_name}.runtime.rpt")]
 
                 # FM/VSLP base + dir variants stored for lazy resolution in StageDetailWorker
-                evt_base_stage = os.path.dirname(rd) if source == "OUTFEED" else evt_base
+                evt_base_stage = get_outfeed_evt_base(rd) if source == "OUTFEED" else evt_base
                 sta_rpt  = os.path.join(evt_base_stage, "pt", r_name, step_name,
                                         "reports", "sta", "summary", "summary.rpt")
                 qor_path = rd if rd.endswith("/") else rd + "/"
@@ -906,9 +882,9 @@ class ScannerWorker(QThread):
             "owner":        owner,
             "is_comp":      is_comp,
             "fe_status":    fe_status,
-            "st_n":         get_fm_info(fm_n),
-            "st_u":         get_fm_info(fm_u),
-            "vslp_status":  get_vslp_info(vslp_rpt),
+            "st_n":         get_fm_info(fm_n) if _SCAN_SIGNOFF_ON_START() else "N/A",
+            "st_u":         get_fm_info(fm_u) if _SCAN_SIGNOFF_ON_START() else "N/A",
+            "vslp_status":  get_vslp_info(vslp_rpt) if _SCAN_SIGNOFF_ON_START() else "N/A",
             "info":         info,
             "fm_n_path":    fm_n,
             "fm_u_path":    fm_u,
@@ -962,10 +938,17 @@ class StageDetailWorker(QThread):
             fm_u_path = fm_n_path = ""
             if fm_base:
                 for be_dir in s.get("_fm_dirs", []):
-                    u_hits = glob.glob(os.path.join(
+                    blk = self.be_run.get("block", "")
+                    u_exact = os.path.join(
+                        fm_base, "fm", be_dir, step, "n2upf_func", "reports",
+                        "{}_n2upf_func.failpoint.rpt".format(blk))
+                    n_exact = os.path.join(
+                        fm_base, "fm", be_dir, step, "n2n_func", "reports",
+                        "{}_n2n_func.failpoint.rpt".format(blk))
+                    u_hits = [u_exact] if cached_exists(u_exact) else glob.glob(os.path.join(
                         fm_base, "fm", be_dir, step, "n2upf_func", "reports", "*.failpoint.rpt"))
-                    n_hits = glob.glob(os.path.join(
-                        fm_base, "fm", be_dir, step, "n2n_func",   "reports", "*.failpoint.rpt"))
+                    n_hits = [n_exact] if cached_exists(n_exact) else glob.glob(os.path.join(
+                        fm_base, "fm", be_dir, step, "n2n_func", "reports", "*.failpoint.rpt"))
                     if u_hits or n_hits:
                         fm_u_path = u_hits[0] if u_hits else ""
                         fm_n_path = n_hits[0] if n_hits else ""
