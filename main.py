@@ -31,10 +31,10 @@ from PyQt5.QtWidgets import (
     QSpinBox, QColorDialog, QTabWidget, QTableWidget,
     QTableWidgetItem, QScrollArea, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate
+from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint
 from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QBrush,
-                         QPainter, QPen, QPixmap, QIcon)
+                         QPainter, QPen, QPixmap, QIcon, QPolygon)
 
 # ===========================================================================
 # CONFIG + MAIL HELPERS (module-level, loaded once at startup)
@@ -1244,14 +1244,95 @@ class _BarChartWidget(QWidget):
                        Qt.AlignHCenter | Qt.AlignTop, lbl_short)
 
 
+class _StackedVtChartWidget(QWidget):
+    """Per-run stacked VT distribution. Clearer than averaging into a pie."""
+    def __init__(self, title="VT Area Distribution per Run"):
+        super().__init__()
+        self.title = title
+        self.labels = []
+        self.rows = []
+        self.is_dark = False
+        self.setMinimumSize(320, 220)
+
+    def set_data(self, labels, rows, is_dark=False):
+        self.labels = labels or []
+        self.rows = rows or []
+        self.is_dark = is_dark
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
+        fg = QColor("#dfe1e5" if self.is_dark else "#263238")
+        muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
+        colors = [QColor("#43a047"), QColor("#1e88e5"), QColor("#fb8c00")]
+        names = ["LVT", "RVT", "HVT"]
+        p.fillRect(self.rect(), bg)
+        r = self.rect()
+        p.setPen(fg)
+        p.drawText(8, 6, r.width() - 16, 20,
+                   Qt.AlignHCenter | Qt.AlignVCenter, self.title)
+        valid = []
+        for label, row in zip(self.labels, self.rows):
+            vals = [max(0.0, float(v or 0.0)) for v in row]
+            if sum(vals) > 0:
+                valid.append((label, vals))
+        if not valid:
+            p.drawText(r, Qt.AlignCenter, "No VT data")
+            return
+        left = 96
+        right = 18
+        top = 38
+        row_h = 22
+        gap = 10
+        max_rows = max(1, min(len(valid), int((r.height() - top - 34) / (row_h + gap))))
+        bar_w = max(80, r.width() - left - right)
+        for i, (label, vals) in enumerate(valid[:max_rows]):
+            y = top + i * (row_h + gap)
+            lbl = label
+            if len(lbl) > 14:
+                lbl = lbl[:11] + "..."
+            p.setPen(fg)
+            p.drawText(6, y, left - 12, row_h,
+                       Qt.AlignRight | Qt.AlignVCenter, lbl)
+            total = sum(vals) or 1.0
+            x = left
+            for idx, val in enumerate(vals):
+                w = int(bar_w * val / total)
+                if idx == len(vals) - 1:
+                    w = left + bar_w - x
+                if w <= 0:
+                    continue
+                p.setBrush(QBrush(colors[idx]))
+                p.setPen(Qt.NoPen)
+                p.drawRect(x, y + 3, w, row_h - 6)
+                pct = val / total * 100.0
+                if w > 44:
+                    p.setPen(QColor("#ffffff"))
+                    p.drawText(x, y, w, row_h, Qt.AlignCenter,
+                               "{:.0f}%".format(pct))
+                x += w
+        ly = r.height() - 24
+        lx = left
+        for i, name in enumerate(names):
+            p.setBrush(QBrush(colors[i]))
+            p.setPen(Qt.NoPen)
+            p.drawRect(lx, ly + 5, 10, 10)
+            p.setPen(muted)
+            p.drawText(lx + 14, ly, 60, 20,
+                       Qt.AlignLeft | Qt.AlignVCenter, name)
+            lx += 64
+
+
 class _TimelineChartWidget(QWidget):
-    """Compact Gantt-style timeline for FE and PNR stage events."""
+    """Readable sequential pipeline timeline for FE and PNR stage events."""
     def __init__(self, events=None, parser=None, is_dark=False):
         super().__init__()
         self.events = events or []
         self.parser = parser
         self.is_dark = is_dark
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(240)
 
     def set_data(self, events, parser, is_dark=False):
         self.events = events or []
@@ -1268,89 +1349,119 @@ class _TimelineChartWidget(QWidget):
         return None
 
     def paintEvent(self, event):
-        from PyQt5.QtCore import QRectF
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
         fg = QColor("#dfe1e5" if self.is_dark else "#263238")
         muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
-        grid = QColor("#55585c" if self.is_dark else "#e5e7eb")
+        line = QColor("#6b7280" if self.is_dark else "#cfd8dc")
         fe_color = QColor("#42a5f5")
         stage_color = QColor("#66bb6a")
+        warn_color = QColor("#ffa726")
         p.fillRect(self.rect(), bg)
         r = self.rect()
-
-        spans = []
-        for ev in self.events:
-            st = self._dt(ev.get("start"))
-            en = self._dt(ev.get("end"))
-            if st and en and en >= st:
-                spans.append((ev, st, en))
-        if not spans:
+        events = list(self.events or [])
+        if not events:
             p.setPen(fg)
             p.drawText(r, Qt.AlignCenter, "No timestamp data available")
             return
-
-        min_dt = min(st for _, st, _ in spans)
-        max_dt = max(en for _, _, en in spans)
-        total = max(1.0, (max_dt - min_dt).total_seconds())
-
-        left = 140
-        right = 22
-        top = 34
-        row_h = 26
-        gap = 8
-        max_rows = max(1, min(len(spans), int((r.height() - top - 28) / (row_h + gap))))
-        plot_w = max(80, r.width() - left - right)
-
         p.setPen(fg)
         p.drawText(8, 8, r.width() - 16, 18,
                    Qt.AlignLeft | Qt.AlignVCenter,
-                   "Timeline overview")
-
-        for i in range(5):
-            x = left + int(plot_w * i / 4.0)
-            p.setPen(QPen(grid, 1))
-            p.drawLine(x, top - 6, x, r.height() - 28)
-            label_dt = min_dt + datetime.timedelta(seconds=total * i / 4.0)
-            p.setPen(muted)
-            p.drawText(x - 45, r.height() - 24, 90, 18,
-                       Qt.AlignCenter, label_dt.strftime("%m/%d %H:%M"))
-
-        shown = spans[:max_rows]
-        for row, (ev, st, en) in enumerate(shown):
-            y = top + row * (row_h + gap)
-            label = ev.get("name", "-")
-            if len(label) > 24:
-                label = label[:21] + "..."
-            p.setPen(fg)
-            p.drawText(8, y, left - 16, row_h,
-                       Qt.AlignRight | Qt.AlignVCenter, label)
-
-            x1 = left + int(((st - min_dt).total_seconds() / total) * plot_w)
-            x2 = left + int(((en - min_dt).total_seconds() / total) * plot_w)
-            w = max(4, x2 - x1)
+                   "Timeline flow")
+        card_w = 176
+        card_h = 68
+        gap_x = 56
+        gap_y = 34
+        left = 18
+        top = 40
+        usable_w = max(card_w, r.width() - left * 2)
+        per_row = max(1, int((usable_w + gap_x) / (card_w + gap_x)))
+        max_rows = max(1, int((r.height() - top - 24) / (card_h + gap_y)))
+        max_items = per_row * max_rows
+        shown = events[:max_items]
+        prev_end = None
+        for idx, ev in enumerate(shown):
+            row = idx // per_row
+            col = idx % per_row
+            x = left + col * (card_w + gap_x)
+            y = top + row * (card_h + gap_y)
             color = fe_color if ev.get("kind") == "FE" else stage_color
-            bar = QRectF(x1, y + 4, w, row_h - 8)
+            if ev.get("runtime", "-") in ("", "-", "N/A"):
+                color = warn_color
             p.setBrush(QBrush(color))
-            p.setPen(QPen(color.darker(115), 1))
-            p.drawRoundedRect(bar, 3, 3)
-
-            p.setPen(fg)
+            p.setPen(QPen(color.darker(120), 1))
+            p.drawRoundedRect(x, y, card_w, card_h, 6, 6)
+            p.setPen(QColor("#ffffff"))
+            name = ev.get("name", "-")
+            if " / " in name:
+                name = name.split(" / ")[-1]
+            if len(name) > 24:
+                name = name[:21] + "..."
+            p.drawText(x + 8, y + 6, card_w - 16, 18,
+                       Qt.AlignLeft | Qt.AlignVCenter, name)
             txt = ev.get("runtime", "-")
-            if w > 70:
-                p.drawText(bar.adjusted(4, 0, -4, 0),
-                           Qt.AlignCenter, txt)
-            else:
-                p.drawText(x2 + 4, y, 80, row_h,
-                           Qt.AlignLeft | Qt.AlignVCenter, txt)
-
-        if len(spans) > len(shown):
+            p.drawText(x + 8, y + 28, card_w - 16, 16,
+                       Qt.AlignLeft | Qt.AlignVCenter,
+                       "Runtime: " + txt)
+            st = self._dt(ev.get("start"))
+            en = self._dt(ev.get("end"))
+            when = ev.get("start", "-")
+            if st:
+                when = st.strftime("%m/%d %H:%M")
+            p.drawText(x + 8, y + 46, card_w - 16, 16,
+                       Qt.AlignLeft | Qt.AlignVCenter, when)
+            if idx > 0:
+                if col == 0:
+                    x1 = left + (per_row - 1) * (card_w + gap_x) + card_w
+                    y1 = y - gap_y + card_h // 2
+                    x2 = x
+                    y2 = y + card_h // 2
+                    p.setPen(QPen(line, 1))
+                    p.drawLine(x1, y1, x1 + 14, y1)
+                    p.drawLine(x1 + 14, y1, x1 + 14, y2)
+                    p.drawLine(x1 + 14, y2, x2 - 8, y2)
+                else:
+                    x1 = x - gap_x
+                    y1 = y + card_h // 2
+                    x2 = x
+                    y2 = y1
+                    p.setPen(QPen(line, 1))
+                    p.drawLine(x1, y1, x2 - 8, y2)
+                p.setBrush(QBrush(line))
+                p.setPen(Qt.NoPen)
+                p.drawPolygon(QPolygon([
+                    QPoint(x2 - 8, y2 - 4),
+                    QPoint(x2 - 8, y2 + 4),
+                    QPoint(x2 - 1, y2)]))
+                gap_txt = self._gap_text(prev_end, st)
+                if gap_txt != "-":
+                    p.setPen(muted)
+                    if col == 0:
+                        p.drawText(x + 4, y - 24, card_w - 8, 18,
+                                   Qt.AlignCenter, gap_txt)
+                    else:
+                        p.drawText(x - gap_x + 4, y + 2, gap_x - 8, 18,
+                                   Qt.AlignCenter, gap_txt)
+            prev_end = en or prev_end
+        if len(events) > len(shown):
             p.setPen(muted)
-            p.drawText(8, r.height() - 44, r.width() - 16, 18,
+            p.drawText(8, r.height() - 22, r.width() - 16, 18,
                        Qt.AlignRight,
-                       "+{} more stage rows in table".format(
-                           len(spans) - len(shown)))
+                       "+{} more rows in table".format(
+                           len(events) - len(shown)))
+
+    def _gap_text(self, prev_end, start):
+        if not prev_end or not start:
+            return "-"
+        secs = int((start - prev_end).total_seconds())
+        if secs < 0:
+            return "overlap"
+        h = secs // 3600
+        m = (secs % 3600) // 60
+        if h >= 24:
+            return "{}d {}h".format(h // 24, h % 24)
+        return "{}h {}m".format(h, m)
 
 
 class BlockSummaryDialog(QDialog):
@@ -1440,13 +1551,13 @@ class BlockSummaryDialog(QDialog):
         refresh_charts_btn.clicked.connect(self._draw_charts)
         tab_charts_layout.addWidget(refresh_charts_btn, 0)
 
-        self._chart_pie  = _PieChartWidget("Avg VT Area Distribution")
+        self._chart_vt   = _StackedVtChartWidget("VT Area Distribution per Run")
         self._chart_area = _BarChartWidget("Std Cell Area per Run")
         self._chart_wns  = _BarChartWidget("R2R Setup WNS per Run")
         self._chart_cgc  = _BarChartWidget("Clock Gating % per Run")
         from PyQt5.QtWidgets import QGridLayout as _QGL
         charts_grid = _QGL()
-        charts_grid.addWidget(self._chart_pie,  0, 0)
+        charts_grid.addWidget(self._chart_vt,   0, 0)
         charts_grid.addWidget(self._chart_area, 0, 1)
         charts_grid.addWidget(self._chart_wns,  1, 0)
         charts_grid.addWidget(self._chart_cgc,  1, 1)
@@ -1636,7 +1747,8 @@ class BlockSummaryDialog(QDialog):
 
         blks      = [_cell(r, 0) for r in range(n)]
         run_names = [_cell(r, 1) for r in range(n)]
-        labels    = [b[:8] + ".." if len(b) > 8 else b for b in blks]
+        labels    = [rn[:14] + ".." if len(rn) > 16 else rn
+                     for rn in run_names]
         std_areas, r2r_wns, cgc_vals = [], [], []
         vth_lvt, vth_rvt, vth_hvt   = [], [], []
 
@@ -1655,13 +1767,10 @@ class BlockSummaryDialog(QDialog):
             except:
                 vth_lvt.append(0.0); vth_rvt.append(0.0); vth_hvt.append(0.0)
 
-        avg_l = sum(vth_lvt) / n if n else 0
-        avg_r = sum(vth_rvt) / n if n else 0
-        avg_h = sum(vth_hvt) / n if n else 0
-
         wns_colors = [QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in r2r_wns]
 
-        self._chart_pie.set_data({"LVT": avg_l, "RVT": avg_r, "HVT": avg_h}, self.is_dark)
+        vt_rows = list(zip(vth_lvt, vth_rvt, vth_hvt))
+        self._chart_vt.set_data(labels, vt_rows, self.is_dark)
         self._chart_area.set_data(labels, std_areas, is_dark=self.is_dark)
         self._chart_wns.set_data(labels, r2r_wns, colors=wns_colors, is_dark=self.is_dark)
         self._chart_cgc.set_data(labels, cgc_vals,
@@ -2702,7 +2811,7 @@ class PDDashboard(QMainWindow):
 
         # Auto-fit Run Name column on expand/collapse (throttled 150ms)
         self._col0_resize_timer.timeout.connect(
-            lambda: self.tree.resizeColumnToContents(0))
+            self._fit_run_name_column)
         self.tree.itemExpanded.connect(
             lambda _: self._col0_resize_timer.start())
         self.tree.itemCollapsed.connect(
@@ -4397,6 +4506,7 @@ class PDDashboard(QMainWindow):
             self.search_count_lbl.setVisible(False)
 
         self._update_status_bar(visible_runs)
+        QTimer.singleShot(80, self._fit_run_name_column)
 
     # ------------------------------------------------------------------
     # COLUMN FILTER
@@ -4819,6 +4929,15 @@ class PDDashboard(QMainWindow):
         for i in range(self.tree.columnCount()):
             if not self.tree.isColumnHidden(i):
                 self.tree.resizeColumnToContents(i)
+        self._fit_run_name_column()
+
+    def _fit_run_name_column(self):
+        try:
+            self.tree.resizeColumnToContents(0)
+            w = self.tree.columnWidth(0)
+            self.tree.setColumnWidth(0, max(380, min(w + 24, 760)))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # CSV EXPORT
@@ -6418,7 +6537,7 @@ class PDDashboard(QMainWindow):
                             QColor("#ef5350") if pct_val < 0 else QColor("#66bb6a"))
                 tbl.setItem(r, tbl.columnCount() - 1, QTableWidgetItem(worst))
         chart.set_data(chart_labels, chart_values,
-                       colors=chart_colors, is_dark=self.is_dark)
+                       colors=chart_colors, is_dark=self.is_dark_mode)
         layout.addWidget(chart)
         layout.addWidget(tbl)
         btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
@@ -6619,6 +6738,7 @@ class PDDashboard(QMainWindow):
         for i in range(self.tree.columnCount()):
             if not self.tree.isColumnHidden(i):
                 self.tree.resizeColumnToContents(i)
+        self._fit_run_name_column()
 
 
 # ----------------------------------------------------------------------
