@@ -144,7 +144,14 @@ def _get_user_email(username):
     try:
         res = subprocess.check_output(
             [USER_INFO_UTIL, '-a', username],
-            stderr=subprocess.DEVNULL).decode('utf-8')
+            stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+        # user_info output is comma-separated; email is field 9 (index 8)
+        fields = res.split(',')
+        if len(fields) >= 9:
+            email = fields[8].strip()
+            if '@' in email:
+                return email
+        # fallback: regex scan
         m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', res)
         if m: return m.group(0)
     except Exception:
@@ -222,7 +229,13 @@ def _send_mail_via_util(dlg):
             "MAIL_UTIL = /user/vwpmailsystem/MAIL/send_mail_for_rhel7")
         return
     subject  = dlg.subject_input.text().strip()
-    body     = dlg.body_input.toPlainText()
+    # Prefer raw HTML body if dialog stored one (e.g. from BlockSummaryDialog._send_mail)
+    if hasattr(dlg, '_html_body') and dlg._html_body:
+        body = dlg._html_body
+        fmt  = "html"
+    else:
+        body = dlg.body_input.toPlainText()
+        fmt  = "text"
     to_list  = [x.strip() for x in dlg.to_input.text().split(',') if x.strip()]
     cc_list  = [x.strip() for x in dlg.cc_input.text().split(',') if x.strip()]
     sender   = _get_user_email(getpass.getuser()) or f"{getpass.getuser()}@samsung.com"
@@ -236,7 +249,7 @@ def _send_mail_via_util(dlg):
            "-sd", sender,
            "-s",  subject,
            "-c",  body,
-           "-fm", "text"]
+           "-fm", fmt]
     for att in dlg.attachments:
         cmd.extend(["-a", att])
     try:
@@ -823,31 +836,32 @@ class QoRSummaryDialog(QDialog):
         # Util string: from utilization report
         util_str = _v(metrics.get("util", {}), "std_util_str", "std_util")
 
+        # (label, value, is_section, path_key_or_None)
+        _paths = metrics.get("_paths", {})
         rows = [
-            # (label,                          value,                      is_section)
-            ("Timing",                         None,                       True),
-            ("R2R (Setup)  WNS/TNS/FEPs",     metrics.get("r2r_setup","-"), False),
-            ("R2R (Hold)   WNS/TNS/FEPs",     metrics.get("r2r_hold",  "-"), False),
-            ("Area",                            None,                       True),
-            ("Total Area",                     _v(area,"total_area"),       False),
+            ("Timing",                         None,                       True,  None),
+            ("R2R (Setup)  WNS/TNS/FEPs",     metrics.get("r2r_setup","-"), False, "r2r_setup"),
+            ("R2R (Hold)   WNS/TNS/FEPs",     metrics.get("r2r_hold",  "-"), False, "r2r_hold"),
+            ("Area",                            None,                       True,  None),
+            ("Total Area",                     _v(area,"total_area"),       False, "total_area"),
             ("Std Cell Area",                  _v(area,"std_cell_area_total",
-                                                      "std_cell_area"),     False),
-            ("Memory Area",                    _v(area,"memory_area"),      False),
-            ("Macro Area (Inc. Mem)",          _v(area,"macro_area"),       False),
+                                                      "std_cell_area"),     False, "std_cell_area"),
+            ("Memory Area",                    _v(area,"memory_area"),      False, "memory_area"),
+            ("Macro Area (Inc. Mem)",          _v(area,"macro_area"),       False, "macro_area"),
             ("Instance Count",                 _v(area,"instance_count",
-                                                   "total_count"),          False),
-            ("Physical",                       None,                        True),
-            ("LVT*/RVT*/HVT* Inst",            lvt_rvt_hvt_inst,            False),
-            ("LVT*/RVT*/HVT* Area",            lvt_rvt_hvt_area,            False),
-            ("Congestion (Both/V/H Dir)",      cong_str,                    False),
-            ("StdCell/StdCell Only Util",      util_str,                    False),
-            ("Quality",                        None,                        True),
-            ("MBIT Ratio",                     _v(metrics, "mbit"),         False),
-            ("CGC Ratio",                      metrics.get("cgc", "-"),     False),
-            ("Power",                          None,                        True),
-            ("Cell Leakage Power",             pwr_str,                     False),
-            ("Runtime",                        metrics.get("runtime","-"),  False),
-            ("Logic Depth",                    metrics.get("logic_depth","-"), False),
+                                                   "total_count"),          False, "instance_count"),
+            ("Physical",                       None,                        True,  None),
+            ("LVT*/RVT*/HVT* Inst",            lvt_rvt_hvt_inst,            False, "vth"),
+            ("LVT*/RVT*/HVT* Area",            lvt_rvt_hvt_area,            False, "vth"),
+            ("Congestion (Both/V/H Dir)",      cong_str,                    False, "congestion"),
+            ("StdCell/StdCell Only Util",      util_str,                    False, "std_cell_area"),
+            ("Quality",                        None,                        True,  None),
+            ("MBIT Ratio",                     _v(metrics, "mbit"),         False, "mbit"),
+            ("CGC Ratio",                      metrics.get("cgc", "-"),     False, "cgc"),
+            ("Power",                          None,                        True,  None),
+            ("Cell Leakage Power",             pwr_str,                     False, "leakage"),
+            ("Runtime",                        metrics.get("runtime","-"),  False, "runtime"),
+            ("Logic Depth",                    metrics.get("logic_depth","-"), False, "logic_depth"),
         ]
 
         # Table
@@ -859,18 +873,18 @@ class QoRSummaryDialog(QDialog):
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
         tbl.setSelectionBehavior(QTableWidget.SelectRows)
+        tbl.setToolTip("Double-click a value to open its report in gvim")
 
         sec_bg  = "#1565c0" if is_dark else "#bbdefb"
         sec_fg  = "white"   if is_dark else "#0d47a1"
         neg_fg  = "#ef5350" if is_dark else "#c62828"
         zero_fg = "#66bb6a" if is_dark else "#2e7d32"
 
-        for label, val, is_sec in rows:
+        for label, val, is_sec, path_key in rows:
             r = tbl.rowCount()
             tbl.insertRow(r)
 
             if is_sec:
-                # Section header row spanning both cols
                 sec_item = QTableWidgetItem(label)
                 sec_item.setBackground(QColor(sec_bg))
                 sec_item.setForeground(QColor(sec_fg))
@@ -883,6 +897,11 @@ class QoRSummaryDialog(QDialog):
                 m_item = QTableWidgetItem("  " + str(label))
                 v_item = QTableWidgetItem(str(val) if val else "-")
                 v_item.setTextAlignment(Qt.AlignCenter)
+                # Store report path so double-click can open it
+                rpt_path = _paths.get(path_key) if path_key else None
+                v_item.setData(Qt.UserRole, rpt_path)
+                if rpt_path:
+                    v_item.setToolTip("Double-click to open in gvim:\n" + str(rpt_path))
                 # Color negative timing values
                 try:
                     fv = float(str(val).split("/")[0])
@@ -894,6 +913,17 @@ class QoRSummaryDialog(QDialog):
                     pass
                 tbl.setItem(r, 0, m_item)
                 tbl.setItem(r, 1, v_item)
+
+        # Double-click value → open report in gvim
+        def _open_qor_rpt(clicked_item):
+            path = clicked_item.data(Qt.UserRole)
+            if path and os.path.exists(path):
+                subprocess.Popen(['gvim', path])
+            elif path:
+                QMessageBox.information(
+                    self, "Not Found",
+                    "Report file not found:\n" + str(path))
+        tbl.itemDoubleClicked.connect(_open_qor_rpt)
 
         layout.addWidget(tbl, 1)
 
@@ -982,14 +1012,131 @@ class QoRWorker(QThread):
         except Exception:
             self.finished.emit("")
 
-try:
-    import matplotlib
-    matplotlib.use("Qt5Agg")
-    from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as _FigureCanvas
-    from matplotlib.figure import Figure as _MplFigure
-    _MPL = True
-except ImportError:
-    _MPL = False
+# ---------------------------------------------------------------------------
+# Lightweight PyQt5-native chart widgets (no matplotlib dependency)
+# ---------------------------------------------------------------------------
+class _PieChartWidget(QWidget):
+    """Pie chart using QPainter. data = {label: float}."""
+    _COLORS = [
+        QColor("#42a5f5"), QColor("#66bb6a"), QColor("#ffa726"),
+        QColor("#ef5350"), QColor("#ab47bc"), QColor("#26c6da"),
+        QColor("#8d6e63"), QColor("#78909c")]
+
+    def __init__(self, title=""):
+        super().__init__()
+        self.title   = title
+        self.data    = {}
+        self.is_dark = False
+        self.setMinimumSize(180, 160)
+
+    def set_data(self, data, is_dark=False):
+        self.data    = {k: v for k, v in data.items() if v > 0}
+        self.is_dark = is_dark
+        self.update()
+
+    def paintEvent(self, event):
+        import math
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        fg  = QColor("#dfe1e5" if self.is_dark else "#333333")
+        bg  = QColor("#2b2d30" if self.is_dark else "#ffffff")
+        p.fillRect(self.rect(), bg)
+        r   = self.rect()
+        # Title
+        p.setPen(fg); p.drawText(r.adjusted(0, 4, 0, 0), Qt.AlignHCenter | Qt.AlignTop, self.title)
+        total = sum(self.data.values())
+        if not total:
+            p.drawText(r, Qt.AlignCenter, "No Data"); return
+        margin = 28
+        dim    = min(r.width(), r.height() - margin) - 8
+        if dim <= 0: return
+        from PyQt5.QtCore import QRectF
+        cx  = r.center().x(); cy = r.center().y() + margin // 2
+        pie = QRectF(cx - dim/2, cy - dim/2, dim, dim)
+        start = 0
+        items = list(self.data.items())
+        for i, (label, val) in enumerate(items):
+            span  = int(val / total * 360 * 16)
+            color = self._COLORS[i % len(self._COLORS)]
+            p.setBrush(QBrush(color))
+            p.setPen(QPen(bg, 1))
+            p.drawPie(pie, start, span)
+            # Small legend dot + text on right
+            lx = r.right() - 110; ly = margin + i * 16
+            p.setBrush(color); p.setPen(Qt.NoPen)
+            p.drawEllipse(lx, ly, 10, 10)
+            p.setPen(fg)
+            p.drawText(lx + 14, ly, 96, 14, Qt.AlignVCenter | Qt.AlignLeft,
+                       "{} {:.1f}%".format(label, val / total * 100))
+            start += span
+
+
+class _BarChartWidget(QWidget):
+    """Bar chart (vertical or horizontal) using QPainter."""
+    def __init__(self, title="", horizontal=False):
+        super().__init__()
+        self.title      = title
+        self.horizontal = horizontal
+        self.labels     = []
+        self.values     = []
+        self.bar_colors = []
+        self.is_dark    = False
+        self.y_label    = ""
+        self.setMinimumSize(180, 160)
+
+    def set_data(self, labels, values, colors=None, is_dark=False, y_label=""):
+        self.labels     = labels
+        self.values     = values
+        self.bar_colors = colors or [QColor("#42a5f5")] * len(values)
+        self.is_dark    = is_dark
+        self.y_label    = y_label
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        fg  = QColor("#dfe1e5" if self.is_dark else "#333333")
+        bg  = QColor("#2b2d30" if self.is_dark else "#ffffff")
+        ax  = QColor("#888888")
+        p.fillRect(self.rect(), bg)
+        r   = self.rect()
+        if not self.values:
+            p.setPen(fg); p.drawText(r, Qt.AlignCenter, "No Data"); return
+        # Title
+        p.setPen(fg)
+        p.drawText(r.adjusted(0, 4, 0, 0), Qt.AlignHCenter | Qt.AlignTop, self.title)
+        margin_t = 22; margin_b = 36; margin_l = 12; margin_r = 8
+        area_w = r.width()  - margin_l - margin_r
+        area_h = r.height() - margin_t - margin_b
+        if area_w <= 0 or area_h <= 0: return
+        n    = len(self.values)
+        vmax = max(abs(v) for v in self.values) or 1
+        vmin = min(self.values)
+        zero_y = margin_t + area_h if vmin >= 0 else (
+            margin_t + int(area_h * max(self.values) / (max(self.values) - vmin)))
+        # Axis line
+        p.setPen(QPen(ax, 1))
+        p.drawLine(margin_l, margin_t, margin_l, margin_t + area_h)
+        p.drawLine(margin_l, zero_y,   margin_l + area_w, zero_y)
+        # Bars
+        bar_w = max(2, area_w // n - 2)
+        for i, (val, col) in enumerate(zip(self.values, self.bar_colors)):
+            x = margin_l + i * (area_w // n) + (area_w // n - bar_w) // 2
+            if val >= 0:
+                h   = int(area_h * val / (vmax if vmax != 0 else 1))
+                top = zero_y - h
+            else:
+                h   = int(area_h * abs(val) / (vmax if vmax != 0 else 1))
+                top = zero_y
+            p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
+            p.drawRect(x, top, bar_w, max(1, h))
+            # X label
+            lbl = self.labels[i] if i < len(self.labels) else ""
+            p.setPen(fg)
+            fm  = p.fontMetrics()
+            lbl_short = lbl[:8] + ".." if fm.width(lbl) > bar_w + 12 else lbl
+            p.drawText(x - 4, zero_y + 2, bar_w + 8, 32,
+                       Qt.AlignHCenter | Qt.AlignTop, lbl_short)
 
 
 class BlockSummaryDialog(QDialog):
@@ -1065,26 +1212,31 @@ class BlockSummaryDialog(QDialog):
         self.tbl.setAlternatingRowColors(True)
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setSortingEnabled(True)
+        self.tbl.setToolTip("Double-click a metric cell to open its report in gvim")
+        self.tbl.itemDoubleClicked.connect(self._open_cell_report)
         tab_tbl_layout.addWidget(self.tbl)
         self._tabs.addTab(tab_tbl, "Table")
 
-        # ── Tab 2: Charts ────────────────────────────────────────────────
+        # ── Tab 2: Charts (PyQt5 native, no matplotlib) ──────────────────
         tab_charts = QWidget()
         tab_charts_layout = QVBoxLayout(tab_charts)
         tab_charts_layout.setContentsMargins(4, 4, 4, 4)
 
-        if _MPL:
-            refresh_charts_btn = QPushButton("Refresh Charts")
-            refresh_charts_btn.clicked.connect(self._draw_charts)
-            tab_charts_layout.addWidget(refresh_charts_btn, 0)
+        refresh_charts_btn = QPushButton("Refresh Charts")
+        refresh_charts_btn.clicked.connect(self._draw_charts)
+        tab_charts_layout.addWidget(refresh_charts_btn, 0)
 
-            self._fig = _MplFigure(figsize=(14, 7), tight_layout=True)
-            self._canvas = _FigureCanvas(self._fig)
-            tab_charts_layout.addWidget(self._canvas, 1)
-        else:
-            tab_charts_layout.addWidget(QLabel(
-                "Charts require matplotlib.\n"
-                "Install with:  pip install matplotlib"))
+        self._chart_pie  = _PieChartWidget("Avg VT Area Distribution")
+        self._chart_area = _BarChartWidget("Std Cell Area per Run")
+        self._chart_wns  = _BarChartWidget("R2R Setup WNS per Run")
+        self._chart_cgc  = _BarChartWidget("Clock Gating % per Run")
+        from PyQt5.QtWidgets import QGridLayout as _QGL
+        charts_grid = _QGL()
+        charts_grid.addWidget(self._chart_pie,  0, 0)
+        charts_grid.addWidget(self._chart_area, 0, 1)
+        charts_grid.addWidget(self._chart_wns,  1, 0)
+        charts_grid.addWidget(self._chart_cgc,  1, 1)
+        tab_charts_layout.addLayout(charts_grid, 1)
 
         self._tabs.addTab(tab_charts, "Charts")
 
@@ -1143,8 +1295,7 @@ class BlockSummaryDialog(QDialog):
                 "Done. " + str(self.tbl.rowCount()) + " rows loaded.")
             self.prog.setVisible(False)
             self.gen_btn.setEnabled(True)
-            if _MPL:
-                self._draw_charts()
+            self._draw_charts()
             return
         blk, run_path, run_name, runtime, source = self._pending.pop(0)
         self.status_lbl.setText(
@@ -1227,6 +1378,9 @@ class BlockSummaryDialog(QDialog):
         vals = [blk, run_name, mbit, cgc, inst, std_area,
                 gc, vth_str, r2r_setup, r2r_hold, logic_depth, rt]
 
+        # run_path stored in metrics — need it for double-click open
+        _run_path = metrics.get("run_dir", "")
+
         self.tbl.setSortingEnabled(False)
         r = self.tbl.rowCount()
         self.tbl.insertRow(r)
@@ -1238,6 +1392,8 @@ class BlockSummaryDialog(QDialog):
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 if c == 0:
                     f2 = item.font(); f2.setBold(True); item.setFont(f2)
+                    # Store run_path on col-0 for double-click gvim open
+                    item.setData(Qt.UserRole, _run_path)
             # Color R2R Setup WNS (col 8)
             if c == self._COL_R2R_SETUP:
                 try:
@@ -1253,109 +1409,80 @@ class BlockSummaryDialog(QDialog):
             self.tbl.setItem(r, c, item)
         self.tbl.setSortingEnabled(True)
 
-    # ── Charts ───────────────────────────────────────────────────────────
+    # ── Charts (PyQt5 native) ─────────────────────────────────────────────
 
     def _draw_charts(self):
-        if not _MPL or self.tbl.rowCount() == 0:
+        if self.tbl.rowCount() == 0:
             return
-
-        # Gather table data
         n = self.tbl.rowCount()
 
         def _cell(r, c):
             it = self.tbl.item(r, c)
             return it.text() if it else "-"
 
-        blks       = [_cell(r, 0) for r in range(n)]
-        run_names  = [_cell(r, 1) for r in range(n)]
-        labels     = [b + "\n" + rn[:12] for b, rn in zip(blks, run_names)]
-        std_areas  = []
-        r2r_wns    = []
-        cgc_vals   = []
-        vth_lvt, vth_rvt, vth_hvt = [], [], []
+        blks      = [_cell(r, 0) for r in range(n)]
+        run_names = [_cell(r, 1) for r in range(n)]
+        labels    = [b[:8] + ".." if len(b) > 8 else b for b in blks]
+        std_areas, r2r_wns, cgc_vals = [], [], []
+        vth_lvt, vth_rvt, vth_hvt   = [], [], []
 
         for r in range(n):
-            # Std area
-            try:
-                std_areas.append(float(_cell(r, 5)))
-            except Exception:
-                std_areas.append(0.0)
-            # R2R Setup WNS
-            try:
-                r2r_wns.append(float(_cell(r, self._COL_R2R_SETUP).split("/")[0]))
-            except Exception:
-                r2r_wns.append(0.0)
-            # CGC %
-            try:
-                cgc_vals.append(float(_cell(r, 3).rstrip('%')))
-            except Exception:
-                cgc_vals.append(0.0)
-            # VTH L/R/H area%
-            vth_raw = _cell(r, 7)
-            parts = vth_raw.replace('%', '').split('/')
+            try:   std_areas.append(float(_cell(r, 5)))
+            except: std_areas.append(0.0)
+            try:   r2r_wns.append(float(_cell(r, self._COL_R2R_SETUP).split("/")[0]))
+            except: r2r_wns.append(0.0)
+            try:   cgc_vals.append(float(_cell(r, 3).rstrip('%')))
+            except: cgc_vals.append(0.0)
+            parts = _cell(r, 7).replace('%', '').split('/')
             try:
                 vth_lvt.append(float(parts[0]) if len(parts) > 0 else 0.0)
                 vth_rvt.append(float(parts[1]) if len(parts) > 1 else 0.0)
                 vth_hvt.append(float(parts[2]) if len(parts) > 2 else 0.0)
-            except Exception:
+            except:
                 vth_lvt.append(0.0); vth_rvt.append(0.0); vth_hvt.append(0.0)
 
-        self._fig.clear()
-        axes = self._fig.subplots(2, 2)
-        bg   = "#2b2d30" if self.is_dark else "white"
-        fg   = "#dfe1e5" if self.is_dark else "#333333"
-        self._fig.patch.set_facecolor(bg)
-        for ax in axes.flat:
-            ax.set_facecolor(bg)
-            ax.tick_params(colors=fg, labelsize=7)
-            for spine in ax.spines.values():
-                spine.set_edgecolor(fg)
-
-        # ── Top-left: Pie — average VT area distribution ────────────────
-        ax_pie = axes[0][0]
         avg_l = sum(vth_lvt) / n if n else 0
         avg_r = sum(vth_rvt) / n if n else 0
         avg_h = sum(vth_hvt) / n if n else 0
-        pie_vals  = [v for v in [avg_l, avg_r, avg_h] if v > 0]
-        pie_lbls  = [l for l, v in zip(["LVT", "RVT", "HVT"],
-                                        [avg_l, avg_r, avg_h]) if v > 0]
-        if pie_vals:
-            ax_pie.pie(pie_vals, labels=pie_lbls, autopct="%1.1f%%",
-                       colors=["#42a5f5", "#66bb6a", "#ffa726"],
-                       textprops={"color": fg, "fontsize": 8})
-        ax_pie.set_title("Avg VT Area Distribution", color=fg, fontsize=9)
 
-        # ── Top-right: Horizontal bar — Std Area per run ─────────────────
-        ax_area = axes[0][1]
-        y_pos = range(n)
-        ax_area.barh(y_pos, std_areas, color="#42a5f5", height=0.6)
-        ax_area.set_yticks(list(y_pos))
-        ax_area.set_yticklabels(labels, fontsize=6)
-        ax_area.set_xlabel("Std Area (um²)", color=fg, fontsize=8)
-        ax_area.set_title("Std Cell Area per Run", color=fg, fontsize=9)
-        ax_area.xaxis.label.set_color(fg)
+        wns_colors = [QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in r2r_wns]
 
-        # ── Bottom-left: Bar — R2R Setup WNS per run ─────────────────────
-        ax_wns = axes[1][0]
-        colors_wns = ["#ef5350" if v < 0 else "#66bb6a" for v in r2r_wns]
-        ax_wns.bar(range(n), r2r_wns, color=colors_wns, width=0.6)
-        ax_wns.set_xticks(range(n))
-        ax_wns.set_xticklabels(labels, fontsize=6, rotation=30, ha="right")
-        ax_wns.axhline(0, color=fg, linewidth=0.8, linestyle="--")
-        ax_wns.set_ylabel("WNS (ns)", color=fg, fontsize=8)
-        ax_wns.set_title("R2R Setup WNS per Run", color=fg, fontsize=9)
-        ax_wns.yaxis.label.set_color(fg)
+        self._chart_pie.set_data({"LVT": avg_l, "RVT": avg_r, "HVT": avg_h}, self.is_dark)
+        self._chart_area.set_data(labels, std_areas, is_dark=self.is_dark)
+        self._chart_wns.set_data(labels, r2r_wns, colors=wns_colors, is_dark=self.is_dark)
+        self._chart_cgc.set_data(labels, cgc_vals,
+                                  colors=[QColor("#ffa726")] * n, is_dark=self.is_dark)
 
-        # ── Bottom-right: Bar — CGC% per run ─────────────────────────────
-        ax_cgc = axes[1][1]
-        ax_cgc.bar(range(n), cgc_vals, color="#ffa726", width=0.6)
-        ax_cgc.set_xticks(range(n))
-        ax_cgc.set_xticklabels(labels, fontsize=6, rotation=30, ha="right")
-        ax_cgc.set_ylabel("CGC %", color=fg, fontsize=8)
-        ax_cgc.set_title("Clock Gating Ratio per Run", color=fg, fontsize=9)
-        ax_cgc.yaxis.label.set_color(fg)
+    # ── Open cell report in gvim ──────────────────────────────────────────
 
-        self._canvas.draw()
+    _COL_REPORT = {
+        2:  ["multibit_banking_ratio.*.rpt"],
+        3:  ["clock_gating_info.mission.rpt", "clock_gating_info.*.rpt"],
+        7:  ["cell_usage.summary.*.rpt"],
+        8:  ["qor.*.rpt"],
+        9:  ["qor.*.rpt"],
+        10: ["report_logic_depth.summary.*.rpt"],
+        11: ["runtime.V2.rpt"],
+    }
+
+    def _open_cell_report(self, item):
+        c = item.column()
+        col0 = self.tbl.item(item.row(), 0)
+        run_path = col0.data(Qt.UserRole) if col0 else None
+        pats = self._COL_REPORT.get(c)
+        if not pats or not run_path:
+            return
+        try:
+            from metric_extract import _find_rpt
+            rpt = _find_rpt(os.path.join(run_path, "reports"), pats)
+            if rpt and os.path.exists(rpt):
+                subprocess.Popen(['gvim', rpt])
+            else:
+                QMessageBox.information(
+                    self, "Not Found",
+                    "No report found for this column.\nRun path: " + str(run_path))
+        except Exception as e:
+            QMessageBox.warning(self, "Error", str(e))
 
     # ── Mail ─────────────────────────────────────────────────────────────
 
@@ -1363,23 +1490,29 @@ class BlockSummaryDialog(QDialog):
         if self.tbl.rowCount() == 0:
             QMessageBox.information(self, "Mail", "Generate table first.")
             return
-        lines = ["\t".join(
-            self.tbl.horizontalHeaderItem(c).text()
-            for c in range(self.tbl.columnCount())
-        )]
+        nc = self.tbl.columnCount()
+        headers = [self.tbl.horizontalHeaderItem(c).text() for c in range(nc)]
+        # Build HTML table for proper alignment in mail
+        html = ["<table border='1' cellpadding='4' cellspacing='0' "
+                "style='border-collapse:collapse;font-family:monospace;font-size:12px;'>"]
+        html.append("<tr>" + "".join(
+            "<th style='background:#1976d2;color:white;'>{}</th>".format(h)
+            for h in headers) + "</tr>")
         for r in range(self.tbl.rowCount()):
-            lines.append("\t".join(
-                (self.tbl.item(r, c).text() if self.tbl.item(r, c) else "")
-                for c in range(self.tbl.columnCount())
-            ))
-        body = "\n".join(lines)
+            html.append("<tr>" + "".join(
+                "<td>{}</td>".format(
+                    self.tbl.item(r, c).text() if self.tbl.item(r, c) else "")
+                for c in range(nc)) + "</tr>")
+        html.append("</table>")
+        html_body = "\n".join(html)
         parent = self.parent()
         if parent and hasattr(parent, '_open_mail_compose_dialog'):
             parent._open_mail_compose_dialog(
                 subject="Block Summary: " + self.windowTitle(),
-                body=body)
+                body=html_body,
+                html_body=html_body)
         else:
-            QMessageBox.information(self, "Mail Body", body[:3000])
+            QMessageBox.information(self, "Mail Body", html_body[:3000])
 
     # ── Export CSV ───────────────────────────────────────────────────────
 
@@ -2006,7 +2139,7 @@ class PDDashboard(QMainWindow):
         self.view_combo.addItems([
             "All Runs", "FE Only", "BE Only",
             "Running Only", "Failed Only", "Today's Runs",
-            "Hide Stages"])
+            "Pinned Only", "Selected Only"])
         self.view_combo.setFixedWidth(120)
         self.view_combo.currentIndexChanged.connect(self.refresh_view)
         top_layout.addWidget(self.view_combo)
@@ -2372,6 +2505,9 @@ class PDDashboard(QMainWindow):
         self.sb_complete = QLabel("Completed: 0")
         self.sb_running  = QLabel("Running: 0")
         self.sb_selected = QLabel("Selected: 0")
+        self.sb_selected.setCursor(Qt.PointingHandCursor)
+        self.sb_selected.setToolTip("Click to show only selected (checked) runs")
+        self.sb_selected.mousePressEvent = lambda e: self._toggle_selected_only()
         self.sb_scan_time = QLabel("")
         self.sb_config   = QLabel("Config: None")
 
@@ -3291,6 +3427,19 @@ class PDDashboard(QMainWindow):
         self.item_map.clear()
 
         self._building_tree = True
+
+        # Save expand state before clear so filter/ignore actions don't collapse tree
+        def _collect_expanded(node):
+            out = set()
+            nt = node.data(0, Qt.UserRole)
+            if nt in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT", "STANDALONE_ROOT"):
+                if node.isExpanded():
+                    out.add((nt, node.text(0)))
+            for i in range(node.childCount()):
+                out |= _collect_expanded(node.child(i))
+            return out
+        _saved_expanded = _collect_expanded(self.tree.invisibleRootItem())
+
         self.tree.blockSignals(True)
         self.tree.setUpdatesEnabled(False)
         self.tree.setSortingEnabled(False)
@@ -3442,6 +3591,17 @@ class PDDashboard(QMainWindow):
         self.tree.setUpdatesEnabled(True)
         self.tree.blockSignals(False)
         self._building_tree = False
+
+        # Restore expand state (ignore action / rescan keeps tree looking the same)
+        if _saved_expanded:
+            def _apply_expanded(node):
+                nt = node.data(0, Qt.UserRole)
+                if nt in ("BLOCK","MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT"):
+                    if (nt, node.text(0)) in _saved_expanded:
+                        node.setExpanded(True)
+                for i in range(node.childCount()):
+                    _apply_expanded(node.child(i))
+            _apply_expanded(self.tree.invisibleRootItem())
 
         if not self._columns_fitted_once:
             self._columns_fitted_once = True
@@ -3769,15 +3929,17 @@ class PDDashboard(QMainWindow):
         _sel_rtl_all = (sel_rtl == "[ SHOW ALL ]")
         _sel_rtl_sfx = sel_rtl + "_"
         _do_search   = (search_pattern != "*")
-        _fe_only     = (preset == "FE Only")
-        _be_only     = (preset == "BE Only")
-        _run_only    = (preset == "Running Only")
-        _fail_only   = (preset == "Failed Only")
-        _today_only  = (preset == "Today's Runs")
-        _hide_stages = (preset == "Hide Stages")
-        _pins        = self.user_pins
-        _rfc         = self.run_filter_config
-        _notes       = self.global_notes
+        _fe_only       = (preset == "FE Only")
+        _be_only       = (preset == "BE Only")
+        _run_only      = (preset == "Running Only")
+        _fail_only     = (preset == "Failed Only")
+        _today_only    = (preset == "Today's Runs")
+        _pinned_only   = (preset == "Pinned Only")
+        _selected_only = (preset == "Selected Only")
+        _checked_set   = self._checked_paths
+        _pins          = self.user_pins
+        _rfc           = self.run_filter_config
+        _notes         = self.global_notes
 
         def _passes(run):
             if run is None:
@@ -3787,6 +3949,8 @@ class PDDashboard(QMainWindow):
             if _src_out and src != "OUTFEED": return False
             path = run["path"]
             is_golden = (_pins.get(path) == "golden")
+            if _pinned_only and path not in _pins:    return False
+            if _selected_only and path not in _checked_set: return False
             if not is_golden:
                 if run["block"] not in checked_blks:
                     return False
@@ -3805,9 +3969,9 @@ class PDDashboard(QMainWindow):
                 if rtl != sel_rtl and not rtl.startswith(_sel_rtl_sfx):
                     return False
             rt_type = run["run_type"]
-            if _fe_only  and rt_type != "FE": return False
-            if _be_only  and rt_type != "BE": return False
-            if _hide_stages and rt_type == "FE": pass  # show FE runs, just hide their stages
+            if _fe_only and rt_type != "FE": return False
+            # BE-only: keep FE items visible as containers for their BE children
+            if _be_only and rt_type not in ("BE", "FE"): return False
             if _run_only and not (rt_type == "FE" and not run["is_comp"]):
                 return False
             if _fail_only:
@@ -3826,6 +3990,7 @@ class PDDashboard(QMainWindow):
                 notes    = " | ".join(_notes.get(note_id, []))
                 combined = (
                     f"{run['r_name']} {rtl} {src} {rt_type} "
+                    f"{run.get('owner','')} "
                     f"{run.get('st_n','')} {run.get('st_u','')} "
                     f"{run.get('vslp_status','')} "
                     f"{run['info']['runtime']} {run['info']['start']} "
@@ -3846,7 +4011,6 @@ class PDDashboard(QMainWindow):
 
         _GROUP_TYPES = frozenset(
             ("BLOCK","MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT"))
-        _expand_when_filtered = (preset != "All Runs" or bool(raw_query))
         _UR   = Qt.UserRole
         _UR10 = Qt.UserRole + 10
 
@@ -3868,20 +4032,19 @@ class PDDashboard(QMainWindow):
                     return not item.isHidden()
                 return False
             # Group nodes (BLOCK, MILESTONE, RTL, IGNORED_ROOT) recurse
-            # into children. Also handles hide_block_nodes=True where
-            # MILESTONE nodes sit directly under root with no BLOCK parent.
+            # into children. Never auto-expand — preserve user's expand state.
             if node_type in _GROUP_TYPES or node_type == "MILESTONE":
                 any_visible = False
                 for i in range(item.childCount()):
                     if _update_visibility(item.child(i)):
                         any_visible = True
                 item.setHidden(not any_visible)
-                if any_visible and _expand_when_filtered:
-                    item.setExpanded(True)
+                # No setExpanded() — user expand state is preserved
                 return any_visible
             else:
-                run    = item.data(0, _UR10)
-                passes = _passes(run)
+                run         = item.data(0, _UR10)
+                passes      = _passes(run)
+                rt_type_run = run.get("run_type") if run else None
                 item.setHidden(not passes)
                 if passes and run:
                     visible_runs.append(run)
@@ -3890,13 +4053,16 @@ class PDDashboard(QMainWindow):
                     if ch.data(0, _UR) == "__PLACEHOLDER__":
                         ch.setHidden(True)
                     elif ch.data(0, _UR) == "STAGE":
-                        # Hide stages if "Hide Stages" preset selected
-                        if _hide_stages:
-                            ch.setHidden(True)
-                        else:
-                            ch.setHidden(not passes)
+                        # When BE-only: hide synthesis stages of FE parent
+                        hide_stage = not passes or (
+                            _be_only and rt_type_run == "FE")
+                        ch.setHidden(hide_stage)
                     else:
-                        ch.setHidden(not passes)
+                        # BE child run under FE item: hide when FE-only
+                        child_run = ch.data(0, _UR10)
+                        child_rt  = child_run.get("run_type") if child_run else None
+                        hide_child = not passes or (_fe_only and child_rt == "BE")
+                        ch.setHidden(hide_child)
                 return passes
 
         root = self.tree.invisibleRootItem()
@@ -5029,17 +5195,32 @@ class PDDashboard(QMainWindow):
         if dlg.exec_():
             _send_mail_via_util(dlg)
 
+    def _toggle_selected_only(self):
+        """Click on Selected count label → toggle Selected Only view."""
+        if self.view_combo.currentText() == "Selected Only":
+            self.view_combo.setCurrentText("All Runs")
+        else:
+            if not self._checked_paths:
+                return  # nothing checked, ignore
+            self.view_combo.setCurrentText("Selected Only")
+
     def send_custom_mail_action(self):
         all_known = _get_all_known_mail_users()
         dlg = AdvancedMailDialog("", "", all_known, "", self)
         if dlg.exec_():
             _send_mail_via_util(dlg)
 
-    def _open_mail_compose_dialog(self, subject="", body="", prefill_to=""):
+    def _open_mail_compose_dialog(self, subject="", body="", prefill_to="",
+                                   html_body=""):
         """Open AdvancedMailDialog pre-filled with subject/body.
-        Called by BlockSummaryDialog 'Send as Mail' button."""
+        Called by BlockSummaryDialog 'Send as Mail' button.
+        Pass html_body to send as HTML email (rendered table etc.)."""
         all_known = _get_all_known_mail_users()
-        dlg = AdvancedMailDialog(subject, body, all_known, prefill_to, self)
+        # Show rendered HTML preview in body widget; store raw HTML for sending
+        display_body = html_body if html_body else body
+        dlg = AdvancedMailDialog(subject, display_body, all_known, prefill_to, self)
+        if html_body:
+            dlg._html_body = html_body  # picked up by _send_mail_via_util
         if dlg.exec_():
             _send_mail_via_util(dlg)
 
@@ -5114,19 +5295,8 @@ class PDDashboard(QMainWindow):
         dlg.resize(1020, 700)
         layout = QVBoxLayout(dlg)
 
-        # Filter bar -- Source and Run Type
+        # Summary bar
         filter_bar = QHBoxLayout()
-        filter_bar.addWidget(QLabel("<b>Source:</b>"))
-        src_filter = QComboBox()
-        src_filter.addItems(["ALL", "WS", "OUTFEED"])
-        src_filter.setFixedWidth(100)
-        filter_bar.addWidget(src_filter)
-        filter_bar.addSpacing(20)
-        filter_bar.addWidget(QLabel("<b>Run Type:</b>"))
-        type_filter = QComboBox()
-        type_filter.addItems(["FE + BE", "FE Only", "BE Only"])
-        type_filter.setFixedWidth(100)
-        filter_bar.addWidget(type_filter)
         filter_bar.addStretch()
         filter_bar.addWidget(QLabel(
             f"<small>Total: {len(fe_runs)} FE runs, {len(be_runs)} BE runs</small>"))

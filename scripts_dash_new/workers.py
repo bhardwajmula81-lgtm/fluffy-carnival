@@ -817,16 +817,18 @@ class ScannerWorker(QThread):
                 if source == "OUTFEED" and step_name in ["reports", "logs", "pass", "fail", "outputs"]:
                     continue
 
+                is_fc = "/innovus/" not in rd.replace("\\", "/")
                 if source == "WS":
                     # WS PNR structure:
-                    # fc:      log -> {rd}/{stage}/logs/{stage}.log
-                    # innovus: log -> {rd}/logs/{stage}.log
-                    rpt        = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
+                    # fc:      log/rpt -> {rd}/{stage}/logs|reports/{stage}.*
+                    # innovus: log/rpt -> {rd}/logs|reports/{stage}.*
                     stage_path = os.path.join(rd, "outputs", step_name)
-                    if "/innovus/" in rd.replace("\\", "/"):
-                        log = os.path.join(rd, "logs", f"{step_name}.log")
+                    if is_fc:
+                        rpt = os.path.join(rd, step_name, "reports", f"{step_name}.runtime.rpt")
+                        log = os.path.join(rd, step_name, "logs",    f"{step_name}.log")
                     else:
-                        log = os.path.join(rd, step_name, "logs", f"{step_name}.log")
+                        rpt = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
+                        log = os.path.join(rd, "logs",    f"{step_name}.log")
                 else:
                     # OUTFEED PNR structure (s_dir = rd/step_name):
                     # log -> {s_dir}/logs/{stage}.log
@@ -834,12 +836,17 @@ class ScannerWorker(QThread):
                     log        = os.path.join(s_dir, "logs",    f"{step_name}.log")
                     stage_path = os.path.join(rd,    step_name)
 
-                fm_u_glob    = glob.glob(os.path.join(evt_base, "fm",   clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
-                fm_n_glob    = glob.glob(os.path.join(evt_base, "fm",   clean_be_run, step_name, "n2n_func",   "reports", "*.failpoint.rpt"))
+                # For OUTFEED BE runs: FM/VSLP live under the run's parent dir
+                # (parent = {BASE_OUTFEED_DIR}/{BLK}/{EVT_ML_DEV_folder})
+                # For WS BE runs: use evt_base from RTL tag lookup
+                evt_base_stage = os.path.dirname(rd) if source == "OUTFEED" else evt_base
+
+                fm_u_glob    = glob.glob(os.path.join(evt_base_stage, "fm",   clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
+                fm_n_glob    = glob.glob(os.path.join(evt_base_stage, "fm",   clean_be_run, step_name, "n2n_func",   "reports", "*.failpoint.rpt"))
                 st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
                 st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
-                st_vslp_rpt  = os.path.join(evt_base, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
-                sta_rpt      = os.path.join(evt_base, "pt",   r_name, step_name, "reports", "sta", "summary", "summary.rpt")
+                st_vslp_rpt  = os.path.join(evt_base_stage, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
+                sta_rpt      = os.path.join(evt_base_stage, "pt",   r_name, step_name, "reports", "sta", "summary", "summary.rpt")
                 qor_path     = rd if rd.endswith("/") else rd + "/"
 
                 stages.append({
