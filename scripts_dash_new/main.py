@@ -3357,6 +3357,10 @@ class PDDashboard(QMainWindow):
         runs_be = [r for r in runs_to_process if r["run_type"] != "FE"]
         ordered_runs = runs_fe + runs_be
 
+        # O(1) FE parent lookup dict: (block, fe_base_name, source) -> QTreeWidgetItem
+        # Built while processing FE runs; used instantly by BE runs.
+        _fe_lookup = {}
+
         _item_count = 0
         for run in ordered_runs:
             run_rtl = run["rtl"]
@@ -3377,66 +3381,36 @@ class PDDashboard(QMainWindow):
                            else self._get_node(attach_root, blk_name, "BLOCK"))
 
             if milestone == "SOC / TOP":
-                # No MILESTONE node for TOP/SOC innovus runs — place RTL directly under block
                 parent_for_run = self._get_node(base_attach, base_rtl, "RTL")
             else:
                 m_node = self._get_node(base_attach, milestone, "MILESTONE")
-                # All syn* variants placed directly under base RTL node
                 parent_for_run = self._get_node(m_node, base_rtl, "RTL")
 
             if run["run_type"] == "FE":
                 run_item = self._create_run_item(parent_for_run, run)
                 run_item.setData(0, Qt.UserRole + 10, run)
+                # Register in O(1) lookup so BE runs can find this instantly
+                fe_text = run["r_name"]
+                fe_base = fe_text[:-3] if fe_text.endswith("-FE") else fe_text
+                src     = run["source"]
+                _fe_lookup[(run["block"], fe_base, src)]  = run_item
+                _fe_lookup[(run["block"], fe_base, "")]   = run_item  # source-agnostic fallback
 
             elif run["run_type"] == "BE":
-                # Pre-compute FE name from BE run name.
-                # FE names have NO underscores -- split at first _ after EVT prefix.
+                be_block  = run["block"]
+                be_source = run["source"]
+
+                # Derive FE base name from BE run name
                 _r = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', run["r_name"])
                 _idx = _r.find('_')
                 if _idx == -1:
-                    # Direct fc BE: run1-BE -> run1
                     fe_name_from_be = _r[:-3] if _r.endswith('-BE') else _r
                 else:
-                    fe_name_from_be = _r[:_idx]  # e.g. "M2D2S2-mohit-bhar-..."
-                be_source = run["source"]
-                be_block  = run["block"]
+                    fe_name_from_be = _r[:_idx]
 
-                def _find_fe_parent(search_node):
-                    """Search for matching FE run.
-                    Uses exact name match: after stripping EVT prefix,
-                    split at first underscore to extract FE name,
-                    then compare directly with FE item text."""
-                    for i in range(search_node.childCount()):
-                        c = search_node.child(i)
-                        nt = c.data(0, Qt.UserRole)
-                        if nt in ("RTL", "MILESTONE"):
-                            found = _find_fe_parent(c)
-                            if found:
-                                return found
-                        if nt in ("STAGE","__PLACEHOLDER__","BLOCK",
-                                  "MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT"):
-                            continue
-                        # FE candidate -- must be from same source
-                        fe_source = c.text(2).strip()
-                        source_ok = (fe_source == be_source
-                                     or not fe_source or not be_source)
-                        if not source_ok:
-                            continue
-                        if c.data(0, Qt.UserRole + 2) != be_block:
-                            continue
-                        fe_text = c.text(0)
-                        fe_base = fe_text[:-3] if fe_text.endswith("-FE") else fe_text
-                        # Exact match using first-underscore split rule
-                        if fe_name_from_be == fe_base:
-                            return c
-                    return None
-
-                # First try the same RTL node (fast path)
-                fe_parent = _find_fe_parent(parent_for_run)
-                # If not found, search the entire block subtree
-                # (handles innovus runs with different RTL than FE)
-                if fe_parent is None:
-                    fe_parent = _find_fe_parent(base_attach)
+                # O(1) lookup: exact source first, then source-agnostic fallback
+                fe_parent = (_fe_lookup.get((be_block, fe_name_from_be, be_source))
+                             or _fe_lookup.get((be_block, fe_name_from_be, "")))
 
                 if fe_parent is None and not is_ignored:
                     st_base = (standalone_root if _hide_blk
@@ -3446,6 +3420,7 @@ class PDDashboard(QMainWindow):
                     actual_parent = st_rtl
                 else:
                     actual_parent = fe_parent if fe_parent else parent_for_run
+
                 be_item = self._create_run_item(actual_parent, run)
                 be_item.setData(0, Qt.UserRole + 10, run)
                 if run.get("stages"):
@@ -3459,21 +3434,6 @@ class PDDashboard(QMainWindow):
             root.removeChild(ign_root)
         if standalone_root.childCount() == 0:
             root.removeChild(standalone_root)
-
-        # Apply pin icons
-        def update_nodes(node):
-            if node.data(0, Qt.UserRole) not in (
-                    "BLOCK", "RTL", "MILESTONE", "IGNORED_ROOT", "STANDALONE_ROOT"):
-                pin_type = self.user_pins.get(node.text(15))
-                if pin_type in self.icons:
-                    node.setIcon(0, self.icons[pin_type])
-                    node.setData(0, Qt.UserRole + 5, pin_type)
-                else:
-                    node.setIcon(0, QIcon())
-                    node.setData(0, Qt.UserRole + 5, None)
-            for i in range(node.childCount()):
-                update_nodes(node.child(i))
-        update_nodes(root)
 
         self.tree.setSortingEnabled(True)
         # Default sort: Run Name column A-Z ascending
@@ -3648,6 +3608,12 @@ class PDDashboard(QMainWindow):
         else:
             child.setForeground(
                 2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
+
+        # Apply pin icon at creation time — O(1), replaces post-build tree walk
+        pin_type = self.user_pins.get(run["path"])
+        if pin_type and pin_type in self.icons:
+            child.setIcon(0, self.icons[pin_type])
+            child.setData(0, Qt.UserRole + 5, pin_type)
 
         return child
 
@@ -5066,6 +5032,14 @@ class PDDashboard(QMainWindow):
     def send_custom_mail_action(self):
         all_known = _get_all_known_mail_users()
         dlg = AdvancedMailDialog("", "", all_known, "", self)
+        if dlg.exec_():
+            _send_mail_via_util(dlg)
+
+    def _open_mail_compose_dialog(self, subject="", body="", prefill_to=""):
+        """Open AdvancedMailDialog pre-filled with subject/body.
+        Called by BlockSummaryDialog 'Send as Mail' button."""
+        all_known = _get_all_known_mail_users()
+        dlg = AdvancedMailDialog(subject, body, all_known, prefill_to, self)
         if dlg.exec_():
             _send_mail_via_util(dlg)
 
