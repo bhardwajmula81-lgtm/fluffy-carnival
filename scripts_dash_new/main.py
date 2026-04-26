@@ -232,7 +232,7 @@ def _send_mail_via_util(dlg):
     # Prefer raw HTML body if dialog stored one (e.g. from BlockSummaryDialog._send_mail)
     if hasattr(dlg, '_html_body') and dlg._html_body:
         body = dlg._html_body
-        fmt  = "html"
+        fmt  = "gormat"   # send_mail_for_rhel7 flag value for HTML format
     else:
         body = dlg.body_input.toPlainText()
         fmt  = "text"
@@ -3601,31 +3601,10 @@ class PDDashboard(QMainWindow):
                 _fe_lookup[(run["block"], fe_base, "")]   = run_item  # source-agnostic fallback
 
             elif run["run_type"] == "BE":
-                be_block  = run["block"]
-                be_source = run["source"]
-
-                # Derive FE base name from BE run name
-                _r = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', run["r_name"])
-                _idx = _r.find('_')
-                if _idx == -1:
-                    fe_name_from_be = _r[:-3] if _r.endswith('-BE') else _r
-                else:
-                    fe_name_from_be = _r[:_idx]
-
-                # O(1) lookup: exact source first, then source-agnostic fallback
-                fe_parent = (_fe_lookup.get((be_block, fe_name_from_be, be_source))
-                             or _fe_lookup.get((be_block, fe_name_from_be, "")))
-
-                if fe_parent is None and not is_ignored:
-                    st_base = (standalone_root if _hide_blk
-                               else self._get_node(standalone_root, blk_name, "BLOCK"))
-                    st_m   = self._get_node(st_base, milestone, "MILESTONE")
-                    st_rtl = self._get_node(st_m, base_rtl, "RTL")
-                    actual_parent = st_rtl
-                else:
-                    actual_parent = fe_parent if fe_parent else parent_for_run
-
-                be_item = self._create_run_item(actual_parent, run)
+                # Place BE runs as siblings of FE under the same RTL node.
+                # Previously BE was nested under its FE item, which broke BE-only filter
+                # (PyQt5 hides the full subtree when parent is hidden).
+                be_item = self._create_run_item(parent_for_run, run)
                 be_item.setData(0, Qt.UserRole + 10, run)
                 if run.get("stages"):
                     ph = QTreeWidgetItem(be_item)
@@ -4023,8 +4002,7 @@ class PDDashboard(QMainWindow):
                     return False
             rt_type = run["run_type"]
             if _fe_only and rt_type != "FE": return False
-            # BE-only: keep FE items visible as containers for their BE children
-            if _be_only and rt_type not in ("BE", "FE"): return False
+            if _be_only and rt_type != "BE": return False
             if _run_only and not (rt_type == "FE" and not run["is_comp"]):
                 return False
             if _fail_only:
@@ -4119,16 +4097,8 @@ class PDDashboard(QMainWindow):
                     if ch.data(0, _UR) == "__PLACEHOLDER__":
                         ch.setHidden(True)
                     elif ch.data(0, _UR) == "STAGE":
-                        # When BE-only: hide synthesis stages of FE parent
-                        hide_stage = not passes or (
-                            _be_only and rt_type_run == "FE")
-                        ch.setHidden(hide_stage)
-                    else:
-                        # BE child run under FE item: hide when FE-only
-                        child_run = ch.data(0, _UR10)
-                        child_rt  = child_run.get("run_type") if child_run else None
-                        hide_child = not passes or (_fe_only and child_rt == "BE")
-                        ch.setHidden(hide_child)
+                        # STAGE child: hide when parent run doesn't pass filter
+                        ch.setHidden(not passes)
                 return passes
 
         root = self.tree.invisibleRootItem()

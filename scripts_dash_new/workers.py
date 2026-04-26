@@ -836,29 +836,64 @@ class ScannerWorker(QThread):
                     # innovus: log/rpt -> {rd}/logs|reports/{stage}.*
                     stage_path = os.path.join(rd, "outputs", step_name)
                     if is_fc:
-                        rpt = os.path.join(rd, step_name, "reports", f"{step_name}.runtime.rpt")
-                        log = os.path.join(rd, step_name, "logs",    f"{step_name}.log")
+                        log = os.path.join(rd, step_name, "logs", f"{step_name}.log")
+                        # fc may place runtime.rpt in reports/ directly or in reports/{stage}/
+                        _rpt_cands = [
+                            os.path.join(rd, step_name, "reports", f"{step_name}.runtime.rpt"),
+                            os.path.join(rd, step_name, f"{step_name}.runtime.rpt"),
+                        ]
+                        rpt = next((p for p in _rpt_cands if os.path.exists(p)), _rpt_cands[0])
                     else:
                         rpt = os.path.join(rd, "reports", step_name, f"{step_name}.runtime.rpt")
                         log = os.path.join(rd, "logs",    f"{step_name}.log")
                 else:
                     # OUTFEED PNR structure (s_dir = rd/step_name):
-                    # log -> {s_dir}/logs/{stage}.log
-                    rpt        = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
-                    log        = os.path.join(s_dir, "logs",    f"{step_name}.log")
-                    stage_path = os.path.join(rd,    step_name)
+                    log        = os.path.join(s_dir, "logs", f"{step_name}.log")
+                    stage_path = os.path.join(rd, step_name)
+                    if is_fc:
+                        # fc OUTFEED: runtime.rpt directly under s_dir/reports/ (no extra subdir)
+                        _rpt_cands = [
+                            os.path.join(s_dir, "reports", f"{step_name}.runtime.rpt"),
+                            os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt"),
+                        ]
+                        rpt = next((p for p in _rpt_cands if os.path.exists(p)), _rpt_cands[0])
+                    else:
+                        rpt = os.path.join(s_dir, "reports", step_name, f"{step_name}.runtime.rpt")
 
                 # For OUTFEED BE runs: FM/VSLP live under the run's parent dir
                 # (parent = {BASE_OUTFEED_DIR}/{BLK}/{EVT_ML_DEV_folder})
                 # For WS BE runs: use evt_base from RTL tag lookup
                 evt_base_stage = os.path.dirname(rd) if source == "OUTFEED" else evt_base
 
-                fm_u_glob    = glob.glob(os.path.join(evt_base_stage, "fm",   clean_be_run, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
-                fm_n_glob    = glob.glob(os.path.join(evt_base_stage, "fm",   clean_be_run, step_name, "n2n_func",   "reports", "*.failpoint.rpt"))
+                # FM globs: try full r_name first (e.g. "EVT1_ML2_DEV3_BLK-BE"),
+                # then clean_be_run (stripped of EVT prefix) as fallback.
+                # User-confirmed path: {evt_base}/fm/{r_name}/{step}/n2*_func/reports/*.failpoint.rpt
+                fm_u_glob = fm_n_glob = []
+                for _be_dir in [r_name, clean_be_run]:
+                    fm_u_glob = glob.glob(os.path.join(
+                        evt_base_stage, "fm", _be_dir, step_name, "n2upf_func", "reports", "*.failpoint.rpt"))
+                    fm_n_glob = glob.glob(os.path.join(
+                        evt_base_stage, "fm", _be_dir, step_name, "n2n_func",   "reports", "*.failpoint.rpt"))
+                    if fm_u_glob or fm_n_glob:
+                        break
                 st_fm_u_path = fm_u_glob[0] if fm_u_glob else ""
                 st_fm_n_path = fm_n_glob[0] if fm_n_glob else ""
-                st_vslp_rpt  = os.path.join(evt_base_stage, "vslp", clean_be_run, "pgnet", step_name, "reports", "report_lp.rpt")
-                sta_rpt      = os.path.join(evt_base_stage, "pt",   r_name, step_name, "reports", "sta", "summary", "summary.rpt")
+
+                # VSLP is under fm/{run}/{step}/pgnet/ — NOT under a separate vslp/ dir.
+                # User-confirmed path: {evt_base}/fm/{r_name}/{step}/pgnet/reports/report_lp.rpt
+                st_vslp_rpt = ""
+                for _be_dir in [r_name, clean_be_run]:
+                    _vslp_cand = os.path.join(
+                        evt_base_stage, "fm", _be_dir, step_name, "pgnet", "reports", "report_lp.rpt")
+                    if os.path.exists(_vslp_cand):
+                        st_vslp_rpt = _vslp_cand
+                        break
+                if not st_vslp_rpt:
+                    # Default to r_name path (will show red/missing if not present — correct)
+                    st_vslp_rpt = os.path.join(
+                        evt_base_stage, "fm", r_name, step_name, "pgnet", "reports", "report_lp.rpt")
+
+                sta_rpt = os.path.join(evt_base_stage, "pt", r_name, step_name, "reports", "sta", "summary", "summary.rpt")
                 qor_path     = rd if rd.endswith("/") else rd + "/"
 
                 stages.append({
