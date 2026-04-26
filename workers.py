@@ -188,13 +188,16 @@ def parse_pnr_runtime_rpt(file_path):
         with open(file_path, "r") as f:
             for line in f:
                 ts = re.search(
-                    r"(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})", line)
+                    r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})", line)
                 tm = re.findall(
                     r"(\d+)d:(\d+)h:(\d+)m:(\d+)s", line)
+                if ts and not first_ts:
+                    first_ts = ts
+                if ts:
+                    last_ts = ts
                 if ts and tm:
                     if not first_ts:
                         first_ts = ts
-                    last_ts = ts
                     t = tm[1] if len(tm) > 1 else tm[0]
                     d2, h2, mn, sc = map(int, t)
                     final_time_str = (f"{d2*24+h2:02}h:"
@@ -857,12 +860,19 @@ class ScannerWorker(QThread):
 
         stages = []
         if run_type == "BE":
-            search_glob = (os.path.join(rd, "outputs", "*") if source == "WS"
-                           else os.path.join(rd, "*"))
+            is_innovus_run = "/innovus/" in rd.replace("\\", "/")
+            if source == "WS" and is_innovus_run:
+                search_glob = os.path.join(rd, "reports", "*")
+            elif source == "WS":
+                search_glob = os.path.join(rd, "outputs", "*")
+            else:
+                search_glob = os.path.join(rd, "*")
             for s_dir in glob.glob(search_glob):
                 if not os.path.isdir(s_dir):
                     continue
                 step_name = os.path.basename(s_dir)
+                if step_name in ["logs", "pass", "fail", "outputs"]:
+                    continue
                 if source == "OUTFEED" and step_name in ["reports", "logs", "pass", "fail", "outputs"]:
                     continue
 
@@ -871,7 +881,8 @@ class ScannerWorker(QThread):
                 # NFS stat calls here would block the scan worker for hundreds of ms per stage.
                 # All path resolution is deferred to StageDetailWorker (background thread).
                 if source == "WS":
-                    stage_path = os.path.join(rd, "outputs", step_name)
+                    stage_path = (os.path.join(rd, "outputs", step_name)
+                                  if is_fc else os.path.join(rd, "reports", step_name))
                     if is_fc:
                         log = os.path.join(rd, step_name, "logs", f"{step_name}.log")
                         rpt_cands = [os.path.join(rd, "reports", step_name,
