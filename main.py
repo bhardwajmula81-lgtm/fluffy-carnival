@@ -1340,6 +1340,18 @@ class _TimelineChartWidget(QWidget):
         self.is_dark = is_dark
         self.update()
 
+    def preferred_height(self, width):
+        card_w = 156
+        card_h = 62
+        gap_x = 40
+        gap_y = 28
+        left = 16
+        top = 36
+        usable_w = max(card_w, int(width) - left * 2)
+        per_row = max(1, int((usable_w + gap_x) / (card_w + gap_x)))
+        rows = max(1, (len(self.events or []) + per_row - 1) // per_row)
+        return top + rows * (card_h + gap_y) + 20
+
     def _dt(self, val):
         if self.parser:
             try:
@@ -1369,17 +1381,15 @@ class _TimelineChartWidget(QWidget):
         p.drawText(8, 8, r.width() - 16, 18,
                    Qt.AlignLeft | Qt.AlignVCenter,
                    "Timeline flow")
-        card_w = 176
-        card_h = 68
-        gap_x = 56
-        gap_y = 34
-        left = 18
-        top = 40
+        card_w = 156
+        card_h = 62
+        gap_x = 40
+        gap_y = 28
+        left = 16
+        top = 36
         usable_w = max(card_w, r.width() - left * 2)
         per_row = max(1, int((usable_w + gap_x) / (card_w + gap_x)))
-        max_rows = max(1, int((r.height() - top - 24) / (card_h + gap_y)))
-        max_items = per_row * max_rows
-        shown = events[:max_items]
+        shown = events
         prev_end = None
         for idx, ev in enumerate(shown):
             row = idx // per_row
@@ -1396,12 +1406,12 @@ class _TimelineChartWidget(QWidget):
             name = ev.get("name", "-")
             if " / " in name:
                 name = name.split(" / ")[-1]
-            if len(name) > 24:
-                name = name[:21] + "..."
+            if len(name) > 20:
+                name = name[:17] + "..."
             p.drawText(x + 8, y + 6, card_w - 16, 18,
                        Qt.AlignLeft | Qt.AlignVCenter, name)
             txt = ev.get("runtime", "-")
-            p.drawText(x + 8, y + 28, card_w - 16, 16,
+            p.drawText(x + 8, y + 26, card_w - 16, 16,
                        Qt.AlignLeft | Qt.AlignVCenter,
                        "Runtime: " + txt)
             st = self._dt(ev.get("start"))
@@ -1409,7 +1419,7 @@ class _TimelineChartWidget(QWidget):
             when = ev.get("start", "-")
             if st:
                 when = st.strftime("%m/%d %H:%M")
-            p.drawText(x + 8, y + 46, card_w - 16, 16,
+            p.drawText(x + 8, y + 43, card_w - 16, 16,
                        Qt.AlignLeft | Qt.AlignVCenter, when)
             if idx > 0:
                 if col == 0:
@@ -1444,13 +1454,6 @@ class _TimelineChartWidget(QWidget):
                         p.drawText(x - gap_x + 4, y + 2, gap_x - 8, 18,
                                    Qt.AlignCenter, gap_txt)
             prev_end = en or prev_end
-        if len(events) > len(shown):
-            p.setPen(muted)
-            p.drawText(8, r.height() - 22, r.width() - 16, 18,
-                       Qt.AlignRight,
-                       "+{} more rows in table".format(
-                           len(events) - len(shown)))
-
     def _gap_text(self, prev_end, start):
         if not prev_end or not start:
             return "-"
@@ -6259,6 +6262,16 @@ class PDDashboard(QMainWindow):
         m = (secs % 3600) // 60
         return "{}{:02d}h:{:02d}m".format(sign, h, m)
 
+    def _valid_timeline_event(self, ev):
+        if not ev:
+            return False
+        runtime = str(ev.get("runtime", "") or "").strip()
+        if runtime in ("", "-", "N/A", "Unknown"):
+            return False
+        start_dt = self._parse_dashboard_time(ev.get("start"))
+        end_dt = self._parse_dashboard_time(ev.get("end"))
+        return bool(start_dt and end_dt and end_dt >= start_dt)
+
     def _stage_info_for_timeline(self, be_run, stage):
         info = dict(stage.get("info", {}) or {})
         if info.get("start") not in ("", "-", "N/A", None):
@@ -6283,13 +6296,15 @@ class PDDashboard(QMainWindow):
         fe_run = fe_item.data(0, Qt.UserRole + 10) if fe_item else None
 
         if fe_run and fe_run.get("run_type") == "FE":
-            events.append({
+            ev = {
                 "name": fe_run.get("r_name", fe_item.text(0)),
                 "kind": "FE",
                 "start": fe_item.data(0, Qt.UserRole + 40) or fe_run.get("info", {}).get("start", "-"),
                 "end": fe_item.data(0, Qt.UserRole + 41) or fe_run.get("info", {}).get("end", "-"),
                 "runtime": fe_run.get("info", {}).get("runtime", "-"),
-            })
+            }
+            if self._valid_timeline_event(ev):
+                events.append(ev)
 
         be_items = []
         if run.get("run_type") == "BE":
@@ -6307,13 +6322,15 @@ class PDDashboard(QMainWindow):
             if be_run.get("stages"):
                 for st in be_run.get("stages", []):
                     info = self._stage_info_for_timeline(be_run, st)
-                    events.append({
+                    ev = {
                         "name": be_name + " / " + st.get("name", "-"),
                         "kind": "STAGE",
                         "start": info.get("start", "-"),
                         "end": info.get("end", "-"),
                         "runtime": info.get("runtime", "-"),
-                    })
+                    }
+                    if self._valid_timeline_event(ev):
+                        events.append(ev)
 
         def _key(ev):
             return self._parse_dashboard_time(ev.get("start")) or datetime.datetime.max
@@ -6322,7 +6339,10 @@ class PDDashboard(QMainWindow):
     def show_timeline_overview(self, item):
         events = self._timeline_events_for_item(item)
         if not events:
-            QMessageBox.information(self, "Timeline", "No timeline data found for this run.")
+            QMessageBox.information(
+                self, "Timeline",
+                "No timed FE/stage rows found for this run. "
+                "Rows without runtime/start/end are hidden from the timeline.")
             return
         dlg = QDialog(self)
         dlg.setWindowTitle("Timeline Overview: " + item.text(0))
@@ -6334,17 +6354,26 @@ class PDDashboard(QMainWindow):
             dlg.resize(1000, 620)
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(10, 10, 10, 10)
-        chain = "  >  ".join(ev["name"] for ev in events[:12])
-        if len(events) > 12:
-            chain += "  >  ..."
-        flow_lbl = QLabel("<b>Flow:</b> " + chain)
-        flow_lbl.setWordWrap(True)
-        flow_lbl.setMaximumHeight(56)
-        layout.addWidget(flow_lbl)
+        first_dt = min(self._parse_dashboard_time(ev.get("start"))
+                       for ev in events)
+        last_dt = max(self._parse_dashboard_time(ev.get("end"))
+                      for ev in events)
+        span_txt = self._fmt_gap(first_dt, last_dt)
+        summary = QLabel(
+            "<b>Timeline:</b> {} timed step(s), total span {}".format(
+                len(events), span_txt))
+        summary.setStyleSheet("color: #1976d2;")
+        layout.addWidget(summary)
 
         chart = _TimelineChartWidget(events, self._parse_dashboard_time,
                                      self.is_dark_mode)
-        layout.addWidget(chart)
+        chart.setMinimumHeight(chart.preferred_height(max(720, dlg.width() - 40)))
+        chart_scroll = QScrollArea()
+        chart_scroll.setWidgetResizable(True)
+        chart_scroll.setWidget(chart)
+        chart_scroll.setMinimumHeight(230)
+        chart_scroll.setMaximumHeight(360)
+        layout.addWidget(chart_scroll)
 
         tbl = QTableWidget(0, 6)
         tbl.setHorizontalHeaderLabels(["Step", "Type", "Start", "End", "Runtime", "Gap From Previous"])
