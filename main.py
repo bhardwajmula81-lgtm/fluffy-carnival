@@ -31,7 +31,7 @@ from PyQt5.QtWidgets import (
     QSpinBox, QColorDialog, QTabWidget, QTableWidget,
     QTableWidgetItem, QScrollArea, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint
+from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint, QRect
 from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QBrush,
                          QPainter, QPen, QPixmap, QIcon, QPolygon)
@@ -1327,12 +1327,16 @@ class _StackedVtChartWidget(QWidget):
 
 class _TimelineChartWidget(QWidget):
     """Readable sequential pipeline timeline for FE and PNR stage events."""
+    event_clicked = pyqtSignal(object)
+
     def __init__(self, events=None, parser=None, is_dark=False):
         super().__init__()
         self.events = events or []
         self.parser = parser
         self.is_dark = is_dark
-        self.setMinimumHeight(240)
+        self._event_rects = []
+        self.setCursor(Qt.PointingHandCursor)
+        self.setMinimumHeight(170)
 
     def set_data(self, events, parser, is_dark=False):
         self.events = events or []
@@ -1341,16 +1345,14 @@ class _TimelineChartWidget(QWidget):
         self.update()
 
     def preferred_height(self, width):
-        card_w = 156
-        card_h = 62
-        gap_x = 40
-        gap_y = 28
-        left = 16
-        top = 36
-        usable_w = max(card_w, int(width) - left * 2)
-        per_row = max(1, int((usable_w + gap_x) / (card_w + gap_x)))
-        rows = max(1, (len(self.events or []) + per_row - 1) // per_row)
-        return top + rows * (card_h + gap_y) + 20
+        return 170
+
+    def preferred_width(self):
+        card_w = 230
+        gap_x = 72
+        left = 18
+        n = max(1, len(self.events or []))
+        return left * 2 + n * card_w + max(0, n - 1) * gap_x
 
     def _dt(self, val):
         if self.parser:
@@ -1366,13 +1368,15 @@ class _TimelineChartWidget(QWidget):
         bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
         fg = QColor("#dfe1e5" if self.is_dark else "#263238")
         muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
-        line = QColor("#6b7280" if self.is_dark else "#cfd8dc")
+        line = QColor("#7b8794" if self.is_dark else "#b0bec5")
         fe_color = QColor("#42a5f5")
         stage_color = QColor("#66bb6a")
-        warn_color = QColor("#ffa726")
+        card_bg = QColor("#30343a" if self.is_dark else "#f8fafc")
+        card_border = QColor("#555b64" if self.is_dark else "#cfd8dc")
         p.fillRect(self.rect(), bg)
         r = self.rect()
         events = list(self.events or [])
+        self._event_rects = []
         if not events:
             p.setPen(fg)
             p.drawText(r, Qt.AlignCenter, "No timestamp data available")
@@ -1381,63 +1385,53 @@ class _TimelineChartWidget(QWidget):
         p.drawText(8, 8, r.width() - 16, 18,
                    Qt.AlignLeft | Qt.AlignVCenter,
                    "Timeline flow")
-        card_w = 156
-        card_h = 62
-        gap_x = 40
-        gap_y = 28
-        left = 16
-        top = 36
-        usable_w = max(card_w, r.width() - left * 2)
-        per_row = max(1, int((usable_w + gap_x) / (card_w + gap_x)))
-        shown = events
+        card_w = 230
+        card_h = 94
+        gap_x = 72
+        left = 18
+        top = 42
         prev_end = None
-        for idx, ev in enumerate(shown):
-            row = idx // per_row
-            col = idx % per_row
-            x = left + col * (card_w + gap_x)
-            y = top + row * (card_h + gap_y)
+        for idx, ev in enumerate(events):
+            x = left + idx * (card_w + gap_x)
+            y = top
             color = fe_color if ev.get("kind") == "FE" else stage_color
-            if ev.get("runtime", "-") in ("", "-", "N/A"):
-                color = warn_color
+            rect = QRect(x, y, card_w, card_h)
+            self._event_rects.append((rect, ev))
+            p.setBrush(QBrush(card_bg))
+            p.setPen(QPen(card_border, 1))
+            p.drawRoundedRect(rect, 7, 7)
             p.setBrush(QBrush(color))
-            p.setPen(QPen(color.darker(120), 1))
-            p.drawRoundedRect(x, y, card_w, card_h, 6, 6)
-            p.setPen(QColor("#ffffff"))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRect(x, y, 7, card_h), 4, 4)
+
+            p.setPen(fg)
             name = ev.get("name", "-")
             if " / " in name:
                 name = name.split(" / ")[-1]
-            if len(name) > 20:
-                name = name[:17] + "..."
-            p.drawText(x + 8, y + 6, card_w - 16, 18,
+            if len(name) > 30:
+                name = name[:27] + "..."
+            p.drawText(x + 16, y + 8, card_w - 26, 20,
                        Qt.AlignLeft | Qt.AlignVCenter, name)
             txt = ev.get("runtime", "-")
-            p.drawText(x + 8, y + 26, card_w - 16, 16,
-                       Qt.AlignLeft | Qt.AlignVCenter,
-                       "Runtime: " + txt)
+            p.setPen(color)
+            p.drawText(x + 16, y + 32, card_w - 26, 18,
+                       Qt.AlignLeft | Qt.AlignVCenter, "Runtime  " + txt)
             st = self._dt(ev.get("start"))
             en = self._dt(ev.get("end"))
-            when = ev.get("start", "-")
-            if st:
-                when = st.strftime("%m/%d %H:%M")
-            p.drawText(x + 8, y + 43, card_w - 16, 16,
-                       Qt.AlignLeft | Qt.AlignVCenter, when)
+            start_txt = st.strftime("%m/%d %H:%M") if st else "-"
+            end_txt = en.strftime("%m/%d %H:%M") if en else "-"
+            p.setPen(muted)
+            p.drawText(x + 16, y + 55, card_w - 26, 16,
+                       Qt.AlignLeft | Qt.AlignVCenter, "Start    " + start_txt)
+            p.drawText(x + 16, y + 73, card_w - 26, 16,
+                       Qt.AlignLeft | Qt.AlignVCenter, "End      " + end_txt)
             if idx > 0:
-                if col == 0:
-                    x1 = left + (per_row - 1) * (card_w + gap_x) + card_w
-                    y1 = y - gap_y + card_h // 2
-                    x2 = x
-                    y2 = y + card_h // 2
-                    p.setPen(QPen(line, 1))
-                    p.drawLine(x1, y1, x1 + 14, y1)
-                    p.drawLine(x1 + 14, y1, x1 + 14, y2)
-                    p.drawLine(x1 + 14, y2, x2 - 8, y2)
-                else:
-                    x1 = x - gap_x
-                    y1 = y + card_h // 2
-                    x2 = x
-                    y2 = y1
-                    p.setPen(QPen(line, 1))
-                    p.drawLine(x1, y1, x2 - 8, y2)
+                x1 = x - gap_x
+                y1 = y + card_h // 2
+                x2 = x
+                y2 = y1
+                p.setPen(QPen(line, 1))
+                p.drawLine(x1, y1, x2 - 8, y2)
                 p.setBrush(QBrush(line))
                 p.setPen(Qt.NoPen)
                 p.drawPolygon(QPolygon([
@@ -1447,13 +1441,17 @@ class _TimelineChartWidget(QWidget):
                 gap_txt = self._gap_text(prev_end, st)
                 if gap_txt != "-":
                     p.setPen(muted)
-                    if col == 0:
-                        p.drawText(x + 4, y - 24, card_w - 8, 18,
-                                   Qt.AlignCenter, gap_txt)
-                    else:
-                        p.drawText(x - gap_x + 4, y + 2, gap_x - 8, 18,
-                                   Qt.AlignCenter, gap_txt)
+                    p.drawText(x - gap_x + 3, y + 23, gap_x - 6, 18,
+                               Qt.AlignCenter, gap_txt)
             prev_end = en or prev_end
+
+    def mousePressEvent(self, event):
+        for rect, ev in self._event_rects:
+            if rect.contains(event.pos()):
+                self.event_clicked.emit(ev)
+                return
+        super().mousePressEvent(event)
+
     def _gap_text(self, prev_end, start):
         if not prev_end or not start:
             return "-"
@@ -2516,7 +2514,7 @@ class PDDashboard(QMainWindow):
         self.view_combo = QComboBox()
         self.view_combo.addItems([
             "All Runs", "FE Only", "BE Only",
-            "Running Only", "Failed Only", "Today's Runs",
+            "Completed Only", "Running Only", "Failed Only", "Today's Runs",
             "Pinned Only", "Selected Only"])
         self.view_combo.setFixedWidth(120)
         self._last_view_preset = self.view_combo.currentText()
@@ -2887,11 +2885,27 @@ class PDDashboard(QMainWindow):
         self.sb_complete = QLabel("Completed: 0")
         self.sb_running  = QLabel("Running: 0")
         self.sb_selected = QLabel("Selected: 0")
-        self.sb_selected.setCursor(Qt.PointingHandCursor)
-        self.sb_selected.setToolTip("Click to show only selected (checked) runs")
-        self.sb_selected.mousePressEvent = lambda e: self._toggle_selected_only()
         self.sb_scan_time = QLabel("")
         self.sb_config   = QLabel("Config: None")
+
+        self._make_status_label_clickable(
+            self.sb_total, "Click to show all runs",
+            lambda: self.view_combo.setCurrentText("All Runs"))
+        self._make_status_label_clickable(
+            self.sb_complete, "Click to show completed FE runs",
+            lambda: self.view_combo.setCurrentText("Completed Only"))
+        self._make_status_label_clickable(
+            self.sb_running, "Click to show running FE runs",
+            lambda: self.view_combo.setCurrentText("Running Only"))
+        self._make_status_label_clickable(
+            self.sb_selected, "Click to show only selected (checked) runs",
+            self._toggle_selected_only)
+        self._make_status_label_clickable(
+            self.sb_scan_time, "Click to refresh scan",
+            self.start_fs_scan)
+        self._make_status_label_clickable(
+            self.sb_config, "Click to load or open active filter config",
+            self._on_status_config_clicked)
 
         for lbl in [self.sb_total, self.sb_complete, self.sb_running,
                     self.sb_selected, self.sb_scan_time, self.sb_config]:
@@ -2907,6 +2921,12 @@ class PDDashboard(QMainWindow):
     def _label(self, text):
         l = QLabel(text)
         return l
+
+    def _make_status_label_clickable(self, label, tooltip, callback):
+        label.setObjectName("statusLink")
+        label.setCursor(Qt.PointingHandCursor)
+        label.setToolTip(tooltip)
+        label.mousePressEvent = lambda e, cb=callback: cb()
 
     def _add_separator(self, layout):
         sep = QFrame()
@@ -3417,7 +3437,11 @@ class PDDashboard(QMainWindow):
                 QMainWindow, QWidget, QDialog {{ background-color: {bg}; color: {fg}; }}
                 QHeaderView::section {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px; font-weight: bold; }}
                 QTreeWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; gridline-color: {fg}; }}
+                QTableWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: {bg}; gridline-color: {fg}; }}
+                QTableWidget::item:selected {{ background-color: {sel}; color: #ffffff; }}
                 QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; }}
+                QScrollArea, QAbstractScrollArea, QScrollBar {{ background-color: {bg}; color: {fg}; }}
+                QLabel {{ color: {fg}; }}
                 QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 4px; }}
                 QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #fff; }}
                 QPushButton, QToolButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; }}
@@ -3428,6 +3452,7 @@ class PDDashboard(QMainWindow):
                 QMenu {{ border: 1px solid {fg}; background-color: {bg}; color: {fg}; }}
                 QMenu::item:selected {{ background-color: {sel}; color: #ffffff; }}
                 QStatusBar {{ background: {bg}; color: {fg}; border-top: 1px solid {fg}; }}
+                QLabel#statusLink {{ color: {sel}; font-weight: bold; }}
                 QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: {sel}; color: #ffffff; }}
                 {cb_style}"""
@@ -3435,7 +3460,11 @@ class PDDashboard(QMainWindow):
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{ background-color: #2b2d30; color: #dfe1e5; }}
                 QTreeWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; }}
+                QTableWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; gridline-color: #43454a; }}
+                QTableWidget::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
                 QListWidget {{ background-color: #1e1f22; color: #dfe1e5; alternate-background-color: #26282b; }}
+                QScrollArea, QAbstractScrollArea {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; }}
+                QLabel {{ color: #dfe1e5; }}
                 QHeaderView::section {{ background-color: #2b2d30; color: #a9b7c6; border: 1px solid #1e1f22; padding: 5px; font-weight: bold; }}
                 QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 3px; }}
                 QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 3px; }}
@@ -3448,6 +3477,7 @@ class PDDashboard(QMainWindow):
                 QMenu {{ border: 1px solid #43454a; background-color: #2b2d30; color: #dfe1e5; }}
                 QMenu::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
                 QStatusBar {{ background: #2b2d30; color: #aaaaaa; border-top: 1px solid #43454a; }}
+                QLabel#statusLink {{ color: #90caf9; font-weight: bold; }}
                 QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
                 QSplitter::handle {{ background-color: #43454a; }}
@@ -3456,7 +3486,10 @@ class PDDashboard(QMainWindow):
             stylesheet = f"""
                 QMainWindow, QWidget, QDialog {{ background-color: #f5f5f5; color: #212121; }}
                 QTreeWidget {{ background-color: #ffffff; color: #212121; alternate-background-color: #f9f9f9; }}
+                QTableWidget {{ background-color: #ffffff; color: #212121; alternate-background-color: #f9f9f9; gridline-color: #d0d0d0; }}
+                QTableWidget::item:selected {{ background-color: #1976D2; color: #ffffff; }}
                 QListWidget {{ background-color: #ffffff; color: #212121; alternate-background-color: #f9f9f9; }}
+                QScrollArea, QAbstractScrollArea {{ background-color: #ffffff; color: #212121; border: 1px solid #d0d0d0; }}
                 QHeaderView::section {{ background-color: #e0e0e0; color: #212121; border: 1px solid #bdbdbd; padding: 5px; font-weight: bold; }}
                 QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #212121; border: 1px solid #bdbdbd; padding: 4px; border-radius: 3px; }}
                 QComboBox {{ background-color: #ffffff; color: #212121; border: 1px solid #bdbdbd; padding: 4px; border-radius: 3px; }}
@@ -3469,6 +3502,7 @@ class PDDashboard(QMainWindow):
                 QMenu {{ border: 1px solid #bdbdbd; background-color: #ffffff; color: #212121; }}
                 QMenu::item:selected {{ background-color: #1976D2; color: #ffffff; }}
                 QStatusBar {{ background: #eeeeee; color: #616161; border-top: 1px solid #bdbdbd; }}
+                QLabel#statusLink {{ color: #1565c0; font-weight: bold; }}
                 QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: #1976D2; color: #ffffff; }}
                 QSplitter::handle {{ background-color: #bdbdbd; }}
@@ -4344,6 +4378,7 @@ class PDDashboard(QMainWindow):
         _do_search   = (search_pattern != "*")
         _fe_only       = (preset == "FE Only")
         _be_only       = (preset == "BE Only")
+        _completed_only = (preset == "Completed Only")
         _run_only      = (preset == "Running Only")
         _fail_only     = (preset == "Failed Only")
         _today_only    = (preset == "Today's Runs")
@@ -4384,7 +4419,12 @@ class PDDashboard(QMainWindow):
             rt_type = run["run_type"]
             if _fe_only and rt_type != "FE": return False
             if _be_only and rt_type != "BE": return False
-            if _run_only and not (rt_type == "FE" and not run["is_comp"]):
+            if _completed_only and not (
+                    rt_type == "FE" and run.get("is_comp")):
+                return False
+            if _run_only and not (
+                    rt_type == "FE"
+                    and run.get("fe_status", "") == "RUNNING"):
                 return False
             if _fail_only:
                 if not ("FAILS" in run.get("st_n","")
@@ -5697,6 +5737,16 @@ class PDDashboard(QMainWindow):
                 return  # nothing checked, ignore
             self.view_combo.setCurrentText("Selected Only")
 
+    def _on_status_config_clicked(self):
+        if self.current_config_path and os.path.exists(self.current_config_path):
+            try:
+                subprocess.Popen(['gvim', self.current_config_path])
+            except Exception:
+                QMessageBox.information(
+                    self, "Config", self.current_config_path)
+        else:
+            self.load_filter_config()
+
     def send_custom_mail_action(self):
         all_known = _get_all_known_mail_users()
         dlg = AdvancedMailDialog("", "", all_known, "", self)
@@ -6362,17 +6412,20 @@ class PDDashboard(QMainWindow):
         summary = QLabel(
             "<b>Timeline:</b> {} timed step(s), total span {}".format(
                 len(events), span_txt))
-        summary.setStyleSheet("color: #1976d2;")
+        summary.setStyleSheet(
+            "color: {}; font-weight: bold;".format(
+                "#64b5f6" if self.is_dark_mode else "#1976d2"))
         layout.addWidget(summary)
 
         chart = _TimelineChartWidget(events, self._parse_dashboard_time,
                                      self.is_dark_mode)
-        chart.setMinimumHeight(chart.preferred_height(max(720, dlg.width() - 40)))
+        chart.setMinimumSize(chart.preferred_width(), chart.preferred_height(dlg.width()))
+        chart.event_clicked.connect(self._show_timeline_event_detail)
         chart_scroll = QScrollArea()
-        chart_scroll.setWidgetResizable(True)
+        chart_scroll.setWidgetResizable(False)
         chart_scroll.setWidget(chart)
-        chart_scroll.setMinimumHeight(230)
-        chart_scroll.setMaximumHeight(360)
+        chart_scroll.setMinimumHeight(190)
+        chart_scroll.setMaximumHeight(230)
         layout.addWidget(chart_scroll)
 
         tbl = QTableWidget(0, 6)
@@ -6384,7 +6437,7 @@ class PDDashboard(QMainWindow):
         tbl.setColumnWidth(2, 150)
         tbl.setColumnWidth(3, 150)
         tbl.setColumnWidth(4, 110)
-        tbl.setColumnWidth(5, 120)
+        tbl.setColumnWidth(5, 155)
         tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
@@ -6399,15 +6452,35 @@ class PDDashboard(QMainWindow):
             for c, val in enumerate(vals):
                 it = QTableWidgetItem(str(val))
                 if ev.get("kind") == "FE":
-                    it.setBackground(QColor("#e3f2fd"))
-                elif ev.get("kind") == "BE":
-                    it.setBackground(QColor("#fff3e0"))
+                    it.setBackground(QColor(
+                        "#1f3b57" if self.is_dark_mode else "#e3f2fd"))
+                    it.setForeground(QColor(
+                        "#dfe1e5" if self.is_dark_mode else "#263238"))
+                elif ev.get("kind") == "STAGE":
+                    it.setBackground(QColor(
+                        "#203828" if self.is_dark_mode else "#e8f5e9"))
+                    it.setForeground(QColor(
+                        "#dfe1e5" if self.is_dark_mode else "#263238"))
                 tbl.setItem(r, c, it)
             prev_end = self._parse_dashboard_time(ev.get("end")) or prev_end
         layout.addWidget(tbl)
         btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
         layout.addWidget(btn)
         dlg.exec_()
+
+    def _show_timeline_event_detail(self, ev):
+        msg = (
+            "Step: {}\n"
+            "Type: {}\n"
+            "Start: {}\n"
+            "End: {}\n"
+            "Runtime: {}").format(
+                ev.get("name", "-"),
+                ev.get("kind", "-"),
+                ev.get("start", "-"),
+                ev.get("end", "-"),
+                ev.get("runtime", "-"))
+        QMessageBox.information(self, "Timeline Step", msg)
 
     def show_selected_timeline_overview(self):
         items = self.tree.selectedItems()
