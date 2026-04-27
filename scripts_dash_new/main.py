@@ -1326,7 +1326,7 @@ class _StackedVtChartWidget(QWidget):
 
 
 class _TimelineChartWidget(QWidget):
-    """Branching timeline for one FE run and its child BE/Innovus stages."""
+    """Readable sequential pipeline timeline for FE and PNR stage events."""
     event_clicked = pyqtSignal(object)
 
     def __init__(self, events=None, parser=None, is_dark=False):
@@ -1336,7 +1336,7 @@ class _TimelineChartWidget(QWidget):
         self.is_dark = is_dark
         self._event_rects = []
         self.setCursor(Qt.PointingHandCursor)
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(170)
 
     def set_data(self, events, parser, is_dark=False):
         self.events = events or []
@@ -1344,30 +1344,15 @@ class _TimelineChartWidget(QWidget):
         self.is_dark = is_dark
         self.update()
 
-    def _branches(self):
-        branches = []
-        seen = set()
-        for ev in self.events or []:
-            if ev.get("kind") == "FE":
-                continue
-            b = ev.get("branch") or "PNR"
-            if b not in seen:
-                seen.add(b)
-                branches.append(b)
-        return branches or ["PNR"]
-
-    def preferred_height(self, width=0):
-        row_h = 128
-        return 40 + max(1, len(self._branches())) * row_h + 24
+    def preferred_height(self, width):
+        return 170
 
     def preferred_width(self):
-        card_w = 210
-        gap_x = 82
-        max_seq = 0
-        for ev in self.events or []:
-            if ev.get("kind") != "FE":
-                max_seq = max(max_seq, int(ev.get("seq", 0) or 0) + 1)
-        return 260 + max(1, max_seq) * (card_w + gap_x) + 80
+        card_w = 230
+        gap_x = 72
+        left = 18
+        n = max(1, len(self.events or []))
+        return left * 2 + n * card_w + max(0, n - 1) * gap_x
 
     def _dt(self, val):
         if self.parser:
@@ -1377,9 +1362,95 @@ class _TimelineChartWidget(QWidget):
                 return None
         return None
 
-    def _short(self, text, max_len):
-        text = str(text or "-")
-        return text if len(text) <= max_len else text[:max_len - 3] + "..."
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
+        fg = QColor("#dfe1e5" if self.is_dark else "#263238")
+        muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
+        line = QColor("#7b8794" if self.is_dark else "#b0bec5")
+        fe_color = QColor("#42a5f5")
+        stage_color = QColor("#66bb6a")
+        card_bg = QColor("#30343a" if self.is_dark else "#f8fafc")
+        card_border = QColor("#555b64" if self.is_dark else "#cfd8dc")
+        p.fillRect(self.rect(), bg)
+        r = self.rect()
+        events = list(self.events or [])
+        self._event_rects = []
+        if not events:
+            p.setPen(fg)
+            p.drawText(r, Qt.AlignCenter, "No timestamp data available")
+            return
+        p.setPen(fg)
+        p.drawText(8, 8, r.width() - 16, 18,
+                   Qt.AlignLeft | Qt.AlignVCenter,
+                   "Timeline flow")
+        card_w = 230
+        card_h = 94
+        gap_x = 72
+        left = 18
+        top = 42
+        prev_end = None
+        for idx, ev in enumerate(events):
+            x = left + idx * (card_w + gap_x)
+            y = top
+            color = fe_color if ev.get("kind") == "FE" else stage_color
+            rect = QRect(x, y, card_w, card_h)
+            self._event_rects.append((rect, ev))
+            p.setBrush(QBrush(card_bg))
+            p.setPen(QPen(card_border, 1))
+            p.drawRoundedRect(rect, 7, 7)
+            p.setBrush(QBrush(color))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(QRect(x, y, 7, card_h), 4, 4)
+
+            p.setPen(fg)
+            name = ev.get("name", "-")
+            if " / " in name:
+                name = name.split(" / ")[-1]
+            if len(name) > 30:
+                name = name[:27] + "..."
+            p.drawText(x + 16, y + 8, card_w - 26, 20,
+                       Qt.AlignLeft | Qt.AlignVCenter, name)
+            txt = ev.get("runtime", "-")
+            p.setPen(color)
+            p.drawText(x + 16, y + 32, card_w - 26, 18,
+                       Qt.AlignLeft | Qt.AlignVCenter, "Runtime  " + txt)
+            st = self._dt(ev.get("start"))
+            en = self._dt(ev.get("end"))
+            start_txt = st.strftime("%m/%d %H:%M") if st else "-"
+            end_txt = en.strftime("%m/%d %H:%M") if en else "-"
+            p.setPen(muted)
+            p.drawText(x + 16, y + 55, card_w - 26, 16,
+                       Qt.AlignLeft | Qt.AlignVCenter, "Start    " + start_txt)
+            p.drawText(x + 16, y + 73, card_w - 26, 16,
+                       Qt.AlignLeft | Qt.AlignVCenter, "End      " + end_txt)
+            if idx > 0:
+                x1 = x - gap_x
+                y1 = y + card_h // 2
+                x2 = x
+                y2 = y1
+                p.setPen(QPen(line, 1))
+                p.drawLine(x1, y1, x2 - 8, y2)
+                p.setBrush(QBrush(line))
+                p.setPen(Qt.NoPen)
+                p.drawPolygon(QPolygon([
+                    QPoint(x2 - 8, y2 - 4),
+                    QPoint(x2 - 8, y2 + 4),
+                    QPoint(x2 - 1, y2)]))
+                gap_txt = self._gap_text(prev_end, st)
+                if gap_txt != "-":
+                    p.setPen(muted)
+                    p.drawText(x - gap_x + 3, y + 23, gap_x - 6, 18,
+                               Qt.AlignCenter, gap_txt)
+            prev_end = en or prev_end
+
+    def mousePressEvent(self, event):
+        for rect, ev in self._event_rects:
+            if rect.contains(event.pos()):
+                self.event_clicked.emit(ev)
+                return
+        super().mousePressEvent(event)
 
     def _gap_text(self, prev_end, start):
         if not prev_end or not start:
@@ -1392,118 +1463,6 @@ class _TimelineChartWidget(QWidget):
         if h >= 24:
             return "{}d {}h".format(h // 24, h % 24)
         return "{}h {}m".format(h, m)
-
-    def _draw_card(self, p, rect, ev, color, fg, muted, card_bg, card_border):
-        p.setBrush(QBrush(card_bg))
-        p.setPen(QPen(card_border, 1))
-        p.drawRoundedRect(rect, 7, 7)
-        p.setBrush(QBrush(color))
-        p.setPen(Qt.NoPen)
-        p.drawRoundedRect(QRect(rect.x(), rect.y(), 7, rect.height()), 4, 4)
-        p.setPen(fg)
-        name = ev.get("name", "-")
-        if " / " in name:
-            name = name.split(" / ")[-1]
-        p.drawText(rect.x() + 16, rect.y() + 8, rect.width() - 24, 20,
-                   Qt.AlignLeft | Qt.AlignVCenter, self._short(name, 24))
-        p.setPen(color)
-        p.drawText(rect.x() + 16, rect.y() + 33, rect.width() - 24, 18,
-                   Qt.AlignLeft | Qt.AlignVCenter,
-                   "Runtime  " + self._short(ev.get("runtime", "-"), 18))
-        st = self._dt(ev.get("start"))
-        en = self._dt(ev.get("end"))
-        p.setPen(muted)
-        p.drawText(rect.x() + 16, rect.y() + 56, rect.width() - 24, 16,
-                   Qt.AlignLeft | Qt.AlignVCenter,
-                   "Start    " + (st.strftime("%m/%d %H:%M") if st else "-"))
-        p.drawText(rect.x() + 16, rect.y() + 74, rect.width() - 24, 16,
-                   Qt.AlignLeft | Qt.AlignVCenter,
-                   "End      " + (en.strftime("%m/%d %H:%M") if en else "-"))
-        self._event_rects.append((rect, ev))
-
-    def paintEvent(self, event):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
-        fg = QColor("#dfe1e5" if self.is_dark else "#263238")
-        muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
-        line = QColor("#7b8794" if self.is_dark else "#90a4ae")
-        fe_color = QColor("#42a5f5")
-        stage_color = QColor("#66bb6a")
-        card_bg = QColor("#30343a" if self.is_dark else "#f8fafc")
-        card_border = QColor("#555b64" if self.is_dark else "#cfd8dc")
-        p.fillRect(self.rect(), bg)
-        self._event_rects = []
-        events = list(self.events or [])
-        if not events:
-            p.setPen(fg)
-            p.drawText(self.rect(), Qt.AlignCenter, "No timestamp data available")
-            return
-
-        p.setPen(fg)
-        p.drawText(10, 8, self.width() - 20, 20,
-                   Qt.AlignLeft | Qt.AlignVCenter, "Parallel FE to PNR timeline")
-        fe_events = [e for e in events if e.get("kind") == "FE"]
-        fe_ev = fe_events[0] if fe_events else None
-        branches = self._branches()
-        row_h = 128
-        card_w = 210
-        card_h = 96
-        fe_x = 24
-        stage_x0 = 280
-        gap_x = 82
-        top0 = 42
-        branch_map = {}
-        for b in branches:
-            branch_map[b] = [e for e in events if e.get("branch") == b and e.get("kind") != "FE"]
-            branch_map[b].sort(key=lambda e: int(e.get("seq", 0) or 0))
-
-        fe_y = top0 + (len(branches) * row_h - card_h) // 2
-        trunk_x = fe_x + card_w + 24
-        if fe_ev:
-            fe_rect = QRect(fe_x, fe_y, card_w, card_h)
-            self._draw_card(p, fe_rect, fe_ev, fe_color, fg, muted, card_bg, card_border)
-            if branches:
-                first_y = top0 + 20 + card_h // 2
-                last_y = top0 + (len(branches) - 1) * row_h + 20 + card_h // 2
-                p.setPen(QPen(line, 1))
-                p.drawLine(trunk_x, first_y, trunk_x, last_y)
-
-        for row, b in enumerate(branches):
-            y = top0 + row * row_h
-            p.setPen(muted)
-            p.drawText(stage_x0, y - 4, 520, 18,
-                       Qt.AlignLeft | Qt.AlignVCenter, self._short(b, 80))
-            prev_end = self._dt(fe_ev.get("end")) if fe_ev else None
-            prev_right = trunk_x if fe_ev else fe_x + card_w
-            for idx, ev in enumerate(branch_map.get(b, [])):
-                x = stage_x0 + idx * (card_w + gap_x)
-                rect = QRect(x, y + 20, card_w, card_h)
-                line_y = rect.y() + card_h // 2
-                p.setPen(QPen(line, 1))
-                p.drawLine(prev_right, line_y, x - 10, line_y)
-                p.setBrush(QBrush(line))
-                p.setPen(Qt.NoPen)
-                p.drawPolygon(QPolygon([
-                    QPoint(x - 10, line_y - 4),
-                    QPoint(x - 10, line_y + 4),
-                    QPoint(x - 2, line_y)]))
-                gap_txt = self._gap_text(prev_end, self._dt(ev.get("start")))
-                if gap_txt != "-":
-                    p.setPen(muted)
-                    p.drawText(prev_right + 4, line_y - 22,
-                               max(40, x - prev_right - 16), 18,
-                               Qt.AlignCenter, gap_txt)
-                self._draw_card(p, rect, ev, stage_color, fg, muted, card_bg, card_border)
-                prev_end = self._dt(ev.get("end")) or prev_end
-                prev_right = rect.x() + rect.width()
-
-    def mousePressEvent(self, event):
-        for rect, ev in self._event_rects:
-            if rect.contains(event.pos()):
-                self.event_clicked.emit(ev)
-                return
-        super().mousePressEvent(event)
 
 class BlockSummaryDialog(QDialog):
     """Block synthesis summary table.
@@ -3752,6 +3711,8 @@ class PDDashboard(QMainWindow):
             src  = prefs.get('UI', 'last_source', fallback='ALL')
             rtl  = prefs.get('UI', 'last_rtl',    fallback='[ SHOW ALL ]')
             view = prefs.get('UI', 'last_view',   fallback='All Runs')
+            if view == 'BE Only':
+                view = 'All Runs'
             srch = prefs.get('UI', 'last_search', fallback='')
             auto = prefs.get('UI', 'last_auto',   fallback='Off')
             idx = self.src_combo.findText(src)
@@ -6405,8 +6366,6 @@ class PDDashboard(QMainWindow):
             ev = {
                 "name": fe_run.get("r_name", fe_item.text(0)),
                 "kind": "FE",
-                "branch": "FE",
-                "seq": 0,
                 "start": fe_item.data(0, Qt.UserRole + 40) or fe_run.get("info", {}).get("start", "-"),
                 "end": fe_item.data(0, Qt.UserRole + 41) or fe_run.get("info", {}).get("end", "-"),
                 "runtime": fe_run.get("info", {}).get("runtime", "-"),
@@ -6424,30 +6383,25 @@ class PDDashboard(QMainWindow):
                 if ch_run and ch_run.get("run_type") == "BE":
                     be_items.append(ch)
 
-        for branch_idx, be_item in enumerate(be_items):
+        for be_item in be_items:
             be_run = be_item.data(0, Qt.UserRole + 10) or {}
             be_name = be_run.get("r_name", be_item.text(0))
-            branch_events = []
-            for st in be_run.get("stages", []) or []:
-                info = self._stage_info_for_timeline(be_run, st)
-                ev = {
-                    "name": be_name + " / " + st.get("name", "-"),
-                    "kind": "STAGE",
-                    "branch": be_name,
-                    "branch_index": branch_idx,
-                    "seq": len(branch_events),
-                    "start": info.get("start", "-"),
-                    "end": info.get("end", "-"),
-                    "runtime": info.get("runtime", "-"),
-                }
-                if self._valid_timeline_event(ev):
-                    branch_events.append(ev)
-            branch_events.sort(
-                key=lambda ev: self._parse_dashboard_time(ev.get("start")) or datetime.datetime.max)
-            for seq, ev in enumerate(branch_events):
-                ev["seq"] = seq
-                events.append(ev)
-        return events
+            if be_run.get("stages"):
+                for st in be_run.get("stages", []):
+                    info = self._stage_info_for_timeline(be_run, st)
+                    ev = {
+                        "name": be_name + " / " + st.get("name", "-"),
+                        "kind": "STAGE",
+                        "start": info.get("start", "-"),
+                        "end": info.get("end", "-"),
+                        "runtime": info.get("runtime", "-"),
+                    }
+                    if self._valid_timeline_event(ev):
+                        events.append(ev)
+
+        def _key(ev):
+            return self._parse_dashboard_time(ev.get("start")) or datetime.datetime.max
+        return sorted(events, key=_key)
     def show_timeline_overview(self, item):
         events = self._timeline_events_for_item(item)
         if not events:
@@ -6486,34 +6440,29 @@ class PDDashboard(QMainWindow):
         chart_scroll = QScrollArea()
         chart_scroll.setWidgetResizable(False)
         chart_scroll.setWidget(chart)
-        chart_scroll.setMinimumHeight(min(420, chart.preferred_height(dlg.width()) + 20))
-        chart_scroll.setMaximumHeight(min(520, chart.preferred_height(dlg.width()) + 30))
+        chart_scroll.setMinimumHeight(190)
+        chart_scroll.setMaximumHeight(230)
         layout.addWidget(chart_scroll)
 
-        tbl = QTableWidget(0, 7)
-        tbl.setHorizontalHeaderLabels(["Branch", "Step", "Type", "Start", "End", "Runtime", "Gap From Previous"])
-        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
-        for c in range(2, 7):
+        tbl = QTableWidget(0, 6)
+        tbl.setHorizontalHeaderLabels(["Step", "Type", "Start", "End", "Runtime", "Gap From Previous"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 6):
             tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
-        tbl.setColumnWidth(0, 220)
-        tbl.setColumnWidth(2, 70)
+        tbl.setColumnWidth(1, 70)
+        tbl.setColumnWidth(2, 150)
         tbl.setColumnWidth(3, 150)
-        tbl.setColumnWidth(4, 150)
-        tbl.setColumnWidth(5, 110)
-        tbl.setColumnWidth(6, 155)
+        tbl.setColumnWidth(4, 110)
+        tbl.setColumnWidth(5, 155)
         tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
-        prev_by_branch = {}
-        table_events = sorted(events, key=lambda ev: (
-            ev.get("branch_index", -1), ev.get("seq", 0), ev.get("kind", "")))
-        for ev in table_events:
+        prev_end = None
+        for ev in events:
             r = tbl.rowCount(); tbl.insertRow(r)
-            branch = ev.get("branch", "-") if ev.get("kind") != "FE" else "FE"
             start_dt = self._parse_dashboard_time(ev.get("start"))
-            gap = self._fmt_gap(prev_by_branch.get(branch), start_dt)
-            vals = [branch, ev.get("name", "-"), ev.get("kind", "-"),
+            gap = self._fmt_gap(prev_end, start_dt)
+            vals = [ev.get("name", "-"), ev.get("kind", "-"),
                     ev.get("start", "-"), ev.get("end", "-"),
                     ev.get("runtime", "-"), gap]
             for c, val in enumerate(vals):
@@ -6529,7 +6478,7 @@ class PDDashboard(QMainWindow):
                     it.setForeground(QColor(
                         "#dfe1e5" if self.is_dark_mode else "#263238"))
                 tbl.setItem(r, c, it)
-            prev_by_branch[branch] = self._parse_dashboard_time(ev.get("end")) or prev_by_branch.get(branch)
+            prev_end = self._parse_dashboard_time(ev.get("end")) or prev_end
         layout.addWidget(tbl)
         btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
         layout.addWidget(btn)
