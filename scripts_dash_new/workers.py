@@ -16,6 +16,31 @@ try:
 except ImportError:
     _METRICS_AVAILABLE = False
 
+
+def _format_size_bytes(total_size):
+    if not total_size or total_size <= 0:
+        return "N/A"
+    for unit in ['K', 'M', 'G']:
+        total_size /= 1024.0
+        if total_size < 1024.0:
+            return "{:.1f}{}".format(total_size, unit)
+    return "{:.1f}T".format(total_size)
+
+
+def _du_size(path, timeout_sec=180):
+    """Fast filesystem size using system du. Falls back to None on timeout/error."""
+    if not path or not os.path.exists(path):
+        return "N/A"
+    try:
+        out = subprocess.check_output(
+            ['du', '-sk', path], stderr=subprocess.DEVNULL,
+            timeout=timeout_sec)
+        line = out.decode('utf-8', errors='ignore').splitlines()[0]
+        kb = int(line.split()[0])
+        return _format_size_bytes(kb * 1024)
+    except Exception:
+        return None
+
 # ---------------------------------------------------------------------------
 # Lazy constant resolution -- these are defined in main.py at module level
 # and available in the process globals by the time workers are started.
@@ -39,6 +64,11 @@ def _bool_cfg(name, default=False):
 def _SCAN_IR_ON_START():      return _bool_cfg("SCAN_IR_ON_START", False)
 def _SCAN_OWNER_ON_START():   return _bool_cfg("SCAN_OWNER_ON_START", False)
 def _SCAN_SIGNOFF_ON_START(): return _bool_cfg("SCAN_SIGNOFF_ON_START", False)
+def _SIGNOFF_BG_WORKERS():
+    try:
+        return max(1, int(_g("SIGNOFF_BG_WORKERS", 6)))
+    except Exception:
+        return 6
 def _BLOCKS():
     """Return frozenset of allowed block names, or empty frozenset (= scan all)."""
     b = _g("BLOCKS", set())
@@ -125,7 +155,7 @@ def extract_rtl(run_dir):
     if not f:
         return "Unknown"
     try:
-        with open(f[0], "r") as fh:
+        with open(f[0], "r", encoding="utf-8", errors="ignore") as fh:
             for line in fh:
                 m = re.search('\\s*all\\s*=\\s*"(.*?)"', line)
                 if m and m.group(1).strip():   # guard: skip empty captures
@@ -149,7 +179,7 @@ def parse_runtime_rpt(file_path):
     if not cached_exists(file_path):
         return d
     try:
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if "TOTAL_START" in line and "Load :" in line:
                     d["start"] = format_log_date(
@@ -180,16 +210,19 @@ def parse_pnr_runtime_rpt(file_path):
               "Jul","Aug","Sep","Oct","Nov","Dec"]
     try:
         first_ts = last_ts = final_time_str = None
-        with open(file_path, "r") as f:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 ts = re.search(
-                    r"(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})", line)
+                    r"(\d{4})-(\d{2})-(\d{2})[ _](\d{2})-(\d{2})", line)
                 tm = re.findall(
                     r"(\d+)d:(\d+)h:(\d+)m:(\d+)s", line)
+                if ts and not first_ts:
+                    first_ts = ts
+                if ts:
+                    last_ts = ts
                 if ts and tm:
                     if not first_ts:
                         first_ts = ts
-                    last_ts = ts
                     t = tm[1] if len(tm) > 1 else tm[0]
                     d2, h2, mn, sc = map(int, t)
                     final_time_str = (f"{d2*24+h2:02}h:"
@@ -212,7 +245,7 @@ def get_fm_info(report_path):
     if not report_path or not cached_exists(report_path):
         return "N/A"
     try:
-        with open(report_path, "r") as f:
+        with open(report_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
                 if "No failing compare points" in line:
                     return "PASS"
@@ -227,7 +260,7 @@ def get_vslp_info(report_path):
     if not report_path or not cached_exists(report_path):
         return "N/A"
     try:
-        with open(report_path, "r") as f:
+        with open(report_path, "r", encoding="utf-8", errors="ignore") as f:
             in_summary = False
             for line in f:
                 if "Management Summary" in line:
@@ -241,13 +274,6 @@ def get_vslp_info(report_path):
     except Exception:
         pass
     return "Not Found"
-try:
-    from metric_extract import extract_fe_metrics, extract_pnr_stage_metrics
-    _METRICS_AVAILABLE = True
-except ImportError:
-    _METRICS_AVAILABLE = False
-
-
 # ===========================================================================
 # BatchSizeWorker -- calculates folder sizes for multiple items in background
 # ===========================================================================
@@ -264,7 +290,7 @@ class BatchSizeWorker(QThread):
         self._is_cancelled = False
 
     def run(self):
-        max_w = min(20, (os.cpu_count() or 4) * 4)
+        max_w = min(8, max(2, (os.cpu_count() or 4)))
         batch = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
             futures = {executor.submit(self.get_size, path): item_id
@@ -286,24 +312,26 @@ class BatchSizeWorker(QThread):
             self.sizes_batch_ready.emit(batch)
 
     def get_size(self, path):
+        fast = _du_size(path, timeout_sec=180)
+        if fast is not None:
+            return fast
         if not path or not os.path.exists(path):
             return "N/A"
         total_size = 0
         try:
             for entry in os.scandir(path):
-                if entry.is_file(follow_symlinks=False):
-                    total_size += entry.stat().st_size
-                elif entry.is_dir(follow_symlinks=False):
-                    total_size += self._calc_dir(entry.path)
-        except:
+                if self._is_cancelled:
+                    return "N/A"
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total_size += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        total_size += self._calc_dir(entry.path)
+                except Exception:
+                    continue
+        except Exception:
             return "N/A"
-        if total_size == 0:
-            return "N/A"
-        for unit in ['K', 'M', 'G']:
-            total_size /= 1024.0
-            if total_size < 1024.0:
-                return f"{total_size:.1f}{unit}"
-        return f"{total_size:.1f}T"
+        return _format_size_bytes(total_size)
 
     def _calc_dir(self, path):
         total = 0
@@ -322,6 +350,56 @@ class BatchSizeWorker(QThread):
 
 
 # ===========================================================================
+# SignoffStatusWorker -- low-impact background FE FM/VSLP scan
+# ===========================================================================
+class SignoffStatusWorker(QThread):
+    batch_ready = pyqtSignal(list)
+
+    def __init__(self, runs):
+        super().__init__()
+        self.runs = list(runs or [])
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        max_w = min(_SIGNOFF_BG_WORKERS(), len(self.runs))
+        if max_w <= 0:
+            return
+        batch = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
+            futures = {executor.submit(self._scan_one, r): r for r in self.runs}
+            for future in concurrent.futures.as_completed(futures):
+                if self._is_cancelled:
+                    break
+                try:
+                    row = future.result()
+                except Exception:
+                    row = None
+                if row:
+                    batch.append(row)
+                if len(batch) >= 25:
+                    self.batch_ready.emit(batch)
+                    batch = []
+        if batch and not self._is_cancelled:
+            self.batch_ready.emit(batch)
+
+    def _scan_one(self, run):
+        if self._is_cancelled:
+            return None
+        row = {
+            "path": run.get("path", ""),
+            "owner": get_owner(run.get("path", "")),
+        }
+        if run.get("run_type") == "FE":
+            row["st_n"] = get_fm_info(run.get("fm_n_path", ""))
+            row["st_u"] = get_fm_info(run.get("fm_u_path", ""))
+            row["vslp_status"] = get_vslp_info(run.get("vslp_rpt_path", ""))
+        return row
+
+
+# ===========================================================================
 # SingleSizeWorker -- calculates folder size for one item on demand
 # ===========================================================================
 class SingleSizeWorker(QThread):
@@ -337,23 +415,26 @@ class SingleSizeWorker(QThread):
         if self._is_cancelled or not self.path or not os.path.exists(self.path):
             self.result.emit(self.item, "N/A")
             return
+        fast = _du_size(self.path, timeout_sec=180)
+        if fast is not None:
+            if not self._is_cancelled:
+                self.result.emit(self.item, fast)
+            return
         total_size = 0
         try:
             for entry in os.scandir(self.path):
-                if entry.is_file(follow_symlinks=False):
-                    total_size += entry.stat().st_size
-                elif entry.is_dir(follow_symlinks=False):
-                    total_size += self._calc_dir(entry.path)
-            if total_size == 0:
-                self.result.emit(self.item, "N/A")
-                return
-            for unit in ['K', 'M', 'G']:
-                total_size /= 1024.0
-                if total_size < 1024.0:
-                    self.result.emit(self.item, f"{total_size:.1f}{unit}")
+                if self._is_cancelled:
+                    self.result.emit(self.item, "N/A")
                     return
-            self.result.emit(self.item, f"{total_size:.1f}T")
-        except:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total_size += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        total_size += self._calc_dir(entry.path)
+                except Exception:
+                    continue
+            self.result.emit(self.item, _format_size_bytes(total_size))
+        except Exception:
             if not self._is_cancelled:
                 self.result.emit(self.item, "N/A")
 
@@ -385,7 +466,7 @@ class DiskScannerWorker(QThread):
             return results
         try:
             cmd    = ['du', '-sk'] + paths
-            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode('utf-8')
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=300).decode('utf-8', errors='ignore')
             for line in output.strip().split('\n'):
                 if not line:
                     continue
@@ -424,7 +505,7 @@ class DiskScannerWorker(QThread):
                 chunk = valid_paths[i:i + 50]
                 tasks.append((cat, chunk))
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
             future_to_cat = {executor.submit(self._get_batch_dir_info, t[1]): t[0] for t in tasks}
             for future in concurrent.futures.as_completed(future_to_cat):
                 cat = future_to_cat[future]
@@ -557,7 +638,7 @@ class ScannerWorker(QThread):
         current_rtl = "Unknown"
         for sf in glob.glob(os.path.join(ws_path, "*.p4_sync")):
             try:
-                with open(sf, 'r') as f:
+                with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
                     lbls = re.findall(r'/([^/]+_syn\d*)\.config', f.read())
                     for l in set(lbls):
                         current_rtl = normalize_rtl(l)
@@ -776,7 +857,11 @@ class ScannerWorker(QThread):
         fm_n     = os.path.join(evt_base, "fm",   clean_run, "r2n",   "reports", f"{b_name}_r2n.failpoint.rpt")
         fm_u     = os.path.join(evt_base, "fm",   clean_run, "r2upf", "reports", f"{b_name}_r2upf.failpoint.rpt")
         vslp_rpt = os.path.join(evt_base, "vslp", clean_run, "pre",   "reports", "report_lp.rpt")
-        info     = parse_runtime_rpt(os.path.join(rd, "reports/runtime.V2.rpt"))
+        if run_type == "FE":
+            info = parse_runtime_rpt(os.path.join(rd, "reports/runtime.V2.rpt"))
+        else:
+            info = {"start": "-", "end": "-",
+                    "runtime": "-", "last_stage": "-"}
 
         is_comp   = True if source == "OUTFEED" else cached_exists(os.path.join(rd, "pass/compile_opt.pass"))
         fe_status = "RUNNING"
@@ -802,12 +887,19 @@ class ScannerWorker(QThread):
 
         stages = []
         if run_type == "BE":
-            search_glob = (os.path.join(rd, "outputs", "*") if source == "WS"
-                           else os.path.join(rd, "*"))
+            is_innovus_run = "/innovus/" in rd.replace("\\", "/")
+            if source == "WS" and is_innovus_run:
+                search_glob = os.path.join(rd, "reports", "*")
+            elif source == "WS":
+                search_glob = os.path.join(rd, "outputs", "*")
+            else:
+                search_glob = os.path.join(rd, "*")
             for s_dir in glob.glob(search_glob):
                 if not os.path.isdir(s_dir):
                     continue
                 step_name = os.path.basename(s_dir)
+                if step_name in ["logs", "pass", "fail", "outputs"]:
+                    continue
                 if source == "OUTFEED" and step_name in ["reports", "logs", "pass", "fail", "outputs"]:
                     continue
 
@@ -816,7 +908,8 @@ class ScannerWorker(QThread):
                 # NFS stat calls here would block the scan worker for hundreds of ms per stage.
                 # All path resolution is deferred to StageDetailWorker (background thread).
                 if source == "WS":
-                    stage_path = os.path.join(rd, "outputs", step_name)
+                    stage_path = (os.path.join(rd, "outputs", step_name)
+                                  if is_fc else os.path.join(rd, "reports", step_name))
                     if is_fc:
                         log = os.path.join(rd, step_name, "logs", f"{step_name}.log")
                         rpt_cands = [os.path.join(rd, "reports", step_name,
@@ -1022,6 +1115,38 @@ class MetricWorker(QThread):
             self.finished.emit(m)
         except Exception as e:
             self.finished.emit({"_error": str(e)})
+
+
+class MetricBatchWorker(QThread):
+    finished = pyqtSignal(list)  # list of task dicts with metrics
+
+    def __init__(self, tasks):
+        super().__init__()
+        self.tasks = list(tasks or [])
+
+    def run(self):
+        out = []
+        if not _METRICS_AVAILABLE:
+            self.finished.emit(out)
+            return
+        for task in self.tasks:
+            row = dict(task)
+            try:
+                if task.get("run_type") == "FE":
+                    row["metrics"] = extract_fe_metrics(
+                        task.get("path", ""),
+                        source=task.get("source", "WS"),
+                        block=task.get("block", ""))
+                else:
+                    row["metrics"] = extract_pnr_stage_metrics(
+                        task.get("path", ""),
+                        task.get("stage_name", ""),
+                        source=task.get("source", "WS"),
+                        block=task.get("block", ""))
+            except Exception as e:
+                row["metrics"] = {"_error": str(e)}
+            out.append(row)
+        self.finished.emit(out)
 
 
 class QoRWorker(QThread):
