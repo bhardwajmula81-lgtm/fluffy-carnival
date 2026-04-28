@@ -264,7 +264,7 @@ def load_user_pins():
     fp = _get_pins_file()
     if os.path.exists(fp):
         try:
-            with open(fp, 'r') as f:
+            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
                 return json.load(f)
         except Exception:
             pass
@@ -287,7 +287,7 @@ def load_all_notes():
     if not os.path.exists(path):
         return {}
     try:
-        with open(path, 'r') as f:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
@@ -1027,7 +1027,7 @@ class QoRSummaryDialog(QDialog):
                 tbl.setItem(r, 0, m_item)
                 tbl.setItem(r, 1, v_item)
 
-        # Double-click value → open report in gvim
+        # Double-click value -> open report in gvim
         def _open_qor_rpt(clicked_item):
             path = clicked_item.data(Qt.UserRole)
             if path and os.path.exists(path):
@@ -1605,7 +1605,7 @@ class BlockSummaryDialog(QDialog):
         self._tabs = QTabWidget()
         layout.addWidget(self._tabs, 1)
 
-        # ── Tab 1: Table ────────────────────────────────────────────────
+        # -- Tab 1: Table ------------------------------------------------
         tab_tbl = QWidget()
         tab_tbl_layout = QVBoxLayout(tab_tbl)
         tab_tbl_layout.setContentsMargins(0, 0, 0, 0)
@@ -1628,7 +1628,7 @@ class BlockSummaryDialog(QDialog):
         tab_tbl_layout.addWidget(self.tbl)
         self._tabs.addTab(tab_tbl, "Table")
 
-        # ── Tab 2: Charts (PyQt5 native, no matplotlib) ──────────────────
+        # -- Tab 2: Charts (PyQt5 native, no matplotlib) ------------------
         tab_charts = QWidget()
         tab_charts_layout = QVBoxLayout(tab_charts)
         tab_charts_layout.setContentsMargins(4, 4, 4, 4)
@@ -1651,7 +1651,7 @@ class BlockSummaryDialog(QDialog):
 
         self._tabs.addTab(tab_charts, "Charts")
 
-        # ── Buttons ──────────────────────────────────────────────────────
+        # -- Buttons ------------------------------------------------------
         btn_row = QHBoxLayout()
         self.gen_btn = QPushButton("Generate Table")
         self.gen_btn.setStyleSheet(
@@ -1685,7 +1685,7 @@ class BlockSummaryDialog(QDialog):
         self.pos_fg  = QColor("#66bb6a" if is_dark else "#2e7d32")
         self._done_count = 0
 
-    # ── Loading ──────────────────────────────────────────────────────────
+    # -- Loading ----------------------------------------------------------
 
     def _start_loading(self):
         if not self._run_list:
@@ -1732,7 +1732,7 @@ class BlockSummaryDialog(QDialog):
         self.prog.setValue(self._done_count)
         QTimer.singleShot(10, self._load_next)
 
-    # ── Row builder ──────────────────────────────────────────────────────
+    # -- Row builder ------------------------------------------------------
 
     def _add_row(self, blk, run_name, runtime, metrics):
         area = metrics.get("area", {})
@@ -1774,7 +1774,7 @@ class BlockSummaryDialog(QDialog):
             except Exception:
                 gc = "-"
 
-        # VTH — use new flat structure from parse_cell_usage
+        # VTH - use new flat structure from parse_cell_usage
         vth_data = metrics.get("vth", {})
         vth_str  = vth_data.get("lvt_rvt_hvt_area",
                     vth_data.get("lvt_rvt_area", "-/-"))
@@ -1790,7 +1790,7 @@ class BlockSummaryDialog(QDialog):
         vals = [blk, run_name, mbit, cgc, inst, std_area,
                 gc, vth_str, r2r_setup, r2r_hold, logic_depth, rt]
 
-        # run_path stored in metrics — need it for double-click open
+        # run_path stored in metrics - need it for double-click open
         _run_path = metrics.get("run_dir", "")
 
         self.tbl.setSortingEnabled(False)
@@ -1821,7 +1821,7 @@ class BlockSummaryDialog(QDialog):
             self.tbl.setItem(r, c, item)
         self.tbl.setSortingEnabled(True)
 
-    # ── Charts (PyQt5 native) ─────────────────────────────────────────────
+    # -- Charts (PyQt5 native) ---------------------------------------------
 
     def _draw_charts(self):
         if self.tbl.rowCount() == 0:
@@ -1863,7 +1863,7 @@ class BlockSummaryDialog(QDialog):
         self._chart_cgc.set_data(labels, cgc_vals,
                                   colors=[QColor("#ffa726")] * n, is_dark=self.is_dark)
 
-    # ── Open cell report in gvim ──────────────────────────────────────────
+    # -- Open cell report in gvim ------------------------------------------
 
     _COL_REPORT = {
         2:  ["multibit_banking_ratio.*.rpt"],
@@ -1894,7 +1894,7 @@ class BlockSummaryDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Error", str(e))
 
-    # ── Mail ─────────────────────────────────────────────────────────────
+    # -- Mail -------------------------------------------------------------
 
     def _send_mail(self):
         if self.tbl.rowCount() == 0:
@@ -1924,7 +1924,7 @@ class BlockSummaryDialog(QDialog):
         else:
             QMessageBox.information(self, "Mail Body", html_body[:3000])
 
-    # ── Export CSV ───────────────────────────────────────────────────────
+    # -- Export CSV -------------------------------------------------------
 
     def _export_csv(self):
         if self.tbl.rowCount() == 0:
@@ -2098,7 +2098,7 @@ class PDDashboard(QMainWindow):
         self._setup_shortcuts()
         self.apply_theme_and_spacing()
         QTimer.singleShot(250, self.start_fs_scan)
-        # DiskScannerWorker runs `du -sk` on NFS — extremely I/O heavy.
+        # DiskScannerWorker runs `du -sk` on NFS - extremely I/O heavy.
         # Removed auto-start: it now only runs when user clicks "Disk Space".
         # This eliminates NFS contention that made all post-scan clicks sluggish.
 
@@ -2182,13 +2182,13 @@ class PDDashboard(QMainWindow):
         """Load run history dict: {run_key: [{status, runtime, fm, vslp, ts}]}"""
         import json
         try:
-            with open(self._history_file(), 'r') as f:
+            with open(self._history_file(), 'r', encoding='utf-8', errors='ignore') as f:
                 return json.load(f)
         except Exception:
             return {}
 
     def _save_run_history(self):
-        """Save run history in a daemon thread — never block the main thread on NFS write."""
+        """Save run history in a daemon thread - never block the main thread on NFS write."""
         import json, threading
         data = dict(self._run_history)   # shallow snapshot is safe (values are lists)
         fp   = self._history_file()
@@ -3525,7 +3525,7 @@ class PDDashboard(QMainWindow):
                     except Exception:
                         err_count = 0
                     item.setData(0, Qt.UserRole + 12, err_count)
-                # else: leave as None — button stays hidden this click; shown next
+                # else: leave as None - button stays hidden this click; shown next
             if err_count is not None:
                 self.current_error_log_path = err_path
                 dark = (self.is_dark_mode or
@@ -4511,7 +4511,7 @@ class PDDashboard(QMainWindow):
             child.setForeground(
                 2, QColor("#8e24aa" if not self.is_dark_mode else "#ce93d8"))
 
-        # Apply pin icon at creation time — O(1), replaces post-build tree walk
+        # Apply pin icon at creation time - O(1), replaces post-build tree walk
         pin_type = self.user_pins.get(run["path"])
         if pin_type and pin_type in self.icons:
             child.setIcon(0, self.icons[pin_type])
@@ -4794,11 +4794,11 @@ class PDDashboard(QMainWindow):
                     return not item.isHidden()
                 return False
             # Group nodes (BLOCK, MILESTONE, RTL, IGNORED_ROOT) recurse
-            # into children. Never auto-expand — preserve user's expand state.
+            # into children. Never auto-expand - preserve user's expand state.
             if node_type in _GROUP_TYPES or node_type == "MILESTONE":
                 # Short-circuit: if this is a BLOCK node whose block is
                 # entirely excluded by the block-list filter, hide it and
-                # skip recursing all its children — big win when many blocks
+                # skip recursing all its children - big win when many blocks
                 # are unchecked (skips 70-80% of tree walk).
                 if node_type == "BLOCK" and item.text(0) not in checked_blks:
                     item.setHidden(True)
@@ -4808,7 +4808,7 @@ class PDDashboard(QMainWindow):
                     if _update_visibility(item.child(i)):
                         any_visible = True
                 item.setHidden(not any_visible)
-                # No setExpanded() — user expand state is preserved
+                # No setExpanded() - user expand state is preserved
                 return any_visible
             else:
                 run         = item.data(0, _UR10)
@@ -4964,6 +4964,7 @@ class PDDashboard(QMainWindow):
             m.addSeparator()
 
         add_config_act = None
+        add_checked_config_act = None
         if b_name and r_rtl and base_run and run_source:
             if self.current_config_path:
                 add_config_act = m.addAction("Add Run to Active Filter Config")
@@ -5214,7 +5215,7 @@ class PDDashboard(QMainWindow):
 
     def _on_batch_sizes(self, batch):
         """Handle a batch of (item_id, size_str) tuples from BatchSizeWorker.
-        One call per 50 results instead of one call per result — keeps UI fluid."""
+        One call per 50 results instead of one call per result - keeps UI fluid."""
         for item_id, size_str in batch:
             self.update_item_size(item_id, size_str)
 
@@ -6226,7 +6227,7 @@ class PDDashboard(QMainWindow):
             _send_mail_via_util(dlg)
 
     def _toggle_selected_only(self):
-        """Click on Selected count label → toggle Selected Only view."""
+        """Click on Selected count label -> toggle Selected Only view."""
         if self.view_combo.currentText() == "Selected Only":
             self.view_combo.setCurrentText("All Runs")
         else:
