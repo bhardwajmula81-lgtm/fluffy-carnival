@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QStatusBar, QFrame, QShortcut, QToolButton, QStyle,
     QHeaderView, QFileDialog, QGroupBox, QTextEdit, QDockWidget,
     QFormLayout, QDialog, QDialogButtonBox, QFontComboBox,
-    QSpinBox, QDoubleSpinBox, QColorDialog, QTabWidget, QTableWidget,
+    QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QColorDialog, QTabWidget, QTableWidget,
     QTableWidgetItem, QScrollArea, QAbstractItemView
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint, QRect
@@ -277,6 +277,43 @@ def save_user_pins(pins_dict):
     except Exception:
         pass
 
+
+def _get_notes_file():
+    ensure_dir(NOTES_DIR)
+    return os.path.join(NOTES_DIR, "notes_{}.json".format(_getpass.getuser()))
+
+def load_all_notes():
+    path = _get_notes_file()
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, 'r') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def save_user_note(identifier, note_text):
+    if not identifier:
+        return False
+    notes = load_all_notes()
+    text = (note_text or '').strip()
+    if text:
+        old = notes.get(identifier, {})
+        if not isinstance(old, dict):
+            old = {"text": str(old)}
+        old["text"] = text
+        old["updated_by"] = _getpass.getuser()
+        old["updated_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        notes[identifier] = old
+    elif identifier in notes:
+        del notes[identifier]
+    try:
+        with open(_get_notes_file(), 'w') as f:
+            json.dump(notes, f, indent=4, sort_keys=True)
+        return True
+    except Exception:
+        return False
 
 def _send_mail_via_util(dlg):
     """Fire MAIL_UTIL subprocess from an AdvancedMailDialog."""
@@ -1361,12 +1398,12 @@ class _TimelineChartWidget(QWidget):
 
     def preferred_width(self):
         card_w = 220
-        gap_x = 74
+        gap_x = 96
         max_seq = 0
         for ev in self.events or []:
             if ev.get("kind") != "FE":
                 max_seq = max(max_seq, int(ev.get("seq", 0) or 0) + 1)
-        return 300 + max(1, max_seq) * (card_w + gap_x) + 70
+        return 380 + max(1, max_seq) * (card_w + gap_x) + 90
 
     def _dt(self, val):
         if self.parser:
@@ -1457,9 +1494,9 @@ class _TimelineChartWidget(QWidget):
         card_h = 94
         row_h = 126
         fe_x = 18
-        stage_x0 = 300
+        stage_x0 = 380
         top0 = 46
-        gap_x = 74
+        gap_x = 96
         fe_y = top0 + (max(1, len(branches)) * row_h - card_h) // 2
         trunk_x = fe_x + card_w + 28
         if fe_ev:
@@ -1492,10 +1529,15 @@ class _TimelineChartWidget(QWidget):
                     QPoint(x - 1, line_y)]))
                 gap_txt = self._gap_text(prev_end, self._dt(ev.get("start")))
                 if gap_txt != "-":
+                    fm = p.fontMetrics()
+                    badge_w = max(54, fm.width(gap_txt) + 16)
+                    badge_x = int((prev_right + x) / 2 - badge_w / 2)
+                    badge = QRect(badge_x, line_y - 29, badge_w, 18)
+                    p.setBrush(QBrush(bg))
+                    p.setPen(QPen(line, 1))
+                    p.drawRoundedRect(badge, 5, 5)
                     p.setPen(muted)
-                    p.drawText(prev_right + 4, line_y - 22,
-                               max(44, x - prev_right - 12), 18,
-                               Qt.AlignCenter, gap_txt)
+                    p.drawText(badge, Qt.AlignCenter, gap_txt)
                 self._draw_card(p, rect, ev, stage_color, fg, muted,
                                 card_bg, card_border)
                 prev_end = self._dt(ev.get("end")) or prev_end
@@ -1926,6 +1968,8 @@ class PDDashboard(QMainWindow):
         self.ir_data      = {}
         self.global_notes = {}
         self.user_pins    = load_user_pins()
+        self._fp_ver_cache = {}
+        self._cong_img_cache = {}
 
         # -- theme/display ------------------------------------------------
         self.is_dark_mode          = False
@@ -1964,6 +2008,7 @@ class PDDashboard(QMainWindow):
         self._last_scan_time        = ""
         self.run_filter_config      = None
         self.current_config_path    = None
+        self.ignore_run_filter      = False
         self.active_col_filters     = {}
         self._tree_builder          = None
 
@@ -2632,6 +2677,9 @@ class PDDashboard(QMainWindow):
 
         filt_menu = self.actions_menu.addMenu("Filter Configs...")
         filt_menu.addAction("Load Run Filter Config...", self.load_filter_config)
+        self.ignore_run_filter_act = filt_menu.addAction("Ignore Run Filter")
+        self.ignore_run_filter_act.setCheckable(True)
+        self.ignore_run_filter_act.triggered.connect(self.toggle_ignore_run_filter)
         filt_menu.addAction("Clear Run Filter Config",   self.clear_filter_config)
         filt_menu.addAction("Generate Sample Config",    self.generate_sample_config)
         self.actions_menu.addSeparator()
@@ -2641,6 +2689,7 @@ class PDDashboard(QMainWindow):
         self.actions_menu.addAction("Failed Runs Digest",      self.show_failed_digest)
         self.actions_menu.addAction("Timeline Overview",       self.show_selected_timeline_overview)
         self.actions_menu.addAction("Deselect All Checked Runs", self.deselect_all_checked_runs)
+        self.actions_menu.addAction("Add Checked Runs to Active Filter Config", self.add_checked_runs_to_filter_config)
 
         self.actions_menu.addAction("Compare Selected Runs",   self.show_run_diff)
         self.actions_menu.addAction("RoR Metric Diff",         self.show_ror_metric_diff)
@@ -2663,7 +2712,7 @@ class PDDashboard(QMainWindow):
         top_layout.addWidget(self._label("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Standard", "Compact", "Full"])
-        self.mode_combo.setFixedWidth(82)
+        self.mode_combo.setMinimumWidth(112)
         self.mode_combo.setToolTip(
             "Column view preset  (keys: 1=Compact  2=Standard  3=Full)")
         self.mode_combo.currentIndexChanged.connect(
@@ -2824,6 +2873,25 @@ class PDDashboard(QMainWindow):
         self.meta_status.setVisible(False)
         self.meta_path = _field_row("Run Path:")
         self.meta_log  = _field_row("Log File:")
+        self.fe_cong_panel = QGroupBox("FE Congestion Window")
+        fe_cong_layout = QVBoxLayout(self.fe_cong_panel)
+        fe_cong_layout.setContentsMargins(6, 6, 6, 6)
+        fe_cong_layout.setSpacing(4)
+        self.fe_fp_ver_lbl = QLabel("FP_VER: -")
+        self.fe_fp_ver_lbl.setWordWrap(True)
+        self.fe_fp_ver_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.fe_fp_ver_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: #1565c0;")
+        self.fe_cong_img_lbl = QLabel("No FE congestion image")
+        self.fe_cong_img_lbl.setAlignment(Qt.AlignCenter)
+        self.fe_cong_img_lbl.setFixedSize(296, 180)
+        self.fe_cong_img_lbl.setCursor(Qt.PointingHandCursor)
+        self.fe_cong_img_lbl.setStyleSheet("border: 1px solid #9e9e9e; background: #f5f5f5; color: #757575; font-size: 10px;")
+        self.fe_cong_img_lbl.mousePressEvent = lambda e: self._open_fe_congestion_fullscreen()
+        self._current_cong_img_path = None
+        fe_cong_layout.addWidget(self.fe_fp_ver_lbl)
+        fe_cong_layout.addWidget(self.fe_cong_img_lbl)
+        self.fe_cong_panel.setVisible(False)
+        left_layout.addWidget(self.fe_cong_panel, 0)
         left_layout.addWidget(self.meta_panel, 0)
 
         self.main_splitter.addWidget(left_panel)
@@ -2895,11 +2963,11 @@ class PDDashboard(QMainWindow):
         self.ins_lbl.setWordWrap(True)
         self.ins_note = QTextEdit()
         self.ins_note.setPlaceholderText(
-            "Enter aliases or personal notes here...\n\nVisible to all dashboard users.")
+            "Enter aliases or personal notes here...\n\nSaved only in your per-user notes JSON.")
         self.ins_save_btn = QPushButton("Save Note")
         self.ins_save_btn.clicked.connect(self.save_inspector_note)
         ins_layout.addWidget(self.ins_lbl)
-        ins_layout.addWidget(QLabel("<b>Shared Notes:</b>"))
+        ins_layout.addWidget(QLabel("<b>Personal Notes:</b>"))
         ins_layout.addWidget(self.ins_note)
         ins_layout.addWidget(self.ins_save_btn)
 
@@ -3317,6 +3385,7 @@ class PDDashboard(QMainWindow):
             self.meta_run_name.setText("")
             self.meta_path.clear()
             self.meta_log.clear()
+            self.fe_cong_panel.setVisible(False)
             self.ins_note.clear()
             self.ins_note.setEnabled(False)
             self.ins_save_btn.setEnabled(False)
@@ -3388,6 +3457,7 @@ class PDDashboard(QMainWindow):
                 clean_text = line.replace(tag, "").strip()
                 break
         self.ins_note.setPlainText(clean_text)
+        self._update_fe_congestion_panel(item, run_data if not is_stage and not is_rtl else None)
 
         # Lazy error count: use cached_exists to avoid blocking NFS on first click
         if len(sel) == 1 and not is_stage and path and path != "N/A":
@@ -3420,6 +3490,120 @@ class PDDashboard(QMainWindow):
                 self.fe_error_btn.setText(f"compile_opt errors: {err_count}")
                 self.fe_error_btn.setVisible(True)
 
+    def _find_fe_congestion_image(self, run_path, block):
+        key = (run_path or "", block or "")
+        if key in self._cong_img_cache:
+            return self._cong_img_cache[key]
+        hit = None
+        try:
+            rpt_dir = os.path.join(run_path, "reports")
+            if os.path.isdir(rpt_dir):
+                pats = []
+                if block:
+                    pats.append("congestion.window.{}.*.jpg".format(block))
+                    pats.append("congestion.window.{}.*.jpeg".format(block))
+                pats.extend(["congestion.window.*.jpg", "congestion.window.*.jpeg"])
+                matches = []
+                for name in os.listdir(rpt_dir):
+                    for pat in pats:
+                        if fnmatch.fnmatch(name, pat):
+                            matches.append(os.path.join(rpt_dir, name))
+                            break
+                if matches:
+                    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    hit = matches[0]
+        except Exception:
+            hit = None
+        self._cong_img_cache[key] = hit
+        return hit
+
+    def _extract_fe_fp_ver(self, run_path):
+        if run_path in self._fp_ver_cache:
+            return self._fp_ver_cache[run_path]
+        val = "-"
+        log_path = os.path.join(run_path or "", "logs", "compile_opt.log")
+        try:
+            if os.path.exists(log_path):
+                with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        m = re.search(r'^\s*INFO\s*:\s*FP_VER\s*[-:]\s*(\S.*)$', line)
+                        if m:
+                            cand = m.group(1).strip().strip('"')
+                            if '$' in cand or cand.upper() in ('FP_VER', '$FP_VER'):
+                                continue
+                            val = cand
+                            break
+        except Exception:
+            val = "-"
+        self._fp_ver_cache[run_path] = val
+        return val
+
+    def _update_fe_congestion_panel(self, item, run_data):
+        is_fe = bool(run_data and run_data.get("run_type") == "FE")
+        run_path = item.text(15) if item else ""
+        if not is_fe or not run_path or run_path == "N/A":
+            self.fe_cong_panel.setVisible(False)
+            self._current_cong_img_path = None
+            return
+        block = (run_data.get("block") or item.data(0, Qt.UserRole + 2) or "")
+        dark = (self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"))
+        self.fe_fp_ver_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: {};".format("#90caf9" if dark else "#1565c0"))
+        self.fe_cong_img_lbl.setStyleSheet("border: 1px solid {}; background: {}; color: {}; font-size: 10px;".format("#555b64" if dark else "#9e9e9e", "#30343a" if dark else "#f5f5f5", "#dfe1e5" if dark else "#757575"))
+        fp_ver = self._extract_fe_fp_ver(run_path)
+        self.fe_fp_ver_lbl.setText("FP_VER: " + (fp_ver if fp_ver and fp_ver != "-" else "not found in compile_opt.log"))
+        img_path = self._find_fe_congestion_image(run_path, block)
+        self._current_cong_img_path = img_path
+        if img_path and os.path.exists(img_path):
+            px = QPixmap(img_path)
+            if not px.isNull():
+                scaled = px.scaled(self.fe_cong_img_lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.fe_cong_img_lbl.setPixmap(scaled)
+                self.fe_cong_img_lbl.setText("")
+                self.fe_cong_img_lbl.setToolTip("Click to open full screen\n" + img_path)
+            else:
+                self.fe_cong_img_lbl.setPixmap(QPixmap())
+                self.fe_cong_img_lbl.setText("Image load failed")
+                self.fe_cong_img_lbl.setToolTip(img_path)
+        else:
+            self.fe_cong_img_lbl.setPixmap(QPixmap())
+            self.fe_cong_img_lbl.setText("No congestion.window image found")
+            self.fe_cong_img_lbl.setToolTip("Expected: reports/congestion.window.{}.*.jpg".format(block or "<block>"))
+        self.fe_cong_panel.setVisible(True)
+
+    def _open_fe_congestion_fullscreen(self):
+        path = getattr(self, "_current_cong_img_path", None)
+        if not path or not os.path.exists(path):
+            QMessageBox.information(self, "Congestion Image", "No congestion image is available for this FE run.")
+            return
+        px = QPixmap(path)
+        if px.isNull():
+            QMessageBox.warning(self, "Congestion Image", "Could not load image:\n" + path)
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("FE Congestion Window - " + os.path.basename(path))
+        layout = QVBoxLayout(dlg)
+        view = QLabel()
+        view.setAlignment(Qt.AlignCenter)
+        try:
+            avail = QApplication.desktop().availableGeometry(self)
+            scaled = px.scaled(avail.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        except Exception:
+            scaled = px
+        view.setPixmap(scaled)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(view)
+        layout.addWidget(scroll)
+        row = QHBoxLayout()
+        path_lbl = QLabel(path)
+        path_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        row.addWidget(path_lbl, 1)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+        dlg.showFullScreen()
+        dlg.exec_()
     def _open_file_or_warn(self, path, label="File"):
         """Open path in gvim, or show a non-blocking warning if it doesn't exist."""
         if path and os.path.exists(path):
@@ -3501,7 +3685,7 @@ class PDDashboard(QMainWindow):
                 QListWidget {{ background-color: {bg}; color: {fg}; alternate-background-color: transparent; }}
                 QScrollArea, QAbstractScrollArea, QScrollBar {{ background-color: {bg}; color: {fg}; }}
                 QLabel {{ color: {fg}; }}
-                QLineEdit, QSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 4px; }}
+                QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 4px; }}
                 QComboBox QAbstractItemView {{ background-color: {bg}; color: {fg}; selection-background-color: {sel}; selection-color: #fff; }}
                 QPushButton, QToolButton {{ background-color: {bg}; color: {fg}; border: 1px solid {fg}; padding: 5px 12px; border-radius: 4px; }}
                 QPushButton:hover, QToolButton:hover {{ border-color: {sel}; }}
@@ -3514,6 +3698,7 @@ class PDDashboard(QMainWindow):
                 QLabel#statusLink {{ color: {sel}; font-weight: bold; }}
                 QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: {sel}; color: #ffffff; }}
+                QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 18px; }}
                 {cb_style}"""
         elif self.is_dark_mode:
             stylesheet = f"""
@@ -3525,7 +3710,7 @@ class PDDashboard(QMainWindow):
                 QScrollArea, QAbstractScrollArea {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; }}
                 QLabel {{ color: #dfe1e5; }}
                 QHeaderView::section {{ background-color: #2b2d30; color: #a9b7c6; border: 1px solid #1e1f22; padding: 5px; font-weight: bold; }}
-                QLineEdit, QSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 3px; }}
+                QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit {{ background-color: #1e1f22; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 3px; }}
                 QComboBox {{ background-color: #2b2d30; color: #dfe1e5; border: 1px solid #43454a; padding: 4px; border-radius: 3px; }}
                 QComboBox QAbstractItemView {{ background-color: #2b2d30; color: #dfe1e5; selection-background-color: #2f65ca; selection-color: #fff; }}
                 QPushButton, QToolButton {{ background-color: #3c3f41; color: #dfe1e5; border: 1px solid #555759; padding: 5px 12px; border-radius: 4px; }}
@@ -3540,6 +3725,7 @@ class PDDashboard(QMainWindow):
                 QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: #2f65ca; color: #ffffff; }}
                 QSplitter::handle {{ background-color: #43454a; }}
+                QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 18px; }}
                 {cb_style}"""
         else:
             stylesheet = f"""
@@ -3550,7 +3736,7 @@ class PDDashboard(QMainWindow):
                 QListWidget {{ background-color: #ffffff; color: #212121; alternate-background-color: #f9f9f9; }}
                 QScrollArea, QAbstractScrollArea {{ background-color: #ffffff; color: #212121; border: 1px solid #d0d0d0; }}
                 QHeaderView::section {{ background-color: #e0e0e0; color: #212121; border: 1px solid #bdbdbd; padding: 5px; font-weight: bold; }}
-                QLineEdit, QSpinBox, QTextEdit {{ background-color: #ffffff; color: #212121; border: 1px solid #bdbdbd; padding: 4px; border-radius: 3px; }}
+                QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit {{ background-color: #ffffff; color: #212121; border: 1px solid #bdbdbd; padding: 4px; border-radius: 3px; }}
                 QComboBox {{ background-color: #ffffff; color: #212121; border: 1px solid #bdbdbd; padding: 4px; border-radius: 3px; }}
                 QComboBox QAbstractItemView {{ background-color: #ffffff; color: #212121; selection-background-color: #1976D2; selection-color: #fff; }}
                 QPushButton, QToolButton {{ background-color: #e0e0e0; color: #212121; border: 1px solid #bdbdbd; padding: 5px 12px; border-radius: 4px; }}
@@ -3565,6 +3751,7 @@ class PDDashboard(QMainWindow):
                 QTreeView::item {{ padding: {pad}px; }} QListWidget::item {{ padding: {pad}px; }}
                 QTreeView::item:selected, QListWidget::item:selected {{ background-color: #1976D2; color: #ffffff; }}
                 QSplitter::handle {{ background-color: #bdbdbd; }}
+                QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 18px; }}
                 {cb_style}"""
 
         if stylesheet != self._last_stylesheet:
@@ -4243,6 +4430,10 @@ class PDDashboard(QMainWindow):
         child.setData(0, Qt.UserRole, "STAGE"
                       if run["run_type"] == "STAGE" else None)
 
+        if self._run_in_filter_config(run):
+            child.setText(23, "CONFIG")
+            child.setForeground(0, QColor("#1565c0" if not self.is_dark_mode else "#90caf9"))
+            tooltip_text += "\n[IN ACTIVE FILTER CONFIG]"
         tooltip_text += f"\nSize: -\n"
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
@@ -4447,7 +4638,7 @@ class PDDashboard(QMainWindow):
         _selected_only = (preset == "Selected Only")
         _checked_set   = self._checked_paths
         _pins          = self.user_pins
-        _rfc           = self.run_filter_config
+        _rfc           = None if self.ignore_run_filter else self.run_filter_config
         _notes         = self.global_notes
 
         def _passes(run):
@@ -4465,14 +4656,14 @@ class PDDashboard(QMainWindow):
                     return False
                 if _rfc is not None:
                     rr, rb = run["rtl"], run["block"]
-                    if (src in _rfc and rr in _rfc[src]
-                            and rb in _rfc[src][rr]):
-                        allowed   = _rfc[src][rr][rb]
-                        base_name = run["r_name"].replace(
-                            "-FE","").replace("-BE","")
-                        if (base_name not in allowed
-                                and run["r_name"] not in allowed):
-                            return False
+                    allowed = None
+                    if src in _rfc and rr in _rfc[src] and rb in _rfc[src][rr]:
+                        allowed = _rfc[src][rr][rb]
+                    if allowed is None:
+                        return False
+                    base_name = run["r_name"].replace("-FE","").replace("-BE","")
+                    if base_name not in allowed and run["r_name"] not in allowed:
+                        return False
             rtl = run["rtl"]
             if not _sel_rtl_all:
                 if rtl != sel_rtl and not rtl.startswith(_sel_rtl_sfx):
@@ -4848,6 +5039,10 @@ class PDDashboard(QMainWindow):
                 self.global_notes = load_all_notes()
                 self.refresh_view()
 
+        elif add_checked_config_act and res == add_checked_config_act:
+            self.add_checked_runs_to_filter_config()
+            return
+
         elif add_config_act and res == add_config_act:
             if not self.current_config_path:
                 path, _ = QFileDialog.getSaveFileName(
@@ -5133,6 +5328,97 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # FILTER CONFIGS
     # ------------------------------------------------------------------
+    def _run_in_filter_config(self, run):
+        if not self.run_filter_config or not run:
+            return False
+        src = run.get("source", "")
+        rtl = run.get("rtl", "")
+        blk = run.get("block", "")
+        allowed = self.run_filter_config.get(src, {}).get(rtl, {}).get(blk)
+        if not allowed:
+            return False
+        base = run.get("r_name", "").replace("-FE", "").replace("-BE", "")
+        return run.get("r_name", "") in allowed or base in allowed
+
+    def _ensure_filter_config_path(self):
+        if self.current_config_path:
+            return True
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Create New Config", "dashboard_filter.cfg",
+            "Config Files (*.cfg *.txt)")
+        if not path:
+            return False
+        self.current_config_path = path
+        return True
+
+    def _task_item_for_filter_config(self, item):
+        if not item:
+            return None
+        if item.data(0, Qt.UserRole) == "STAGE":
+            item = item.parent()
+        run = item.data(0, Qt.UserRole + 10) if item else None
+        if not run:
+            return None
+        return item
+
+    def add_checked_runs_to_filter_config(self):
+        items = []
+        seen = set()
+        for item in self._checked_run_items():
+            item = self._task_item_for_filter_config(item)
+            if not item:
+                continue
+            path = item.text(15)
+            if path in seen:
+                continue
+            seen.add(path)
+            items.append(item)
+        if not items:
+            QMessageBox.information(
+                self, "Filter Config", "Check one or more runs first.")
+            return
+        if not self._ensure_filter_config_path():
+            return
+        added_count = 0
+        for item in items:
+            run = item.data(0, Qt.UserRole + 10) or {}
+            base_run = item.data(0, Qt.UserRole + 4) or item.text(0)
+            before = list(self.run_filter_config.get(
+                run.get("source", ""), {}).get(
+                item.text(1), {}).get(
+                run.get("block", item.data(0, Qt.UserRole + 2) or ""), [])) if self.run_filter_config else []
+            self._add_run_to_filter_config(
+                run.get("source", item.text(2)),
+                item.text(1),
+                run.get("block", item.data(0, Qt.UserRole + 2) or ""),
+                base_run)
+            after = self.run_filter_config.get(
+                run.get("source", item.text(2)), {}).get(
+                item.text(1), {}).get(
+                run.get("block", item.data(0, Qt.UserRole + 2) or ""), [])
+            if len(after) > len(before):
+                added_count += 1
+        self._save_current_config()
+        self.ignore_run_filter = False
+        if hasattr(self, "ignore_run_filter_act"):
+            self.ignore_run_filter_act.setChecked(False)
+        self.sb_config.setText(
+            "Config: {}".format(os.path.basename(self.current_config_path)))
+        self.status_bar.showMessage(
+            "Added {} checked run(s) to active filter config".format(added_count),
+            5000)
+        self.refresh_view()
+
+    def toggle_ignore_run_filter(self, checked):
+        self.ignore_run_filter = bool(checked)
+        if self.current_config_path:
+            name = os.path.basename(self.current_config_path)
+            self.sb_config.setText(
+                "Config: {}{}".format(name, " (ignored)" if checked else ""))
+        else:
+            self.sb_config.setText("Config: None")
+        self.refresh_view()
+
     def load_filter_config(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Run Filter Config", "",
@@ -5164,6 +5450,9 @@ class PDDashboard(QMainWindow):
                         rtl, {})[block] = run_list
             self.run_filter_config  = cfg
             self.current_config_path = path
+            self.ignore_run_filter = False
+            if hasattr(self, "ignore_run_filter_act"):
+                self.ignore_run_filter_act.setChecked(False)
             self.sb_config.setText(
                 f"Config: {os.path.basename(path)}")
             self.refresh_view()
@@ -5173,6 +5462,9 @@ class PDDashboard(QMainWindow):
     def clear_filter_config(self):
         self.run_filter_config  = None
         self.current_config_path = None
+        self.ignore_run_filter = False
+        if hasattr(self, "ignore_run_filter_act"):
+            self.ignore_run_filter_act.setChecked(False)
         self.sb_config.setText("Config: None")
         self.refresh_view()
 
@@ -6590,229 +6882,143 @@ class PDDashboard(QMainWindow):
                 tbl.setItem(r, c, it)
             prev_by_branch[branch] = self._parse_dashboard_time(ev.get("end")) or prev_by_branch.get(branch)
         layout.addWidget(tbl)
-        btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
-        layout.addWidget(btn)
+
+        btn_row = QHBoxLayout()
+        max_btn = QPushButton("Maximize Window")
+        full_btn = QPushButton("Full Screen Flowchart")
+        close_btn = QPushButton("Close")
+
+        def _toggle_maximize():
+            if dlg.isMaximized():
+                dlg.showNormal()
+                max_btn.setText("Maximize Window")
+            else:
+                dlg.showMaximized()
+                max_btn.setText("Restore Window")
+
+        def _show_full_chart():
+            fd = QDialog(dlg)
+            fd.setWindowTitle("Timeline Flowchart - Full Screen")
+            fdl = QVBoxLayout(fd)
+            full_chart = _TimelineChartWidget(events, self._parse_dashboard_time, self.is_dark_mode)
+            full_chart.event_clicked.connect(self._show_timeline_event_detail)
+            fs = QScrollArea()
+            fs.setWidgetResizable(False)
+            full_chart.setMinimumSize(full_chart.preferred_width(), full_chart.preferred_height(1400))
+            fs.setWidget(full_chart)
+            fdl.addWidget(fs)
+            fr = QHBoxLayout()
+            exit_btn = QPushButton("Exit Full Screen")
+            exit_btn.clicked.connect(fd.accept)
+            fr.addStretch(1)
+            fr.addWidget(exit_btn)
+            fdl.addLayout(fr)
+            fd.showFullScreen()
+            fd.exec_()
+
+        max_btn.clicked.connect(_toggle_maximize)
+        full_btn.clicked.connect(_show_full_chart)
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(max_btn)
+        btn_row.addWidget(full_btn)
+        btn_row.addStretch(1)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
         dlg.exec_()
 
     def _show_timeline_event_detail(self, ev):
         msg = (
             "Step: {}\n"
             "Type: {}\n"
+            "Branch: {}\n"
             "Start: {}\n"
             "End: {}\n"
-            "Runtime: {}").format(
-                ev.get("name", "-"),
-                ev.get("kind", "-"),
-                ev.get("start", "-"),
-                ev.get("end", "-"),
-                ev.get("runtime", "-"))
+            "Runtime: {}"
+        ).format(
+            ev.get("name", "-"), ev.get("kind", "-"),
+            ev.get("branch", "-"), ev.get("start", "-"),
+            ev.get("end", "-"), ev.get("runtime", "-"))
         QMessageBox.information(self, "Timeline Step", msg)
 
-    def show_selected_timeline_overview(self):
-        items = self.tree.selectedItems()
-        if not items:
-            QMessageBox.information(
-                self, "Timeline Overview",
-                "Select a FE run, BE run, or stage row first.")
-            return
-        self.show_timeline_overview(items[0])
-
-    def _clear_fe_hover_metric_tooltips(self):
-        def walk(node):
-            for i in range(node.childCount()):
-                child = node.child(i)
-                try:
-                    tip = child.toolTip(0) or ""
-                    if "FE QoR metrics" in tip:
-                        child.setToolTip(0, re.sub(
-                            r"\nFE QoR metrics[\s\S]*$", "", tip))
-                except RuntimeError:
-                    pass
-                walk(child)
-        walk(self.tree.invisibleRootItem())
-
-    def _hover_gate_count(self, area):
-        gc = area.get("gate_count", "-")
-        if gc and str(gc).strip() not in ("", "-"):
-            return str(gc)
-        std_area = area.get("std_cell_area", "-")
-        try:
-            return str(int(float(str(std_area).replace(",", "")) / self.gate_count_unit_area))
-        except Exception:
-            return "-"
-
-    def _format_hover_metrics(self, metrics):
-        area = metrics.get("area", {}) or {}
-        vth = metrics.get("vth", {}) or {}
-
-        inst = area.get("instance_count", area.get("total_count", "-"))
-        std_area = area.get("std_cell_area", "-")
-        gate_count = self._hover_gate_count(area)
-        vth_area = vth.get("lvt_rvt_hvt_area",
-                           vth.get("lvt_rvt_area", "-/-/-"))
-
-        parts = ["FE QoR metrics"]
-        parts.append("R2R Setup WNS/TNS/FEPs: " + str(metrics.get("r2r_setup", "-")))
-        parts.append("Instance Count: " + str(inst))
-        parts.append("Std Cell Area: " + str(std_area))
-        parts.append("Gate Count: " + str(gate_count))
-        parts.append("VT L/R/H Area %: " + str(vth_area))
-        parts.append("Logic Depth: " + str(metrics.get("logic_depth", "-")))
-        return "\n" + "\n".join(parts)
-
-    def _append_hover_metrics_to_item(self, item, metrics):
-        try:
-            old = item.toolTip(0) or ""
-            old = re.sub(r"\nFE QoR metrics[\s\S]*$", "", old)
-            if self.enable_fe_hover_metrics:
-                item.setToolTip(0, old + self._format_hover_metrics(metrics))
-            else:
-                item.setToolTip(0, old)
-        except RuntimeError:
-            pass
-
-    def _on_hover_metric_done(self, path, item, metrics):
-        self._hover_metric_worker = None
-        self._hover_metric_path = ""
-        if not self.enable_fe_hover_metrics:
-            return
-        if metrics is None or metrics.get("_error"):
-            return
-        self._hover_metric_cache[path] = metrics
-        self._append_hover_metrics_to_item(item, metrics)
-
-    def _on_tree_item_hovered(self, item, col):
-        if not self.enable_fe_hover_metrics:
-            return
-        if not hasattr(self, "view_combo") or self.view_combo.currentText() != "FE Only":
-            return
-        if not item or item.data(0, Qt.UserRole) is not None:
-            return
-        run = item.data(0, Qt.UserRole + 10) or {}
-        if run.get("run_type") != "FE":
-            return
-        path = run.get("path") or item.text(15)
-        if not path or path == "N/A":
-            return
-        if path in self._hover_metric_cache:
-            self._append_hover_metrics_to_item(item, self._hover_metric_cache[path])
-            return
-        if self._hover_metric_worker and self._hover_metric_worker.isRunning():
-            return
-        try:
-            self._hover_metric_path = path
-            self._hover_metric_worker = MetricWorker(
-                path, run.get("block") or item.data(0, Qt.UserRole + 2) or "",
-                "FE", run.get("source") or item.text(2))
-            self._hover_metric_worker.finished.connect(
-                lambda metrics, p=path, it=item: self._on_hover_metric_done(p, it, metrics))
-            self._hover_metric_worker.start()
-        except Exception:
-            self._hover_metric_worker = None
-            self._hover_metric_path = ""
-    def deselect_all_checked_runs(self):
-        self.tree.blockSignals(True)
-        def walk(node):
-            for i in range(node.childCount()):
-                child = node.child(i)
-                try:
-                    if child.checkState(0) == Qt.Checked:
-                        child.setCheckState(0, Qt.Unchecked)
-                except Exception:
-                    pass
-                walk(child)
-        walk(self.tree.invisibleRootItem())
-        self.tree.blockSignals(False)
-        self._checked_paths.clear()
-        self._update_status_bar([])
-        self.refresh_view()
-    def _checked_run_items(self):
-        items = []
-        def collect(node):
-            for i in range(node.childCount()):
-                c = node.child(i)
-                nt = c.data(0, Qt.UserRole)
-                if (c.checkState(0) == Qt.Checked
-                        and nt not in ("BLOCK","MILESTONE","RTL","IGNORED_ROOT",
-                                       "__PLACEHOLDER__")):
-                    items.append(c)
-                collect(c)
-        collect(self.tree.invisibleRootItem())
-        return items
-
     def _metric_task_from_item(self, item):
-        nt = item.data(0, Qt.UserRole)
-        if nt == "STAGE":
+        if not item:
+            return None
+        role = item.data(0, Qt.UserRole)
+        if role == "STAGE":
             parent = item.parent()
             if not parent:
                 return None
-            run = parent.data(0, Qt.UserRole + 10) or {}
-            return {"name": parent.text(0) + " / " + item.text(0),
-                    "path": parent.text(15), "run_type": "BE",
-                    "stage_name": item.text(0),
-                    "source": parent.text(2), "block": parent.data(0, Qt.UserRole + 2) or ""}
+            return {
+                "name": parent.text(0) + " / " + item.text(0),
+                "path": parent.text(15),
+                "run_type": "BE",
+                "stage_name": item.text(0),
+                "source": item.text(2) or parent.text(2) or "WS",
+                "block": item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or "",
+            }
         run = item.data(0, Qt.UserRole + 10) or {}
-        if run.get("run_type") != "FE":
+        path = item.text(15)
+        if not path or path == "N/A":
             return None
-        return {"name": item.text(0), "path": item.text(15), "run_type": "FE",
-                "stage_name": None, "source": item.text(2),
-                "block": item.data(0, Qt.UserRole + 2) or ""}
+        run_type = run.get("run_type") or ("FE" if item.text(0).endswith("-FE") else "")
+        if run_type != "FE":
+            return None
+        return {
+            "name": item.text(0),
+            "path": path,
+            "run_type": "FE",
+            "stage_name": None,
+            "source": run.get("source", item.text(2) or "WS"),
+            "block": run.get("block", item.data(0, Qt.UserRole + 2) or ""),
+        }
+
+    def _num(self, value):
+        if value is None:
+            return None
+        try:
+            txt = str(value).replace(',', '').strip()
+            m = re.search(r'[-+]?\d+(?:\.\d+)?', txt)
+            return float(m.group(0)) if m else None
+        except Exception:
+            return None
 
     def _metric_value(self, metrics, key):
-        area = metrics.get("area", {}) or {}
-        cong = metrics.get("congestion", {}) or {}
-        power = metrics.get("power", {}) or {}
-        util = metrics.get("util", {}) or {}
-        flat = {
-            "r2r_setup": metrics.get("r2r_setup", "-"),
-            "r2r_hold": metrics.get("r2r_hold", "-"),
-            "total_area": area.get("total_area", "-"),
-            "instance_count": area.get("instance_count", "-"),
-            "std_cell_area": area.get("std_cell_area", "-"),
-            "memory_area": area.get("memory_area", "-"),
-            "macro_area": area.get("macro_area", "-"),
-            "std_util": util.get("std_util_str", metrics.get("std_util_str", "-")),
-            "mbit": metrics.get("mbit", "-"),
-            "cgc": metrics.get("cgc", "-"),
-            "congestion": cong.get("cong_both", "-"),
-            "leakage": power.get("leakage", "-"),
-            "runtime": metrics.get("runtime", "-"),
-            "logic_depth": metrics.get("logic_depth", "-"),
-        }
-        return flat.get(key, "-")
-
-    def _num(self, val):
-        s = str(val or "")
-        # Runtime strings: 00d:05h:12m:39s, 05h:12m:39s, etc.
-        if re.search(r'[dhms:]', s):
-            rt = re.search(
-                r'(?:(\d+)\s*d[: ]*)?(?:(\d+)\s*h[: ]*)?(?:(\d+)\s*m[: ]*)?(?:(\d+)\s*s)?',
-                s)
-            if rt and any(rt.groups()):
-                d = float(rt.group(1) or 0)
-                h = float(rt.group(2) or 0)
-                m = float(rt.group(3) or 0)
-                sec = float(rt.group(4) or 0)
-                return d * 24.0 + h + (m / 60.0) + (sec / 3600.0)
-        m = re.search(r'-?\d+(?:\.\d+)?', str(val or ""))
-        return float(m.group(0)) if m else None
+        metrics = metrics or {}
+        area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
+        vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
+        if key == "std_cell_area":
+            return area.get("std_cell_area", metrics.get("std_cell_area", "-"))
+        if key == "instance_count":
+            return area.get("instance_count", metrics.get("instance_count", "-"))
+        if key == "gate_count":
+            val = metrics.get("gate_count", "-")
+            if val != "-":
+                return val
+            std_area = self._num(area.get("std_cell_area", "-"))
+            factor = getattr(self, "gate_count_unit_area", 0.2419) or 0.2419
+            return str(int(std_area / factor)) if std_area is not None and factor else "-"
+        if key == "vth_area":
+            return vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-"))
+        if key == "wns":
+            return str(metrics.get("r2r_setup", "-")).split('/')[0]
+        if key == "hold_wns":
+            return str(metrics.get("r2r_hold", "-")).split('/')[0]
+        return metrics.get(key, "-")
 
     def _show_metric_diff_dialog(self, title, rows, baseline_name=None):
+        if not rows:
+            QMessageBox.information(self, title, "No metrics were extracted.")
+            return
         fields = [
-            ("R2R Setup WNS/TNS/FEPs", "r2r_setup"),
-            ("R2R Hold WNS/TNS/FEPs", "r2r_hold"),
-            ("Total Area", "total_area"),
-            ("Instance Count", "instance_count"),
             ("Std Cell Area", "std_cell_area"),
-            ("Memory Area", "memory_area"),
-            ("Macro Area", "macro_area"),
-            ("Std Util", "std_util"),
-            ("MBIT Ratio", "mbit"),
-            ("CGC Ratio", "cgc"),
-            ("Congestion", "congestion"),
-            ("Leakage", "leakage"),
-            ("Runtime", "runtime"),
+            ("Gate Count", "gate_count"),
+            ("Instance Count", "instance_count"),
+            ("R2R Setup WNS", "wns"),
+            ("R2R Hold WNS", "hold_wns"),
+            ("CGC %", "cgc"),
+            ("MBIT %", "mbit"),
             ("Logic Depth", "logic_depth"),
+            ("VT L/R/H Area %", "vth_area"),
         ]
         dlg = QDialog(self)
         dlg.setWindowTitle(title)
@@ -6822,7 +7028,9 @@ class PDDashboard(QMainWindow):
         if baseline_name:
             layout.addWidget(QLabel("<b>Baseline:</b> " + baseline_name))
         layout.addWidget(QLabel("<b>Runs:</b> " + "  |  ".join(names)))
-        tbl = QTableWidget(0, 5 if len(rows) == 2 else len(rows) + 2)
+
+        col_count = 5 if len(rows) == 2 else len(rows) + 2
+        tbl = QTableWidget(0, col_count)
         if len(rows) == 2:
             tbl.setHorizontalHeaderLabels(["Metric", names[0], names[1], "Delta", "Delta %"])
         else:
@@ -6832,12 +7040,10 @@ class PDDashboard(QMainWindow):
             tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
-        chart = _BarChartWidget(
-            "Metric Delta % (comparison vs baseline)")
+
+        chart = _BarChartWidget("Metric Delta % (comparison vs baseline)")
         chart.setMinimumHeight(210)
-        chart_labels = []
-        chart_values = []
-        chart_colors = []
+        chart_labels, chart_values, chart_colors = [], [], []
         for label, key in fields:
             r = tbl.rowCount(); tbl.insertRow(r)
             tbl.setItem(r, 0, QTableWidgetItem(label))
@@ -6848,37 +7054,34 @@ class PDDashboard(QMainWindow):
             if len(rows) == 2:
                 delta_txt = pct_txt = "-"
                 if nums[0] is not None and nums[1] is not None:
-                    d = nums[1] - nums[0]
-                    delta_txt = "{:+.4g}".format(d)
+                    delta = nums[1] - nums[0]
+                    delta_txt = "{:+.4g}".format(delta)
                     if nums[0] != 0:
-                        pct_val = (d / abs(nums[0])) * 100.0
-                        pct_txt = "{:+.2f}%".format(pct_val)
+                        pct = (delta / abs(nums[0])) * 100.0
+                        pct_txt = "{:+.2f}%".format(pct)
                         chart_labels.append(label.split()[0])
-                        chart_values.append(pct_val)
-                        chart_colors.append(
-                            QColor("#ef5350") if pct_val < 0 else QColor("#66bb6a"))
+                        chart_values.append(pct)
+                        chart_colors.append(QColor("#ef5350") if pct < 0 else QColor("#66bb6a"))
                 tbl.setItem(r, 3, QTableWidgetItem(delta_txt))
                 tbl.setItem(r, 4, QTableWidgetItem(pct_txt))
             else:
-                base = nums[0]
                 worst = "-"
+                base = nums[0]
                 if base not in (None, 0):
-                    pcts = [((n - base) / abs(base)) * 100.0
-                            for n in nums[1:] if n is not None]
+                    pcts = [((n - base) / abs(base)) * 100.0 for n in nums[1:] if n is not None]
                     if pcts:
-                        pct_val = max(pcts, key=lambda x: abs(x))
-                        worst = "{:+.2f}%".format(pct_val)
+                        pct = max(pcts, key=lambda x: abs(x))
+                        worst = "{:+.2f}%".format(pct)
                         chart_labels.append(label.split()[0])
-                        chart_values.append(pct_val)
-                        chart_colors.append(
-                            QColor("#ef5350") if pct_val < 0 else QColor("#66bb6a"))
+                        chart_values.append(pct)
+                        chart_colors.append(QColor("#ef5350") if pct < 0 else QColor("#66bb6a"))
                 tbl.setItem(r, tbl.columnCount() - 1, QTableWidgetItem(worst))
-        chart.set_data(chart_labels, chart_values,
-                       colors=chart_colors, is_dark=self.is_dark_mode)
+        chart.set_data(chart_labels, chart_values, colors=chart_colors, is_dark=self.is_dark_mode)
         layout.addWidget(chart)
         layout.addWidget(tbl)
-        btn = QPushButton("Close"); btn.clicked.connect(dlg.accept)
-        layout.addWidget(btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn)
         dlg.exec_()
 
     def show_ror_metric_diff(self):
