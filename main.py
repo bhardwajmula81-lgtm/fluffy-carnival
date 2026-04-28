@@ -1464,7 +1464,6 @@ class _TimelineChartWidget(QWidget):
             return "{}d {}h".format(h // 24, h % 24)
         return "{}h {}m".format(h, m)
 
-
 class BlockSummaryDialog(QDialog):
     """Block synthesis summary table.
     One row per selected run. User clicks Generate to start loading.
@@ -1908,7 +1907,12 @@ class PDDashboard(QMainWindow):
         self._building_tree         = False
         self._last_stylesheet       = ""
         self._closure_enabled       = prefs.get(
-            'UI', 'closure_enabled', fallback='true').lower() != 'false' 
+            'UI', 'closure_enabled', fallback='true').lower() != 'false'
+        self.enable_fe_hover_metrics = prefs.get(
+            'UI', 'enable_fe_hover_metrics', fallback='false').lower() == 'true'
+        self._hover_metric_cache     = {}
+        self._hover_metric_worker    = None
+        self._hover_metric_path      = ""
         self._columns_fitted_once   = False
         self._initial_size_calc_done= False
         self._last_scan_time        = ""
@@ -2269,6 +2273,7 @@ class PDDashboard(QMainWindow):
     def _refresh_timestamps(self):
         """Re-apply IST/relative format to all timestamp columns using stored
         raw values (UserRole+40/41). No tree rebuild needed."""
+        current_mode = self.mode_combo.currentText() if hasattr(self, "mode_combo") else "Standard"
         GROUP = frozenset(("BLOCK", "MILESTONE", "RTL",
                            "IGNORED_ROOT", "STANDALONE_ROOT", "__PLACEHOLDER__"))
         def _walk(node):
@@ -2281,6 +2286,9 @@ class PDDashboard(QMainWindow):
                     item.setText(14, self._fmt_ts(e_raw))
                 _walk(item)
         _walk(self.tree.invisibleRootItem())
+        if hasattr(self, "mode_combo"):
+            self._set_col_preset(
+                {"Standard": 2, "Compact": 1, "Full": 3}.get(current_mode, 2))
 
     def _ensure_standalone_root(self, root):
         """Get or create the Standalone PNR Runs top-level node."""
@@ -2586,6 +2594,8 @@ class PDDashboard(QMainWindow):
         self.actions_menu.addSeparator()
         self.actions_menu.addAction("Failed Runs Digest",      self.show_failed_digest)
         self.actions_menu.addAction("Timeline Overview",       self.show_selected_timeline_overview)
+        self.actions_menu.addAction("Deselect All Checked Runs", self.deselect_all_checked_runs)
+
         self.actions_menu.addAction("Compare Selected Runs",   self.show_run_diff)
         self.actions_menu.addAction("RoR Metric Diff",         self.show_ror_metric_diff)
         self.actions_menu.addAction("Golden Benchmark",        self.show_golden_benchmark)
@@ -2809,6 +2819,9 @@ class PDDashboard(QMainWindow):
 
         self.tree.itemSelectionChanged.connect(self.on_tree_selection_changed)
         self.tree.itemExpanded.connect(self.on_item_expanded)
+        self.tree.setMouseTracking(True)
+        self.tree.viewport().setMouseTracking(True)
+        self.tree.itemEntered.connect(self._on_tree_item_hovered)
 
         # Auto-fit Run Name column on expand/collapse (throttled 150ms)
         self._col0_resize_timer.timeout.connect(
@@ -3696,6 +3709,8 @@ class PDDashboard(QMainWindow):
             src  = prefs.get('UI', 'last_source', fallback='ALL')
             rtl  = prefs.get('UI', 'last_rtl',    fallback='[ SHOW ALL ]')
             view = prefs.get('UI', 'last_view',   fallback='All Runs')
+            if view == 'BE Only':
+                view = 'All Runs'
             srch = prefs.get('UI', 'last_search', fallback='')
             auto = prefs.get('UI', 'last_auto',   fallback='Off')
             idx = self.src_combo.findText(src)
@@ -4828,7 +4843,7 @@ class PDDashboard(QMainWindow):
             item.setText(6, "Calc...")
             item_id = f"{item.text(0)}|{item.text(1)}|{item.text(15)}"
             self.item_map[item_id] = item
-            worker = SingleSizeWorker(run_path)
+            worker = SingleSizeWorker(item, run_path)
             def _safe_set_size(it, sz):
                 try:
                     it.setText(6, sz)
@@ -4838,7 +4853,7 @@ class PDDashboard(QMainWindow):
                             r'Size: .*?\n', f'Size: {sz}\n', old_tip))
                 except RuntimeError:
                     pass
-            worker.result.connect(lambda sz: _safe_set_size(item, sz))
+            worker.result.connect(_safe_set_size)
             self.size_workers.append(worker)
             worker.finished.connect(
                 lambda w=worker: self.size_workers.remove(w)
@@ -5210,6 +5225,10 @@ class PDDashboard(QMainWindow):
         closure_cb.setChecked(getattr(self, '_closure_enabled', True))
         gen_l.addRow("", closure_cb)
 
+        fe_hover_cb = QCheckBox("Enable FE hover metrics in FE Only view")
+        fe_hover_cb.setChecked(getattr(self, 'enable_fe_hover_metrics', False))
+        gen_l.addRow("", fe_hover_cb)
+
         theme_cb = QCheckBox("Enable Dark Mode")
         theme_cb.setChecked(self.is_dark_mode)
         gen_l.addRow("", theme_cb)
@@ -5418,6 +5437,7 @@ class PDDashboard(QMainWindow):
             return
 
         # Apply general settings
+        current_mode_before_settings = self.mode_combo.currentText()
         _need_rebuild = False  # set True below if tree structure changes
         font = font_combo.currentFont()
         font.setPointSize(size_spin.value())
@@ -5440,6 +5460,12 @@ class PDDashboard(QMainWindow):
         self._closure_enabled   = closure_cb.isChecked()
         prefs.set('UI', 'closure_enabled',
                   'true' if self._closure_enabled else 'false')
+        old_fe_hover = self.enable_fe_hover_metrics
+        self.enable_fe_hover_metrics = fe_hover_cb.isChecked()
+        prefs.set('UI', 'enable_fe_hover_metrics',
+                  'true' if self.enable_fe_hover_metrics else 'false')
+        if old_fe_hover and not self.enable_fe_hover_metrics:
+            self._clear_fe_hover_metric_tooltips()
 
         # Save tapeout date
         import datetime
@@ -5510,9 +5536,8 @@ class PDDashboard(QMainWindow):
             QTimer.singleShot(50, self._build_tree)
         else:
             self.refresh_view()
-        current_mode = self.mode_combo.currentText()
         self._set_col_preset(
-            {"Standard": 2, "Compact": 1, "Full": 3}.get(current_mode, 2))
+            {"Standard": 2, "Compact": 1, "Full": 3}.get(current_mode_before_settings, 2))
 
     # ------------------------------------------------------------------
     # DISK USAGE
@@ -6385,7 +6410,6 @@ class PDDashboard(QMainWindow):
         def _key(ev):
             return self._parse_dashboard_time(ev.get("start")) or datetime.datetime.max
         return sorted(events, key=_key)
-
     def show_timeline_overview(self, item):
         events = self._timeline_events_for_item(item)
         if not events:
@@ -6491,6 +6515,115 @@ class PDDashboard(QMainWindow):
             return
         self.show_timeline_overview(items[0])
 
+    def _clear_fe_hover_metric_tooltips(self):
+        def walk(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                try:
+                    tip = child.toolTip(0) or ""
+                    if "FE QoR metrics" in tip:
+                        child.setToolTip(0, re.sub(
+                            r"\nFE QoR metrics[\s\S]*$", "", tip))
+                except RuntimeError:
+                    pass
+                walk(child)
+        walk(self.tree.invisibleRootItem())
+
+    def _hover_gate_count(self, area):
+        gc = area.get("gate_count", "-")
+        if gc and str(gc).strip() not in ("", "-"):
+            return str(gc)
+        std_area = area.get("std_cell_area", "-")
+        try:
+            return str(int(float(str(std_area).replace(",", "")) / 0.2419))
+        except Exception:
+            return "-"
+
+    def _format_hover_metrics(self, metrics):
+        area = metrics.get("area", {}) or {}
+        vth = metrics.get("vth", {}) or {}
+
+        inst = area.get("instance_count", area.get("total_count", "-"))
+        std_area = area.get("std_cell_area", "-")
+        gate_count = self._hover_gate_count(area)
+        vth_area = vth.get("lvt_rvt_hvt_area",
+                           vth.get("lvt_rvt_area", "-/-/-"))
+
+        parts = ["FE QoR metrics"]
+        parts.append("R2R Setup WNS/TNS/FEPs: " + str(metrics.get("r2r_setup", "-")))
+        parts.append("Instance Count: " + str(inst))
+        parts.append("Std Cell Area: " + str(std_area))
+        parts.append("Gate Count: " + str(gate_count))
+        parts.append("VT L/R/H Area %: " + str(vth_area))
+        parts.append("Logic Depth: " + str(metrics.get("logic_depth", "-")))
+        return "\n" + "\n".join(parts)
+
+    def _append_hover_metrics_to_item(self, item, metrics):
+        try:
+            old = item.toolTip(0) or ""
+            old = re.sub(r"\nFE QoR metrics[\s\S]*$", "", old)
+            if self.enable_fe_hover_metrics:
+                item.setToolTip(0, old + self._format_hover_metrics(metrics))
+            else:
+                item.setToolTip(0, old)
+        except RuntimeError:
+            pass
+
+    def _on_hover_metric_done(self, path, item, metrics):
+        self._hover_metric_worker = None
+        self._hover_metric_path = ""
+        if not self.enable_fe_hover_metrics:
+            return
+        if metrics is None or metrics.get("_error"):
+            return
+        self._hover_metric_cache[path] = metrics
+        self._append_hover_metrics_to_item(item, metrics)
+
+    def _on_tree_item_hovered(self, item, col):
+        if not self.enable_fe_hover_metrics:
+            return
+        if not hasattr(self, "view_combo") or self.view_combo.currentText() != "FE Only":
+            return
+        if not item or item.data(0, Qt.UserRole) is not None:
+            return
+        run = item.data(0, Qt.UserRole + 10) or {}
+        if run.get("run_type") != "FE":
+            return
+        path = run.get("path") or item.text(15)
+        if not path or path == "N/A":
+            return
+        if path in self._hover_metric_cache:
+            self._append_hover_metrics_to_item(item, self._hover_metric_cache[path])
+            return
+        if self._hover_metric_worker and self._hover_metric_worker.isRunning():
+            return
+        try:
+            self._hover_metric_path = path
+            self._hover_metric_worker = MetricWorker(
+                path, run.get("block") or item.data(0, Qt.UserRole + 2) or "",
+                "FE", run.get("source") or item.text(2))
+            self._hover_metric_worker.finished.connect(
+                lambda metrics, p=path, it=item: self._on_hover_metric_done(p, it, metrics))
+            self._hover_metric_worker.start()
+        except Exception:
+            self._hover_metric_worker = None
+            self._hover_metric_path = ""
+    def deselect_all_checked_runs(self):
+        self.tree.blockSignals(True)
+        def walk(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                try:
+                    if child.checkState(0) == Qt.Checked:
+                        child.setCheckState(0, Qt.Unchecked)
+                except Exception:
+                    pass
+                walk(child)
+        walk(self.tree.invisibleRootItem())
+        self.tree.blockSignals(False)
+        self._checked_paths.clear()
+        self._update_status_bar([])
+        self.refresh_view()
     def _checked_run_items(self):
         items = []
         def collect(node):
