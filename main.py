@@ -6059,6 +6059,46 @@ class PDDashboard(QMainWindow):
         collect(self.tree.invisibleRootItem())
         return items
 
+    def _checked_run_items(self):
+        return self._iter_checked_items()
+
+    def deselect_all_checked_runs(self):
+        self.tree.blockSignals(True)
+        try:
+            def walk(node):
+                for i in range(node.childCount()):
+                    c = node.child(i)
+                    if c.checkState(0) == Qt.Checked:
+                        c.setCheckState(0, Qt.Unchecked)
+                    walk(c)
+            walk(self.tree.invisibleRootItem())
+        finally:
+            self.tree.blockSignals(False)
+        self._checked_paths.clear()
+        self._update_status_bar([])
+        if self.view_combo.currentText() == "Selected Only":
+            self.refresh_view()
+
+    def show_selected_timeline_overview(self):
+        item = None
+        selected = self.tree.selectedItems()
+        if selected:
+            item = selected[0]
+        else:
+            checked = self._checked_run_items()
+            if checked:
+                item = checked[0]
+        if not item:
+            QMessageBox.information(
+                self, "Timeline Overview",
+                "Select or check one FE/BE run first.")
+            return
+        if item.data(0, Qt.UserRole) in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT", "__PLACEHOLDER__"):
+            QMessageBox.information(
+                self, "Timeline Overview",
+                "Select or check a run row, not a grouping row.")
+            return
+        self.show_timeline_overview(item)
     # ------------------------------------------------------------------
     # MAIL
     # ------------------------------------------------------------------
