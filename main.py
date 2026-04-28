@@ -3372,6 +3372,58 @@ class PDDashboard(QMainWindow):
             self._checked_paths.discard(path)
         self._update_status_bar([])
 
+    def _on_tree_item_hovered(self, item, column):
+        """Optional FE hover hook. Keep it lightweight; no report parsing on hover."""
+        if not getattr(self, 'enable_fe_hover_metrics', False):
+            return
+        if not item:
+            return
+        try:
+            role = item.data(0, Qt.UserRole)
+            if role in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT", "STAGE", "__PLACEHOLDER__"):
+                return
+            run = item.data(0, Qt.UserRole + 10) or {}
+            if run.get("run_type") != "FE":
+                return
+            base = item.toolTip(0) or item.text(0)
+            marker = "\n[FE Hover Metrics]"
+            if marker in base:
+                return
+            path = item.text(15)
+            cached = self._hover_metric_cache.get(path, {}) if path else {}
+            lines = []
+            if cached:
+                area = cached.get("area", {}) if isinstance(cached.get("area", {}), dict) else {}
+                vth = cached.get("vth", {}) if isinstance(cached.get("vth", {}), dict) else {}
+                std_area = area.get("std_cell_area", "-")
+                gate_count = self._metric_value(cached, "gate_count") if hasattr(self, "_metric_value") else "-"
+                lines.extend([
+                    "WNS: " + str(self._metric_value(cached, "wns")),
+                    "Gate Count: " + str(gate_count),
+                    "Instance Count: " + str(area.get("instance_count", "-")),
+                    "VT L/R/H Area %: " + str(vth.get("lvt_rvt_hvt_area", "-")),
+                    "Logic Depth: " + str(cached.get("logic_depth", "-")),
+                    "Std Cell Area: " + str(std_area),
+                ])
+            else:
+                lines.append("Use QoR Summary or Block Summary to load detailed FE metrics.")
+            item.setToolTip(0, base + marker + "\n" + "\n".join(lines))
+        except Exception:
+            return
+
+    def _clear_fe_hover_metric_tooltips(self):
+        marker = "\n[FE Hover Metrics]"
+        try:
+            def walk(node):
+                for i in range(node.childCount()):
+                    c = node.child(i)
+                    tip = c.toolTip(0) or ""
+                    if marker in tip:
+                        c.setToolTip(0, tip.split(marker, 1)[0])
+                    walk(c)
+            walk(self.tree.invisibleRootItem())
+        except Exception:
+            pass
     # ------------------------------------------------------------------
     # INSPECTOR / SELECTION
     # ------------------------------------------------------------------
