@@ -278,12 +278,19 @@ def save_user_pins(pins_dict):
         pass
 
 
+def _ensure_notes_dir():
+    if not os.path.exists(NOTES_DIR):
+        try:
+            os.makedirs(NOTES_DIR)
+        except Exception:
+            pass
+
 def _get_personal_notes_file():
-    ensure_dir(NOTES_DIR)
+    _ensure_notes_dir()
     return os.path.join(NOTES_DIR, "personal_notes_{}.json".format(_getpass.getuser()))
 
 def _get_shared_notes_file():
-    ensure_dir(NOTES_DIR)
+    _ensure_notes_dir()
     return os.path.join(NOTES_DIR, "shared_notes.json")
 
 def _get_notes_file():
