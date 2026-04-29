@@ -7276,6 +7276,7 @@ class PDDashboard(QMainWindow):
         try:
             dlg.setWindowFlags(
                 dlg.windowFlags()
+                | Qt.Window
                 | Qt.WindowMaximizeButtonHint
                 | Qt.WindowMinimizeButtonHint)
             dlg.setSizeGripEnabled(True)
@@ -7309,6 +7310,17 @@ class PDDashboard(QMainWindow):
         row.addWidget(close_btn)
         layout.addLayout(row)
         return max_btn, close_btn
+
+    def _clean_app_option_cell(self, value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        # report_app_options sometimes inserts pipe/dash visual separators
+        # inside long wrapped fields. They are layout artifacts, not values.
+        text = re.sub(r'\s*[-]?\|[-]?\s*', ' ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
+
     def _show_metric_diff_dialog(self, title, rows, baseline_name=None):
         if not rows:
             QMessageBox.information(self, title, "No metrics were extracted.")
@@ -7545,13 +7557,13 @@ class PDDashboard(QMainWindow):
             typ = line[pos[1]:pos[2]].strip()
             if not name or not typ:
                 continue
-            value = line[pos[2]:pos[3]].strip()
-            user_value = line[pos[3]:pos[4]].strip()
-            user_default = line[pos[4]:pos[5]].strip()
-            system_default = line[pos[5]:pos[6]].strip()
-            scope = line[pos[6]:pos[7]].strip()
-            status = line[pos[7]:pos[8]].strip()
-            source = line[pos[8]:].strip()
+            value = self._clean_app_option_cell(line[pos[2]:pos[3]])
+            user_value = self._clean_app_option_cell(line[pos[3]:pos[4]])
+            user_default = self._clean_app_option_cell(line[pos[4]:pos[5]])
+            system_default = self._clean_app_option_cell(line[pos[5]:pos[6]])
+            scope = self._clean_app_option_cell(line[pos[6]:pos[7]])
+            status = self._clean_app_option_cell(line[pos[7]:pos[8]])
+            source = self._clean_app_option_cell(line[pos[8]:])
             opts[name] = {
                 "type": typ,
                 "value": value,
