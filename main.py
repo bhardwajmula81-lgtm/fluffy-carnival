@@ -6491,6 +6491,7 @@ class PDDashboard(QMainWindow):
             return
 
         dlg = QDialog(self)
+        self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle(
             f"Analytics Dashboard  "
             f"({len(fe_runs)} FE runs, {len(be_runs)} BE runs)")
@@ -6540,6 +6541,7 @@ class PDDashboard(QMainWindow):
                 i, QHeaderView.ResizeToContents)
         t1.setEditTriggers(QTableWidget.NoEditTriggers)
         t1.setAlternatingRowColors(True)
+        self._make_table_user_adjustable(t1)
         t1.verticalHeader().setVisible(False)
         t1.setSortingEnabled(False)  # enable AFTER insert to avoid row misalignment
 
@@ -6600,6 +6602,7 @@ class PDDashboard(QMainWindow):
                 i, QHeaderView.ResizeToContents)
         t2.setEditTriggers(QTableWidget.NoEditTriggers)
         t2.setAlternatingRowColors(True)
+        self._make_table_user_adjustable(t2)
         t2.verticalHeader().setVisible(False)
         t2.setSortingEnabled(False)
 
@@ -6660,6 +6663,7 @@ class PDDashboard(QMainWindow):
                 i, QHeaderView.ResizeToContents)
         t3.setEditTriggers(QTableWidget.NoEditTriggers)
         t3.setAlternatingRowColors(True)
+        self._make_table_user_adjustable(t3)
         t3.verticalHeader().setVisible(False)
         t3.setSortingEnabled(False)
 
@@ -6703,6 +6707,7 @@ class PDDashboard(QMainWindow):
             t4.horizontalHeader().setSectionResizeMode(i, QHeaderView.Stretch)
         t4.setEditTriggers(QTableWidget.NoEditTriggers)
         t4.setAlternatingRowColors(True)
+        self._make_table_user_adjustable(t4)
         t4.verticalHeader().setVisible(False)
 
         for src, s in sorted(src_stats.items()):
@@ -6818,6 +6823,7 @@ class PDDashboard(QMainWindow):
                     s["be_comp"] += 1
 
         dlg = QDialog(self)
+        self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle("Team Workload View")
         dlg.resize(980, 500)
         layout = QVBoxLayout(dlg)
@@ -6841,6 +6847,7 @@ class PDDashboard(QMainWindow):
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
         tbl.verticalHeader().setVisible(False)
+        self._make_table_user_adjustable(tbl)
         tbl.setSortingEnabled(False)  # enable after insert
 
         for owner, s in sorted(
@@ -6911,6 +6918,7 @@ class PDDashboard(QMainWindow):
 
         total = sum(len(v) for v in groups.values())
         dlg   = QDialog(self)
+        self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle(f"Failed Runs Digest  ({total} issues)")
         dlg.resize(700, 480)
         layout = QVBoxLayout(dlg)
@@ -6926,6 +6934,7 @@ class PDDashboard(QMainWindow):
             tbl.setEditTriggers(QTableWidget.NoEditTriggers)
             tbl.setAlternatingRowColors(True)
             tbl.verticalHeader().setVisible(False)
+            self._make_table_user_adjustable(tbl)
             for blk, run, user, log in items:
                 r = tbl.rowCount(); tbl.insertRow(r)
                 tbl.setItem(r, 0, QTableWidgetItem(blk))
@@ -7062,6 +7071,7 @@ class PDDashboard(QMainWindow):
                 "Rows without runtime/start/end are hidden from the timeline.")
             return
         dlg = QDialog(self)
+        self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle("Timeline Overview: " + item.text(0))
         try:
             avail = QApplication.desktop().availableGeometry(self)
@@ -7109,6 +7119,7 @@ class PDDashboard(QMainWindow):
         tbl.setColumnWidth(5, 110)
         tbl.setColumnWidth(6, 155)
         tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._make_table_user_adjustable(tbl)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
         prev_by_branch = {}
@@ -7261,6 +7272,43 @@ class PDDashboard(QMainWindow):
             return str(metrics.get("r2r_hold", "-")).split('/')[0]
         return metrics.get(key, "-")
 
+    def _prepare_utility_dialog(self, dlg):
+        try:
+            dlg.setWindowFlags(
+                dlg.windowFlags()
+                | Qt.WindowMaximizeButtonHint
+                | Qt.WindowMinimizeButtonHint)
+            dlg.setSizeGripEnabled(True)
+        except Exception:
+            pass
+
+    def _make_table_user_adjustable(self, tbl, movable=True):
+        try:
+            hh = tbl.horizontalHeader()
+            hh.setSectionsMovable(bool(movable))
+            hh.setStretchLastSection(False)
+            tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        except Exception:
+            pass
+
+    def _add_standard_dialog_buttons(self, layout, dlg):
+        row = QHBoxLayout()
+        row.addStretch(1)
+        max_btn = QPushButton("Maximize")
+        close_btn = QPushButton("Close")
+        def _toggle():
+            if dlg.isMaximized():
+                dlg.showNormal()
+                max_btn.setText("Maximize")
+            else:
+                dlg.showMaximized()
+                max_btn.setText("Restore")
+        max_btn.clicked.connect(_toggle)
+        close_btn.clicked.connect(dlg.accept)
+        row.addWidget(max_btn)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+        return max_btn, close_btn
     def _show_metric_diff_dialog(self, title, rows, baseline_name=None):
         if not rows:
             QMessageBox.information(self, title, "No metrics were extracted.")
@@ -7277,6 +7325,7 @@ class PDDashboard(QMainWindow):
             ("VT L/R/H Area %", "vth_area"),
         ]
         dlg = QDialog(self)
+        self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle(title)
         dlg.resize(1100, 650)
         layout = QVBoxLayout(dlg)
@@ -7296,6 +7345,7 @@ class PDDashboard(QMainWindow):
             tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Stretch)
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
+        self._make_table_user_adjustable(tbl)
 
         chart = _BarChartWidget("Metric Delta % (comparison vs baseline)")
         chart.setMinimumHeight(210)
@@ -7335,9 +7385,7 @@ class PDDashboard(QMainWindow):
         chart.set_data(chart_labels, chart_values, colors=chart_colors, is_dark=self.is_dark_mode)
         layout.addWidget(chart)
         layout.addWidget(tbl)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        layout.addWidget(close_btn)
+        self._add_standard_dialog_buttons(layout, dlg)
         dlg.exec_()
 
     def show_ror_metric_diff(self):
@@ -7465,10 +7513,12 @@ class PDDashboard(QMainWindow):
         positions = None
         for idx, line in enumerate(lines):
             if ("Name" in line and "Type" in line and "Value" in line
-                    and "User-value" in line and "System-default" in line):
+                    and "User-value" in line and "System-default" in line
+                    and "Scope" in line and "Status" in line and "Source" in line):
                 header = idx
                 keys = ["Name", "Type", "Value", "User-value",
-                        "User-default", "System-default"]
+                        "User-default", "System-default",
+                        "Scope", "Status", "Source"]
                 pos = []
                 for key in keys:
                     p = line.find(key)
@@ -7498,13 +7548,19 @@ class PDDashboard(QMainWindow):
             value = line[pos[2]:pos[3]].strip()
             user_value = line[pos[3]:pos[4]].strip()
             user_default = line[pos[4]:pos[5]].strip()
-            system_default = line[pos[5]:].strip()
+            system_default = line[pos[5]:pos[6]].strip()
+            scope = line[pos[6]:pos[7]].strip()
+            status = line[pos[7]:pos[8]].strip()
+            source = line[pos[8]:].strip()
             opts[name] = {
                 "type": typ,
                 "value": value,
                 "user_value": user_value,
                 "user_default": user_default,
                 "system_default": system_default,
+                "scope": scope,
+                "status": status,
+                "source": source,
             }
         return opts
 
@@ -7556,6 +7612,7 @@ class PDDashboard(QMainWindow):
             return
 
         dlg = QDialog(self)
+        self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle("App Options Diff  ({} FE runs)".format(len(rows)))
         dlg.resize(min(520 + len(rows) * 190, 1600), 720)
         layout = QVBoxLayout(dlg)
@@ -7568,6 +7625,9 @@ class PDDashboard(QMainWindow):
         field_combo.addItem("User-value", "user_value")
         field_combo.addItem("User-default", "user_default")
         field_combo.addItem("System-default", "system_default")
+        field_combo.addItem("Scope", "scope")
+        field_combo.addItem("Status", "status")
+        field_combo.addItem("Source", "source")
         search = QLineEdit()
         search.setPlaceholderText("Search option name...")
         top.addWidget(diff_only_cb)
@@ -7597,6 +7657,7 @@ class PDDashboard(QMainWindow):
         tbl.verticalHeader().setVisible(False)
         tbl.setSortingEnabled(False)
         tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._make_table_user_adjustable(tbl)
         layout.addWidget(tbl, 1)
 
         status_lbl = QLabel("")
@@ -7663,12 +7724,7 @@ class PDDashboard(QMainWindow):
         search.textChanged.connect(_populate)
         _populate()
 
-        btn_row = QHBoxLayout()
-        btn_row.addStretch(1)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        btn_row.addWidget(close_btn)
-        layout.addLayout(btn_row)
+        self._add_standard_dialog_buttons(layout, dlg)
         dlg.exec_()
     def show_run_diff(self):
         """Compare N checked runs side-by-side."""
@@ -7701,6 +7757,7 @@ class PDDashboard(QMainWindow):
         n = len(checked)
 
         dlg = QDialog(self)
+        self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle(f"Run Comparison  ({n} runs selected)")
         dlg.resize(min(300 + n * 200, 1400), 520)
         layout = QVBoxLayout(dlg)
@@ -7719,6 +7776,7 @@ class PDDashboard(QMainWindow):
         tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         tbl.setAlternatingRowColors(True)
         tbl.verticalHeader().setVisible(False)
+        self._make_table_user_adjustable(tbl)
 
         amber    = QColor("#fff3e0")
         red_bg   = QColor("#ffebee")
@@ -7757,9 +7815,7 @@ class PDDashboard(QMainWindow):
             "Red = fail/error.  Green = pass/completed.</small>")
         summary.setStyleSheet("color: gray;")
         layout.addWidget(summary)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        layout.addWidget(close_btn)
+        self._add_standard_dialog_buttons(layout, dlg)
         dlg.exec_()
 
     # ------------------------------------------------------------------
