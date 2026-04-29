@@ -278,12 +278,19 @@ def save_user_pins(pins_dict):
         pass
 
 
-def _get_notes_file():
+def _get_personal_notes_file():
     ensure_dir(NOTES_DIR)
-    return os.path.join(NOTES_DIR, "notes_{}.json".format(_getpass.getuser()))
+    return os.path.join(NOTES_DIR, "personal_notes_{}.json".format(_getpass.getuser()))
 
-def load_all_notes():
-    path = _get_notes_file()
+def _get_shared_notes_file():
+    ensure_dir(NOTES_DIR)
+    return os.path.join(NOTES_DIR, "shared_notes.json")
+
+def _get_notes_file():
+    # Backward-compatible alias. Personal notes are per user.
+    return _get_personal_notes_file()
+
+def _read_json_dict(path):
     if not os.path.exists(path):
         return {}
     try:
@@ -293,28 +300,103 @@ def load_all_notes():
     except Exception:
         return {}
 
-def save_user_note(identifier, note_text):
+def load_personal_notes():
+    data = _read_json_dict(_get_personal_notes_file())
+    out = {}
+    for key, val in data.items():
+        if isinstance(val, dict):
+            txt = val.get("text", "")
+        elif isinstance(val, list):
+            txt = "\n".join(str(x) for x in val)
+        else:
+            txt = str(val)
+        if txt.strip():
+            out[key] = txt.strip()
+    return out
+
+def save_personal_note(identifier, note_text):
     if not identifier:
         return False
-    notes = load_all_notes()
+    notes = load_personal_notes()
     text = (note_text or '').strip()
     if text:
-        old = notes.get(identifier, {})
-        if not isinstance(old, dict):
-            old = {"text": str(old)}
-        old["text"] = text
-        old["updated_by"] = _getpass.getuser()
-        old["updated_at"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        notes[identifier] = old
-    elif identifier in notes:
-        del notes[identifier]
+        notes[identifier] = text
+    else:
+        notes.pop(identifier, None)
     try:
-        with open(_get_notes_file(), 'w') as f:
+        with open(_get_personal_notes_file(), 'w') as f:
             json.dump(notes, f, indent=4, sort_keys=True)
         return True
     except Exception:
         return False
 
+def _format_shared_entry(entry):
+    if not isinstance(entry, dict):
+        return str(entry)
+    ts = entry.get("updated_at", "")
+    user = entry.get("user", "unknown")
+    text = entry.get("text", "")
+    return "{}  {}: {}".format(ts, user, text).strip()
+
+def load_shared_note_entries():
+    data = _read_json_dict(_get_shared_notes_file())
+    out = {}
+    for key, val in data.items():
+        entries = []
+        if isinstance(val, list):
+            for entry in val:
+                if isinstance(entry, dict):
+                    if str(entry.get("text", "")).strip():
+                        entries.append(entry)
+                elif str(entry).strip():
+                    entries.append({
+                        "user": "unknown",
+                        "text": str(entry).strip(),
+                        "updated_at": "",
+                    })
+        elif isinstance(val, dict):
+            txt = str(val.get("text", "")).strip()
+            if txt:
+                entries.append({
+                    "user": val.get("updated_by", val.get("user", "unknown")),
+                    "text": txt,
+                    "updated_at": val.get("updated_at", ""),
+                })
+        elif str(val).strip():
+            entries.append({"user": "unknown", "text": str(val).strip(), "updated_at": ""})
+        entries.sort(key=lambda e: e.get("updated_at", ""))
+        if entries:
+            out[key] = entries
+    return out
+
+def load_all_notes():
+    # Shared notes, formatted for display/search compatibility.
+    entries = load_shared_note_entries()
+    return dict((key, [_format_shared_entry(e) for e in vals])
+                for key, vals in entries.items())
+
+def save_shared_note(identifier, note_text):
+    if not identifier:
+        return False
+    text = (note_text or '').strip()
+    if not text:
+        return False
+    data = load_shared_note_entries()
+    data.setdefault(identifier, []).append({
+        "user": _getpass.getuser(),
+        "text": text,
+        "updated_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    })
+    try:
+        with open(_get_shared_notes_file(), 'w') as f:
+            json.dump(data, f, indent=4, sort_keys=True)
+        return True
+    except Exception:
+        return False
+
+def save_user_note(identifier, note_text):
+    # Backward-compatible name used by older code paths: personal only.
+    return save_personal_note(identifier, note_text)
 def _send_mail_via_util(dlg):
     """Fire MAIL_UTIL subprocess from an AdvancedMailDialog."""
     if not MAIL_UTIL:
@@ -1403,7 +1485,7 @@ class _TimelineChartWidget(QWidget):
         for ev in self.events or []:
             if ev.get("kind") != "FE":
                 max_seq = max(max_seq, int(ev.get("seq", 0) or 0) + 1)
-        return 380 + max(1, max_seq) * (card_w + gap_x) + 90
+        return 380 + max(1, max_seq) * (card_w + gap_x) + card_w + 220
 
     def _dt(self, val):
         if self.parser:
@@ -1966,7 +2048,8 @@ class PDDashboard(QMainWindow):
         self.ws_data      = {}
         self.out_data     = {}
         self.ir_data      = {}
-        self.global_notes = {}
+        self.global_notes = load_all_notes()
+        self.personal_notes = load_personal_notes()
         self.user_pins    = load_user_pins()
         self._fp_ver_cache = {}
         self._cong_img_cache = {}
@@ -2963,13 +3046,27 @@ class PDDashboard(QMainWindow):
         self.ins_lbl.setWordWrap(True)
         self.ins_note = QTextEdit()
         self.ins_note.setPlaceholderText(
-            "Enter aliases or personal notes here...\n\nSaved only in your per-user notes JSON.")
-        self.ins_save_btn = QPushButton("Save Note")
+            "Personal note visible only to your user account.")
+        self.ins_save_btn = QPushButton("Save Personal Note")
         self.ins_save_btn.clicked.connect(self.save_inspector_note)
+        self.shared_note_history = QTextEdit()
+        self.shared_note_history.setReadOnly(True)
+        self.shared_note_history.setPlaceholderText("No shared notes for this item.")
+        self.shared_note_history.setMaximumHeight(110)
+        self.shared_note_input = QTextEdit()
+        self.shared_note_input.setPlaceholderText(
+            "Add shared note visible to all dashboard users.")
+        self.shared_note_input.setMaximumHeight(70)
+        self.shared_save_btn = QPushButton("Add Shared Note")
+        self.shared_save_btn.clicked.connect(self.save_shared_inspector_note)
         ins_layout.addWidget(self.ins_lbl)
-        ins_layout.addWidget(QLabel("<b>Personal Notes:</b>"))
+        ins_layout.addWidget(QLabel("<b>Personal Note:</b>"))
         ins_layout.addWidget(self.ins_note)
         ins_layout.addWidget(self.ins_save_btn)
+        ins_layout.addWidget(QLabel("<b>Shared Notes:</b>"))
+        ins_layout.addWidget(self.shared_note_history)
+        ins_layout.addWidget(self.shared_note_input)
+        ins_layout.addWidget(self.shared_save_btn)
 
         self.inspector_dock = QDockWidget(self)
         self.inspector_dock.setAllowedAreas(
@@ -3501,14 +3598,9 @@ class PDDashboard(QMainWindow):
                 f"{reg_part}")
             self._current_note_id = f"{rtl} : {run_name}"
 
-        notes      = self.global_notes.get(self._current_note_id, [])
-        clean_text = "\n".join(notes)
-        tag        = f"[{getpass.getuser()}]"
-        for line in notes:
-            if line.startswith(tag):
-                clean_text = line.replace(tag, "").strip()
-                break
-        self.ins_note.setPlainText(clean_text)
+        self.ins_note.setPlainText(self.personal_notes.get(self._current_note_id, ""))
+        self.shared_note_history.setPlainText(self._shared_notes_text(self._current_note_id))
+        self.shared_note_input.clear()
         self._update_fe_congestion_panel(item, run_data if not is_stage and not is_rtl else None)
 
         # Lazy error count: use cached_exists to avoid blocking NFS on first click
@@ -3656,6 +3748,30 @@ class PDDashboard(QMainWindow):
         layout.addLayout(row)
         dlg.showFullScreen()
         dlg.exec_()
+    def _shared_notes_text(self, note_id):
+        notes = self.global_notes.get(note_id, [])
+        return "\n".join(notes) if notes else ""
+
+    def _note_display(self, note_id):
+        parts = []
+        personal = self.personal_notes.get(note_id, "") if hasattr(self, 'personal_notes') else ""
+        if personal:
+            first = personal.splitlines()[0]
+            parts.append("Personal: " + first[:80])
+        shared = self.global_notes.get(note_id, []) if hasattr(self, 'global_notes') else []
+        if shared:
+            parts.append("Shared: " + " | ".join(shared))
+        return " | ".join(parts)
+
+    def _apply_note_display_to_item(self, item, note_id):
+        note_text = self._note_display(note_id)
+        item.setText(22, note_text)
+        item.setToolTip(22, note_text)
+        if note_text:
+            item.setForeground(22, self._colors["note"])
+            f = item.font(0); f.setItalic(True); item.setFont(0, f)
+        else:
+            f = item.font(0); f.setItalic(False); item.setFont(0, f)
     def _open_file_or_warn(self, path, label="File"):
         """Open path in gvim, or show a non-blocking warning if it doesn't exist."""
         if path and os.path.exists(path):
@@ -3681,25 +3797,28 @@ class PDDashboard(QMainWindow):
             subprocess.Popen(['gvim', self.current_error_log_path])
 
     def save_inspector_note(self):
-        if not hasattr(self, '_current_note_id'):
+        if not hasattr(self, "_current_note_id"):
             return
-        txt = self.ins_note.toPlainText()
-        save_user_note(self._current_note_id, txt)
-        self.global_notes = load_all_notes()
+        save_personal_note(self._current_note_id, self.ins_note.toPlainText())
+        self.personal_notes = load_personal_notes()
         sel = self.tree.selectedItems()
         if sel:
-            item      = sel[0]
-            notes     = self.global_notes.get(self._current_note_id, [])
-            note_text = " | ".join(notes)
-            item.setText(22, note_text)
-            item.setToolTip(22, note_text)
-            if note_text:
-                item.setForeground(22, self._colors["note"])
-                # Note indicator: italic run name
-                f = item.font(0); f.setItalic(True); item.setFont(0, f)
-            else:
-                # No notes -- remove italic
-                f = item.font(0); f.setItalic(False); item.setFont(0, f)
+            self._apply_note_display_to_item(sel[0], self._current_note_id)
+        self._update_status_bar([])
+
+    def save_shared_inspector_note(self):
+        if not hasattr(self, "_current_note_id"):
+            return
+        text = self.shared_note_input.toPlainText()
+        if not text.strip():
+            return
+        if save_shared_note(self._current_note_id, text):
+            self.global_notes = load_all_notes()
+            self.shared_note_history.setPlainText(self._shared_notes_text(self._current_note_id))
+            self.shared_note_input.clear()
+            sel = self.tree.selectedItems()
+            if sel:
+                self._apply_note_display_to_item(sel[0], self._current_note_id)
         self._update_status_bar([])
 
     # ------------------------------------------------------------------
@@ -3923,6 +4042,7 @@ class PDDashboard(QMainWindow):
         self.tree.setEnabled(True)
         self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
         self.global_notes    = load_all_notes()
+        self.personal_notes  = load_personal_notes()
 
         # FEAT 3+5: Record history for all completed runs
         all_runs_for_history = (self.ws_data.get("all_runs", []) +
@@ -4396,18 +4516,7 @@ class PDDashboard(QMainWindow):
                       r_name.replace("-FE","").replace("-BE",""))
 
         note_id = f"{run['rtl']} : {r_name}"
-        notes   = self.global_notes.get(note_id, [])
-        if notes:
-            note_text = " | ".join(notes)
-            child.setText(22, note_text)
-            child.setToolTip(22, note_text)
-            child.setForeground(22, self._colors["note"])
-            # FEAT 5: Visual note indicator -- italic run name
-            f = child.font(0)
-            f.setItalic(True)
-            child.setFont(0, f)
-            child.setToolTip(0, (child.toolTip(0) or "") +
-                             "\n[Has shared notes]")
+        self._apply_note_display_to_item(child, note_id)
 
         tooltip_text = (
             f"Run: {r_name}\n"
@@ -4535,9 +4644,9 @@ class PDDashboard(QMainWindow):
             f = p.font(0); f.setBold(True); p.setFont(0, f)
         elif node_type == "RTL":
             f = p.font(0); f.setItalic(True); p.setFont(0, f)
-            if text in self.global_notes:
-                notes = " | ".join(self.global_notes[text])
-                p.setText(22, notes); p.setToolTip(22, notes)
+            note_text = self._note_display(text)
+            if note_text:
+                p.setText(22, note_text); p.setToolTip(22, note_text)
                 p.setForeground(22, self._colors["note"])
         return p
 
@@ -4692,6 +4801,7 @@ class PDDashboard(QMainWindow):
         _pins          = self.user_pins
         _rfc           = None if self.ignore_run_filter else self.run_filter_config
         _notes         = self.global_notes
+        _personal_notes = self.personal_notes
 
         def _passes(run):
             if run is None:
@@ -4708,14 +4818,18 @@ class PDDashboard(QMainWindow):
                     return False
                 if _rfc is not None:
                     rr, rb = run["rtl"], run["block"]
-                    allowed = None
-                    if src in _rfc and rr in _rfc[src] and rb in _rfc[src][rr]:
-                        allowed = _rfc[src][rr][rb]
-                    if allowed is None:
-                        return False
-                    base_name = run["r_name"].replace("-FE","").replace("-BE","")
-                    if base_name not in allowed and run["r_name"] not in allowed:
-                        return False
+                    src_cfg = _rfc.get(src, {})
+                    matched_rtls = [k for k in src_cfg
+                                    if k == rr or (k and k in rr) or (rr and rr in k)]
+                    if matched_rtls:
+                        allowed = []
+                        for cfg_rtl in matched_rtls:
+                            allowed.extend(src_cfg.get(cfg_rtl, {}).get(rb, []) or [])
+                        if not allowed:
+                            return False
+                        base_name = run["r_name"].replace("-FE", "").replace("-BE", "")
+                        if base_name not in allowed and run["r_name"] not in allowed:
+                            return False
             rtl = run["rtl"]
             if not _sel_rtl_all:
                 if rtl != sel_rtl and not rtl.startswith(_sel_rtl_sfx):
@@ -4744,6 +4858,8 @@ class PDDashboard(QMainWindow):
             if _do_search:
                 note_id  = f"{rtl} : {run['r_name']}"
                 notes    = " | ".join(_notes.get(note_id, []))
+                if note_id in _personal_notes:
+                    notes += " | " + _personal_notes.get(note_id, "")
                 combined = (
                     f"{run['r_name']} {rtl} {src} {rt_type} "
                     f"{run.get('owner','')} "
@@ -5086,10 +5202,11 @@ class PDDashboard(QMainWindow):
             self.show_timeline_overview(item)
 
         elif edit_note_act and res == edit_note_act:
-            dlg = EditNoteDialog(item.text(22), note_identifier, self)
+            dlg = EditNoteDialog(self.personal_notes.get(note_identifier, ""),
+                                 note_identifier, self)
             if dlg.exec_():
-                save_user_note(note_identifier, dlg.get_text())
-                self.global_notes = load_all_notes()
+                save_personal_note(note_identifier, dlg.get_text())
+                self.personal_notes = load_personal_notes()
                 self.refresh_view()
 
         elif add_checked_config_act and res == add_checked_config_act:
@@ -5479,7 +5596,7 @@ class PDDashboard(QMainWindow):
         if not path:
             return
         try:
-            cfg = {}
+            cfg = self.run_filter_config or {}
             with open(path, 'r', encoding='utf-8', errors='ignore') as f:
                 for raw in f:
                     line = raw.strip()
@@ -5499,8 +5616,11 @@ class PDDashboard(QMainWindow):
                         source, rtl, block = parts
                     run_list = [r.strip() for r in runs_str.split(',')
                                 if r.strip()]
-                    cfg.setdefault(source, {}).setdefault(
-                        rtl, {})[block] = run_list
+                    current = cfg.setdefault(source, {}).setdefault(
+                        rtl, {}).setdefault(block, [])
+                    for run_name in run_list:
+                        if run_name not in current:
+                            current.append(run_name)
             self.run_filter_config  = cfg
             self.current_config_path = path
             self.ignore_run_filter = False
@@ -6929,6 +7049,7 @@ class PDDashboard(QMainWindow):
         chart.event_clicked.connect(self._show_timeline_event_detail)
         chart_scroll = QScrollArea()
         chart_scroll.setWidgetResizable(False)
+        chart_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         chart_scroll.setWidget(chart)
         chart_scroll.setMinimumHeight(min(430, chart.preferred_height(dlg.width()) + 20))
         chart_scroll.setMaximumHeight(min(540, chart.preferred_height(dlg.width()) + 30))
@@ -6997,6 +7118,7 @@ class PDDashboard(QMainWindow):
             full_chart.event_clicked.connect(self._show_timeline_event_detail)
             fs = QScrollArea()
             fs.setWidgetResizable(False)
+            fs.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
             full_chart.setMinimumSize(full_chart.preferred_width(), full_chart.preferred_height(1400))
             fs.setWidget(full_chart)
             fdl.addWidget(fs)
