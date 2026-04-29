@@ -29,7 +29,7 @@ from PyQt5.QtWidgets import (
     QHeaderView, QFileDialog, QGroupBox, QTextEdit, QDockWidget,
     QFormLayout, QDialog, QDialogButtonBox, QFontComboBox,
     QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QColorDialog, QTabWidget, QTableWidget,
-    QTableWidgetItem, QScrollArea, QAbstractItemView
+    QTableWidgetItem, QScrollArea, QAbstractItemView, QSizePolicy
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint, QRect
 from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
@@ -2801,6 +2801,7 @@ class PDDashboard(QMainWindow):
         self.actions_menu.addAction("Add Checked Runs to Active Filter Config", self.add_checked_runs_to_filter_config)
 
         self.actions_menu.addAction("Compare Selected Runs",   self.show_run_diff)
+        self.actions_menu.addAction("App Options Diff",        self.show_app_options_diff)
         self.actions_menu.addAction("RoR Metric Diff",         self.show_ror_metric_diff)
         self.actions_menu.addAction("Golden Benchmark",        self.show_golden_benchmark)
         self.actions_menu.addSeparator()
@@ -3072,13 +3073,13 @@ class PDDashboard(QMainWindow):
         self.ins_lbl.setWordWrap(True)
         self.personal_note_box = QGroupBox("Personal Note")
         self.personal_note_box.setCheckable(True)
-        self.personal_note_box.setChecked(True)
+        self.personal_note_box.setChecked(False)
         personal_note_layout = QVBoxLayout(self.personal_note_box)
         personal_note_layout.setContentsMargins(6, 6, 6, 6)
         self.ins_note = QTextEdit()
         self.ins_note.setPlaceholderText(
             "Personal note visible only to your user account.")
-        self.ins_note.setMaximumHeight(75)
+        self.ins_note.setMaximumHeight(64)
         self.ins_save_btn = QPushButton("Save Personal Note")
         self.ins_save_btn.clicked.connect(self.save_inspector_note)
         personal_note_layout.addWidget(self.ins_note)
@@ -3087,8 +3088,8 @@ class PDDashboard(QMainWindow):
         self.shared_note_history = QTextEdit()
         self.shared_note_history.setReadOnly(True)
         self.shared_note_history.setPlaceholderText("No shared notes for this item.")
-        self.shared_note_history.setMinimumHeight(95)
-        self.shared_note_history.setMaximumHeight(170)
+        self.shared_note_history.setMinimumHeight(240)
+        self.shared_note_history.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.shared_note_input = QTextEdit()
         self.shared_note_input.setPlaceholderText(
             "Add shared note visible to all dashboard users.")
@@ -3098,7 +3099,7 @@ class PDDashboard(QMainWindow):
         ins_layout.addWidget(self.ins_lbl)
         ins_layout.addWidget(self.personal_note_box)
         ins_layout.addWidget(QLabel("<b>Shared Notes:</b>"))
-        ins_layout.addWidget(self.shared_note_history)
+        ins_layout.addWidget(self.shared_note_history, 1)
         ins_layout.addWidget(self.shared_note_input)
         ins_layout.addWidget(self.shared_save_btn)
 
@@ -7423,6 +7424,252 @@ class PDDashboard(QMainWindow):
         self._show_metric_diff_dialog(
             "Golden Benchmark", rows, baseline_name=rows[0].get("name", "Golden"))
 
+    def _find_app_options_report(self, run_path, block):
+        if not run_path or run_path == "N/A":
+            return ""
+        rpt_dir = os.path.join(run_path, "reports")
+        if not os.path.isdir(rpt_dir):
+            return ""
+        patterns = []
+        if block:
+            patterns.append("report_app_options.full.{}.*.rpt".format(block))
+        patterns.append("report_app_options.full.*.rpt")
+        try:
+            names = os.listdir(rpt_dir)
+        except Exception:
+            return ""
+        hits = []
+        for pat in patterns:
+            for name in names:
+                if fnmatch.fnmatch(name, pat):
+                    hits.append(os.path.join(rpt_dir, name))
+            if hits:
+                break
+        if not hits:
+            return ""
+        try:
+            return sorted(hits, key=os.path.getmtime)[-1]
+        except Exception:
+            return sorted(hits)[-1]
+
+    def _parse_app_options_report(self, path):
+        opts = {}
+        if not path or not os.path.exists(path):
+            return opts
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                lines = f.readlines()
+        except Exception:
+            return opts
+        header = None
+        positions = None
+        for idx, line in enumerate(lines):
+            if ("Name" in line and "Type" in line and "Value" in line
+                    and "User-value" in line and "System-default" in line):
+                header = idx
+                keys = ["Name", "Type", "Value", "User-value",
+                        "User-default", "System-default"]
+                pos = []
+                for key in keys:
+                    p = line.find(key)
+                    if p < 0:
+                        p = len(line)
+                    pos.append(p)
+                positions = pos
+                break
+        if header is None or positions is None:
+            return opts
+        pos = positions + [None]
+        for raw in lines[header + 1:]:
+            line = raw.rstrip("\n")
+            if not line.strip():
+                continue
+            stripped = line.strip()
+            if set(stripped) <= set("- "):
+                continue
+            if stripped.startswith("*") or stripped.startswith("Report:"):
+                continue
+            if len(line) <= pos[1]:
+                continue
+            name = line[pos[0]:pos[1]].strip()
+            typ = line[pos[1]:pos[2]].strip()
+            if not name or not typ:
+                continue
+            value = line[pos[2]:pos[3]].strip()
+            user_value = line[pos[3]:pos[4]].strip()
+            user_default = line[pos[4]:pos[5]].strip()
+            system_default = line[pos[5]:].strip()
+            opts[name] = {
+                "type": typ,
+                "value": value,
+                "user_value": user_value,
+                "user_default": user_default,
+                "system_default": system_default,
+            }
+        return opts
+
+    def _app_option_value(self, opt, field_key):
+        if not opt:
+            return "-"
+        val = opt.get(field_key, "")
+        return val if str(val).strip() else "-"
+
+    def show_app_options_diff(self):
+        checked = []
+        seen = set()
+        for item in self._checked_run_items():
+            run = item.data(0, Qt.UserRole + 10) or {}
+            path = item.text(15)
+            if not path or path == "N/A" or path in seen:
+                continue
+            seen.add(path)
+            if run.get("run_type") and run.get("run_type") != "FE":
+                continue
+            checked.append(item)
+        if len(checked) < 2:
+            QMessageBox.information(
+                self, "App Options Diff",
+                "Check 2 or more FE runs, then open Utilities > App Options Diff.")
+            return
+
+        rows = []
+        all_options = set()
+        for item in checked:
+            run = item.data(0, Qt.UserRole + 10) or {}
+            block = run.get("block") or item.data(0, Qt.UserRole + 2) or ""
+            rpt = self._find_app_options_report(item.text(15), block)
+            opts = self._parse_app_options_report(rpt) if rpt else {}
+            all_options.update(opts.keys())
+            rows.append({
+                "name": item.text(0),
+                "block": block,
+                "path": item.text(15),
+                "report": rpt,
+                "options": opts,
+            })
+        if not all_options:
+            missing = [r["name"] for r in rows if not r["report"]]
+            msg = "No report_app_options.full reports were found for the selected FE runs."
+            if missing:
+                msg += "\n\nMissing reports for:\n" + "\n".join(missing[:12])
+            QMessageBox.information(self, "App Options Diff", msg)
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("App Options Diff  ({} FE runs)".format(len(rows)))
+        dlg.resize(min(520 + len(rows) * 190, 1600), 720)
+        layout = QVBoxLayout(dlg)
+
+        top = QHBoxLayout()
+        diff_only_cb = QCheckBox("Show differences only")
+        diff_only_cb.setChecked(True)
+        field_combo = QComboBox()
+        field_combo.addItem("Value", "value")
+        field_combo.addItem("User-value", "user_value")
+        field_combo.addItem("User-default", "user_default")
+        field_combo.addItem("System-default", "system_default")
+        search = QLineEdit()
+        search.setPlaceholderText("Search option name...")
+        top.addWidget(diff_only_cb)
+        top.addWidget(QLabel("Compare:"))
+        top.addWidget(field_combo)
+        top.addWidget(search, 1)
+        layout.addLayout(top)
+
+        info = QLabel("Reports: " + "  |  ".join(
+            [os.path.basename(r["report"]) if r["report"] else r["name"] + ": MISSING"
+             for r in rows[:5]]))
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray;")
+        layout.addWidget(info)
+
+        tbl = QTableWidget(0, len(rows) + 3)
+        tbl.setHorizontalHeaderLabels(
+            ["Option", "Type"] + [r["name"] for r in rows] + ["Status"])
+        tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        tbl.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        for c in range(2, len(rows) + 2):
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
+            tbl.setColumnWidth(c, 190)
+        tbl.horizontalHeader().setSectionResizeMode(len(rows) + 2, QHeaderView.ResizeToContents)
+        tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        tbl.setAlternatingRowColors(True)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setSortingEnabled(False)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        layout.addWidget(tbl, 1)
+
+        status_lbl = QLabel("")
+        status_lbl.setStyleSheet("color: gray;")
+        layout.addWidget(status_lbl)
+
+        amber = QColor("#fff3e0")
+        missing_bg = QColor("#eeeeee")
+        dark_diff = QColor("#5a3c12")
+        dark_missing = QColor("#3a3a3a")
+
+        def _populate():
+            field = field_combo.currentData()
+            query = search.text().strip().lower()
+            tbl.setRowCount(0)
+            diff_count = 0
+            same_count = 0
+            missing_count = 0
+            for opt_name in sorted(all_options):
+                if query and query not in opt_name.lower():
+                    continue
+                vals = []
+                types = []
+                missing_here = False
+                for r in rows:
+                    opt = r["options"].get(opt_name)
+                    if not opt:
+                        missing_here = True
+                    vals.append(self._app_option_value(opt, field))
+                    if opt and opt.get("type"):
+                        types.append(opt.get("type"))
+                status = "MISSING" if missing_here else ("SAME" if len(set(vals)) == 1 else "DIFF")
+                if status == "SAME":
+                    same_count += 1
+                elif status == "DIFF":
+                    diff_count += 1
+                else:
+                    missing_count += 1
+                if diff_only_cb.isChecked() and status == "SAME":
+                    continue
+                row = tbl.rowCount(); tbl.insertRow(row)
+                tbl.setItem(row, 0, QTableWidgetItem(opt_name))
+                tbl.setItem(row, 1, QTableWidgetItem(types[0] if types else "-"))
+                for c, val in enumerate(vals):
+                    cell = QTableWidgetItem(str(val))
+                    cell.setToolTip(str(val))
+                    if status == "DIFF":
+                        cell.setBackground(dark_diff if self.is_dark_mode else amber)
+                    elif status == "MISSING" and val == "-":
+                        cell.setBackground(dark_missing if self.is_dark_mode else missing_bg)
+                    tbl.setItem(row, c + 2, cell)
+                st_item = QTableWidgetItem(status)
+                if status == "DIFF":
+                    st_item.setBackground(dark_diff if self.is_dark_mode else amber)
+                elif status == "MISSING":
+                    st_item.setBackground(dark_missing if self.is_dark_mode else missing_bg)
+                tbl.setItem(row, len(rows) + 2, st_item)
+            status_lbl.setText(
+                "Shown: {} option(s). Different: {}. Missing: {}. Same: {}.".format(
+                    tbl.rowCount(), diff_count, missing_count, same_count))
+
+        diff_only_cb.toggled.connect(_populate)
+        field_combo.currentIndexChanged.connect(_populate)
+        search.textChanged.connect(_populate)
+        _populate()
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        dlg.exec_()
     def show_run_diff(self):
         """Compare N checked runs side-by-side."""
         checked = []
