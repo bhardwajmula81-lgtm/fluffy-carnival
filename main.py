@@ -343,7 +343,26 @@ def _format_shared_entry(entry):
     ts = entry.get("updated_at", "")
     user = entry.get("user", "unknown")
     text = entry.get("text", "")
+    if isinstance(text, (list, tuple)):
+        text = "; ".join(_note_lines(text))
     return "{}  {}: {}".format(ts, user, text).strip()
+
+def _note_lines(value):
+    lines = []
+    def _walk(v):
+        if isinstance(v, dict):
+            s = _format_shared_entry(v).strip()
+            if s:
+                lines.append(s)
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                _walk(x)
+        elif v is not None:
+            s = str(v).strip()
+            if s:
+                lines.append(s)
+    _walk(value)
+    return lines
 
 def load_shared_note_entries():
     data = _read_json_dict(_get_shared_notes_file())
@@ -379,7 +398,7 @@ def load_shared_note_entries():
 def load_all_notes():
     # Shared notes, formatted for display/search compatibility.
     entries = load_shared_note_entries()
-    return dict((key, [_format_shared_entry(e) for e in vals])
+    return dict((key, _note_lines([_format_shared_entry(e) for e in vals]))
                 for key, vals in entries.items())
 
 def save_shared_note(identifier, note_text):
@@ -3051,15 +3070,25 @@ class PDDashboard(QMainWindow):
         ins_layout = QVBoxLayout(self.inspector)
         self.ins_lbl = QLabel("Select a run to view details.")
         self.ins_lbl.setWordWrap(True)
+        self.personal_note_box = QGroupBox("Personal Note")
+        self.personal_note_box.setCheckable(True)
+        self.personal_note_box.setChecked(True)
+        personal_note_layout = QVBoxLayout(self.personal_note_box)
+        personal_note_layout.setContentsMargins(6, 6, 6, 6)
         self.ins_note = QTextEdit()
         self.ins_note.setPlaceholderText(
             "Personal note visible only to your user account.")
+        self.ins_note.setMaximumHeight(75)
         self.ins_save_btn = QPushButton("Save Personal Note")
         self.ins_save_btn.clicked.connect(self.save_inspector_note)
+        personal_note_layout.addWidget(self.ins_note)
+        personal_note_layout.addWidget(self.ins_save_btn)
+        self.personal_note_box.toggled.connect(self._toggle_personal_note_box)
         self.shared_note_history = QTextEdit()
         self.shared_note_history.setReadOnly(True)
         self.shared_note_history.setPlaceholderText("No shared notes for this item.")
-        self.shared_note_history.setMaximumHeight(110)
+        self.shared_note_history.setMinimumHeight(95)
+        self.shared_note_history.setMaximumHeight(170)
         self.shared_note_input = QTextEdit()
         self.shared_note_input.setPlaceholderText(
             "Add shared note visible to all dashboard users.")
@@ -3067,9 +3096,7 @@ class PDDashboard(QMainWindow):
         self.shared_save_btn = QPushButton("Add Shared Note")
         self.shared_save_btn.clicked.connect(self.save_shared_inspector_note)
         ins_layout.addWidget(self.ins_lbl)
-        ins_layout.addWidget(QLabel("<b>Personal Note:</b>"))
-        ins_layout.addWidget(self.ins_note)
-        ins_layout.addWidget(self.ins_save_btn)
+        ins_layout.addWidget(self.personal_note_box)
         ins_layout.addWidget(QLabel("<b>Shared Notes:</b>"))
         ins_layout.addWidget(self.shared_note_history)
         ins_layout.addWidget(self.shared_note_input)
@@ -3545,6 +3572,8 @@ class PDDashboard(QMainWindow):
             self.ins_note.clear()
             self.ins_note.setEnabled(False)
             self.ins_save_btn.setEnabled(False)
+            self.shared_note_history.clear()
+            self.shared_note_input.clear()
             return
 
         item     = sel[0]
@@ -3755,8 +3784,12 @@ class PDDashboard(QMainWindow):
         layout.addLayout(row)
         dlg.showFullScreen()
         dlg.exec_()
+    def _toggle_personal_note_box(self, checked):
+        self.ins_note.setVisible(bool(checked))
+        self.ins_save_btn.setVisible(bool(checked))
+
     def _shared_notes_text(self, note_id):
-        notes = self.global_notes.get(note_id, [])
+        notes = _note_lines(self.global_notes.get(note_id, []))
         return "\n".join(notes) if notes else ""
 
     def _note_display(self, note_id):
@@ -3765,7 +3798,7 @@ class PDDashboard(QMainWindow):
         if personal:
             first = personal.splitlines()[0]
             parts.append("Personal: " + first[:80])
-        shared = self.global_notes.get(note_id, []) if hasattr(self, 'global_notes') else []
+        shared = _note_lines(self.global_notes.get(note_id, [])) if hasattr(self, 'global_notes') else []
         if shared:
             parts.append("Shared: " + " | ".join(shared))
         return " | ".join(parts)
@@ -4864,7 +4897,7 @@ class PDDashboard(QMainWindow):
                     return False
             if _do_search:
                 note_id  = f"{rtl} : {run['r_name']}"
-                notes    = " | ".join(_notes.get(note_id, []))
+                notes    = " | ".join(_note_lines(_notes.get(note_id, [])))
                 if note_id in _personal_notes:
                     notes += " | " + _personal_notes.get(note_id, "")
                 combined = (
