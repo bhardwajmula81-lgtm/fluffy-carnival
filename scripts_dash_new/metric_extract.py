@@ -468,6 +468,28 @@ def _parse_stage_cts(text):
     return {}
 
 
+def _parse_stage_runtime(text):
+    runtime = "-"
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if not parts[0].lower().startswith("total_"):
+            continue
+        # Runtime files use columns similar to:
+        # STAGE TIMESTAMP CPUTIME REALTIME MEMORY
+        for tok in reversed(parts):
+            if re.match(r"\d+d\.\d+h\.\d+m\.\d+s", tok):
+                runtime = tok
+                break
+            if re.match(r"\d+h:\d+m:\d+s", tok):
+                runtime = tok
+                break
+        if runtime != "-":
+            break
+    return runtime
+
+
 # ===========================================================================
 # MAIN EXTRACTION WRAPPERS
 # ===========================================================================
@@ -702,6 +724,12 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
     if cts_path:
         result.update(_parse_stage_cts(_read_stage_text(cts_path)))
 
+    runtime_path = _find_stage_rpt(
+        run_dir, stage_name, source,
+        ["{}.runtime.rpt".format(stage_name), "*.runtime.rpt"])
+    result["runtime"] = _parse_stage_runtime(
+        _read_stage_text(runtime_path)) if runtime_path else "-"
+
     result["_paths"] = {
         "r2r_setup":     qor_path,
         "r2r_hold":      qor_path,
@@ -718,6 +746,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
         "macro_area":    util_path,
         "vth":           cell_path,
         "skew_latency":  cts_path,
+        "runtime":       runtime_path,
     }
 
     return result

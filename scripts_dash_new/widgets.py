@@ -1,4 +1,5 @@
 import math
+import re
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                               QScrollArea, QLineEdit, QCompleter, QDialog)
 from PyQt5.QtCore import Qt, QRectF, QStringListModel
@@ -47,6 +48,28 @@ class GanttChartDialog(QDialog):
 
 
 class CustomTreeItem(QTreeWidgetItem):
+    @staticmethod
+    def _date_sort_key(text):
+        if not text or text in ("-", "N/A"):
+            return None
+        s = str(text)
+        m = re.search(
+            r"([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{1,2}):(\d{2})",
+            s)
+        if m:
+            months = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4,
+                      "May": 5, "Jun": 6, "Jul": 7, "Aug": 8,
+                      "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+            return (int(m.group(3)), months.get(m.group(1), 12),
+                    int(m.group(2)), int(m.group(4)), int(m.group(5)), 0)
+        m = re.search(
+            r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})\D+(\d{1,2}):(\d{2})(?::(\d{2}))?",
+            s)
+        if m:
+            return (int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                    int(m.group(4)), int(m.group(5)), int(m.group(6) or 0))
+        return None
+
     def __lt__(self, other):
         col = self.treeWidget().sortColumn()
 
@@ -60,6 +83,19 @@ class CustomTreeItem(QTreeWidgetItem):
 
         t1 = self.text(col).strip() if self.text(col) else ""
         t2 = other.text(col).strip() if other.text(col) else ""
+
+        if col in (13, 14):
+            raw1 = self.data(0, Qt.UserRole + (40 if col == 13 else 41)) or t1
+            raw2 = other.data(0, Qt.UserRole + (40 if col == 13 else 41)) or t2
+            k1 = self._date_sort_key(raw1)
+            k2 = self._date_sort_key(raw2)
+            if (k1 is None) != (k2 is None):
+                return False if k1 is None else True
+            if k1 is None and k2 is None:
+                return t1 < t2
+            if k1 != k2:
+                asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
+                return k1 < k2 if asc else k1 > k2
 
         if col in [3, 7, 8, 9]:
             def score(val):
