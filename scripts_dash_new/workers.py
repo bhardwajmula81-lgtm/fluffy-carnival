@@ -279,7 +279,7 @@ def get_vslp_info(report_path):
 # ===========================================================================
 class BatchSizeWorker(QThread):
     # Batch signal: emits list[(item_id, size_str)] every 50 results
-    # instead of one signal per item — prevents flooding the main-thread event queue.
+    # instead of one signal per item - prevents flooding the main-thread event queue.
     sizes_batch_ready = pyqtSignal(list)
     # Keep old signal for backward-compat with any direct callers
     size_calculated   = pyqtSignal(str, str)
@@ -304,7 +304,7 @@ class BatchSizeWorker(QThread):
                 except Exception:
                     size_str = "N/A"
                 batch.append((item_id, size_str))
-                # Emit in chunks of 50 — ~10 signal deliveries vs 500
+                # Emit in chunks of 50 - about 10 signal deliveries vs 500
                 if len(batch) >= 50:
                     self.sizes_batch_ready.emit(batch)
                     batch = []
@@ -940,7 +940,7 @@ class ScannerWorker(QThread):
                     "rpt":           rpt_cands[0],   # primary (used as fallback)
                     "_rpt_cands":    rpt_cands,       # resolved lazily in StageDetailWorker
                     "log":           log,
-                    # All deferred — filled by StageDetailWorker on expand
+                    # All deferred - filled by StageDetailWorker on expand
                     "info":          {"start": "-", "end": "-",
                                       "runtime": "-", "last_stage": "-"},
                     "st_n":          "-",
@@ -1058,7 +1058,7 @@ class StageDetailWorker(QThread):
                         vslp_path = cand
                         break
                 if not vslp_path:
-                    # Default to first dir variant — get_vslp_info will return N/A if missing
+                    # Default to first dir variant - get_vslp_info will return N/A if missing
                     dirs = s.get("_fm_dirs", [])
                     if dirs:
                         vslp_path = os.path.join(
@@ -1143,6 +1143,8 @@ class MetricBatchWorker(QThread):
                         task.get("stage_name", ""),
                         source=task.get("source", "WS"),
                         block=task.get("block", ""))
+                    if task.get("runtime"):
+                        row["metrics"]["runtime"] = task.get("runtime")
             except Exception as e:
                 row["metrics"] = {"_error": str(e)}
             out.append(row)

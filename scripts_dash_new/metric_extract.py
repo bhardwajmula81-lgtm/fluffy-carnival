@@ -1,4 +1,4 @@
-# -*- coding: ascii -*-
+# -*- coding: utf-8 -*-
 # metric_extract.py
 # QoR metric extraction for Singularity PD dashboard.
 # Parsers validated against user standalone script output.
@@ -6,6 +6,7 @@
 import os
 import re
 import glob
+import gzip
 
 # ===========================================================================
 # PATH HELPERS
@@ -153,6 +154,13 @@ def parse_qor(file_path):
             content = f.read()
 
         def get_r2r_data(section_name):
+            low_content = content.lower()
+            if (section_name.lower().startswith("setup")
+                    and "no setup violations found" in low_content):
+                return "0/0/0"
+            if (section_name.lower().startswith("hold")
+                    and "no hold violations found" in low_content):
+                return "0/0/0"
             section = re.search(
                 section_name + r".*?(?=Report :|$)", content, re.DOTALL)
             if not section:
@@ -291,6 +299,175 @@ def parse_logic_depth(file_path):
     return "-"
 
 
+def _stage_report_dirs(run_dir, stage_name, source="WS"):
+    dirs = [
+        os.path.join(run_dir, "reports", stage_name),
+        os.path.join(run_dir, stage_name, "reports", stage_name),
+        os.path.join(run_dir, stage_name, "reports"),
+        os.path.join(run_dir, "reports"),
+    ]
+    out = []
+    for d in dirs:
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def _find_stage_rpt(run_dir, stage_name, source, patterns):
+    for d in _stage_report_dirs(run_dir, stage_name, source):
+        hit = _find_rpt(d, patterns)
+        if hit:
+            return hit
+    return None
+
+
+def _read_stage_text(path):
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _trip(a, b, c):
+    return "{}/{}/{}".format(a, b, c)
+
+
+def _parse_stage_fc_timing(text, section_name):
+    low = text.lower()
+    if section_name.lower().startswith("setup") and "no setup violations found" in low:
+        return ("0/0/0", "0/0/0")
+    if section_name.lower().startswith("hold") and "no hold violations found" in low:
+        return ("0/0/0", "0/0/0")
+    m = re.search(section_name + r".*?(?=\n\s*(?:Setup violations|Hold violations|END_CMD|Report :|$))",
+                  text, re.S | re.I)
+    if not m:
+        return ("-", "-")
+    sec = m.group(0)
+    wns = re.search(r"^\s*WNS\s+(.+)$", sec, re.M)
+    tns = re.search(r"^\s*TNS\s+(.+)$", sec, re.M)
+    num = re.search(r"^\s*(?:NUM|FEP|NVE)\s+(.+)$", sec, re.M)
+    if not (wns and tns and num):
+        return ("-", "-")
+    wv = wns.group(1).split()
+    tv = tns.group(1).split()
+    nv = num.group(1).split()
+    if len(wv) < 2 or len(tv) < 2 or len(nv) < 2:
+        return ("-", "-")
+    return (_trip(wv[0], tv[0], nv[0]), _trip(wv[1], tv[1], nv[1]))
+
+
+def _parse_stage_innovus_setup(text):
+    header = None
+    rows = {}
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if not cells:
+            continue
+        if cells[0].lower().startswith("setup mode"):
+            header = [c.lower() for c in cells]
+        elif header and cells[0].lower().startswith("wns"):
+            rows["wns"] = cells
+        elif header and cells[0].lower().startswith("tns"):
+            rows["tns"] = cells
+        elif header and cells[0].lower().startswith("violating"):
+            rows["num"] = cells
+            break
+    if not header or not all(k in rows for k in ("wns", "tns", "num")):
+        return ("-", "-")
+    try:
+        all_i = header.index("all")
+        r2r_i = header.index("reg2reg")
+        return (
+            _trip(rows["wns"][all_i], rows["tns"][all_i], rows["num"][all_i]),
+            _trip(rows["wns"][r2r_i], rows["tns"][r2r_i], rows["num"][r2r_i]))
+    except Exception:
+        return ("-", "-")
+
+
+def _parse_stage_innovus_hold(text):
+    m = re.search(r"#\s*HOLD.*?View\s*:\s*ALL\s+([-\d.]+)\s+([-\d.]+)\s+(\d+)",
+                  text, re.S | re.I)
+    return _trip(m.group(1), m.group(2), m.group(3)) if m else "-"
+
+
+def _parse_stage_grc(text):
+    m = re.search(
+        r"Overflow:\s*\S+\s*=\s*\S+\s*\(([^)]*H)\)\s*\+\s*\S+\s*\(([^)]*V)\)",
+        text, re.I)
+    if m:
+        return "{} + {}".format(m.group(1).strip(), m.group(2).strip())
+    h = re.search(r"H\s+routing.*?\(\s*([\d.]+%)\s*\)", text, re.I)
+    v = re.search(r"V\s+routing.*?\(\s*([\d.]+%)\s*\)", text, re.I)
+    if h and v:
+        return "{} H + {} V".format(h.group(1), v.group(1))
+    return "-"
+
+
+def _parse_stage_area(text):
+    out = {}
+    m = re.search(r"^\s*std_cell\(\+headbuf\+epbuf\)\s+(\d+)\s+([\d.]+)",
+                  text, re.M)
+    if m:
+        out["std_cell_count"] = m.group(1)
+        out["std_cell_area"] = m.group(2)
+        out["std_cell_count_area"] = "{}/{}".format(m.group(1), m.group(2))
+    m = re.search(r"Standard\s+cell\s+only\s+utilization\s*:\s*([\d.]+)%", text, re.I)
+    if m:
+        out["std_cell_only_util"] = m.group(1) + "%"
+    m = re.search(r"^\s*Total\s+utilization\s*:\s*([\d.]+)%", text, re.I | re.M)
+    if m:
+        out["total_util"] = m.group(1) + "%"
+    return out
+
+
+def _parse_stage_vth(text):
+    m = re.search(r"##\s*Logic cells only(.*?)(?=##\s*Total cells|$)", text, re.S | re.I)
+    if not m:
+        return {}
+    groups = {}
+    for line in m.group(1).splitlines():
+        r = re.search(
+            r"^\s*([A-Za-z][A-Za-z0-9]*_\d+)\s+[-+\d.]+\s+\(\s*([\d.]+)\s*%\s*\)\s+[-+\d.]+\s+\(\s*([\d.]+)\s*%\s*\)",
+            line)
+        if not r:
+            continue
+        g = r.group(1).split("_", 1)[0].upper()
+        vals = groups.setdefault(g, [0.0, 0.0])
+        vals[0] += float(r.group(2))
+        vals[1] += float(r.group(3))
+    if not groups:
+        return {}
+    preferred = ["UHVT", "HVT", "RVT", "LVT", "SLVT"]
+    order = [g for g in preferred if g in groups]
+    order.extend(sorted(g for g in groups if g not in order))
+    return {
+        "stage_vt_label": "/".join(g + "*" for g in order),
+        "stage_vt_inst": "/".join("{:.2f}%".format(groups[g][0]) for g in order),
+        "stage_vt_area": "/".join("{:.2f}%".format(groups[g][1]) for g in order),
+    }
+
+
+def _parse_stage_cts(text):
+    for line in text.splitlines():
+        if not re.match(r"^\s*All\s+Clocks\b", line):
+            continue
+        nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
+        if len(nums) >= 7:
+            return {
+                "skew_latency": "{}/{}".format(nums[6], nums[5]),
+                "clock_repeater_count_area": "{}/{}".format(nums[2], nums[3]),
+            }
+    return {}
+
+
 # ===========================================================================
 # MAIN EXTRACTION WRAPPERS
 # ===========================================================================
@@ -364,61 +541,183 @@ def extract_fe_metrics(run_dir, source="WS", block=None):
     ld_path = _find_rpt(rpt_dir, ["report_logic_depth.summary.*.rpt"])
     result["logic_depth"] = parse_logic_depth(ld_path)
 
+    # Report file paths - for double-click "open in gvim" from dialogs
+    _rt_path = os.path.join(run_dir, "reports", "runtime.V2.rpt")
+    result["_paths"] = {
+        "r2r_setup":     qor_path,
+        "r2r_hold":      qor_path,
+        "logic_depth":   ld_path,
+        "cgc":           cgc_path,
+        "mbit":          mbit_path,
+        "congestion":    cong_path,
+        "leakage":       pwr_path,
+        "area":          area_path,
+        "total_area":    area_path,
+        "instance_count": area_path,
+        "std_cell_area": util_path,
+        "memory_area":   util_path,
+        "macro_area":    util_path,
+        "vth":           cell_path,
+        "runtime":       _rt_path if os.path.exists(_rt_path) else None,
+    }
+
     return result
 
 
 def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
     """Extract QoR metrics for a single PNR stage."""
     result = {"stage": stage_name, "run_dir": run_dir}
-    if source == "WS":
-        rpt_dir = os.path.join(run_dir, "reports", stage_name)
-    else:
-        rpt_dir = os.path.join(run_dir, stage_name, "reports")
     b = block or _get_block_name(run_dir)
 
-    qor_path = _find_rpt(rpt_dir, ["qor.{}.*.rpt".format(b), "qor.*.rpt"])
-    qor_data = parse_qor(qor_path)
-    result["r2r_setup"] = qor_data.get("r2r_setup", "-")
-    result["r2r_hold"]  = qor_data.get("r2r_hold",  "-")
+    # New BE stage reports are stage-local and tool-specific.
+    # Keep old FE-like fallbacks for compatibility with older runs.
+    qor_sum = _find_stage_rpt(
+        run_dir, stage_name, source,
+        ["{}.qor_sum.rpt".format(stage_name), "*.qor_sum.rpt"])
+    qor_path = qor_sum
+    if qor_sum:
+        text = _read_stage_text(qor_sum)
+        setup_total, setup_r2r = _parse_stage_fc_timing(text, "Setup violations")
+        hold_total, hold_r2r = _parse_stage_fc_timing(text, "Hold violations")
+        result["setup_total"] = setup_total
+        result["setup_r2r"] = setup_r2r
+        result["hold_total"] = hold_total
+        result["hold_r2r"] = hold_r2r
+        result["r2r_setup"] = setup_r2r
+        result["r2r_hold"] = hold_r2r
+    else:
+        setup_path = _find_stage_rpt(
+            run_dir, stage_name, source,
+            ["{}_p*.summary.gz".format(stage_name),
+             "{}_p*.summary".format(stage_name),
+             "*_p*.summary.gz"])
+        if setup_path:
+            text = _read_stage_text(setup_path)
+            setup_total, setup_r2r = _parse_stage_innovus_setup(text)
+            result["setup_total"] = setup_total
+            result["setup_r2r"] = setup_r2r
+            result["r2r_setup"] = setup_r2r
+            qor_path = setup_path
+        hold_path = _find_stage_rpt(
+            run_dir, stage_name, source,
+            ["{}.qor.snap.rpt".format(stage_name), "*.qor.snap.rpt"])
+        if hold_path:
+            hold_all = _parse_stage_innovus_hold(_read_stage_text(hold_path))
+            result["hold_all"] = hold_all
+            result["r2r_hold"] = hold_all
+            if not qor_path:
+                qor_path = hold_path
 
-    area_path = _find_rpt(rpt_dir, ["area.{}.*.rpt".format(b), "area.*.rpt"])
-    area_data = parse_area(area_path)
+    if "r2r_setup" not in result:
+        old_qor = _find_stage_rpt(
+            run_dir, stage_name, source,
+            ["qor.{}.*.rpt".format(b), "qor.*.rpt"])
+        qor_data = parse_qor(old_qor)
+        result["r2r_setup"] = qor_data.get("r2r_setup", "-")
+        result["r2r_hold"] = qor_data.get("r2r_hold", "-")
+        qor_path = old_qor
+
+    area_path = _find_stage_rpt(
+        run_dir, stage_name, source,
+        ["{}.sec_get_area.rpt".format(stage_name), "*.sec_get_area.rpt"])
+    stage_area = _parse_stage_area(_read_stage_text(area_path)) if area_path else {}
+    if not stage_area:
+        area_path = _find_stage_rpt(
+            run_dir, stage_name, source,
+            ["area.{}.*.rpt".format(b), "area.*.rpt"])
+        stage_area = parse_area(area_path)
     result["area"] = {
-        "total_area":     area_data.get("total_area",     "-"),
-        "instance_count": area_data.get("instance_count", "-"),
+        "total_area":     stage_area.get("total_area",     "-"),
+        "instance_count": stage_area.get(
+            "instance_count", stage_area.get("std_cell_count", "-")),
+        "std_cell_area":  stage_area.get("std_cell_area", "-"),
     }
+    result["std_cell_count_area"] = stage_area.get("std_cell_count_area", "-")
+    result["std_cell_only_util"] = stage_area.get("std_cell_only_util", "-")
+    result["total_util"] = stage_area.get("total_util", "-")
+    util_path = area_path
+    util_data = {}
+    if result["area"].get("std_cell_area", "-") == "-":
+        util_path = _find_stage_rpt(
+            run_dir, stage_name, source,
+            ["utilization.{}.*.rpt".format(b), "utilization.*.rpt"])
+        util_data = parse_utilization(util_path)
+        result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
+        result["area"]["memory_area"] = util_data.get("memory_area", "-")
+        result["area"]["macro_area"] = util_data.get("macro_area", "-")
+        result["std_util_str"] = util_data.get("std_util_str", "-/-")
+        result["util"] = util_data
+    else:
+        result["std_util_str"] = "{}/{}".format(
+            result["total_util"], result["std_cell_only_util"])
+        result["util"] = {
+            "std_cell_area": result["area"].get("std_cell_area", "-"),
+            "std_util": result["std_util_str"],
+            "std_util_str": result["std_util_str"],
+        }
 
-    util_path = _find_rpt(rpt_dir, [
-        "utilization.{}.*.rpt".format(b), "utilization.*.rpt"])
-    util_data = parse_utilization(util_path)
-    result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
-    result["area"]["memory_area"]   = util_data.get("memory_area",   "-")
-    result["area"]["macro_area"]    = util_data.get("macro_area",    "-")
-    result["util"]         = util_data
-    result["std_util_str"] = util_data.get("std_util_str", "-/-")
+    cell_path = _find_stage_rpt(
+        run_dir, stage_name, source,
+        ["{}.sec_vth_use.rpt".format(stage_name), "*.sec_vth_use.rpt"])
+    vth_data = _parse_stage_vth(_read_stage_text(cell_path)) if cell_path else {}
+    if not vth_data:
+        cell_path = _find_stage_rpt(
+            run_dir, stage_name, source,
+            ["cell_usage.summary.{}.*.rpt".format(b),
+             "cell_usage.summary.*.rpt"])
+        vth_data = parse_cell_usage(cell_path)
+    result["vth"] = vth_data
 
-    cell_path = _find_rpt(rpt_dir, [
-        "cell_usage.summary.{}.*.rpt".format(b),
-        "cell_usage.summary.*.rpt"])
-    result["vth"] = parse_cell_usage(cell_path)
-
-    cgc_path = _find_rpt(rpt_dir, [
+    cgc_path = _find_stage_rpt(run_dir, stage_name, source, [
         "clock_gating_info.mission.rpt",
         "clock_gating_info.{}.*.rpt".format(b),
         "clock_gating_info*.rpt"])
     result["cgc"] = parse_clock_gating(cgc_path)
 
-    mbit_path = _find_rpt(rpt_dir, [
+    mbit_path = _find_stage_rpt(run_dir, stage_name, source, [
         "multibit_banking_ratio.{}.*.rpt".format(b),
         "multibit_banking_ratio.*.rpt"])
     result["mbit"] = parse_multibit(mbit_path)
 
-    cong_path = _find_rpt(rpt_dir, [
-        "congestion.{}.*.rpt".format(b), "congestion.*.rpt"])
-    result["congestion"] = parse_congestion(cong_path)
+    cong_path = _find_stage_rpt(
+        run_dir, stage_name, source,
+        ["{}.grc.rpt".format(stage_name), "*.grc.rpt",
+         "congestion.{}.*.rpt".format(b), "congestion.*.rpt"])
+    if cong_path and os.path.basename(cong_path).endswith(".grc.rpt"):
+        result["congestion"] = {"cong_both": _parse_stage_grc(_read_stage_text(cong_path))}
+    else:
+        result["congestion"] = parse_congestion(cong_path)
 
-    pwr_path = _find_rpt(rpt_dir, [
+    pwr_path = _find_stage_rpt(run_dir, stage_name, source, [
         "report_power_info.mission.ss*.rpt", "report_power*.rpt"])
     result["power"] = parse_power(pwr_path)
+
+    ld_path = _find_stage_rpt(
+        run_dir, stage_name, source, ["report_logic_depth.summary.*.rpt"])
+    result["logic_depth"] = parse_logic_depth(ld_path)
+
+    cts_path = _find_stage_rpt(
+        run_dir, stage_name, source,
+        ["{}.cts.qor.final.rpt".format(stage_name), "*.cts.qor.final.rpt"])
+    if cts_path:
+        result.update(_parse_stage_cts(_read_stage_text(cts_path)))
+
+    result["_paths"] = {
+        "r2r_setup":     qor_path,
+        "r2r_hold":      qor_path,
+        "logic_depth":   ld_path,
+        "cgc":           cgc_path,
+        "mbit":          mbit_path,
+        "congestion":    cong_path,
+        "leakage":       pwr_path,
+        "area":          area_path,
+        "total_area":    area_path,
+        "instance_count": area_path,
+        "std_cell_area": util_path,
+        "memory_area":   util_path,
+        "macro_area":    util_path,
+        "vth":           cell_path,
+        "skew_latency":  cts_path,
+    }
 
     return result
