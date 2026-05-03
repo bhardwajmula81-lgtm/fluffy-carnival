@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Singularity PD | Pro Edition -- main.py
+# Flow Pulse | Beta 1 -- main.py
 # Pure ASCII comments only (Python 3.6 compatible on Linux)
 
 import os
@@ -19,6 +19,8 @@ import getpass
 import configparser
 import concurrent.futures
 import tempfile
+import gzip
+import html
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -34,7 +36,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint, QRect
 from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QBrush,
-                         QPainter, QPen, QPixmap, QIcon, QPolygon)
+                         QPainter, QPen, QPixmap, QIcon, QPolygon, QImage)
 
 # ===========================================================================
 # CONFIG + MAIL HELPERS (module-level, loaded once at startup)
@@ -1045,8 +1047,11 @@ class QoRSummaryDialog(QDialog):
 
         # LVT/RVT/HVT combined inst/area strings from parse_cell_usage
         vth              = metrics.get("vth", {})
-        lvt_rvt_hvt_inst = vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-/-"))
-        lvt_rvt_hvt_area = vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-/-"))
+        vt_label = vth.get("stage_vt_label", "LVT*/RVT*/HVT*")
+        lvt_rvt_hvt_inst = vth.get("stage_vt_inst",
+                                   vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-/-")))
+        lvt_rvt_hvt_area = vth.get("stage_vt_area",
+                                   vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-/-")))
 
         # Congestion: cong_both already formatted as "Both%/V%/H%"
         cong_str = _v(cong, "cong_both")
@@ -1056,34 +1061,63 @@ class QoRSummaryDialog(QDialog):
 
         # Util string: from utilization report
         util_str = _v(metrics.get("util", {}), "std_util_str", "std_util")
+        gate_count = metrics.get("gate_count", "-")
+        if gate_count == "-":
+            try:
+                parent_obj = self.parent()
+                factor = getattr(parent_obj, "gate_count_unit_area", 0.2419) or 0.2419
+                gate_count = str(int(float(area.get("std_cell_area", "-")) / factor))
+            except Exception:
+                gate_count = "-"
 
         # (label, value, is_section, path_key_or_None)
         _paths = metrics.get("_paths", {})
-        rows = [
-            ("Timing",                         None,                       True,  None),
-            ("R2R (Setup)  WNS/TNS/FEPs",     metrics.get("r2r_setup","-"), False, "r2r_setup"),
-            ("R2R (Hold)   WNS/TNS/FEPs",     metrics.get("r2r_hold",  "-"), False, "r2r_hold"),
-            ("Area",                            None,                       True,  None),
-            ("Total Area",                     _v(area,"total_area"),       False, "total_area"),
-            ("Std Cell Area",                  _v(area,"std_cell_area_total",
-                                                      "std_cell_area"),     False, "std_cell_area"),
-            ("Memory Area",                    _v(area,"memory_area"),      False, "memory_area"),
-            ("Macro Area (Inc. Mem)",          _v(area,"macro_area"),       False, "macro_area"),
-            ("Instance Count",                 _v(area,"instance_count",
-                                                   "total_count"),          False, "instance_count"),
-            ("Physical",                       None,                        True,  None),
-            ("LVT*/RVT*/HVT* Inst",            lvt_rvt_hvt_inst,            False, "vth"),
-            ("LVT*/RVT*/HVT* Area",            lvt_rvt_hvt_area,            False, "vth"),
-            ("Congestion (Both/V/H Dir)",      cong_str,                    False, "congestion"),
-            ("StdCell/StdCell Only Util",      util_str,                    False, "std_cell_area"),
-            ("Quality",                        None,                        True,  None),
-            ("MBIT Ratio",                     _v(metrics, "mbit"),         False, "mbit"),
-            ("CGC Ratio",                      metrics.get("cgc", "-"),     False, "cgc"),
-            ("Power",                          None,                        True,  None),
-            ("Cell Leakage Power",             pwr_str,                     False, "leakage"),
-            ("Runtime",                        metrics.get("runtime","-"),  False, "runtime"),
-            ("Logic Depth",                    metrics.get("logic_depth","-"), False, "logic_depth"),
-        ]
+        if metrics.get("stage"):
+            rows = [
+                ("Timing",                         None,                         True,  None),
+                ("R2R Setup WNS/TNS/NVE",          metrics.get("setup_r2r", metrics.get("r2r_setup", "-")), False, "r2r_setup"),
+                ("Total Setup WNS/TNS/NVE",        metrics.get("setup_total", "-"), False, "r2r_setup"),
+                ("R2R Hold WNS/TNS/NVE",           metrics.get("hold_r2r", metrics.get("r2r_hold", "-")), False, "r2r_hold"),
+                ("Total Hold WNS/TNS/NVE",         metrics.get("hold_total", metrics.get("hold_all", "-")), False, "r2r_hold"),
+                ("Physical",                       None,                         True,  None),
+                ("Congestion",                     cong_str,                     False, "congestion"),
+                ("Std Cell Count/Area",            metrics.get("std_cell_count_area", "-"), False, "std_cell_area"),
+                ("Gate Count",                     gate_count, False, "std_cell_area"),
+                ("StdCell/StdCell Only Util",      util_str,                     False, "std_cell_area"),
+                ("Total Util",                     metrics.get("total_util", "-"), False, "std_cell_area"),
+                (vt_label + " Inst",               lvt_rvt_hvt_inst,             False, "vth"),
+                (vt_label + " Area",               lvt_rvt_hvt_area,             False, "vth"),
+                ("Clock",                          None,                         True,  None),
+                ("Skew/Latency",                   metrics.get("skew_latency", "-"), False, "skew_latency"),
+                ("Clock Repeater Count/Area",      metrics.get("clock_repeater_count_area", "-"), False, "skew_latency"),
+                ("Runtime",                        metrics.get("runtime","-"),  False, "runtime"),
+            ]
+        else:
+            rows = [
+                ("Timing",                         None,                       True,  None),
+                ("R2R (Setup)  WNS/TNS/FEPs",     metrics.get("r2r_setup","-"), False, "r2r_setup"),
+                ("R2R (Hold)   WNS/TNS/FEPs",     metrics.get("r2r_hold",  "-"), False, "r2r_hold"),
+                ("Area",                            None,                       True,  None),
+                ("Total Area",                     _v(area,"total_area"),       False, "total_area"),
+                ("Std Cell Area",                  _v(area,"std_cell_area_total",
+                                                          "std_cell_area"),     False, "std_cell_area"),
+                ("Memory Area",                    _v(area,"memory_area"),      False, "memory_area"),
+                ("Macro Area (Inc. Mem)",          _v(area,"macro_area"),       False, "macro_area"),
+                ("Instance Count",                 _v(area,"instance_count",
+                                                       "total_count"),          False, "instance_count"),
+                ("Physical",                       None,                        True,  None),
+                ("LVT*/RVT*/HVT* Inst",            lvt_rvt_hvt_inst,            False, "vth"),
+                ("LVT*/RVT*/HVT* Area",            lvt_rvt_hvt_area,            False, "vth"),
+                ("Congestion (Both/V/H Dir)",      cong_str,                    False, "congestion"),
+                ("StdCell/StdCell Only Util",      util_str,                    False, "std_cell_area"),
+                ("Quality",                        None,                        True,  None),
+                ("MBIT Ratio",                     _v(metrics, "mbit"),         False, "mbit"),
+                ("CGC Ratio",                      metrics.get("cgc", "-"),     False, "cgc"),
+                ("Power",                          None,                        True,  None),
+                ("Cell Leakage Power",             pwr_str,                     False, "leakage"),
+                ("Runtime",                        metrics.get("runtime","-"),  False, "runtime"),
+                ("Logic Depth",                    metrics.get("logic_depth","-"), False, "logic_depth"),
+            ]
 
         # Table
         tbl = QTableWidget(0, 2)
@@ -1232,6 +1266,414 @@ class QoRWorker(QThread):
                 else "")
         except Exception:
             self.finished.emit("")
+
+
+class FeCongestionLookupWorker(QThread):
+    finished = pyqtSignal(int, str, str, str, str, object)
+
+    def __init__(self, token, run_path, block):
+        super().__init__()
+        self.token = token
+        self.run_path = run_path or ""
+        self.block = block or ""
+
+    def run(self):
+        fp_ver = "-"
+        img_path = ""
+        img = QImage()
+        try:
+            log_path = os.path.join(self.run_path, "logs", "compile_opt.log")
+            if os.path.exists(log_path):
+                with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        m = re.search(r'^\s*INFO\s*:\s*FP_VER\s*[-:]\s*(\S.*)$', line)
+                        if not m:
+                            continue
+                        cand = m.group(1).strip().strip('"')
+                        if '$' in cand or cand.upper() in ('FP_VER', '$FP_VER'):
+                            continue
+                        fp_ver = cand
+                        break
+        except Exception:
+            fp_ver = "-"
+
+        try:
+            rpt_dir = os.path.join(self.run_path, "reports")
+            if os.path.isdir(rpt_dir):
+                pats = []
+                if self.block:
+                    pats.append("congestion.window.{}.*.jpg".format(self.block))
+                    pats.append("congestion.window.{}.*.jpeg".format(self.block))
+                pats.extend(["congestion.window.*.jpg", "congestion.window.*.jpeg"])
+                matches = []
+                for name in os.listdir(rpt_dir):
+                    for pat in pats:
+                        if fnmatch.fnmatch(name, pat):
+                            matches.append(os.path.join(rpt_dir, name))
+                            break
+                if matches:
+                    matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+                    img_path = matches[0]
+                    try:
+                        with open(img_path, 'rb') as f:
+                            img.loadFromData(f.read())
+                    except Exception:
+                        img = QImage()
+        except Exception:
+            img_path = ""
+            img = QImage()
+
+        self.finished.emit(self.token, self.run_path, self.block, fp_ver, img_path, img)
+
+
+class StageScreenshotLookupWorker(QThread):
+    finished = pyqtSignal(int, str, str, str, object, object)
+
+    def __init__(self, token, be_path, stage_path, stage_name, block):
+        super().__init__()
+        self.token = token
+        self.be_path = be_path or ""
+        self.stage_path = stage_path or ""
+        self.stage_name = stage_name or ""
+        self.block = block or ""
+
+    def _candidate_dirs(self):
+        out = []
+        for d in (
+                os.path.join(self.stage_path, "screenshot"),
+                os.path.join(self.be_path, self.stage_name, "screenshot"),
+                os.path.join(self.be_path, "screenshot"),
+                os.path.join(self.be_path, "outputs", self.stage_name, "screenshot"),
+                os.path.join(self.be_path, "reports", self.stage_name, "screenshot")):
+            if d and d not in out:
+                out.append(d)
+        return out
+
+    def _match(self, names, patterns):
+        for pat in patterns:
+            for name in names:
+                if fnmatch.fnmatch(name.lower(), pat.lower()):
+                    return name
+        return ""
+
+    def run(self):
+        labels = [
+            ("Congestion Map", [
+                "{}.{}.jpg".format(self.stage_name, self.block),
+                "{}.{}.jpeg".format(self.stage_name, self.block)]),
+            ("Pin Map", [
+                "{}.{}_pin_density.*".format(self.stage_name, self.block),
+                "{}.*_pin_density.*".format(self.stage_name)]),
+            ("Cell Density Map", [
+                "{}.{}_cell_density.*".format(self.stage_name, self.block),
+                "{}.*_cell_density.*".format(self.stage_name)]),
+            ("Shorts Map", [
+                "{}.{}_Short*.jpg".format(self.stage_name, self.block),
+                "{}.*_Short*.jpg".format(self.stage_name),
+                "{}.{}_Short*.jpeg".format(self.stage_name, self.block),
+                "{}.*_Short*.jpeg".format(self.stage_name)]),
+        ]
+        found = {}
+        img = QImage()
+        try:
+            for d in self._candidate_dirs():
+                if not os.path.isdir(d):
+                    continue
+                names = [n for n in os.listdir(d)
+                         if n.lower().endswith((".jpg", ".jpeg"))]
+                if not names:
+                    continue
+                for label, pats in labels:
+                    if label in found:
+                        continue
+                    hit = self._match(names, pats)
+                    if hit:
+                        found[label] = os.path.join(d, hit)
+                if "Congestion Map" in found and img.isNull():
+                    try:
+                        with open(found["Congestion Map"], 'rb') as f:
+                            img.loadFromData(f.read())
+                    except Exception:
+                        img = QImage()
+                if len(found) == len(labels):
+                    break
+        except Exception:
+            found = {}
+            img = QImage()
+        self.finished.emit(
+            self.token, self.be_path, self.stage_name, self.block, found, img)
+
+
+class StageMetricLookupWorker(QThread):
+    finished = pyqtSignal(int, str, str, object)
+
+    def __init__(self, token, be_path, stage_path, stage_name, block, runtime, gate_factor):
+        super().__init__()
+        self.token = token
+        self.be_path = be_path or ""
+        self.stage_path = stage_path or ""
+        self.stage_name = stage_name or ""
+        self.block = block or ""
+        self.runtime = runtime or "-"
+        self.gate_factor = gate_factor or 0.2419
+
+    def _candidate_report_dirs(self):
+        dirs = [
+            os.path.join(self.be_path, "reports", self.stage_name),
+            os.path.join(self.stage_path, "reports"),
+            os.path.join(self.stage_path, "reports", self.stage_name),
+            os.path.join(self.be_path, self.stage_name, "reports"),
+            os.path.join(self.be_path, self.stage_name, "reports", self.stage_name),
+            os.path.join(self.be_path, "reports"),
+            self.stage_path,
+        ]
+        out = []
+        for d in dirs:
+            if d and d not in out:
+                out.append(d)
+        return out
+
+    def _find_file(self, patterns):
+        hits = []
+        for d in self._candidate_report_dirs():
+            try:
+                if not os.path.isdir(d):
+                    continue
+                names = os.listdir(d)
+            except Exception:
+                continue
+            for pat in patterns:
+                for name in names:
+                    if fnmatch.fnmatch(name, pat):
+                        hits.append(os.path.join(d, name))
+                if hits:
+                    break
+            if hits:
+                break
+        if not hits:
+            return ""
+        try:
+            return sorted(hits, key=os.path.getmtime)[-1]
+        except Exception:
+            return sorted(hits)[-1]
+
+    def _read_text(self, path):
+        if not path or not os.path.exists(path):
+            return ""
+        try:
+            if path.endswith(".gz"):
+                with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read()
+        except Exception:
+            return ""
+
+    def _trip(self, a, b, c):
+        return "{}/{}/{}".format(a, b, c)
+
+    def _fc_timing_section(self, text, label):
+        m = re.search(label + r".*?(?=\n\s*(?:Setup violations|Hold violations|END_CMD|Report :|$))",
+                      text, re.S | re.I)
+        return m.group(0) if m else ""
+
+    def _parse_fc_timing(self, text, label):
+        low = text.lower()
+        if label.lower().startswith("setup") and "no setup violations found" in low:
+            return ("0/0/0", "0/0/0")
+        if label.lower().startswith("hold") and "no hold violations found" in low:
+            return ("0/0/0", "0/0/0")
+        sec = self._fc_timing_section(text, label)
+        if not sec:
+            return ("-", "-")
+        wns = re.search(r"^\s*WNS\s+(.+)$", sec, re.M)
+        tns = re.search(r"^\s*TNS\s+(.+)$", sec, re.M)
+        num = re.search(r"^\s*(?:NUM|FEP|NVE)\s+(.+)$", sec, re.M)
+        if not (wns and tns and num):
+            return ("-", "-")
+        wv = wns.group(1).split()
+        tv = tns.group(1).split()
+        nv = num.group(1).split()
+        if len(wv) < 2 or len(tv) < 2 or len(nv) < 2:
+            return ("-", "-")
+        total = self._trip(wv[0], tv[0], nv[0])
+        r2r = self._trip(wv[1], tv[1], nv[1])
+        return (total, r2r)
+
+    def _pipe_cells(self, line):
+        return [c.strip() for c in line.strip().strip("|").split("|")]
+
+    def _parse_innovus_setup(self, text):
+        lines = text.splitlines()
+        header = None
+        rows = {}
+        for line in lines:
+            if "|" not in line:
+                continue
+            cells = self._pipe_cells(line)
+            if not cells:
+                continue
+            if cells[0].lower().startswith("setup mode"):
+                header = [c.lower() for c in cells]
+                continue
+            if header and cells[0].lower().startswith("wns"):
+                rows["wns"] = cells
+            elif header and cells[0].lower().startswith("tns"):
+                rows["tns"] = cells
+            elif header and cells[0].lower().startswith("violating"):
+                rows["num"] = cells
+                break
+        if not header or not all(k in rows for k in ("wns", "tns", "num")):
+            return ("-", "-")
+        try:
+            all_i = header.index("all")
+            r2r_i = header.index("reg2reg")
+            total = self._trip(rows["wns"][all_i], rows["tns"][all_i], rows["num"][all_i])
+            r2r = self._trip(rows["wns"][r2r_i], rows["tns"][r2r_i], rows["num"][r2r_i])
+            return (total, r2r)
+        except Exception:
+            return ("-", "-")
+
+    def _parse_innovus_hold(self, text):
+        m = re.search(r"#\s*HOLD.*?View\s*:\s*ALL\s+([-\d.]+)\s+([-\d.]+)\s+(\d+)",
+                      text, re.S | re.I)
+        if m:
+            return self._trip(m.group(1), m.group(2), m.group(3))
+        return "-"
+
+    def _parse_congestion(self, text):
+        m = re.search(
+            r"Overflow:\s*\S+\s*=\s*\S+\s*\(([^)]*H)\)\s*\+\s*\S+\s*\(([^)]*V)\)",
+            text, re.I)
+        if m:
+            return "{} + {}".format(m.group(1).strip(), m.group(2).strip())
+        h = re.search(r"H\s+routing.*?\(\s*([\d.]+%)\s*\)", text, re.I)
+        v = re.search(r"V\s+routing.*?\(\s*([\d.]+%)\s*\)", text, re.I)
+        if h and v:
+            return "{} H + {} V".format(h.group(1), v.group(1))
+        both = re.search(r"Both\s+Dirs.*?\(\s*([\d.]+%)\s*\)", text, re.I)
+        if both:
+            return both.group(1)
+        return "-"
+
+    def _parse_area(self, text):
+        out = {}
+        m = re.search(r"^\s*std_cell\(\+headbuf\+epbuf\)\s+(\d+)\s+([\d.]+)",
+                      text, re.M)
+        if m:
+            out["std_cell_count"] = m.group(1)
+            out["std_cell_area"] = m.group(2)
+            out["std_cell_count_area"] = "{}/{}".format(m.group(1), m.group(2))
+            try:
+                out["gate_count"] = str(int(float(m.group(2)) / self.gate_factor))
+            except Exception:
+                out["gate_count"] = "-"
+        m = re.search(r"Standard\s+cell\s+only\s+utilization\s*:\s*([\d.]+)%", text, re.I)
+        if m:
+            out["std_cell_only_util"] = m.group(1) + "%"
+        m = re.search(r"^\s*Total\s+utilization\s*:\s*([\d.]+)%", text, re.I | re.M)
+        if m:
+            out["total_util"] = m.group(1) + "%"
+        return out
+
+    def _parse_vth(self, text):
+        m = re.search(r"##\s*Logic cells only(.*?)(?=##\s*Total cells|$)", text, re.S | re.I)
+        if not m:
+            return {}
+        groups = {}
+        for line in m.group(1).splitlines():
+            r = re.search(
+                r"^\s*([A-Za-z][A-Za-z0-9]*_\d+)\s+[-+\d.]+\s+\(\s*([\d.]+)\s*%\s*\)\s+[-+\d.]+\s+\(\s*([\d.]+)\s*%\s*\)",
+                line)
+            if not r:
+                continue
+            group = r.group(1).split("_", 1)[0].upper()
+            vals = groups.setdefault(group, [0.0, 0.0])
+            vals[0] += float(r.group(2))
+            vals[1] += float(r.group(3))
+        if not groups:
+            return {}
+        preferred = ["UHVT", "HVT", "RVT", "LVT", "SLVT"]
+        order = [g for g in preferred if g in groups]
+        order.extend(sorted(g for g in groups if g not in order))
+        labels = "/".join(g + "*" for g in order)
+        inst = "/".join("{:.2f}%".format(groups[g][0]) for g in order)
+        area = "/".join("{:.2f}%".format(groups[g][1]) for g in order)
+        return {"vt_label": labels, "vt_inst": inst, "vt_area": area}
+
+    def _parse_cts(self, text):
+        for line in text.splitlines():
+            if not re.match(r"^\s*All\s+Clocks\b", line):
+                continue
+            nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
+            if len(nums) >= 7:
+                return {
+                    "skew_latency": "{}/{}".format(nums[6], nums[5]),
+                    "clock_repeater_count_area": "{}/{}".format(nums[2], nums[3]),
+                }
+        return {}
+
+    def run(self):
+        result = {
+            "stage": self.stage_name,
+            "runtime": self.runtime or "-",
+            "report_dir": "-",
+        }
+        try:
+            qor_sum = self._find_file(["{}.qor_sum.rpt".format(self.stage_name), "*.qor_sum.rpt"])
+            if qor_sum:
+                text = self._read_text(qor_sum)
+                setup_total, setup_r2r = self._parse_fc_timing(text, "Setup violations")
+                hold_total, hold_r2r = self._parse_fc_timing(text, "Hold violations")
+                result["setup_total"] = setup_total
+                result["setup_r2r"] = setup_r2r
+                result["hold_total"] = hold_total
+                result["hold_r2r"] = hold_r2r
+                result["timing_report"] = qor_sum
+                result["report_dir"] = os.path.dirname(qor_sum)
+            else:
+                setup_path = self._find_file([
+                    "{}_p*.summary.gz".format(self.stage_name),
+                    "{}_p*.summary".format(self.stage_name),
+                    "*_p*.summary.gz"])
+                if setup_path:
+                    setup_total, setup_r2r = self._parse_innovus_setup(self._read_text(setup_path))
+                    result["setup_total"] = setup_total
+                    result["setup_r2r"] = setup_r2r
+                    result["timing_report"] = setup_path
+                    result["report_dir"] = os.path.dirname(setup_path)
+                hold_path = self._find_file(["{}.qor.snap.rpt".format(self.stage_name), "*.qor.snap.rpt"])
+                if hold_path:
+                    result["hold_all"] = self._parse_innovus_hold(self._read_text(hold_path))
+                    result["hold_report"] = hold_path
+                    result["report_dir"] = os.path.dirname(hold_path)
+
+            grc = self._find_file(["{}.grc.rpt".format(self.stage_name), "*.grc.rpt"])
+            if grc:
+                result["congestion"] = self._parse_congestion(self._read_text(grc))
+                result["congestion_report"] = grc
+                result["report_dir"] = os.path.dirname(grc)
+
+            area = self._find_file(["{}.sec_get_area.rpt".format(self.stage_name), "*.sec_get_area.rpt"])
+            if area:
+                result.update(self._parse_area(self._read_text(area)))
+                result["area_report"] = area
+                result["report_dir"] = os.path.dirname(area)
+
+            vth = self._find_file(["{}.sec_vth_use.rpt".format(self.stage_name), "*.sec_vth_use.rpt"])
+            if vth:
+                result.update(self._parse_vth(self._read_text(vth)))
+                result["vth_report"] = vth
+                result["report_dir"] = os.path.dirname(vth)
+
+            cts = self._find_file(["{}.cts.qor.final.rpt".format(self.stage_name), "*.cts.qor.final.rpt"])
+            if cts:
+                result.update(self._parse_cts(self._read_text(cts)))
+                result["cts_report"] = cts
+                result["report_dir"] = os.path.dirname(cts)
+        except Exception as e:
+            result["error"] = str(e)
+        self.finished.emit(self.token, self.be_path, self.stage_name, result)
 
 # ---------------------------------------------------------------------------
 # Lightweight PyQt5-native chart widgets (no matplotlib dependency)
@@ -1605,7 +2047,7 @@ class _TimelineChartWidget(QWidget):
         stage_x0 = 380
         top0 = 46
         gap_x = 96
-        fe_y = top0 + (max(1, len(branches)) * row_h - card_h) // 2
+        fe_y = top0 + (max(1, len(branches)) - 1) * row_h // 2
         trunk_x = fe_x + card_w + 28
         if fe_ev:
             self._draw_card(p, QRect(fe_x, fe_y, card_w, card_h),
@@ -1613,8 +2055,16 @@ class _TimelineChartWidget(QWidget):
             if branches:
                 first_y = top0 + card_h // 2
                 last_y = top0 + (len(branches) - 1) * row_h + card_h // 2
+                fe_mid_y = fe_y + card_h // 2
                 p.setPen(QPen(line, 1))
+                p.drawLine(fe_x + card_w, fe_mid_y, trunk_x, fe_mid_y)
                 p.drawLine(trunk_x, first_y, trunk_x, last_y)
+                p.setBrush(QBrush(line))
+                p.setPen(Qt.NoPen)
+                p.drawPolygon(QPolygon([
+                    QPoint(trunk_x - 1, fe_mid_y),
+                    QPoint(trunk_x - 8, fe_mid_y - 4),
+                    QPoint(trunk_x - 8, fe_mid_y + 4)]))
 
         for row, b in enumerate(branches):
             y = top0 + row * row_h
@@ -1679,7 +2129,7 @@ class BlockSummaryDialog(QDialog):
     def __init__(self, rtl_label, run_list, is_dark, parent=None):
         """run_list: list of (blk, run_path, run_name, runtime, source)"""
         super().__init__(parent)
-        self.setWindowTitle("Block Summary: " + str(rtl_label))
+        self.setWindowTitle("FE Block Summary: " + str(rtl_label))
         self.setWindowFlags(
             self.windowFlags()
             | Qt.WindowMaximizeButtonHint
@@ -1840,6 +2290,31 @@ class BlockSummaryDialog(QDialog):
         self.prog.setValue(self._done_count)
         QTimer.singleShot(10, self._load_next)
 
+    def closeEvent(self, event):
+        self._stop_active_worker()
+        event.accept()
+
+    def accept(self):
+        self._stop_active_worker()
+        super().accept()
+
+    def reject(self):
+        self._stop_active_worker()
+        super().reject()
+
+    def _stop_active_worker(self):
+        w = getattr(self, "_active_worker", None)
+        try:
+            if w and w.isRunning():
+                if hasattr(w, "cancel"):
+                    w.cancel()
+                w.wait(1000)
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(300)
+        except Exception:
+            pass
+
     # -- Row builder ------------------------------------------------------
 
     def _add_row(self, blk, run_name, runtime, metrics):
@@ -1910,10 +2385,11 @@ class BlockSummaryDialog(QDialog):
             item.setTextAlignment(Qt.AlignCenter)
             if c in (0, 1):
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                item.setForeground(QColor("#64b5f6" if self.is_dark else "#1565c0"))
+                item.setToolTip("Double-click to open run folder:\n" + str(_run_path))
+                item.setData(Qt.UserRole, _run_path)
                 if c == 0:
                     f2 = item.font(); f2.setBold(True); item.setFont(f2)
-                    # Store run_path on col-0 for double-click gvim open
-                    item.setData(Qt.UserRole, _run_path)
             # Color R2R Setup WNS (col 8)
             if c == self._COL_R2R_SETUP:
                 try:
@@ -1987,6 +2463,15 @@ class BlockSummaryDialog(QDialog):
         c = item.column()
         col0 = self.tbl.item(item.row(), 0)
         run_path = col0.data(Qt.UserRole) if col0 else None
+        if c in (0, 1) and run_path:
+            try:
+                subprocess.Popen(['xdg-open', run_path])
+            except Exception:
+                try:
+                    subprocess.Popen(['gvim', run_path])
+                except Exception as e:
+                    QMessageBox.warning(self, "Open Path", str(e))
+            return
         pats = self._COL_REPORT.get(c)
         if not pats or not run_path:
             return
@@ -2002,31 +2487,249 @@ class BlockSummaryDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "Error", str(e))
 
+
+class BEStageSummaryDialog(QDialog):
+    HEADERS = [
+        "Block", "BE Run", "Stage",
+        "R2R Setup W/T/N", "Total Setup W/T/N",
+        "Hold W/T/N",
+        "Cong/Shorts", "Std Cell Count/Area", "GC",
+        "Std Cell/Std Only Util", "Total Util",
+        "VT Inst%", "VT Area%", "Skew/Latency",
+        "Clock Repeater Count/Area", "Runtime",
+    ]
+
+    def __init__(self, title, tasks, is_dark, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowMinimizeButtonHint)
+        self.setSizeGripEnabled(True)
+        self.resize(1500, 650)
+        self._tasks = list(tasks or [])
+        self._worker = None
+        self.is_dark = is_dark
+        layout = QVBoxLayout(self)
+
+        hdr = QLabel("<b>{}</b>".format(html.escape(str(title))))
+        hdr.setAlignment(Qt.AlignCenter)
+        layout.addWidget(hdr)
+
+        self.status_lbl = QLabel("{} stage(s) selected. Click Generate to extract metrics.".format(len(self._tasks)))
+        self.status_lbl.setStyleSheet("color: #1976d2;")
+        layout.addWidget(self.status_lbl)
+
+        self.tbl = QTableWidget(0, len(self.HEADERS))
+        self.tbl.setHorizontalHeaderLabels(self.HEADERS)
+        hh = self.tbl.horizontalHeader()
+        hh.setSectionsMovable(True)
+        for c in range(len(self.HEADERS)):
+            hh.setSectionResizeMode(c, QHeaderView.Interactive)
+            self.tbl.setColumnWidth(c, 115)
+        self.tbl.setColumnWidth(1, 260)
+        self.tbl.setColumnWidth(2, 120)
+        self.tbl.setColumnWidth(7, 160)
+        self.tbl.setColumnWidth(14, 170)
+        self.tbl.setColumnWidth(15, 130)
+        self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.tbl.setAlternatingRowColors(True)
+        self.tbl.verticalHeader().setVisible(False)
+        self.tbl.setSortingEnabled(True)
+        self.tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        parent_obj = self.parent()
+        if parent_obj and hasattr(parent_obj, "_make_table_user_adjustable"):
+            parent_obj._make_table_user_adjustable(self.tbl)
+        layout.addWidget(self.tbl, 1)
+
+        btn_row = QHBoxLayout()
+        self.gen_btn = QPushButton("Generate Table")
+        self.gen_btn.clicked.connect(self._start_loading)
+        btn_row.addWidget(self.gen_btn)
+        self.prog = QProgressBar()
+        self.prog.setRange(0, len(self._tasks))
+        self.prog.setValue(0)
+        self.prog.setVisible(False)
+        btn_row.addWidget(self.prog, 1)
+        export_btn = QPushButton("Export CSV")
+        export_btn.clicked.connect(self._export_csv)
+        btn_row.addWidget(export_btn)
+        mail_btn = QPushButton("Send as Mail")
+        mail_btn.clicked.connect(self._send_mail)
+        btn_row.addWidget(mail_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _metric_value(self, metrics, key):
+        metrics = metrics or {}
+        area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
+        vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
+        cong = metrics.get("congestion", {}) if isinstance(metrics.get("congestion", {}), dict) else {}
+        if key == "std_count_area":
+            return metrics.get("std_cell_count_area", "-")
+        if key == "gc":
+            val = metrics.get("gate_count", "-")
+            if val != "-":
+                return val
+            parent_obj = self.parent()
+            try:
+                factor = getattr(parent_obj, "gate_count_unit_area", 0.2419) or 0.2419
+                return str(int(float(area.get("std_cell_area", "-")) / factor))
+            except Exception:
+                return "-"
+        if key == "std_util":
+            util = metrics.get("util", {}) if isinstance(metrics.get("util", {}), dict) else {}
+            return util.get("std_util_str", metrics.get("std_util_str", "-"))
+        if key == "vt_inst":
+            if vth.get("stage_vt_inst"):
+                return vth.get("stage_vt_inst")
+            return vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-"))
+        if key == "vt_area":
+            if vth.get("stage_vt_area"):
+                return vth.get("stage_vt_area")
+            return vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-"))
+        if key == "cong":
+            return cong.get("cong_both", metrics.get("congestion", "-"))
+        if key == "runtime":
+            return metrics.get("runtime", "-")
+        return metrics.get(key, "-")
+
+    def _vt_header_label(self, rows, suffix):
+        for row in rows or []:
+            metrics = row.get("metrics", {}) if isinstance(row, dict) else {}
+            vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
+            label = vth.get("stage_vt_label")
+            if label:
+                return label + " " + suffix
+        return "VT " + suffix
+
+    def _start_loading(self):
+        if not self._tasks:
+            return
+        self.tbl.setSortingEnabled(False)
+        self.tbl.setRowCount(0)
+        self.tbl.setSortingEnabled(True)
+        self.gen_btn.setEnabled(False)
+        self.prog.setVisible(True)
+        self.prog.setRange(0, len(self._tasks))
+        self.status_lbl.setText("Extracting BE stage metrics...")
+        try:
+            self._worker = MetricBatchWorker(self._tasks)
+            self._worker.finished.connect(self._on_metrics_done)
+            self._worker.start()
+        except Exception as e:
+            self.gen_btn.setEnabled(True)
+            QMessageBox.warning(self, "BE Stage Summary", str(e))
+
+    def _on_metrics_done(self, rows):
+        self.tbl.setSortingEnabled(False)
+        self.tbl.setRowCount(0)
+        headers = list(self.HEADERS)
+        headers[11] = self._vt_header_label(rows, "Inst%")
+        headers[12] = self._vt_header_label(rows, "Area%")
+        self.tbl.setHorizontalHeaderLabels(headers)
+        for row in rows:
+            self._add_row(row, row.get("metrics", {}))
+        self.tbl.setSortingEnabled(True)
+        self.prog.setValue(len(rows))
+        self.prog.setVisible(False)
+        self.gen_btn.setEnabled(True)
+        self.status_lbl.setText("Done. {} row(s) loaded.".format(self.tbl.rowCount()))
+
+    def closeEvent(self, event):
+        self._stop_active_worker()
+        event.accept()
+
+    def accept(self):
+        self._stop_active_worker()
+        super().accept()
+
+    def reject(self):
+        self._stop_active_worker()
+        super().reject()
+
+    def _stop_active_worker(self):
+        w = getattr(self, "_worker", None)
+        try:
+            if w and w.isRunning():
+                if hasattr(w, "cancel"):
+                    w.cancel()
+                w.wait(1000)
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(300)
+        except Exception:
+            pass
+
+    def _add_row(self, task, metrics):
+        values = [
+            task.get("block", "-"),
+            task.get("be_name", task.get("name", "-")),
+            task.get("stage_name", "-"),
+            self._metric_value(metrics, "setup_r2r"),
+            self._metric_value(metrics, "setup_total"),
+            self._metric_value(metrics, "hold_total") if self._metric_value(metrics, "hold_total") != "-" else self._metric_value(metrics, "hold_all"),
+            self._metric_value(metrics, "cong"),
+            self._metric_value(metrics, "std_count_area"),
+            self._metric_value(metrics, "gc"),
+            self._metric_value(metrics, "std_util"),
+            self._metric_value(metrics, "total_util"),
+            self._metric_value(metrics, "vt_inst"),
+            self._metric_value(metrics, "vt_area"),
+            self._metric_value(metrics, "skew_latency"),
+            self._metric_value(metrics, "clock_repeater_count_area"),
+            self._metric_value(metrics, "runtime"),
+        ]
+        r = self.tbl.rowCount()
+        self.tbl.insertRow(r)
+        for c, val in enumerate(values):
+            item = QTableWidgetItem(str(val) if val else "-")
+            item.setTextAlignment(Qt.AlignCenter)
+            if c in (0, 1, 2):
+                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            if c in (3, 4, 5):
+                try:
+                    first = float(str(val).split("/")[0])
+                    if first < 0:
+                        item.setForeground(QColor("#ef5350" if self.is_dark else "#c62828"))
+                    elif first == 0:
+                        item.setForeground(QColor("#66bb6a" if self.is_dark else "#2e7d32"))
+                except Exception:
+                    pass
+            self.tbl.setItem(r, c, item)
+
+    def _html_table(self):
+        nc = self.tbl.columnCount()
+        headers = [self.tbl.horizontalHeaderItem(c).text() for c in range(nc)]
+        html_lines = [
+            "<table border='1' cellpadding='4' cellspacing='0' "
+            "style='border-collapse:collapse;font-family:Arial,monospace;font-size:12px;'>",
+            "<tr>" + "".join(
+                "<th style='background:#1976d2;color:white;'>{}</th>".format(
+                    html.escape(h)) for h in headers) + "</tr>"
+        ]
+        for r in range(self.tbl.rowCount()):
+            html_lines.append("<tr>" + "".join(
+                "<td>{}</td>".format(html.escape(
+                    self.tbl.item(r, c).text() if self.tbl.item(r, c) else ""))
+                for c in range(nc)) + "</tr>")
+        html_lines.append("</table>")
+        return "\n".join(html_lines)
+
     # -- Mail -------------------------------------------------------------
 
     def _send_mail(self):
         if self.tbl.rowCount() == 0:
             QMessageBox.information(self, "Mail", "Generate table first.")
             return
-        nc = self.tbl.columnCount()
-        headers = [self.tbl.horizontalHeaderItem(c).text() for c in range(nc)]
-        # Build HTML table for proper alignment in mail
-        html = ["<table border='1' cellpadding='4' cellspacing='0' "
-                "style='border-collapse:collapse;font-family:monospace;font-size:12px;'>"]
-        html.append("<tr>" + "".join(
-            "<th style='background:#1976d2;color:white;'>{}</th>".format(h)
-            for h in headers) + "</tr>")
-        for r in range(self.tbl.rowCount()):
-            html.append("<tr>" + "".join(
-                "<td>{}</td>".format(
-                    self.tbl.item(r, c).text() if self.tbl.item(r, c) else "")
-                for c in range(nc)) + "</tr>")
-        html.append("</table>")
-        html_body = "\n".join(html)
+        html_body = self._html_table()
         parent = self.parent()
         if parent and hasattr(parent, '_open_mail_compose_dialog'):
             parent._open_mail_compose_dialog(
-                subject="Block Summary: " + self.windowTitle(),
+                subject="BE Stage Summary: " + self.windowTitle(),
                 body=html_body,
                 html_body=html_body)
         else:
@@ -2040,7 +2743,7 @@ class BlockSummaryDialog(QDialog):
                 self, "Export", "No data yet. Click Generate first.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export", "block_summary.csv", "CSV Files (*.csv)")
+            self, "Export", "be_stage_summary.csv", "CSV Files (*.csv)")
         if not path:
             return
         try:
@@ -2066,7 +2769,7 @@ class PDDashboard(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Singularity PD | Pro Edition")
+        self.setWindowTitle("Flow Pulse | Beta 1")
         self.resize(1280, 720)
         self.setMinimumSize(800, 600)
 
@@ -2079,6 +2782,16 @@ class PDDashboard(QMainWindow):
         self.user_pins    = load_user_pins()
         self._fp_ver_cache = {}
         self._cong_img_cache = {}
+        self._cong_image_cache = {}
+        self._fe_cong_workers = []
+        self._fe_cong_request_token = 0
+        self._stage_screenshot_cache = {}
+        self._stage_screenshot_workers = []
+        self._stage_screenshot_request_token = 0
+        self._stage_metric_cache = {}
+        self._stage_metric_workers = []
+        self._stage_metric_request_token = 0
+        self._stage_metric_last_key = None
 
         # -- theme/display ------------------------------------------------
         self.is_dark_mode          = False
@@ -2095,11 +2808,18 @@ class PDDashboard(QMainWindow):
         # -- worker/state -------------------------------------------------
         self.size_workers           = []
         self._stage_workers         = []
+        self.worker                 = None
+        self._metric_worker          = None
+        self._qor_worker             = None
+        self._disk_scan_worker       = None
+        self._metric_batch_worker    = None
         self.item_map               = {}
         self._signoff_items_by_path  = {}
         self._signoff_worker         = None
         self._signoff_bg_done        = False
         self._last_view_preset       = "All Runs"
+        self._tree_sort_mode         = prefs.get(
+            'UI', 'last_sort', fallback='Start Date Old->New')
         self.ignored_paths          = set()
         self._checked_paths         = set()
         self.current_error_log_path = None
@@ -2214,6 +2934,76 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CLOSE
     # ------------------------------------------------------------------
+    def _cancel_worker_if_possible(self, worker):
+        if not worker:
+            return
+        try:
+            if hasattr(worker, "cancel"):
+                worker.cancel()
+        except Exception:
+            pass
+        try:
+            if hasattr(worker, "requestInterruption"):
+                worker.requestInterruption()
+        except Exception:
+            pass
+
+    def _stop_worker_if_running(self, worker, timeout_ms=1200):
+        if not worker:
+            return
+        try:
+            if not worker.isRunning():
+                return
+        except RuntimeError:
+            return
+        except Exception:
+            return
+        self._cancel_worker_if_possible(worker)
+        try:
+            worker.wait(timeout_ms)
+        except RuntimeError:
+            return
+        except Exception:
+            pass
+        try:
+            if worker.isRunning():
+                worker.terminate()
+                worker.wait(500)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _cancel_worker_list_keep_running(self, workers):
+        kept = []
+        for worker in list(workers or []):
+            self._cancel_worker_if_possible(worker)
+            if self._worker_is_running(worker):
+                kept.append(worker)
+        return kept
+
+    def _stop_worker_list_now(self, workers, timeout_ms=500):
+        for worker in list(workers or []):
+            self._stop_worker_if_running(worker, timeout_ms)
+        return []
+
+    def _shutdown_all_workers(self):
+        for seq_name in (
+                "size_workers", "_stage_workers", "_fe_cong_workers",
+                "_stage_screenshot_workers", "_stage_metric_workers"):
+            seq = getattr(self, seq_name, [])
+            for worker in list(seq or []):
+                self._stop_worker_if_running(worker)
+            try:
+                setattr(self, seq_name, [])
+            except Exception:
+                pass
+        for name in (
+                "worker", "_signoff_worker", "_metric_worker",
+                "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
+                "_hover_metric_worker"):
+            self._stop_worker_if_running(getattr(self, name, None))
+
     def closeEvent(self, event):
         if not prefs.has_section('UI'):
             prefs.add_section('UI')
@@ -2222,6 +3012,8 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'last_source',  self.src_combo.currentText())
         prefs.set('UI', 'last_rtl',     self.rel_combo.currentText())
         prefs.set('UI', 'last_view',    self.view_combo.currentText())
+        prefs.set('UI', 'last_sort', getattr(
+            self, "_tree_sort_mode", "Start Date Old->New"))
         prefs.set('UI', 'last_search',  self.search.text())
         prefs.set('UI', 'last_auto',    self.auto_combo.currentText())
         prefs.set('UI', 'search_history', '|||'.join(self._search_history[:15]))
@@ -2235,7 +3027,8 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'col_hidden', col_hidden)
         with open(USER_PREFS_FILE, 'w') as f:
             prefs.write(f)
-        os._exit(0)
+        self._shutdown_all_workers()
+        event.accept()
 
     # ------------------------------------------------------------------
     # MILESTONE MAP (user-configurable)
@@ -2326,9 +3119,52 @@ class PDDashboard(QMainWindow):
         }
         if key not in self._run_history:
             self._run_history[key] = []
+        if self._run_history[key]:
+            last = dict(self._run_history[key][-1])
+            last.pop("ts", None)
+            cmp_entry = dict(entry)
+            cmp_entry.pop("ts", None)
+            if last == cmp_entry:
+                return
         # Keep last 20 entries per run
         self._run_history[key].append(entry)
         self._run_history[key] = self._run_history[key][-20:]
+
+    def _run_regression_entry(self, run):
+        return {
+            "name": run.get("r_name", ""),
+            "runtime": run.get("info", {}).get("runtime", ""),
+            "fm_n": run.get("st_n", ""),
+            "fm_u": run.get("st_u", ""),
+            "vslp": run.get("vslp_status", ""),
+        }
+
+    def _compare_regression_entries(self, prev, curr):
+        issues = []
+        def _mins(rt):
+            m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
+            return int(m.group(1))*60+int(m.group(2)) if m else None
+        pm, cm = _mins(prev.get("runtime","")), _mins(curr.get("runtime",""))
+        if pm and cm and pm > 0 and cm > pm * 1.15:
+            issues.append(
+                "Runtime +{}% ({} -> {})".format(
+                    int((cm-pm)/pm*100), prev.get("runtime","-"),
+                    curr.get("runtime","-")))
+        if ("PASS" in prev.get("fm_n","").upper()
+                and "FAIL" in curr.get("fm_n","").upper()):
+            issues.append("FM-NONUPF PASS->FAILS")
+        if ("PASS" in prev.get("fm_u","").upper()
+                and "FAIL" in curr.get("fm_u","").upper()):
+            issues.append("FM-UPF PASS->FAILS")
+        def _verr(v):
+            m = re.search(r'Error:\s*(\d+)', v or "")
+            return int(m.group(1)) if m else 0
+        pe, ce = _verr(prev.get("vslp","")), _verr(curr.get("vslp",""))
+        if ce > pe and pe == 0:
+            issues.append("VSLP errors 0->{}".format(ce))
+        elif ce > pe*1.5 and pe > 0:
+            issues.append("VSLP errors {}->{}".format(pe, ce))
+        return " | ".join(issues)
 
     def _check_regression(self, run):
         """Compare run to previous entry. Return (has_regression, message).
@@ -2339,33 +3175,8 @@ class PDDashboard(QMainWindow):
             return False, ""
         prev = history[-2]
         curr = history[-1]
-        issues = []
-        # Runtime regression: >15% increase
-        def _mins(rt):
-            m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
-            return int(m.group(1))*60+int(m.group(2)) if m else None
-        pm, cm = _mins(prev.get("runtime","")), _mins(curr.get("runtime",""))
-        if pm and cm and pm > 0 and cm > pm * 1.15:
-            issues.append(
-                f"Runtime +{int((cm-pm)/pm*100)}%"
-                f" ({prev['runtime']} -> {curr['runtime']})")
-        # FM regression
-        if ("PASS" in prev.get("fm_n","").upper()
-                and "FAIL" in curr.get("fm_n","").upper()):
-            issues.append("FM-NONUPF PASS->FAILS")
-        if ("PASS" in prev.get("fm_u","").upper()
-                and "FAIL" in curr.get("fm_u","").upper()):
-            issues.append("FM-UPF PASS->FAILS")
-        # VSLP regression
-        def _verr(v):
-            m = re.search(r'Error:\s*(\d+)', v or "")
-            return int(m.group(1)) if m else 0
-        pe, ce = _verr(prev.get("vslp","")), _verr(curr.get("vslp",""))
-        if ce > pe and pe == 0:
-            issues.append(f"VSLP errors 0->{ce}")
-        elif ce > pe*1.5 and pe > 0:
-            issues.append(f"VSLP errors {pe}->{ce}")
-        return (True, " | ".join(issues)) if issues else (False, "")
+        msg = self._compare_regression_entries(prev, curr)
+        return (True, msg) if msg else (False, "")
 
     def _get_run_history_text(self, run):
         """Return formatted history string for inspector panel."""
@@ -2383,7 +3194,7 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _update_title(self):
         import datetime
-        base = "Singularity PD | Pro Edition"
+        base = "Flow Pulse | Beta 1"
         if self._tapeout_date:
             delta = self._tapeout_date - datetime.datetime.now()
             days  = delta.days
@@ -2435,6 +3246,7 @@ class PDDashboard(QMainWindow):
             f"Extracting QoR metrics for {run_name}...")
         self.setEnabled(False)
 
+        self._stop_worker_if_running(getattr(self, "_metric_worker", None))
         self._metric_worker = MetricWorker(
             actual_path, item.data(0, Qt.UserRole + 2) or "",
             run_type, source, stage_name)
@@ -2571,6 +3383,31 @@ class PDDashboard(QMainWindow):
         _UR   = Qt.UserRole
         _UR10 = Qt.UserRole + 10
         count = [0]
+        sibling_regressions = {}
+        try:
+            groups = {}
+            for it in self._iter_tree_items():
+                run = it.data(0, _UR10)
+                if not run or run.get("run_type") != "FE" or not run.get("is_comp"):
+                    continue
+                key = (run.get("block", ""), run.get("rtl", ""))
+                groups.setdefault(key, []).append((it, run))
+            for key, vals in groups.items():
+                vals.sort(key=lambda pair:
+                          self._parse_dashboard_time(
+                              pair[1].get("info", {}).get("start", ""))
+                          or datetime.datetime.max)
+                prev_run = None
+                for it, run in vals:
+                    if prev_run:
+                        msg = self._compare_regression_entries(
+                            self._run_regression_entry(prev_run),
+                            self._run_regression_entry(run))
+                        if msg:
+                            sibling_regressions[run.get("path", "")] = msg
+                    prev_run = run
+        except Exception:
+            sibling_regressions = {}
 
         def _walk(node):
             for i in range(node.childCount()):
@@ -2588,9 +3425,13 @@ class PDDashboard(QMainWindow):
                     continue
                 # Closure scorecard
                 self._update_closure_on_item(child)
+                child.setData(0, Qt.UserRole + 30, None)
                 # Regression check (only for completed runs with history)
                 if run.get("is_comp"):
                     has_reg, msg = self._check_regression(run)
+                    if not has_reg:
+                        msg = sibling_regressions.get(run.get("path", ""), "")
+                        has_reg = bool(msg)
                     if has_reg:
                         child.setToolTip(
                             0, child.toolTip(0) + f"\n[REGRESSION] {msg}")
@@ -2729,8 +3570,6 @@ class PDDashboard(QMainWindow):
         self.view_combo.currentIndexChanged.connect(self._on_view_changed)
         top_layout.addWidget(self.view_combo)
 
-        self._add_separator(top_layout)
-
         self.search = QLineEdit()
         self.search.setPlaceholderText(
             "Search runs, blocks, status, runtime...  [Ctrl+F]")
@@ -2764,49 +3603,54 @@ class PDDashboard(QMainWindow):
         self._add_separator(top_layout)
 
         # Utilities menu (renamed from Actions)
-        self.actions_btn  = QPushButton("Utilities  v")
+        self.actions_btn  = QPushButton("Utilities")
         self.actions_menu = QMenu(self)
 
-        self.actions_menu.addAction("Fit Columns",             self.fit_all_columns)
-        self.actions_menu.addAction("Expand All",              self.safe_expand_all)
-        self.actions_menu.addAction("Collapse All",            self.safe_collapse_all)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Calculate All Run Sizes", self.calculate_all_sizes)
-        self.actions_menu.addAction("Export to CSV",           self.export_csv)
-        self.actions_menu.addAction("Compare QoR",             self.run_qor_comparison)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Block Summary Table",     self.open_block_summary)
-        self.actions_menu.addSeparator()
+        view_menu = self.actions_menu.addMenu("Tree View")
+        view_menu.addAction("Fit Columns", self.fit_all_columns)
+        view_menu.addAction("Expand All", self.safe_expand_all)
+        view_menu.addAction("Collapse All", self.safe_collapse_all)
+        view_menu.addAction("Deselect All Checked Runs",
+                            self.deselect_all_checked_runs)
 
-        mail_menu = self.actions_menu.addMenu("Send Mail...")
+        export_menu = self.actions_menu.addMenu("Export / Mail")
+        export_menu.addAction("Export to CSV", self.export_csv)
+        mail_menu = export_menu.addMenu("Send Mail...")
         mail_menu.addAction("Cleanup Mail (Selected Runs)", self.send_cleanup_mail_action)
         mail_menu.addAction("Send Compare QoR Mail",        self.send_qor_mail_action)
         mail_menu.addAction("Send Custom Mail",             self.send_custom_mail_action)
-        self.actions_menu.addSeparator()
+        export_menu.addAction("Failed Runs Digest", self.show_failed_digest)
 
-        filt_menu = self.actions_menu.addMenu("Filter Configs...")
+        analysis_menu = self.actions_menu.addMenu("Run Analysis")
+        analysis_menu.addAction("Compare QoR", self.run_qor_comparison)
+        analysis_menu.addAction("Compare Selected Runs", self.show_run_diff)
+        analysis_menu.addAction("RoR Metric Diff", self.show_ror_metric_diff)
+        analysis_menu.addAction("Golden Benchmark", self.show_golden_benchmark)
+        analysis_menu.addAction("App Options Diff", self.show_app_options_diff)
+
+        summary_menu = self.actions_menu.addMenu("Summaries / Timeline")
+        summary_menu.addAction("FE Block Summary Table", self.open_block_summary)
+        summary_menu.addAction("BE Stage Summary Table",
+                               self.show_be_stage_summary_table)
+        summary_menu.addAction("Timeline Overview",
+                               self.show_selected_timeline_overview)
+        summary_menu.addAction("Analytics / Charts", self.show_analytics)
+
+        filt_menu = self.actions_menu.addMenu("Config / Filters")
         filt_menu.addAction("Load Run Filter Config...", self.load_filter_config)
         self.ignore_run_filter_act = filt_menu.addAction("Ignore Run Filter")
         self.ignore_run_filter_act.setCheckable(True)
         self.ignore_run_filter_act.triggered.connect(self.toggle_ignore_run_filter)
         filt_menu.addAction("Clear Run Filter Config",   self.clear_filter_config)
         filt_menu.addAction("Generate Sample Config",    self.generate_sample_config)
-        self.actions_menu.addSeparator()
+        filt_menu.addAction("Add Checked Runs to Active Filter Config",
+                            self.add_checked_runs_to_filter_config)
 
-        self.actions_menu.addAction("Disk Space",              self.open_disk_usage)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Failed Runs Digest",      self.show_failed_digest)
-        self.actions_menu.addAction("Timeline Overview",       self.show_selected_timeline_overview)
-        self.actions_menu.addAction("Deselect All Checked Runs", self.deselect_all_checked_runs)
-        self.actions_menu.addAction("Add Checked Runs to Active Filter Config", self.add_checked_runs_to_filter_config)
-
-        self.actions_menu.addAction("Compare Selected Runs",   self.show_run_diff)
-        self.actions_menu.addAction("App Options Diff",        self.show_app_options_diff)
-        self.actions_menu.addAction("RoR Metric Diff",         self.show_ror_metric_diff)
-        self.actions_menu.addAction("Golden Benchmark",        self.show_golden_benchmark)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Analytics / Charts",      self.show_analytics)
-        self.actions_menu.addAction("Team Workload View",       self.show_team_workload)
+        resource_menu = self.actions_menu.addMenu("Storage / Team")
+        resource_menu.addAction("Calculate All Run Sizes",
+                                self.calculate_all_sizes)
+        resource_menu.addAction("Disk Space", self.open_disk_usage)
+        resource_menu.addAction("Team Workload View", self.show_team_workload)
 
         self.actions_btn.setMenu(self.actions_menu)
         top_layout.addWidget(self.actions_btn)
@@ -2834,7 +3678,7 @@ class PDDashboard(QMainWindow):
         self._add_separator(top_layout)
 
         # Notes toggle button
-        self.notes_toggle_btn = QPushButton("[ Notes >> ]")
+        self.notes_toggle_btn = QPushButton("Notes  >")
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
@@ -2983,7 +3827,7 @@ class PDDashboard(QMainWindow):
         self.meta_status.setVisible(False)
         self.meta_path = _field_row("Run Path:")
         self.meta_log  = _field_row("Log File:")
-        self.fe_cong_panel = QGroupBox("FE Congestion Window")
+        self.fe_cong_panel = QGroupBox("Run Images")
         fe_cong_layout = QVBoxLayout(self.fe_cong_panel)
         fe_cong_layout.setContentsMargins(6, 6, 6, 6)
         fe_cong_layout.setSpacing(4)
@@ -2998,8 +3842,17 @@ class PDDashboard(QMainWindow):
         self.fe_cong_img_lbl.setStyleSheet("border: 1px solid #9e9e9e; background: #f5f5f5; color: #757575; font-size: 10px;")
         self.fe_cong_img_lbl.mousePressEvent = lambda e: self._open_fe_congestion_fullscreen()
         self._current_cong_img_path = None
+        self.stage_map_links = {}
         fe_cong_layout.addWidget(self.fe_fp_ver_lbl)
         fe_cong_layout.addWidget(self.fe_cong_img_lbl)
+        for _label in ("Congestion Map", "Pin Map", "Cell Density Map", "Shorts Map"):
+            _btn = QPushButton(_label)
+            _btn.setObjectName("linkBtn")
+            _btn.setCursor(Qt.PointingHandCursor)
+            _btn.setVisible(False)
+            _btn.clicked.connect(lambda _, name=_label: self._open_stage_map_link(name))
+            self.stage_map_links[_label] = _btn
+            fe_cong_layout.addWidget(_btn)
         self.fe_cong_panel.setVisible(False)
         left_layout.addWidget(self.fe_cong_panel, 0)
         left_layout.addWidget(self.meta_panel, 0)
@@ -3071,6 +3924,15 @@ class PDDashboard(QMainWindow):
         ins_layout = QVBoxLayout(self.inspector)
         self.ins_lbl = QLabel("Select a run to view details.")
         self.ins_lbl.setWordWrap(True)
+        self.stage_metric_box = QGroupBox("BE Stage Metrics")
+        stage_metric_layout = QVBoxLayout(self.stage_metric_box)
+        stage_metric_layout.setContentsMargins(6, 6, 6, 6)
+        self.stage_metric_text = QTextEdit()
+        self.stage_metric_text.setReadOnly(True)
+        self.stage_metric_text.setMaximumHeight(230)
+        self.stage_metric_text.setPlaceholderText("Select a BE stage to load QoR metrics.")
+        stage_metric_layout.addWidget(self.stage_metric_text)
+        self.stage_metric_box.setVisible(False)
         self.personal_note_box = QGroupBox("Personal Note")
         self.personal_note_box.setCheckable(True)
         self.personal_note_box.setChecked(False)
@@ -3097,6 +3959,7 @@ class PDDashboard(QMainWindow):
         self.shared_save_btn = QPushButton("Add Shared Note")
         self.shared_save_btn.clicked.connect(self.save_shared_inspector_note)
         ins_layout.addWidget(self.ins_lbl)
+        ins_layout.addWidget(self.stage_metric_box)
         ins_layout.addWidget(self.personal_note_box)
         ins_layout.addWidget(QLabel("<b>Shared Notes:</b>"))
         ins_layout.addWidget(self.shared_note_history, 1)
@@ -3205,10 +4068,10 @@ class PDDashboard(QMainWindow):
     def toggle_notes_dock(self):
         if self.inspector_dock.isVisible():
             self.inspector_dock.hide()
-            self.notes_toggle_btn.setText("[ Notes >> ]")
+            self.notes_toggle_btn.setText("Notes  >")
         else:
             self.inspector_dock.show()
-            self.notes_toggle_btn.setText("[ << Notes ]")
+            self.notes_toggle_btn.setText("<  Notes")
 
     def safe_expand_all(self):
         # Populate all lazy BE placeholders first, then expand
@@ -3538,10 +4401,18 @@ class PDDashboard(QMainWindow):
                     "Std Cell Area: " + str(std_area),
                 ])
             else:
-                lines.append("Use QoR Summary or Block Summary to load detailed FE metrics.")
+                lines.append("Use QoR Summary or FE Block Summary to load detailed FE metrics.")
             item.setToolTip(0, base + marker + "\n" + "\n".join(lines))
         except Exception:
             return
+
+    def _show_utilities_menu(self):
+        try:
+            pos = self.actions_btn.mapToGlobal(
+                QPoint(0, self.actions_btn.height()))
+            self.actions_menu.exec_(pos)
+        except Exception:
+            pass
 
     def _clear_fe_hover_metric_tooltips(self):
         marker = "\n[FE Hover Metrics]"
@@ -3556,6 +4427,160 @@ class PDDashboard(QMainWindow):
             walk(self.tree.invisibleRootItem())
         except Exception:
             pass
+
+    def _hide_stage_map_links(self):
+        for btn in getattr(self, "stage_map_links", {}).values():
+            btn.setVisible(False)
+            btn.setEnabled(False)
+            btn.setProperty("_path", "")
+
+    def _hide_run_image_panel(self):
+        self._fe_cong_request_token += 1
+        self._stage_screenshot_request_token += 1
+        self._current_cong_img_path = None
+        self._hide_stage_map_links()
+        self.fe_cong_img_lbl.setPixmap(QPixmap())
+        self.fe_cong_panel.setVisible(False)
+
+    def _keep_running_workers(self, workers):
+        alive = []
+        for worker in list(workers or []):
+            try:
+                if worker and worker.isRunning():
+                    alive.append(worker)
+            except RuntimeError:
+                # Qt may already have deleted the wrapped C++ QThread object.
+                pass
+            except Exception:
+                pass
+        return alive
+
+    def _worker_is_running(self, worker):
+        try:
+            return bool(worker and worker.isRunning())
+        except RuntimeError:
+            return False
+        except Exception:
+            return False
+
+    def _hide_stage_metric_panel(self):
+        self._stage_metric_request_token += 1
+        if hasattr(self, "stage_metric_box"):
+            self.stage_metric_text.clear()
+            self.stage_metric_box.setVisible(False)
+
+    def _format_stage_metrics(self, metrics):
+        metrics = metrics if isinstance(metrics, dict) else {}
+        rows = [
+            ("Runtime", metrics.get("runtime")),
+            ("Setup R2R-WNS/TNS/NVE", metrics.get("setup_r2r")),
+            ("Setup Total-WNS/TNS/NVE", metrics.get("setup_total")),
+            ("Hold R2R-WNS/TNS/NVE", metrics.get("hold_r2r")),
+            ("Hold Total-WNS/TNS/NVE", metrics.get("hold_total")),
+            ("Hold-WNS/TNS/NVE", metrics.get("hold_all")),
+            ("Congestion", metrics.get("congestion")),
+            ("Std Cell Count/Area", metrics.get("std_cell_count_area")),
+            ("Gate Count", metrics.get("gate_count")),
+            ("Std Cell Only Util%", metrics.get("std_cell_only_util")),
+            ("Total Util%", metrics.get("total_util")),
+            ("Skew/Latency", metrics.get("skew_latency")),
+            ("Clock Repeater Count/Area", metrics.get("clock_repeater_count_area")),
+        ]
+        vt_label = metrics.get("vt_label")
+        if vt_label:
+            rows.append((vt_label + " Inst%", metrics.get("vt_inst")))
+            rows.append((vt_label + " Area%", metrics.get("vt_area")))
+        lines = []
+        for label, value in rows:
+            if value and value != "-":
+                lines.append("{}: {}".format(label, value))
+        rpt_dir = metrics.get("report_dir")
+        if rpt_dir and rpt_dir != "-":
+            lines.append("")
+            lines.append("Report dir: {}".format(rpt_dir))
+        if metrics.get("error"):
+            lines.append("")
+            lines.append("Parser warning: {}".format(metrics.get("error")))
+        return "\n".join(lines) if lines else "No BE stage metric reports found."
+
+    def _strip_tooltip_block(self, tip, marker):
+        tip = tip or ""
+        if marker in tip:
+            return tip.split(marker, 1)[0].rstrip()
+        loose = "[BE Stage Metrics]"
+        if loose in tip:
+            return tip.split(loose, 1)[0].rstrip()
+        return tip
+
+    def _update_stage_metric_panel(self, item):
+        if not item or item.data(0, Qt.UserRole) != "STAGE" or not item.parent():
+            self._hide_stage_metric_panel()
+            return
+        parent = item.parent()
+        be_path = parent.text(15)
+        stage_path = item.text(15)
+        stage_name = item.text(0)
+        block = item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or ""
+        runtime = item.text(12) or "-"
+        key = (be_path or "", stage_path or "", stage_name or "", block or "", runtime or "")
+        self.stage_metric_box.setVisible(True)
+        if self._stage_metric_last_key != key:
+            self.stage_metric_text.setPlainText("Loading BE stage metrics...")
+        self._stage_metric_last_key = key
+        self._stage_metric_request_token += 1
+        token = self._stage_metric_request_token
+        if key in self._stage_metric_cache:
+            self._apply_stage_metric_lookup(token, item, self._stage_metric_cache.get(key, {}))
+            return
+        QTimer.singleShot(
+            120,
+            lambda t=token, bp=be_path, sp=stage_path, sn=stage_name, b=block, rt=runtime, k=key:
+                self._start_stage_metric_lookup(t, bp, sp, sn, b, rt, k))
+
+    def _start_stage_metric_lookup(self, token, be_path, stage_path, stage_name, block, runtime, key):
+        if token != self._stage_metric_request_token:
+            return
+        worker = StageMetricLookupWorker(
+            token, be_path, stage_path, stage_name, block, runtime,
+            getattr(self, "gate_count_unit_area", 0.2419))
+        worker._cache_key = key
+        self._stage_metric_workers.append(worker)
+        worker.finished.connect(self._on_stage_metric_lookup_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_stage_metric_lookup_done(self, token, be_path, stage_name, metrics):
+        cache_key = None
+        sender = self.sender()
+        try:
+            cache_key = getattr(sender, "_cache_key", None)
+        except Exception:
+            cache_key = None
+        if cache_key:
+            self._stage_metric_cache[cache_key] = metrics if isinstance(metrics, dict) else {}
+        self._stage_metric_workers = self._keep_running_workers(
+            self._stage_metric_workers)
+        if token != self._stage_metric_request_token:
+            return
+        sel = self.tree.selectedItems()
+        item = sel[0] if sel else None
+        self._apply_stage_metric_lookup(token, item, metrics)
+
+    def _apply_stage_metric_lookup(self, token, item, metrics):
+        if token != self._stage_metric_request_token:
+            return
+        if not item or item.data(0, Qt.UserRole) != "STAGE":
+            self._hide_stage_metric_panel()
+            return
+        text = self._format_stage_metrics(metrics)
+        self.stage_metric_text.setPlainText(text)
+        try:
+            marker = "\n\n[BE Stage Metrics]\n"
+            base_tip = self._strip_tooltip_block(item.toolTip(0) or item.text(0), marker)
+            item.setToolTip(0, base_tip + "\n\n[BE Stage Metrics]\n" + text)
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # INSPECTOR / SELECTION
     # ------------------------------------------------------------------
@@ -3569,7 +4594,8 @@ class PDDashboard(QMainWindow):
             self.meta_run_name.setText("")
             self.meta_path.clear()
             self.meta_log.clear()
-            self.fe_cong_panel.setVisible(False)
+            self._hide_run_image_panel()
+            self._hide_stage_metric_panel()
             self.ins_note.clear()
             self.ins_note.setEnabled(False)
             self.ins_save_btn.setEnabled(False)
@@ -3587,15 +4613,10 @@ class PDDashboard(QMainWindow):
         self.meta_path.setText(path)
         log_val = item.text(16)
         if log_val and log_val not in ("N/A", ""):
-            # Use cached_exists to avoid blocking NFS stat on every click
-            if cached_exists(log_val):
-                self.meta_log.setText(log_val)
-                self.meta_log.setStyleSheet("")
-                self.meta_log.setToolTip(log_val)
-            else:
-                self.meta_log.setText("Log not found: " + log_val)
-                self.meta_log.setStyleSheet("color: #c0392b; font-style: italic;")
-                self.meta_log.setToolTip("File does not exist:\n" + log_val)
+            # Do not stat NFS on selection; open action validates the path.
+            self.meta_log.setText(log_val)
+            self.meta_log.setStyleSheet("")
+            self.meta_log.setToolTip(log_val)
         else:
             self.meta_log.setText(log_val or "")
             self.meta_log.setStyleSheet("")
@@ -3638,23 +4659,18 @@ class PDDashboard(QMainWindow):
         self.ins_note.setPlainText(self.personal_notes.get(self._current_note_id, ""))
         self.shared_note_history.setPlainText(self._shared_notes_text(self._current_note_id))
         self.shared_note_input.clear()
-        self._update_fe_congestion_panel(item, run_data if not is_stage and not is_rtl else None)
+        if is_stage:
+            self._update_stage_screenshot_panel(item)
+            self._update_stage_metric_panel(item)
+        else:
+            self._hide_stage_metric_panel()
+            self._update_fe_congestion_panel(item, run_data if not is_rtl else None)
 
-        # Lazy error count: use cached_exists to avoid blocking NFS on first click
+        # Keep selection instant: do not cold-stat/read error logs here.
+        # The context/open actions validate paths when explicitly requested.
         if len(sel) == 1 and not is_stage and path and path != "N/A":
             err_count = item.data(0, Qt.UserRole + 12)
             err_path  = os.path.join(path, "logs", "compile_opt.error.log")
-            if err_count is None:
-                # Only read if cache already has the answer (no cold NFS stat)
-                if cached_exists(err_path):
-                    try:
-                        with open(err_path, 'r',
-                                  encoding='utf-8', errors='ignore') as _ef:
-                            err_count = sum(1 for ln in _ef if ln.strip())
-                    except Exception:
-                        err_count = 0
-                    item.setData(0, Qt.UserRole + 12, err_count)
-                # else: leave as None - button stays hidden this click; shown next
             if err_count is not None:
                 self.current_error_log_path = err_path
                 dark = (self.is_dark_mode or
@@ -3723,45 +4739,194 @@ class PDDashboard(QMainWindow):
         is_fe = bool(run_data and run_data.get("run_type") == "FE")
         run_path = item.text(15) if item else ""
         if not is_fe or not run_path or run_path == "N/A":
-            self.fe_cong_panel.setVisible(False)
-            self._current_cong_img_path = None
+            self._hide_run_image_panel()
             return
+        self._stage_screenshot_request_token += 1
+        self._hide_stage_map_links()
+        self.fe_cong_panel.setTitle("FE Congestion Window")
         block = (run_data.get("block") or item.data(0, Qt.UserRole + 2) or "")
         dark = (self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"))
         self.fe_fp_ver_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: {};".format("#90caf9" if dark else "#1565c0"))
         self.fe_cong_img_lbl.setStyleSheet("border: 1px solid {}; background: {}; color: {}; font-size: 10px;".format("#555b64" if dark else "#9e9e9e", "#30343a" if dark else "#f5f5f5", "#dfe1e5" if dark else "#757575"))
-        fp_ver = self._extract_fe_fp_ver(run_path)
-        self.fe_fp_ver_lbl.setText("FP_VER: " + (fp_ver if fp_ver and fp_ver != "-" else "not found in compile_opt.log"))
-        img_path = self._find_fe_congestion_image(run_path, block)
-        self._current_cong_img_path = img_path
-        if img_path and os.path.exists(img_path):
-            px = QPixmap(img_path)
-            if not px.isNull():
-                scaled = px.scaled(self.fe_cong_img_lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.fe_cong_img_lbl.setPixmap(scaled)
-                self.fe_cong_img_lbl.setText("")
-                self.fe_cong_img_lbl.setToolTip("Click to open full screen\n" + img_path)
-            else:
-                self.fe_cong_img_lbl.setPixmap(QPixmap())
-                self.fe_cong_img_lbl.setText("Image load failed")
-                self.fe_cong_img_lbl.setToolTip(img_path)
+        self.fe_cong_panel.setVisible(True)
+        self._fe_cong_request_token += 1
+        token = self._fe_cong_request_token
+        key = (run_path or "", block or "")
+        if (run_path in self._fp_ver_cache and key in self._cong_img_cache
+                and key in self._cong_image_cache):
+            self._apply_fe_congestion_lookup(
+                token, run_path, self._fp_ver_cache.get(run_path, "-"),
+                self._cong_img_cache.get(key, ""),
+                self._cong_image_cache.get(key, QImage()))
+            return
+        self._current_cong_img_path = None
+        self.fe_fp_ver_lbl.setText("FP_VER: loading...")
+        self.fe_cong_img_lbl.setPixmap(QPixmap())
+        self.fe_cong_img_lbl.setText("Loading congestion image...")
+        self.fe_cong_img_lbl.setToolTip("")
+        QTimer.singleShot(
+            180,
+            lambda t=token, p=run_path, b=block: self._start_fe_congestion_lookup(t, p, b))
+
+    def _update_stage_screenshot_panel(self, item):
+        if not item or item.data(0, Qt.UserRole) != "STAGE" or not item.parent():
+            self._hide_run_image_panel()
+            return
+        self._fe_cong_request_token += 1
+        self.fe_cong_panel.setTitle("PNR Stage Screenshots")
+        stage_name = item.text(0)
+        stage_path = item.text(15)
+        parent = item.parent()
+        be_path = parent.text(15)
+        block = item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or ""
+        dark = (self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"))
+        self.fe_fp_ver_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: {};".format("#90caf9" if dark else "#1565c0"))
+        self.fe_cong_img_lbl.setStyleSheet("border: 1px solid {}; background: {}; color: {}; font-size: 10px;".format("#555b64" if dark else "#9e9e9e", "#30343a" if dark else "#f5f5f5", "#dfe1e5" if dark else "#757575"))
+        self.fe_fp_ver_lbl.setText("Stage: {}   Block: {}".format(stage_name, block or "-"))
+        self.fe_cong_img_lbl.setPixmap(QPixmap())
+        self.fe_cong_img_lbl.setText("Loading stage screenshot...")
+        self.fe_cong_img_lbl.setToolTip("")
+        self._hide_stage_map_links()
+        self.fe_cong_panel.setVisible(True)
+        self._current_cong_img_path = None
+        self._stage_screenshot_request_token += 1
+        token = self._stage_screenshot_request_token
+        key = (be_path or "", stage_path or "", stage_name or "", block or "")
+        if key in self._stage_screenshot_cache:
+            found, img = self._stage_screenshot_cache.get(key, ({}, QImage()))
+            self._apply_stage_screenshot_lookup(token, stage_name, block, found, img)
+            return
+        QTimer.singleShot(
+            180,
+            lambda t=token, bp=be_path, sp=stage_path, sn=stage_name, b=block:
+                self._start_stage_screenshot_lookup(t, bp, sp, sn, b))
+
+    def _start_stage_screenshot_lookup(self, token, be_path, stage_path, stage_name, block):
+        if token != self._stage_screenshot_request_token:
+            return
+        worker = StageScreenshotLookupWorker(token, be_path, stage_path, stage_name, block)
+        self._stage_screenshot_workers.append(worker)
+        worker.finished.connect(self._on_stage_screenshot_lookup_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_stage_screenshot_lookup_done(self, token, be_path, stage_name, block, found, img):
+        key = ""
+        try:
+            sel = self.tree.selectedItems()
+            if sel and sel[0].data(0, Qt.UserRole) == "STAGE":
+                key = (sel[0].parent().text(15) or "", sel[0].text(15) or "",
+                       stage_name or "", block or "")
+        except Exception:
+            key = ""
+        if key:
+            self._stage_screenshot_cache[key] = (
+                found if isinstance(found, dict) else {},
+                img if isinstance(img, QImage) else QImage())
+        self._stage_screenshot_workers = self._keep_running_workers(
+            self._stage_screenshot_workers)
+        if token != self._stage_screenshot_request_token:
+            return
+        self._apply_stage_screenshot_lookup(token, stage_name, block, found, img)
+
+    def _apply_stage_screenshot_lookup(self, token, stage_name, block, found, img):
+        if token != self._stage_screenshot_request_token:
+            return
+        found = found if isinstance(found, dict) else {}
+        main_path = found.get("Congestion Map", "")
+        self._current_cong_img_path = main_path or None
+        if main_path and isinstance(img, QImage) and not img.isNull():
+            px = QPixmap.fromImage(img)
+            scaled = px.scaled(self.fe_cong_img_lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.fe_cong_img_lbl.setPixmap(scaled)
+            self.fe_cong_img_lbl.setText("")
+            self.fe_cong_img_lbl.setToolTip("Click to open full screen\n" + main_path)
+        elif main_path:
+            self.fe_cong_img_lbl.setPixmap(QPixmap())
+            self.fe_cong_img_lbl.setText("Main screenshot found but image load failed")
+            self.fe_cong_img_lbl.setToolTip(main_path)
+        else:
+            self.fe_cong_img_lbl.setPixmap(QPixmap())
+            self.fe_cong_img_lbl.setText("No {}.{}.jpg screenshot found".format(stage_name, block or "<block>"))
+            self.fe_cong_img_lbl.setToolTip("")
+        for label, btn in self.stage_map_links.items():
+            path = found.get(label, "")
+            btn.setVisible(True)
+            btn.setEnabled(bool(path))
+            btn.setText(label if path else label + " (missing)")
+            btn.setProperty("_path", path)
+            btn.setToolTip(path)
+
+    def _start_fe_congestion_lookup(self, token, run_path, block):
+        if token != self._fe_cong_request_token:
+            return
+        worker = FeCongestionLookupWorker(token, run_path, block)
+        self._fe_cong_workers.append(worker)
+        worker.finished.connect(self._on_fe_congestion_lookup_done)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_fe_congestion_lookup_done(self, token, run_path, block, fp_ver, img_path, img):
+        key = (run_path or "", block or "")
+        self._fp_ver_cache[run_path] = fp_ver or "-"
+        self._cong_img_cache[key] = img_path or ""
+        self._cong_image_cache[key] = img if isinstance(img, QImage) else QImage()
+        self._fe_cong_workers = self._keep_running_workers(
+            self._fe_cong_workers)
+        if token != self._fe_cong_request_token:
+            return
+        self._apply_fe_congestion_lookup(token, run_path, fp_ver, img_path, img)
+
+    def _apply_fe_congestion_lookup(self, token, run_path, fp_ver, img_path, img):
+        if token != self._fe_cong_request_token:
+            return
+        self.fe_fp_ver_lbl.setText(
+            "FP_VER: " + (fp_ver if fp_ver and fp_ver != "-" else "not found in compile_opt.log"))
+        self._current_cong_img_path = img_path if img_path else None
+        if img_path and isinstance(img, QImage) and not img.isNull():
+            px = QPixmap.fromImage(img)
+            scaled = px.scaled(self.fe_cong_img_lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.fe_cong_img_lbl.setPixmap(scaled)
+            self.fe_cong_img_lbl.setText("")
+            self.fe_cong_img_lbl.setToolTip("Click to open full screen\n" + img_path)
+        elif img_path:
+            self.fe_cong_img_lbl.setPixmap(QPixmap())
+            self.fe_cong_img_lbl.setText("Image load failed")
+            self.fe_cong_img_lbl.setToolTip(img_path)
         else:
             self.fe_cong_img_lbl.setPixmap(QPixmap())
             self.fe_cong_img_lbl.setText("No congestion.window image found")
-            self.fe_cong_img_lbl.setToolTip("Expected: reports/congestion.window.{}.*.jpg".format(block or "<block>"))
-        self.fe_cong_panel.setVisible(True)
+            self.fe_cong_img_lbl.setToolTip("Expected: reports/congestion.window.<block>.*.jpg")
 
     def _open_fe_congestion_fullscreen(self):
         path = getattr(self, "_current_cong_img_path", None)
+        self._open_image_fullscreen(path, "Run Image")
+
+    def _open_stage_map_link(self, label):
+        btn = self.stage_map_links.get(label)
+        path = btn.property("_path") if btn else ""
         if not path or not os.path.exists(path):
-            QMessageBox.information(self, "Congestion Image", "No congestion image is available for this FE run.")
+            QMessageBox.information(self, label, "No image is available for this selection.")
+            return
+        try:
+            subprocess.Popen(
+                ["xdg-open", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            return
+        except Exception:
+            self._open_image_fullscreen(path, label)
+
+    def _open_image_fullscreen(self, path, title):
+        if not path or not os.path.exists(path):
+            QMessageBox.information(self, title, "No image is available for this selection.")
             return
         px = QPixmap(path)
         if px.isNull():
-            QMessageBox.warning(self, "Congestion Image", "Could not load image:\n" + path)
+            QMessageBox.warning(self, title, "Could not load image:\n" + path)
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle("FE Congestion Window - " + os.path.basename(path))
+        dlg.setWindowTitle(title + " - " + os.path.basename(path))
         layout = QVBoxLayout(dlg)
         view = QLabel()
         view.setAlignment(Qt.AlignCenter)
@@ -4024,16 +5189,20 @@ class PDDashboard(QMainWindow):
     # SCAN
     # ------------------------------------------------------------------
     def start_fs_scan(self):
-        if hasattr(self, 'worker') and self.worker.isRunning():
+        if hasattr(self, 'worker') and self._worker_is_running(self.worker):
             return
         clear_path_cache()
-        for w in list(self.size_workers):
-            if hasattr(w, 'cancel'):
-                w.cancel()
-        self.size_workers.clear()
+        self.size_workers = self._cancel_worker_list_keep_running(
+            self.size_workers)
+        self._stage_workers = self._stop_worker_list_now(self._stage_workers)
+        self._fe_cong_workers = self._stop_worker_list_now(self._fe_cong_workers)
+        self._stage_screenshot_workers = self._stop_worker_list_now(
+            self._stage_screenshot_workers)
+        self._stage_metric_workers = self._stop_worker_list_now(
+            self._stage_metric_workers)
         self.item_map.clear()
         self._signoff_bg_done = False
-        if self._signoff_worker and self._signoff_worker.isRunning():
+        if self._worker_is_running(self._signoff_worker):
             if hasattr(self._signoff_worker, 'cancel'):
                 self._signoff_worker.cancel()
 
@@ -4157,6 +5326,8 @@ class PDDashboard(QMainWindow):
             view = prefs.get('UI', 'last_view',   fallback='All Runs')
             if view == 'BE Only':
                 view = 'All Runs'
+            sort_mode = prefs.get(
+                'UI', 'last_sort', fallback='Start Date Old->New')
             srch = prefs.get('UI', 'last_search', fallback='')
             auto = prefs.get('UI', 'last_auto',   fallback='Off')
             idx = self.src_combo.findText(src)
@@ -4177,6 +5348,7 @@ class PDDashboard(QMainWindow):
                 self.search.blockSignals(True)
                 self.search.setText(srch)
                 self.search.blockSignals(False)
+            self._tree_sort_mode = sort_mode
             idx = self.auto_combo.findText(auto)
             if idx >= 0:
                 self.auto_combo.blockSignals(True)
@@ -4310,13 +5482,17 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _build_tree(self):
         """Build the full tree once. Filtering done by setHidden() only."""
-        for w in list(self.size_workers):
-            if hasattr(w, 'cancel'):
-                w.cancel()
-        self.size_workers.clear()
+        self.size_workers = self._cancel_worker_list_keep_running(
+            self.size_workers)
+        self._stage_workers = self._stop_worker_list_now(self._stage_workers)
+        self._fe_cong_workers = self._stop_worker_list_now(self._fe_cong_workers)
+        self._stage_screenshot_workers = self._stop_worker_list_now(
+            self._stage_screenshot_workers)
+        self._stage_metric_workers = self._stop_worker_list_now(
+            self._stage_metric_workers)
         self.item_map.clear()
         self._signoff_items_by_path.clear()
-        if self._signoff_worker and self._signoff_worker.isRunning():
+        if self._worker_is_running(self._signoff_worker):
             if hasattr(self._signoff_worker, 'cancel'):
                 self._signoff_worker.cancel()
             self._signoff_bg_done = False
@@ -4480,9 +5656,7 @@ class PDDashboard(QMainWindow):
             root.removeChild(standalone_root)
 
         self.tree.setSortingEnabled(True)
-        # Default sort: Run Name column A-Z ascending
-        self.tree.sortByColumn(0, Qt.AscendingOrder)
-        self.tree.header().setSortIndicator(0, Qt.AscendingOrder)
+        self._apply_tree_sort()
         self.tree.setUpdatesEnabled(True)
         self.tree.blockSignals(False)
         self._building_tree = False
@@ -4539,6 +5713,35 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
     # ------------------------------------------------------------------
+    def _guess_owner_from_run_name(self, name):
+        name = name or ""
+        base = name.replace("-FE", "").replace("-BE", "")
+        toks = [t for t in re.split(r'[-_]+', base) if t]
+        skip = set(["EVT0", "EVT1", "ML0", "ML1", "ML2", "ML3", "ML4",
+                    "DEV00", "DEV01", "DEV02", "DEV03", "DEV04",
+                    "PRE", "SVP", "FFN", "SYN", "AUTOFP", "FP", "DP",
+                    "TRIAL", "FINAL", "PHYSYN", "PRESVP", "POSTSVP"])
+        for i, tok in enumerate(toks):
+            low = tok.lower()
+            if len(low) < 3:
+                continue
+            if low.upper() in skip:
+                continue
+            if re.match(r'^[a-z][a-z]+$', low):
+                if i + 1 < len(toks) and re.match(r'^[a-z][a-z]+$', toks[i + 1].lower()):
+                    return low + "." + toks[i + 1].lower()
+                return low
+        return "Unknown"
+
+    def _display_owner_for_run(self, run):
+        owner = (run.get("owner") or "").strip()
+        if owner and owner != "Unknown":
+            return owner
+        guessed = self._guess_owner_from_run_name(run.get("r_name", ""))
+        if guessed and guessed != "Unknown":
+            return guessed
+        return "Unknown"
+
     def _create_run_item(self, parent_item, run):
         child = CustomTreeItem(parent_item)
         child.setFlags(
@@ -4546,10 +5749,13 @@ class PDDashboard(QMainWindow):
         child.setCheckState(0, Qt.Unchecked)
 
         r_name = run["r_name"]
+        display_owner = self._display_owner_for_run(run)
+        if display_owner != "Unknown" and not (run.get("owner") and run.get("owner") != "Unknown"):
+            run["owner"] = display_owner
         child.setText(0, r_name)
         child.setText(1, run["rtl"])
         child.setText(2, run["source"])
-        child.setText(5, run.get("owner", ""))
+        child.setText(5, display_owner)
         child.setText(15, run["path"])
         child.setText(22, "")
         child.setData(0, Qt.UserRole + 2, run["block"])
@@ -4750,37 +5956,110 @@ class PDDashboard(QMainWindow):
 
     def _on_stage_details_loaded(self, be_item, enriched_stages):
         """Called by StageDetailWorker when stage timing/FM/VSLP is ready."""
-        be_run = be_item.data(0, Qt.UserRole + 11)
-        if be_run:
-            be_run["stages"] = enriched_stages
-        for i in range(be_item.childCount()):
-            ch = be_item.child(i)
-            if ch.data(0, Qt.UserRole) != "STAGE":
-                continue
-            sname = ch.text(0)
-            for s in enriched_stages:
-                if s["name"] == sname:
-                    s_start = s.get("info", {}).get("start", "")
-                    s_end   = s.get("info", {}).get("end", "")
-                    ch.setData(0, Qt.UserRole + 40, s_start)
-                    ch.setData(0, Qt.UserRole + 41, s_end)
-                    ch.setText(12, s.get("info", {}).get("runtime", "-"))
-                    ch.setText(13, self._fmt_ts(s_start))
-                    ch.setText(14, self._fmt_ts(s_end))
-                    ch.setText(7,  "NONUPF - " + s["st_n"])
-                    ch.setText(8,  "UPF - "    + s["st_u"])
-                    ch.setText(9,  s["vslp_status"])
-                    self._apply_fm_color(ch, 7, ch.text(7))
-                    self._apply_fm_color(ch, 8, ch.text(8))
-                    self._apply_vslp_color(ch, 9, ch.text(9))
-                    break
-        # Clean up finished workers
-        self._stage_workers = [w for w in self._stage_workers
-                               if w.isRunning()]
+        try:
+            be_run = be_item.data(0, Qt.UserRole + 11)
+            if be_run:
+                be_run["stages"] = enriched_stages
+            for i in range(be_item.childCount()):
+                ch = be_item.child(i)
+                if ch.data(0, Qt.UserRole) != "STAGE":
+                    continue
+                sname = ch.text(0)
+                for s in enriched_stages:
+                    if s["name"] == sname:
+                        s_start = s.get("info", {}).get("start", "")
+                        s_end   = s.get("info", {}).get("end", "")
+                        ch.setData(0, Qt.UserRole + 40, s_start)
+                        ch.setData(0, Qt.UserRole + 41, s_end)
+                        ch.setText(12, s.get("info", {}).get("runtime", "-"))
+                        ch.setText(13, self._fmt_ts(s_start))
+                        ch.setText(14, self._fmt_ts(s_end))
+                        ch.setText(7,  "NONUPF - " + s["st_n"])
+                        ch.setText(8,  "UPF - "    + s["st_u"])
+                        ch.setText(9,  s["vslp_status"])
+                        self._apply_fm_color(ch, 7, ch.text(7))
+                        self._apply_fm_color(ch, 8, ch.text(8))
+                        self._apply_vslp_color(ch, 9, ch.text(9))
+                        break
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+        self._stage_workers = self._keep_running_workers(self._stage_workers)
 
     # ------------------------------------------------------------------
     # REFRESH VIEW (pure hide/show -- zero item creation)
     # ------------------------------------------------------------------
+    def _iter_tree_items(self):
+        out = []
+        def collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                out.append(child)
+                collect(child)
+        collect(self.tree.invisibleRootItem())
+        return out
+
+    def _cache_modified_times_for_sort(self):
+        for item in self._iter_tree_items():
+            role = item.data(0, Qt.UserRole)
+            if role in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT",
+                        "STANDALONE_ROOT", "__PLACEHOLDER__"):
+                continue
+            path = item.text(15)
+            val = 0.0
+            if path and path not in ("N/A", "-"):
+                try:
+                    val = os.path.getmtime(path)
+                except Exception:
+                    val = 0.0
+            item.setData(0, Qt.UserRole + 60, val)
+
+    def _move_special_roots_to_bottom(self):
+        try:
+            root = self.tree.invisibleRootItem()
+            for role in ("STANDALONE_ROOT", "IGNORED_ROOT"):
+                for i in range(root.childCount()):
+                    child = root.child(i)
+                    if child.data(0, Qt.UserRole) == role:
+                        moved = root.takeChild(i)
+                        root.addChild(moved)
+                        break
+        except Exception:
+            pass
+
+    def _apply_tree_sort(self):
+        mode = getattr(self, "_tree_sort_mode", "Start Date Old->New")
+        self.tree.setProperty("flow_sort_mode", "")
+        if mode == "Start Date New->Old":
+            col, order = 13, Qt.DescendingOrder
+        elif mode == "End Date Old->New":
+            col, order = 14, Qt.AscendingOrder
+        elif mode == "End Date New->Old":
+            col, order = 14, Qt.DescendingOrder
+        elif mode == "Modified Date Old->New":
+            self.tree.setProperty("flow_sort_mode", "modified")
+            self._cache_modified_times_for_sort()
+            col, order = 0, Qt.AscendingOrder
+        elif mode == "Modified Date New->Old":
+            self.tree.setProperty("flow_sort_mode", "modified")
+            self._cache_modified_times_for_sort()
+            col, order = 0, Qt.DescendingOrder
+        elif mode == "Run Name A-Z":
+            self.tree.setProperty("flow_sort_mode", "")
+            col, order = 0, Qt.AscendingOrder
+        else:
+            self.tree.setProperty("flow_sort_mode", "")
+            col, order = 13, Qt.AscendingOrder
+        self.tree.sortByColumn(col, order)
+        self.tree.header().setSortIndicator(col, order)
+        self._move_special_roots_to_bottom()
+
+    def _set_tree_sort_mode(self, mode):
+        self._tree_sort_mode = mode
+        self._apply_tree_sort()
+        self._fit_run_name_column()
+
     def _on_view_changed(self):
         new_view = self.view_combo.currentText()
         old_view = getattr(self, "_last_view_preset", "")
@@ -4933,6 +6212,28 @@ class PDDashboard(QMainWindow):
         _UR   = Qt.UserRole
         _UR10 = Qt.UserRole + 10
 
+        def _item_has_pinned_desc(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                p = ch.text(15)
+                if p and p in _pins:
+                    return True
+                run = ch.data(0, _UR10)
+                if run:
+                    for st in run.get("stages", []) or []:
+                        sp = st.get("stage_path", "")
+                        if sp and sp in _pins:
+                            return True
+                if _item_has_pinned_desc(ch):
+                    return True
+            run = item.data(0, _UR10)
+            if run:
+                for st in run.get("stages", []) or []:
+                    sp = st.get("stage_path", "")
+                    if sp and sp in _pins:
+                        return True
+            return False
+
         def _update_visibility(item):
             node_type = item.data(0, _UR)
             if node_type == "__PLACEHOLDER__":
@@ -4970,6 +6271,8 @@ class PDDashboard(QMainWindow):
             else:
                 run         = item.data(0, _UR10)
                 passes      = _passes(run)
+                if _pinned_only and not passes and _item_has_pinned_desc(item):
+                    passes = True
                 rt_type_run = run.get("run_type") if run else None
                 item.setHidden(not passes)
                 if passes and run:
@@ -4982,12 +6285,21 @@ class PDDashboard(QMainWindow):
                         # When BE-only: hide synthesis stages of FE parent
                         hide_stage = not passes or (
                             _be_only and rt_type_run == "FE")
+                        if _pinned_only:
+                            parent_pinned = bool(run and run.get("path") in _pins)
+                            stage_pinned = bool(ch.text(15) and ch.text(15) in _pins)
+                            hide_stage = not (parent_pinned or stage_pinned)
                         ch.setHidden(hide_stage)
                     else:
                         # BE child run under FE item: hide when FE-only
                         child_run = ch.data(0, _UR10)
                         child_rt  = child_run.get("run_type") if child_run else None
                         hide_child = not passes or (_fe_only and child_rt == "BE")
+                        if _pinned_only:
+                            child_path = child_run.get("path") if child_run else ch.text(15)
+                            hide_child = not (
+                                (child_path and child_path in _pins)
+                                or _item_has_pinned_desc(ch))
                         ch.setHidden(hide_child)
                 return passes
 
@@ -5083,6 +6395,8 @@ class PDDashboard(QMainWindow):
         log_path  = item.text(16)
         is_stage  = item.data(0, Qt.UserRole) == "STAGE"
         is_rtl    = item.data(0, Qt.UserRole) == "RTL"
+        run_data_for_menu = item.data(0, Qt.UserRole + 10) or {}
+        is_be_run = bool(run_data_for_menu.get("run_type") == "BE")
 
         target_item = item if not is_stage else item.parent()
         b_name      = target_item.data(0, Qt.UserRole + 2)
@@ -5093,6 +6407,7 @@ class PDDashboard(QMainWindow):
         act_gold = act_good = act_red = act_later = act_clear = None
         gantt_act = None
         timeline_act = None
+        sort_actions = {}
 
         if (run_path and run_path != "N/A") or is_stage:
             pin_menu  = m.addMenu("Pin as...")
@@ -5105,10 +6420,21 @@ class PDDashboard(QMainWindow):
             m.addSeparator()
             if (item.childCount() > 0
                     and item.child(0).data(0, Qt.UserRole) == "STAGE"):
-                gantt_act = m.addAction("Show Timeline (Gantt Chart)")
+                gantt_act = m.addAction("Show Timeline Overview")
                 m.addSeparator()
-            timeline_act = m.addAction("Run Timeline Overview")
-            m.addSeparator()
+            else:
+                timeline_act = m.addAction("Run Timeline Overview")
+                m.addSeparator()
+
+        sort_menu = m.addMenu("Sort Tree By")
+        for label in [
+                "Run Name A-Z",
+                "Start Date Old->New", "Start Date New->Old",
+                "End Date Old->New", "End Date New->Old",
+                "Modified Date Old->New", "Modified Date New->Old"]:
+            act = sort_menu.addAction(label)
+            sort_actions[act] = label
+        m.addSeparator()
 
         edit_note_act = None; note_identifier = ""
         if run_path and run_path != "N/A" and not is_stage:
@@ -5174,6 +6500,16 @@ class PDDashboard(QMainWindow):
             qor_sum_act = m.addAction("Show QoR Summary")
             m.addSeparator()
 
+        be_stage_table_act = None
+        app_opt_paths_act = None
+        if is_stage or is_be_run:
+            be_stage_table_act = m.addAction(
+                "Generate BE Stage Summary Table")
+            if is_stage:
+                app_opt_paths_act = m.addAction(
+                    "Show App Options Search Paths")
+            m.addSeparator()
+
         # Copy cell submenu -- copy any visible column value
         m.addSeparator()
         copy_menu = m.addMenu("Copy Cell Value...")
@@ -5198,6 +6534,14 @@ class PDDashboard(QMainWindow):
         # Show QoR Summary -- launch MetricWorker on demand
         if qor_sum_act and res == qor_sum_act:
             self._launch_metric_worker(item)
+            return
+
+        if be_stage_table_act and res == be_stage_table_act:
+            self.show_be_stage_summary_table(item)
+            return
+
+        if app_opt_paths_act and res == app_opt_paths_act:
+            self.show_stage_app_options_search_paths(item)
             return
 
         # Handle copy actions
@@ -5226,18 +6570,12 @@ class PDDashboard(QMainWindow):
                 # Also walk all items in case same path appears multiple times
                 self._apply_pin_icons()
 
+        elif res in sort_actions:
+            self._set_tree_sort_mode(sort_actions[res])
+            return
+
         elif gantt_act and res == gantt_act:
-            stages = []
-            for i in range(item.childCount()):
-                c = item.child(i)
-                if c.data(0, Qt.UserRole) == "STAGE":
-                    rt = c.text(12)
-                    stages.append({
-                        'name': c.text(0),
-                        'time_str': rt,
-                        'sec': self._time_to_seconds(rt)})
-            dlg = GanttChartDialog(item.text(0), stages, self)
-            dlg.exec_()
+            self.show_timeline_overview(item)
 
         elif timeline_act and res == timeline_act:
             self.show_timeline_overview(item)
@@ -5383,7 +6721,7 @@ class PDDashboard(QMainWindow):
     def start_bg_signoff_scan(self):
         if self._building_tree:
             return
-        if self._signoff_worker and self._signoff_worker.isRunning():
+        if self._worker_is_running(self._signoff_worker):
             return
         runs = []
         for r in (self.ws_data.get("all_runs", []) +
@@ -5483,9 +6821,9 @@ class PDDashboard(QMainWindow):
 
         if not run_list:
             QMessageBox.information(
-                self, "Block Summary",
+                self, "FE Block Summary",
                 "Please check (tick) the FE runs you want to include\n"
-                "in the summary table, then click Block Summary Table.")
+                "in the summary table, then click FE Block Summary Table.")
             return
 
         rtl_label = self.rel_combo.currentText()
@@ -5575,7 +6913,7 @@ class PDDashboard(QMainWindow):
     def add_checked_runs_to_filter_config(self):
         items = []
         seen = set()
-        for item in self._checked_run_items():
+        for item in self._checked_run_items() + self._checked_stage_items():
             item = self._task_item_for_filter_config(item)
             if not item:
                 continue
@@ -6148,8 +7486,10 @@ class PDDashboard(QMainWindow):
 
     def start_bg_disk_scan(self, force=False):
         if (not force and hasattr(self, '_disk_scan_worker')
-                and self._disk_scan_worker.isRunning()):
+                and self._worker_is_running(self._disk_scan_worker)):
             return
+        if force:
+            self._stop_worker_if_running(getattr(self, "_disk_scan_worker", None))
         # Disable disk button while scanning
         if hasattr(self, 'disk_btn'):
             self.disk_btn.setEnabled(False)
@@ -6196,6 +7536,7 @@ class PDDashboard(QMainWindow):
         script = self._resolve_qor_script()
         if not script: return
 
+        self._stop_worker_if_running(getattr(self, "_qor_worker", None))
         worker = QoRWorker(script, sel, _PYTHON_BIN)
         worker.finished.connect(self._on_qor_done)
         worker.start()
@@ -6234,6 +7575,7 @@ class PDDashboard(QMainWindow):
         if be_run_path and not be_run_path.endswith("/"):
             be_run_path += "/"
 
+        self._stop_worker_if_running(getattr(self, "_qor_worker", None))
         worker = QoRWorker(script, [be_run_path, "-stage", stage_name],
                             _PYTHON_BIN)
         worker.finished.connect(self._on_qor_done)
@@ -6275,6 +7617,18 @@ class PDDashboard(QMainWindow):
 
     def _checked_run_items(self):
         return self._iter_checked_items()
+
+    def _checked_stage_items(self):
+        items = []
+        def collect(node):
+            for i in range(node.childCount()):
+                c = node.child(i)
+                if (c.checkState(0) == Qt.Checked
+                        and c.data(0, Qt.UserRole) == "STAGE"):
+                    items.append(c)
+                collect(c)
+        collect(self.tree.invisibleRootItem())
+        return items
 
     def deselect_all_checked_runs(self):
         self.tree.blockSignals(True)
@@ -7207,22 +8561,95 @@ class PDDashboard(QMainWindow):
             ev.get("end", "-"), ev.get("runtime", "-"))
         QMessageBox.information(self, "Timeline Step", msg)
 
+    def _stage_task_from_item(self, item):
+        if not item or item.data(0, Qt.UserRole) != "STAGE" or not item.parent():
+            return None
+        parent = item.parent()
+        return {
+            "name": parent.text(0) + " / " + item.text(0),
+            "be_name": parent.text(0),
+            "path": parent.text(15),
+            "run_type": "BE",
+            "stage_name": item.text(0),
+            "stage_path": item.text(15),
+            "runtime": item.text(12) or "-",
+            "source": item.text(2) or parent.text(2) or "WS",
+            "block": item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or "",
+        }
+
+    def _stage_tasks_from_be_item(self, item):
+        tasks = []
+        if not item:
+            return tasks
+        run = item.data(0, Qt.UserRole + 10) or {}
+        if run.get("run_type") != "BE":
+            return tasks
+        if item.childCount() and item.child(0).data(0, Qt.UserRole) != "__PLACEHOLDER__":
+            for i in range(item.childCount()):
+                task = self._stage_task_from_item(item.child(i))
+                if task:
+                    tasks.append(task)
+            return tasks
+        be_path = item.text(15)
+        block = run.get("block") or item.data(0, Qt.UserRole + 2) or ""
+        source = run.get("source") or item.text(2) or "WS"
+        for stage in run.get("stages", []):
+            name = stage.get("name", "")
+            if not name:
+                continue
+            info = stage.get("info", {}) or {}
+            tasks.append({
+                "name": item.text(0) + " / " + name,
+                "be_name": item.text(0),
+                "path": be_path,
+                "run_type": "BE",
+                "stage_name": name,
+                "stage_path": stage.get("stage_path", ""),
+                "runtime": info.get("runtime", "-"),
+                "source": source,
+                "block": block,
+            })
+        return tasks
+
+    def _selected_stage_tasks(self):
+        tasks = []
+        seen = set()
+        for item in self._checked_stage_items():
+            task = self._stage_task_from_item(item)
+            if not task:
+                continue
+            key = (task.get("path"), task.get("stage_name"), task.get("stage_path"))
+            if key in seen:
+                continue
+            seen.add(key)
+            tasks.append(task)
+        return tasks
+
+    def show_be_stage_summary_table(self, item=None):
+        if item and item.data(0, Qt.UserRole) == "STAGE":
+            tasks = self._selected_stage_tasks() or [self._stage_task_from_item(item)]
+            title = "BE Stage Summary: selected stages"
+        elif item and (item.data(0, Qt.UserRole + 10) or {}).get("run_type") == "BE":
+            tasks = self._stage_tasks_from_be_item(item)
+            title = "BE Stage Summary: " + item.text(0)
+        else:
+            tasks = self._selected_stage_tasks()
+            title = "BE Stage Summary: selected stages"
+        tasks = [t for t in tasks if t]
+        if not tasks:
+            QMessageBox.information(
+                self, "BE Stage Summary",
+                "Select or check BE stage rows, or right-click a BE run.")
+            return
+        dlg = BEStageSummaryDialog(title, tasks, self.is_dark_mode, self)
+        dlg.exec_()
+
     def _metric_task_from_item(self, item):
         if not item:
             return None
         role = item.data(0, Qt.UserRole)
         if role == "STAGE":
-            parent = item.parent()
-            if not parent:
-                return None
-            return {
-                "name": parent.text(0) + " / " + item.text(0),
-                "path": parent.text(15),
-                "run_type": "BE",
-                "stage_name": item.text(0),
-                "source": item.text(2) or parent.text(2) or "WS",
-                "block": item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or "",
-            }
+            return self._stage_task_from_item(item)
         run = item.data(0, Qt.UserRole + 10) or {}
         path = item.text(15)
         if not path or path == "N/A":
@@ -7253,6 +8680,7 @@ class PDDashboard(QMainWindow):
         metrics = metrics or {}
         area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
         vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
+        cong = metrics.get("congestion", {}) if isinstance(metrics.get("congestion", {}), dict) else {}
         if key == "std_cell_area":
             return area.get("std_cell_area", metrics.get("std_cell_area", "-"))
         if key == "instance_count":
@@ -7265,11 +8693,25 @@ class PDDashboard(QMainWindow):
             factor = getattr(self, "gate_count_unit_area", 0.2419) or 0.2419
             return str(int(std_area / factor)) if std_area is not None and factor else "-"
         if key == "vth_area":
+            if vth.get("stage_vt_area"):
+                return vth.get("stage_vt_area")
             return vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-"))
+        if key == "vth_inst":
+            if vth.get("stage_vt_inst"):
+                return vth.get("stage_vt_inst")
+            return vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-"))
         if key == "wns":
-            return str(metrics.get("r2r_setup", "-")).split('/')[0]
+            return str(metrics.get("setup_r2r", metrics.get("r2r_setup", "-"))).split('/')[0]
         if key == "hold_wns":
-            return str(metrics.get("r2r_hold", "-")).split('/')[0]
+            return str(metrics.get("hold_r2r", metrics.get("r2r_hold", metrics.get("hold_all", "-")))).split('/')[0]
+        if key == "setup_total_wns":
+            return str(metrics.get("setup_total", "-")).split('/')[0]
+        if key == "hold_total_wns":
+            return str(metrics.get("hold_total", metrics.get("hold_all", "-"))).split('/')[0]
+        if key == "congestion":
+            return cong.get("cong_both", metrics.get("congestion", "-"))
+        if key == "std_count_area":
+            return metrics.get("std_cell_count_area", "-")
         return metrics.get(key, "-")
 
     def _prepare_utility_dialog(self, dlg):
@@ -7325,17 +8767,39 @@ class PDDashboard(QMainWindow):
         if not rows:
             QMessageBox.information(self, title, "No metrics were extracted.")
             return
-        fields = [
-            ("Std Cell Area", "std_cell_area"),
-            ("Gate Count", "gate_count"),
-            ("Instance Count", "instance_count"),
-            ("R2R Setup WNS", "wns"),
-            ("R2R Hold WNS", "hold_wns"),
-            ("CGC %", "cgc"),
-            ("MBIT %", "mbit"),
-            ("Logic Depth", "logic_depth"),
-            ("VT L/R/H Area %", "vth_area"),
-        ]
+        is_stage_diff = all(r.get("run_type") == "BE" for r in rows)
+        if is_stage_diff:
+            fields = [
+                ("R2R Setup WNS", "wns"),
+                ("Total Setup WNS", "setup_total_wns"),
+                ("R2R Hold WNS", "hold_wns"),
+                ("Total Hold WNS", "hold_total_wns"),
+                ("Std Cell Area", "std_cell_area"),
+                ("Gate Count", "gate_count"),
+                ("Instance Count", "instance_count"),
+                ("Runtime", "runtime"),
+                ("Std Cell Count/Area", "std_count_area"),
+                ("Std/StdOnly Util", "std_util_str"),
+                ("Total Util", "total_util"),
+                ("VT Inst %", "vth_inst"),
+                ("VT Area %", "vth_area"),
+                ("Congestion", "congestion"),
+                ("Skew/Latency", "skew_latency"),
+                ("Clock Repeater Count/Area", "clock_repeater_count_area"),
+            ]
+        else:
+            fields = [
+                ("Std Cell Area", "std_cell_area"),
+                ("Gate Count", "gate_count"),
+                ("Instance Count", "instance_count"),
+                ("Runtime", "runtime"),
+                ("R2R Setup WNS", "wns"),
+                ("R2R Hold WNS", "hold_wns"),
+                ("CGC %", "cgc"),
+                ("MBIT %", "mbit"),
+                ("Logic Depth", "logic_depth"),
+                ("VT L/R/H Area %", "vth_area"),
+            ]
         dlg = QDialog(self)
         self._prepare_utility_dialog(dlg)
         dlg.setWindowTitle(title)
@@ -7402,7 +8866,7 @@ class PDDashboard(QMainWindow):
 
     def show_ror_metric_diff(self):
         tasks = []
-        for item in self._checked_run_items():
+        for item in self._checked_run_items() + self._checked_stage_items():
             task = self._metric_task_from_item(item)
             if task:
                 tasks.append(task)
@@ -7412,6 +8876,7 @@ class PDDashboard(QMainWindow):
                 "Check exactly two FE runs or two stage rows for metric diff.")
             return
         self.status_bar.showMessage("Extracting metrics for RoR diff...")
+        self._stop_worker_if_running(getattr(self, "_metric_batch_worker", None))
         self._metric_batch_worker = MetricBatchWorker(tasks)
         self._metric_batch_worker.finished.connect(self._on_ror_metric_done)
         self._metric_batch_worker.start()
@@ -7475,6 +8940,7 @@ class PDDashboard(QMainWindow):
                 "Select at least one non-golden run to compare.")
             return
         self.status_bar.showMessage("Extracting metrics for golden benchmark...")
+        self._stop_worker_if_running(getattr(self, "_metric_batch_worker", None))
         self._metric_batch_worker = MetricBatchWorker(tasks)
         self._metric_batch_worker.finished.connect(self._on_golden_metric_done)
         self._metric_batch_worker.start()
@@ -7512,6 +8978,88 @@ class PDDashboard(QMainWindow):
         except Exception:
             return sorted(hits)[-1]
 
+    def _stage_report_dirs_for_item(self, item):
+        if not item or item.data(0, Qt.UserRole) != "STAGE" or not item.parent():
+            return []
+        stage = item.text(0)
+        stage_path = item.text(15)
+        be_path = item.parent().text(15)
+        dirs = [
+            os.path.join(be_path, "reports", stage),
+            os.path.join(stage_path, "reports"),
+            os.path.join(stage_path, "reports", stage),
+            os.path.join(be_path, stage, "reports"),
+            os.path.join(be_path, stage, "reports", stage),
+            os.path.join(be_path, "reports"),
+            stage_path,
+        ]
+        out = []
+        for d in dirs:
+            if d and d not in out:
+                out.append(d)
+        return out
+
+    def _find_stage_app_options_report(self, item):
+        if not item or item.data(0, Qt.UserRole) != "STAGE":
+            return ""
+        stage = item.text(0)
+        patterns = self._stage_app_options_patterns(stage)
+        hits = []
+        for d in self._stage_report_dirs_for_item(item):
+            try:
+                if not os.path.isdir(d):
+                    continue
+                names = os.listdir(d)
+            except Exception:
+                continue
+            for pat in patterns:
+                for name in names:
+                    if fnmatch.fnmatch(name, pat):
+                        hits.append(os.path.join(d, name))
+                if hits:
+                    break
+            if hits:
+                break
+        if not hits:
+            return ""
+        try:
+            return sorted(hits, key=os.path.getmtime)[-1]
+        except Exception:
+            return sorted(hits)[-1]
+
+    def _stage_app_options_patterns(self, stage):
+        return [
+            "{}.opt.options.rpt".format(stage),
+            "{}.env.app_options.full.rpt".format(stage),
+            "{}env.app_options.full.rpt".format(stage),
+            "*.opt.options.rpt",
+            "*.env.app_options.full.rpt",
+            "*env.app_options.full.rpt",
+            "*.app_options.full.rpt",
+        ]
+
+    def show_stage_app_options_search_paths(self, item):
+        if not item or item.data(0, Qt.UserRole) != "STAGE":
+            QMessageBox.information(
+                self, "App Options Search Paths",
+                "Select or right-click a PNR stage row.")
+            return
+        stage = item.text(0)
+        dirs = self._stage_report_dirs_for_item(item)
+        patterns = self._stage_app_options_patterns(stage)
+        found = self._find_stage_app_options_report(item)
+        lines = [
+            "Stage: {}".format(stage),
+            "Found: {}".format(found if found else "NO MATCH"),
+            "",
+            "Directories tried:",
+        ]
+        lines.extend(["  " + d for d in dirs])
+        lines.extend(["", "Filename patterns tried:"])
+        lines.extend(["  " + p for p in patterns])
+        QMessageBox.information(
+            self, "App Options Search Paths", "\n".join(lines))
+
     def _parse_app_options_report(self, path):
         opts = {}
         if not path or not os.path.exists(path):
@@ -7539,40 +9087,85 @@ class PDDashboard(QMainWindow):
                     pos.append(p)
                 positions = pos
                 break
-        if header is None or positions is None:
+        if header is not None and positions is not None:
+            pos = positions + [None]
+            for raw in lines[header + 1:]:
+                line = raw.rstrip("\n")
+                if not line.strip():
+                    continue
+                stripped = line.strip()
+                if set(stripped) <= set("- "):
+                    continue
+                if stripped.startswith("*") or stripped.startswith("Report:"):
+                    continue
+                if len(line) <= pos[1]:
+                    continue
+                name = line[pos[0]:pos[1]].strip()
+                typ = line[pos[1]:pos[2]].strip()
+                if not name or not typ:
+                    continue
+                value = self._clean_app_option_cell(line[pos[2]:pos[3]])
+                user_value = self._clean_app_option_cell(line[pos[3]:pos[4]])
+                user_default = self._clean_app_option_cell(line[pos[4]:pos[5]])
+                system_default = self._clean_app_option_cell(line[pos[5]:pos[6]])
+                scope = self._clean_app_option_cell(line[pos[6]:pos[7]])
+                status = self._clean_app_option_cell(line[pos[7]:pos[8]])
+                source = self._clean_app_option_cell(line[pos[8]:])
+                opts[name] = {
+                    "type": typ,
+                    "value": value,
+                    "user_value": user_value,
+                    "user_default": user_default,
+                    "system_default": system_default,
+                    "scope": scope,
+                    "status": status,
+                    "source": source,
+                }
+            if opts:
+                return opts
+
+        # Innovus stage report fallback:
+        # Attribute Name | Data Type:Default | Current Value
+        header = None
+        positions = None
+        for idx, line in enumerate(lines):
+            if ("Attribute Name" in line and "Data Type:Default" in line
+                    and "Current Value" in line):
+                header = idx
+                positions = [
+                    line.find("Attribute Name"),
+                    line.find("Data Type:Default"),
+                    line.find("Current Value"),
+                ]
+                break
+        if header is None or positions is None or min(positions) < 0:
             return opts
-        pos = positions + [None]
+        p0, p1, p2 = positions
         for raw in lines[header + 1:]:
             line = raw.rstrip("\n")
-            if not line.strip():
-                continue
             stripped = line.strip()
-            if set(stripped) <= set("- "):
+            if not stripped or set(stripped) <= set("- "):
                 continue
-            if stripped.startswith("*") or stripped.startswith("Report:"):
+            if stripped.startswith("*") or stripped.startswith("="):
                 continue
-            if len(line) <= pos[1]:
+            if len(line) <= p1:
                 continue
-            name = line[pos[0]:pos[1]].strip()
-            typ = line[pos[1]:pos[2]].strip()
-            if not name or not typ:
+            name = line[p0:p1].strip()
+            typ_default = line[p1:p2].strip()
+            value = self._clean_app_option_cell(line[p2:])
+            if not name or not typ_default:
                 continue
-            value = self._clean_app_option_cell(line[pos[2]:pos[3]])
-            user_value = self._clean_app_option_cell(line[pos[3]:pos[4]])
-            user_default = self._clean_app_option_cell(line[pos[4]:pos[5]])
-            system_default = self._clean_app_option_cell(line[pos[5]:pos[6]])
-            scope = self._clean_app_option_cell(line[pos[6]:pos[7]])
-            status = self._clean_app_option_cell(line[pos[7]:pos[8]])
-            source = self._clean_app_option_cell(line[pos[8]:])
+            typ = typ_default.split(":", 1)[0].strip() if ":" in typ_default else typ_default
+            default = typ_default.split(":", 1)[1].strip() if ":" in typ_default else ""
             opts[name] = {
                 "type": typ,
                 "value": value,
-                "user_value": user_value,
-                "user_default": user_default,
-                "system_default": system_default,
-                "scope": scope,
-                "status": status,
-                "source": source,
+                "user_value": value,
+                "user_default": "-",
+                "system_default": default,
+                "scope": "-",
+                "status": "-",
+                "source": "-",
             }
         return opts
 
@@ -7585,31 +9178,42 @@ class PDDashboard(QMainWindow):
     def show_app_options_diff(self):
         checked = []
         seen = set()
-        for item in self._checked_run_items():
+        for item in list(self._checked_run_items()) + list(self._checked_stage_items()):
             run = item.data(0, Qt.UserRole + 10) or {}
             path = item.text(15)
-            if not path or path == "N/A" or path in seen:
+            role = item.data(0, Qt.UserRole)
+            if role == "STAGE":
+                parent = item.parent()
+                key = (parent.text(15) if parent else "", item.text(0), path)
+            else:
+                key = (path, "", "")
+            if not path or path == "N/A" or key in seen:
                 continue
-            seen.add(path)
-            if run.get("run_type") and run.get("run_type") != "FE":
+            seen.add(key)
+            if role != "STAGE" and run.get("run_type") and run.get("run_type") != "FE":
                 continue
             checked.append(item)
         if len(checked) < 2:
             QMessageBox.information(
                 self, "App Options Diff",
-                "Check 2 or more FE runs, then open Utilities > App Options Diff.")
+                "Check 2 or more FE runs or BE stage rows, then open Utilities > App Options Diff.")
             return
 
         rows = []
         all_options = set()
         for item in checked:
             run = item.data(0, Qt.UserRole + 10) or {}
-            block = run.get("block") or item.data(0, Qt.UserRole + 2) or ""
-            rpt = self._find_app_options_report(item.text(15), block)
+            is_stage = item.data(0, Qt.UserRole) == "STAGE"
+            parent = item.parent() if is_stage else None
+            block = (item.data(0, Qt.UserRole + 2)
+                     or (parent.data(0, Qt.UserRole + 2) if parent else "")
+                     or run.get("block") or "")
+            rpt = (self._find_stage_app_options_report(item) if is_stage
+                   else self._find_app_options_report(item.text(15), block))
             opts = self._parse_app_options_report(rpt) if rpt else {}
             all_options.update(opts.keys())
             rows.append({
-                "name": item.text(0),
+                "name": (parent.text(0) + " / " + item.text(0)) if is_stage else item.text(0),
                 "block": block,
                 "path": item.text(15),
                 "report": rpt,
@@ -7617,7 +9221,7 @@ class PDDashboard(QMainWindow):
             })
         if not all_options:
             missing = [r["name"] for r in rows if not r["report"]]
-            msg = "No report_app_options.full reports were found for the selected FE runs."
+            msg = "No app-options reports were found for the selected runs/stages."
             if missing:
                 msg += "\n\nMissing reports for:\n" + "\n".join(missing[:12])
             QMessageBox.information(self, "App Options Diff", msg)
@@ -7625,7 +9229,7 @@ class PDDashboard(QMainWindow):
 
         dlg = QDialog(self)
         self._prepare_utility_dialog(dlg)
-        dlg.setWindowTitle("App Options Diff  ({} FE runs)".format(len(rows)))
+        dlg.setWindowTitle("App Options Diff  ({} item(s))".format(len(rows)))
         dlg.resize(min(520 + len(rows) * 190, 1600), 720)
         layout = QVBoxLayout(dlg)
 
@@ -7844,19 +9448,12 @@ class PDDashboard(QMainWindow):
             pass
         return 0
 
-    def fit_all_columns(self):
-        for i in range(self.tree.columnCount()):
-            if not self.tree.isColumnHidden(i):
-                self.tree.resizeColumnToContents(i)
-        self._fit_run_name_column()
-
-
 # ----------------------------------------------------------------------
 # ENTRY POINT
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setApplicationName("Singularity PD")
+    app.setApplicationName("Flow Pulse")
     window = PDDashboard()
     window.showMaximized()
     sys.exit(app.exec_())
