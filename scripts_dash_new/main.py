@@ -2129,7 +2129,7 @@ class BlockSummaryDialog(QDialog):
     def __init__(self, rtl_label, run_list, is_dark, parent=None):
         """run_list: list of (blk, run_path, run_name, runtime, source)"""
         super().__init__(parent)
-        self.setWindowTitle("Block Summary: " + str(rtl_label))
+        self.setWindowTitle("FE Block Summary: " + str(rtl_label))
         self.setWindowFlags(
             self.windowFlags()
             | Qt.WindowMaximizeButtonHint
@@ -2776,6 +2776,7 @@ class PDDashboard(QMainWindow):
         self._stage_metric_cache = {}
         self._stage_metric_workers = []
         self._stage_metric_request_token = 0
+        self._stage_metric_last_key = None
 
         # -- theme/display ------------------------------------------------
         self.is_dark_mode          = False
@@ -3510,7 +3511,7 @@ class PDDashboard(QMainWindow):
         self._add_separator(top_layout)
 
         # Utilities menu (renamed from Actions)
-        self.actions_btn  = QPushButton("Utilities  v")
+        self.actions_btn  = QPushButton("Utilities")
         self.actions_menu = QMenu(self)
 
         view_menu = self.actions_menu.addMenu("Tree View")
@@ -3536,7 +3537,7 @@ class PDDashboard(QMainWindow):
         analysis_menu.addAction("App Options Diff", self.show_app_options_diff)
 
         summary_menu = self.actions_menu.addMenu("Summaries / Timeline")
-        summary_menu.addAction("Block Summary Table", self.open_block_summary)
+        summary_menu.addAction("FE Block Summary Table", self.open_block_summary)
         summary_menu.addAction("BE Stage Summary Table",
                                self.show_be_stage_summary_table)
         summary_menu.addAction("Timeline Overview",
@@ -4308,7 +4309,7 @@ class PDDashboard(QMainWindow):
                     "Std Cell Area: " + str(std_area),
                 ])
             else:
-                lines.append("Use QoR Summary or Block Summary to load detailed FE metrics.")
+                lines.append("Use QoR Summary or FE Block Summary to load detailed FE metrics.")
             item.setToolTip(0, base + marker + "\n" + "\n".join(lines))
         except Exception:
             return
@@ -4402,6 +4403,12 @@ class PDDashboard(QMainWindow):
             lines.append("Parser warning: {}".format(metrics.get("error")))
         return "\n".join(lines) if lines else "No BE stage metric reports found."
 
+    def _strip_tooltip_block(self, tip, marker):
+        tip = tip or ""
+        if marker in tip:
+            return tip.split(marker, 1)[0].rstrip()
+        return tip
+
     def _update_stage_metric_panel(self, item):
         if not item or item.data(0, Qt.UserRole) != "STAGE" or not item.parent():
             self._hide_stage_metric_panel()
@@ -4414,7 +4421,9 @@ class PDDashboard(QMainWindow):
         runtime = item.text(12) or "-"
         key = (be_path or "", stage_path or "", stage_name or "", block or "", runtime or "")
         self.stage_metric_box.setVisible(True)
-        self.stage_metric_text.setPlainText("Loading BE stage metrics...")
+        if self._stage_metric_last_key != key:
+            self.stage_metric_text.setPlainText("Loading BE stage metrics...")
+        self._stage_metric_last_key = key
         self._stage_metric_request_token += 1
         token = self._stage_metric_request_token
         if key in self._stage_metric_cache:
@@ -4463,7 +4472,8 @@ class PDDashboard(QMainWindow):
         text = self._format_stage_metrics(metrics)
         self.stage_metric_text.setPlainText(text)
         try:
-            base_tip = item.toolTip(0) or item.text(0)
+            marker = "\n\n[BE Stage Metrics]\n"
+            base_tip = self._strip_tooltip_block(item.toolTip(0) or item.text(0), marker)
             item.setToolTip(0, base_tip + "\n\n[BE Stage Metrics]\n" + text)
         except Exception:
             pass
@@ -5592,6 +5602,35 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
     # ------------------------------------------------------------------
+    def _guess_owner_from_run_name(self, name):
+        name = name or ""
+        base = name.replace("-FE", "").replace("-BE", "")
+        toks = [t for t in re.split(r'[-_]+', base) if t]
+        skip = set(["EVT0", "EVT1", "ML0", "ML1", "ML2", "ML3", "ML4",
+                    "DEV00", "DEV01", "DEV02", "DEV03", "DEV04",
+                    "PRE", "SVP", "FFN", "SYN", "AUTOFP", "FP", "DP",
+                    "TRIAL", "FINAL", "PHYSYN", "PRESVP", "POSTSVP"])
+        for i, tok in enumerate(toks):
+            low = tok.lower()
+            if len(low) < 3:
+                continue
+            if low.upper() in skip:
+                continue
+            if re.match(r'^[a-z][a-z]+$', low):
+                if i + 1 < len(toks) and re.match(r'^[a-z][a-z]+$', toks[i + 1].lower()):
+                    return low + "." + toks[i + 1].lower()
+                return low
+        return "Unknown"
+
+    def _display_owner_for_run(self, run):
+        owner = (run.get("owner") or "").strip()
+        if owner and owner != "Unknown":
+            return owner
+        guessed = self._guess_owner_from_run_name(run.get("r_name", ""))
+        if guessed and guessed != "Unknown":
+            return guessed
+        return "Unknown"
+
     def _create_run_item(self, parent_item, run):
         child = CustomTreeItem(parent_item)
         child.setFlags(
@@ -5599,10 +5638,13 @@ class PDDashboard(QMainWindow):
         child.setCheckState(0, Qt.Unchecked)
 
         r_name = run["r_name"]
+        display_owner = self._display_owner_for_run(run)
+        if display_owner != "Unknown" and not (run.get("owner") and run.get("owner") != "Unknown"):
+            run["owner"] = display_owner
         child.setText(0, r_name)
         child.setText(1, run["rtl"])
         child.setText(2, run["source"])
-        child.setText(5, run.get("owner", ""))
+        child.setText(5, display_owner)
         child.setText(15, run["path"])
         child.setText(22, "")
         child.setData(0, Qt.UserRole + 2, run["block"])
@@ -5858,6 +5900,19 @@ class PDDashboard(QMainWindow):
                     val = 0.0
             item.setData(0, Qt.UserRole + 60, val)
 
+    def _move_special_roots_to_bottom(self):
+        try:
+            root = self.tree.invisibleRootItem()
+            for role in ("STANDALONE_ROOT", "IGNORED_ROOT"):
+                for i in range(root.childCount()):
+                    child = root.child(i)
+                    if child.data(0, Qt.UserRole) == role:
+                        moved = root.takeChild(i)
+                        root.addChild(moved)
+                        break
+        except Exception:
+            pass
+
     def _apply_tree_sort(self):
         mode = getattr(self, "_tree_sort_mode", "Start Date Old->New")
         self.tree.setProperty("flow_sort_mode", "")
@@ -5883,6 +5938,7 @@ class PDDashboard(QMainWindow):
             col, order = 13, Qt.AscendingOrder
         self.tree.sortByColumn(col, order)
         self.tree.header().setSortIndicator(col, order)
+        self._move_special_roots_to_bottom()
 
     def _set_tree_sort_mode(self, mode):
         self._tree_sort_mode = mode
@@ -6041,6 +6097,28 @@ class PDDashboard(QMainWindow):
         _UR   = Qt.UserRole
         _UR10 = Qt.UserRole + 10
 
+        def _item_has_pinned_desc(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                p = ch.text(15)
+                if p and p in _pins:
+                    return True
+                run = ch.data(0, _UR10)
+                if run:
+                    for st in run.get("stages", []) or []:
+                        sp = st.get("stage_path", "")
+                        if sp and sp in _pins:
+                            return True
+                if _item_has_pinned_desc(ch):
+                    return True
+            run = item.data(0, _UR10)
+            if run:
+                for st in run.get("stages", []) or []:
+                    sp = st.get("stage_path", "")
+                    if sp and sp in _pins:
+                        return True
+            return False
+
         def _update_visibility(item):
             node_type = item.data(0, _UR)
             if node_type == "__PLACEHOLDER__":
@@ -6078,6 +6156,8 @@ class PDDashboard(QMainWindow):
             else:
                 run         = item.data(0, _UR10)
                 passes      = _passes(run)
+                if _pinned_only and not passes and _item_has_pinned_desc(item):
+                    passes = True
                 rt_type_run = run.get("run_type") if run else None
                 item.setHidden(not passes)
                 if passes and run:
@@ -6090,12 +6170,21 @@ class PDDashboard(QMainWindow):
                         # When BE-only: hide synthesis stages of FE parent
                         hide_stage = not passes or (
                             _be_only and rt_type_run == "FE")
+                        if _pinned_only:
+                            parent_pinned = bool(run and run.get("path") in _pins)
+                            stage_pinned = bool(ch.text(15) and ch.text(15) in _pins)
+                            hide_stage = not (parent_pinned or stage_pinned)
                         ch.setHidden(hide_stage)
                     else:
                         # BE child run under FE item: hide when FE-only
                         child_run = ch.data(0, _UR10)
                         child_rt  = child_run.get("run_type") if child_run else None
                         hide_child = not passes or (_fe_only and child_rt == "BE")
+                        if _pinned_only:
+                            child_path = child_run.get("path") if child_run else ch.text(15)
+                            hide_child = not (
+                                (child_path and child_path in _pins)
+                                or _item_has_pinned_desc(ch))
                         ch.setHidden(hide_child)
                 return passes
 
@@ -6297,9 +6386,13 @@ class PDDashboard(QMainWindow):
             m.addSeparator()
 
         be_stage_table_act = None
+        app_opt_paths_act = None
         if is_stage or is_be_run:
             be_stage_table_act = m.addAction(
                 "Generate BE Stage Summary Table")
+            if is_stage:
+                app_opt_paths_act = m.addAction(
+                    "Show App Options Search Paths")
             m.addSeparator()
 
         # Copy cell submenu -- copy any visible column value
@@ -6330,6 +6423,10 @@ class PDDashboard(QMainWindow):
 
         if be_stage_table_act and res == be_stage_table_act:
             self.show_be_stage_summary_table(item)
+            return
+
+        if app_opt_paths_act and res == app_opt_paths_act:
+            self.show_stage_app_options_search_paths(item)
             return
 
         # Handle copy actions
@@ -6609,9 +6706,9 @@ class PDDashboard(QMainWindow):
 
         if not run_list:
             QMessageBox.information(
-                self, "Block Summary",
+                self, "FE Block Summary",
                 "Please check (tick) the FE runs you want to include\n"
-                "in the summary table, then click Block Summary Table.")
+                "in the summary table, then click FE Block Summary Table.")
             return
 
         rtl_label = self.rel_combo.currentText()
@@ -8785,15 +8882,7 @@ class PDDashboard(QMainWindow):
         if not item or item.data(0, Qt.UserRole) != "STAGE":
             return ""
         stage = item.text(0)
-        patterns = [
-            "{}.opt.options.rpt".format(stage),
-            "{}.env.app_options.full.rpt".format(stage),
-            "{}env.app_options.full.rpt".format(stage),
-            "*.opt.options.rpt",
-            "*.env.app_options.full.rpt",
-            "*env.app_options.full.rpt",
-            "*.app_options.full.rpt",
-        ]
+        patterns = self._stage_app_options_patterns(stage)
         hits = []
         for d in self._stage_report_dirs_for_item(item):
             try:
@@ -8816,6 +8905,39 @@ class PDDashboard(QMainWindow):
             return sorted(hits, key=os.path.getmtime)[-1]
         except Exception:
             return sorted(hits)[-1]
+
+    def _stage_app_options_patterns(self, stage):
+        return [
+            "{}.opt.options.rpt".format(stage),
+            "{}.env.app_options.full.rpt".format(stage),
+            "{}env.app_options.full.rpt".format(stage),
+            "*.opt.options.rpt",
+            "*.env.app_options.full.rpt",
+            "*env.app_options.full.rpt",
+            "*.app_options.full.rpt",
+        ]
+
+    def show_stage_app_options_search_paths(self, item):
+        if not item or item.data(0, Qt.UserRole) != "STAGE":
+            QMessageBox.information(
+                self, "App Options Search Paths",
+                "Select or right-click a PNR stage row.")
+            return
+        stage = item.text(0)
+        dirs = self._stage_report_dirs_for_item(item)
+        patterns = self._stage_app_options_patterns(stage)
+        found = self._find_stage_app_options_report(item)
+        lines = [
+            "Stage: {}".format(stage),
+            "Found: {}".format(found if found else "NO MATCH"),
+            "",
+            "Directories tried:",
+        ]
+        lines.extend(["  " + d for d in dirs])
+        lines.extend(["", "Filename patterns tried:"])
+        lines.extend(["  " + p for p in patterns])
+        QMessageBox.information(
+            self, "App Options Search Paths", "\n".join(lines))
 
     def _parse_app_options_report(self, path):
         opts = {}
