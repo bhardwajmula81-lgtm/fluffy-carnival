@@ -2793,6 +2793,11 @@ class PDDashboard(QMainWindow):
         # -- worker/state -------------------------------------------------
         self.size_workers           = []
         self._stage_workers         = []
+        self.worker                 = None
+        self._metric_worker          = None
+        self._qor_worker             = None
+        self._disk_scan_worker       = None
+        self._metric_batch_worker    = None
         self.item_map               = {}
         self._signoff_items_by_path  = {}
         self._signoff_worker         = None
@@ -2914,6 +2919,76 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CLOSE
     # ------------------------------------------------------------------
+    def _cancel_worker_if_possible(self, worker):
+        if not worker:
+            return
+        try:
+            if hasattr(worker, "cancel"):
+                worker.cancel()
+        except Exception:
+            pass
+        try:
+            if hasattr(worker, "requestInterruption"):
+                worker.requestInterruption()
+        except Exception:
+            pass
+
+    def _stop_worker_if_running(self, worker, timeout_ms=1200):
+        if not worker:
+            return
+        try:
+            if not worker.isRunning():
+                return
+        except RuntimeError:
+            return
+        except Exception:
+            return
+        self._cancel_worker_if_possible(worker)
+        try:
+            worker.wait(timeout_ms)
+        except RuntimeError:
+            return
+        except Exception:
+            pass
+        try:
+            if worker.isRunning():
+                worker.terminate()
+                worker.wait(500)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _cancel_worker_list_keep_running(self, workers):
+        kept = []
+        for worker in list(workers or []):
+            self._cancel_worker_if_possible(worker)
+            if self._worker_is_running(worker):
+                kept.append(worker)
+        return kept
+
+    def _stop_worker_list_now(self, workers, timeout_ms=500):
+        for worker in list(workers or []):
+            self._stop_worker_if_running(worker, timeout_ms)
+        return []
+
+    def _shutdown_all_workers(self):
+        for seq_name in (
+                "size_workers", "_stage_workers", "_fe_cong_workers",
+                "_stage_screenshot_workers", "_stage_metric_workers"):
+            seq = getattr(self, seq_name, [])
+            for worker in list(seq or []):
+                self._stop_worker_if_running(worker)
+            try:
+                setattr(self, seq_name, [])
+            except Exception:
+                pass
+        for name in (
+                "worker", "_signoff_worker", "_metric_worker",
+                "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
+                "_hover_metric_worker"):
+            self._stop_worker_if_running(getattr(self, name, None))
+
     def closeEvent(self, event):
         if not prefs.has_section('UI'):
             prefs.add_section('UI')
@@ -2937,7 +3012,8 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'col_hidden', col_hidden)
         with open(USER_PREFS_FILE, 'w') as f:
             prefs.write(f)
-        os._exit(0)
+        self._shutdown_all_workers()
+        event.accept()
 
     # ------------------------------------------------------------------
     # MILESTONE MAP (user-configurable)
@@ -3560,7 +3636,7 @@ class PDDashboard(QMainWindow):
         resource_menu.addAction("Disk Space", self.open_disk_usage)
         resource_menu.addAction("Team Workload View", self.show_team_workload)
 
-        self.actions_btn.setMenu(self.actions_menu)
+        self.actions_btn.clicked.connect(self._show_utilities_menu)
         top_layout.addWidget(self.actions_btn)
 
         # Settings button -- always visible in toolbar
@@ -4314,6 +4390,14 @@ class PDDashboard(QMainWindow):
         except Exception:
             return
 
+    def _show_utilities_menu(self):
+        try:
+            pos = self.actions_btn.mapToGlobal(
+                QPoint(0, self.actions_btn.height()))
+            self.actions_menu.exec_(pos)
+        except Exception:
+            pass
+
     def _clear_fe_hover_metric_tooltips(self):
         marker = "\n[FE Hover Metrics]"
         try:
@@ -4407,6 +4491,9 @@ class PDDashboard(QMainWindow):
         tip = tip or ""
         if marker in tip:
             return tip.split(marker, 1)[0].rstrip()
+        loose = "[BE Stage Metrics]"
+        if loose in tip:
+            return tip.split(loose, 1)[0].rstrip()
         return tip
 
     def _update_stage_metric_panel(self, item):
@@ -5089,10 +5176,14 @@ class PDDashboard(QMainWindow):
         if hasattr(self, 'worker') and self._worker_is_running(self.worker):
             return
         clear_path_cache()
-        for w in list(self.size_workers):
-            if hasattr(w, 'cancel'):
-                w.cancel()
-        self.size_workers.clear()
+        self.size_workers = self._cancel_worker_list_keep_running(
+            self.size_workers)
+        self._stage_workers = self._stop_worker_list_now(self._stage_workers)
+        self._fe_cong_workers = self._stop_worker_list_now(self._fe_cong_workers)
+        self._stage_screenshot_workers = self._stop_worker_list_now(
+            self._stage_screenshot_workers)
+        self._stage_metric_workers = self._stop_worker_list_now(
+            self._stage_metric_workers)
         self.item_map.clear()
         self._signoff_bg_done = False
         if self._worker_is_running(self._signoff_worker):
@@ -5375,10 +5466,14 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _build_tree(self):
         """Build the full tree once. Filtering done by setHidden() only."""
-        for w in list(self.size_workers):
-            if hasattr(w, 'cancel'):
-                w.cancel()
-        self.size_workers.clear()
+        self.size_workers = self._cancel_worker_list_keep_running(
+            self.size_workers)
+        self._stage_workers = self._stop_worker_list_now(self._stage_workers)
+        self._fe_cong_workers = self._stop_worker_list_now(self._fe_cong_workers)
+        self._stage_screenshot_workers = self._stop_worker_list_now(
+            self._stage_screenshot_workers)
+        self._stage_metric_workers = self._stop_worker_list_now(
+            self._stage_metric_workers)
         self.item_map.clear()
         self._signoff_items_by_path.clear()
         if self._worker_is_running(self._signoff_worker):
@@ -5845,31 +5940,35 @@ class PDDashboard(QMainWindow):
 
     def _on_stage_details_loaded(self, be_item, enriched_stages):
         """Called by StageDetailWorker when stage timing/FM/VSLP is ready."""
-        be_run = be_item.data(0, Qt.UserRole + 11)
-        if be_run:
-            be_run["stages"] = enriched_stages
-        for i in range(be_item.childCount()):
-            ch = be_item.child(i)
-            if ch.data(0, Qt.UserRole) != "STAGE":
-                continue
-            sname = ch.text(0)
-            for s in enriched_stages:
-                if s["name"] == sname:
-                    s_start = s.get("info", {}).get("start", "")
-                    s_end   = s.get("info", {}).get("end", "")
-                    ch.setData(0, Qt.UserRole + 40, s_start)
-                    ch.setData(0, Qt.UserRole + 41, s_end)
-                    ch.setText(12, s.get("info", {}).get("runtime", "-"))
-                    ch.setText(13, self._fmt_ts(s_start))
-                    ch.setText(14, self._fmt_ts(s_end))
-                    ch.setText(7,  "NONUPF - " + s["st_n"])
-                    ch.setText(8,  "UPF - "    + s["st_u"])
-                    ch.setText(9,  s["vslp_status"])
-                    self._apply_fm_color(ch, 7, ch.text(7))
-                    self._apply_fm_color(ch, 8, ch.text(8))
-                    self._apply_vslp_color(ch, 9, ch.text(9))
-                    break
-        # Clean up finished workers
+        try:
+            be_run = be_item.data(0, Qt.UserRole + 11)
+            if be_run:
+                be_run["stages"] = enriched_stages
+            for i in range(be_item.childCount()):
+                ch = be_item.child(i)
+                if ch.data(0, Qt.UserRole) != "STAGE":
+                    continue
+                sname = ch.text(0)
+                for s in enriched_stages:
+                    if s["name"] == sname:
+                        s_start = s.get("info", {}).get("start", "")
+                        s_end   = s.get("info", {}).get("end", "")
+                        ch.setData(0, Qt.UserRole + 40, s_start)
+                        ch.setData(0, Qt.UserRole + 41, s_end)
+                        ch.setText(12, s.get("info", {}).get("runtime", "-"))
+                        ch.setText(13, self._fmt_ts(s_start))
+                        ch.setText(14, self._fmt_ts(s_end))
+                        ch.setText(7,  "NONUPF - " + s["st_n"])
+                        ch.setText(8,  "UPF - "    + s["st_u"])
+                        ch.setText(9,  s["vslp_status"])
+                        self._apply_fm_color(ch, 7, ch.text(7))
+                        self._apply_fm_color(ch, 8, ch.text(8))
+                        self._apply_vslp_color(ch, 9, ch.text(9))
+                        break
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
         self._stage_workers = self._keep_running_workers(self._stage_workers)
 
     # ------------------------------------------------------------------
