@@ -111,6 +111,12 @@ class CustomTreeItem(QTreeWidgetItem):
                 return s1 < s2 if asc else s1 > s2
 
         if col == 0:
+            if self.treeWidget().property("flow_sort_mode") == "modified":
+                v1 = self.data(0, Qt.UserRole + 60) or 0
+                v2 = other.data(0, Qt.UserRole + 60) or 0
+                if v1 != v2:
+                    asc = self.treeWidget().header().sortIndicatorOrder() == Qt.AscendingOrder
+                    return v1 < v2 if asc else v1 > v2
             if t1 == "[ Ignored Runs ]": return False
             if t2 == "[ Ignored Runs ]": return True
             m_order = {"INITIAL RELEASE": 1, "PRE-SVP": 2, "SVP": 3, "FFN": 4}

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Singularity PD | Pro Edition -- main.py
+# Flow Pulse | Pro Edition -- main.py
 # Pure ASCII comments only (Python 3.6 compatible on Linux)
 
 import os
@@ -2360,10 +2360,11 @@ class BlockSummaryDialog(QDialog):
             item.setTextAlignment(Qt.AlignCenter)
             if c in (0, 1):
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                item.setForeground(QColor("#64b5f6" if self.is_dark else "#1565c0"))
+                item.setToolTip("Double-click to open run folder:\n" + str(_run_path))
+                item.setData(Qt.UserRole, _run_path)
                 if c == 0:
                     f2 = item.font(); f2.setBold(True); item.setFont(f2)
-                    # Store run_path on col-0 for double-click gvim open
-                    item.setData(Qt.UserRole, _run_path)
             # Color R2R Setup WNS (col 8)
             if c == self._COL_R2R_SETUP:
                 try:
@@ -2437,6 +2438,15 @@ class BlockSummaryDialog(QDialog):
         c = item.column()
         col0 = self.tbl.item(item.row(), 0)
         run_path = col0.data(Qt.UserRole) if col0 else None
+        if c in (0, 1) and run_path:
+            try:
+                subprocess.Popen(['xdg-open', run_path])
+            except Exception:
+                try:
+                    subprocess.Popen(['gvim', run_path])
+                except Exception as e:
+                    QMessageBox.warning(self, "Open Path", str(e))
+            return
         pats = self._COL_REPORT.get(c)
         if not pats or not run_path:
             return
@@ -2457,7 +2467,7 @@ class BEStageSummaryDialog(QDialog):
     HEADERS = [
         "Block", "BE Run", "Stage",
         "R2R Setup W/T/N", "Total Setup W/T/N",
-        "R2R Hold W/T/N", "Total Hold W/T/N",
+        "Hold W/T/N",
         "Cong/Shorts", "Std Cell Count/Area", "GC",
         "Std Cell/Std Only Util", "Total Util",
         "VT Inst%", "VT Area%", "Skew/Latency",
@@ -2495,8 +2505,9 @@ class BEStageSummaryDialog(QDialog):
             self.tbl.setColumnWidth(c, 115)
         self.tbl.setColumnWidth(1, 260)
         self.tbl.setColumnWidth(2, 120)
-        self.tbl.setColumnWidth(8, 160)
-        self.tbl.setColumnWidth(15, 170)
+        self.tbl.setColumnWidth(7, 160)
+        self.tbl.setColumnWidth(14, 170)
+        self.tbl.setColumnWidth(15, 130)
         self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tbl.setAlternatingRowColors(True)
         self.tbl.verticalHeader().setVisible(False)
@@ -2561,6 +2572,15 @@ class BEStageSummaryDialog(QDialog):
             return metrics.get("runtime", "-")
         return metrics.get(key, "-")
 
+    def _vt_header_label(self, rows, suffix):
+        for row in rows or []:
+            metrics = row.get("metrics", {}) if isinstance(row, dict) else {}
+            vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
+            label = vth.get("stage_vt_label")
+            if label:
+                return label + " " + suffix
+        return "VT " + suffix
+
     def _start_loading(self):
         if not self._tasks:
             return
@@ -2582,6 +2602,10 @@ class BEStageSummaryDialog(QDialog):
     def _on_metrics_done(self, rows):
         self.tbl.setSortingEnabled(False)
         self.tbl.setRowCount(0)
+        headers = list(self.HEADERS)
+        headers[11] = self._vt_header_label(rows, "Inst%")
+        headers[12] = self._vt_header_label(rows, "Area%")
+        self.tbl.setHorizontalHeaderLabels(headers)
         for row in rows:
             self._add_row(row, row.get("metrics", {}))
         self.tbl.setSortingEnabled(True)
@@ -2597,7 +2621,6 @@ class BEStageSummaryDialog(QDialog):
             task.get("stage_name", "-"),
             self._metric_value(metrics, "setup_r2r"),
             self._metric_value(metrics, "setup_total"),
-            self._metric_value(metrics, "hold_r2r"),
             self._metric_value(metrics, "hold_total") if self._metric_value(metrics, "hold_total") != "-" else self._metric_value(metrics, "hold_all"),
             self._metric_value(metrics, "cong"),
             self._metric_value(metrics, "std_count_area"),
@@ -2617,7 +2640,7 @@ class BEStageSummaryDialog(QDialog):
             item.setTextAlignment(Qt.AlignCenter)
             if c in (0, 1, 2):
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-            if c in (3, 4, 5, 6):
+            if c in (3, 4, 5):
                 try:
                     first = float(str(val).split("/")[0])
                     if first < 0:
@@ -2687,25 +2710,11 @@ class BEStageSummaryDialog(QDialog):
         if self.tbl.rowCount() == 0:
             QMessageBox.information(self, "Mail", "Generate table first.")
             return
-        nc = self.tbl.columnCount()
-        headers = [self.tbl.horizontalHeaderItem(c).text() for c in range(nc)]
-        # Build HTML table for proper alignment in mail
-        html = ["<table border='1' cellpadding='4' cellspacing='0' "
-                "style='border-collapse:collapse;font-family:monospace;font-size:12px;'>"]
-        html.append("<tr>" + "".join(
-            "<th style='background:#1976d2;color:white;'>{}</th>".format(h)
-            for h in headers) + "</tr>")
-        for r in range(self.tbl.rowCount()):
-            html.append("<tr>" + "".join(
-                "<td>{}</td>".format(
-                    self.tbl.item(r, c).text() if self.tbl.item(r, c) else "")
-                for c in range(nc)) + "</tr>")
-        html.append("</table>")
-        html_body = "\n".join(html)
+        html_body = self._html_table()
         parent = self.parent()
         if parent and hasattr(parent, '_open_mail_compose_dialog'):
             parent._open_mail_compose_dialog(
-                subject="Block Summary: " + self.windowTitle(),
+                subject="BE Stage Summary: " + self.windowTitle(),
                 body=html_body,
                 html_body=html_body)
         else:
@@ -2719,7 +2728,7 @@ class BEStageSummaryDialog(QDialog):
                 self, "Export", "No data yet. Click Generate first.")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export", "block_summary.csv", "CSV Files (*.csv)")
+            self, "Export", "be_stage_summary.csv", "CSV Files (*.csv)")
         if not path:
             return
         try:
@@ -2745,7 +2754,7 @@ class PDDashboard(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Singularity PD | Pro Edition")
+        self.setWindowTitle("Flow Pulse | Pro Edition")
         self.resize(1280, 720)
         self.setMinimumSize(800, 600)
 
@@ -2788,6 +2797,8 @@ class PDDashboard(QMainWindow):
         self._signoff_worker         = None
         self._signoff_bg_done        = False
         self._last_view_preset       = "All Runs"
+        self._tree_sort_mode         = prefs.get(
+            'UI', 'last_sort', fallback='Start Date Old->New')
         self.ignored_paths          = set()
         self._checked_paths         = set()
         self.current_error_log_path = None
@@ -2910,8 +2921,8 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'last_source',  self.src_combo.currentText())
         prefs.set('UI', 'last_rtl',     self.rel_combo.currentText())
         prefs.set('UI', 'last_view',    self.view_combo.currentText())
-        if hasattr(self, "sort_combo"):
-            prefs.set('UI', 'last_sort', self.sort_combo.currentText())
+        prefs.set('UI', 'last_sort', getattr(
+            self, "_tree_sort_mode", "Start Date Old->New"))
         prefs.set('UI', 'last_search',  self.search.text())
         prefs.set('UI', 'last_auto',    self.auto_combo.currentText())
         prefs.set('UI', 'search_history', '|||'.join(self._search_history[:15]))
@@ -3016,9 +3027,52 @@ class PDDashboard(QMainWindow):
         }
         if key not in self._run_history:
             self._run_history[key] = []
+        if self._run_history[key]:
+            last = dict(self._run_history[key][-1])
+            last.pop("ts", None)
+            cmp_entry = dict(entry)
+            cmp_entry.pop("ts", None)
+            if last == cmp_entry:
+                return
         # Keep last 20 entries per run
         self._run_history[key].append(entry)
         self._run_history[key] = self._run_history[key][-20:]
+
+    def _run_regression_entry(self, run):
+        return {
+            "name": run.get("r_name", ""),
+            "runtime": run.get("info", {}).get("runtime", ""),
+            "fm_n": run.get("st_n", ""),
+            "fm_u": run.get("st_u", ""),
+            "vslp": run.get("vslp_status", ""),
+        }
+
+    def _compare_regression_entries(self, prev, curr):
+        issues = []
+        def _mins(rt):
+            m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
+            return int(m.group(1))*60+int(m.group(2)) if m else None
+        pm, cm = _mins(prev.get("runtime","")), _mins(curr.get("runtime",""))
+        if pm and cm and pm > 0 and cm > pm * 1.15:
+            issues.append(
+                "Runtime +{}% ({} -> {})".format(
+                    int((cm-pm)/pm*100), prev.get("runtime","-"),
+                    curr.get("runtime","-")))
+        if ("PASS" in prev.get("fm_n","").upper()
+                and "FAIL" in curr.get("fm_n","").upper()):
+            issues.append("FM-NONUPF PASS->FAILS")
+        if ("PASS" in prev.get("fm_u","").upper()
+                and "FAIL" in curr.get("fm_u","").upper()):
+            issues.append("FM-UPF PASS->FAILS")
+        def _verr(v):
+            m = re.search(r'Error:\s*(\d+)', v or "")
+            return int(m.group(1)) if m else 0
+        pe, ce = _verr(prev.get("vslp","")), _verr(curr.get("vslp",""))
+        if ce > pe and pe == 0:
+            issues.append("VSLP errors 0->{}".format(ce))
+        elif ce > pe*1.5 and pe > 0:
+            issues.append("VSLP errors {}->{}".format(pe, ce))
+        return " | ".join(issues)
 
     def _check_regression(self, run):
         """Compare run to previous entry. Return (has_regression, message).
@@ -3029,33 +3083,8 @@ class PDDashboard(QMainWindow):
             return False, ""
         prev = history[-2]
         curr = history[-1]
-        issues = []
-        # Runtime regression: >15% increase
-        def _mins(rt):
-            m = re.match(r'(\d+)h:(\d+)m:(\d+)s', rt or "")
-            return int(m.group(1))*60+int(m.group(2)) if m else None
-        pm, cm = _mins(prev.get("runtime","")), _mins(curr.get("runtime",""))
-        if pm and cm and pm > 0 and cm > pm * 1.15:
-            issues.append(
-                f"Runtime +{int((cm-pm)/pm*100)}%"
-                f" ({prev['runtime']} -> {curr['runtime']})")
-        # FM regression
-        if ("PASS" in prev.get("fm_n","").upper()
-                and "FAIL" in curr.get("fm_n","").upper()):
-            issues.append("FM-NONUPF PASS->FAILS")
-        if ("PASS" in prev.get("fm_u","").upper()
-                and "FAIL" in curr.get("fm_u","").upper()):
-            issues.append("FM-UPF PASS->FAILS")
-        # VSLP regression
-        def _verr(v):
-            m = re.search(r'Error:\s*(\d+)', v or "")
-            return int(m.group(1)) if m else 0
-        pe, ce = _verr(prev.get("vslp","")), _verr(curr.get("vslp",""))
-        if ce > pe and pe == 0:
-            issues.append(f"VSLP errors 0->{ce}")
-        elif ce > pe*1.5 and pe > 0:
-            issues.append(f"VSLP errors {pe}->{ce}")
-        return (True, " | ".join(issues)) if issues else (False, "")
+        msg = self._compare_regression_entries(prev, curr)
+        return (True, msg) if msg else (False, "")
 
     def _get_run_history_text(self, run):
         """Return formatted history string for inspector panel."""
@@ -3073,7 +3102,7 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _update_title(self):
         import datetime
-        base = "Singularity PD | Pro Edition"
+        base = "Flow Pulse | Pro Edition"
         if self._tapeout_date:
             delta = self._tapeout_date - datetime.datetime.now()
             days  = delta.days
@@ -3261,6 +3290,31 @@ class PDDashboard(QMainWindow):
         _UR   = Qt.UserRole
         _UR10 = Qt.UserRole + 10
         count = [0]
+        sibling_regressions = {}
+        try:
+            groups = {}
+            for it in self._iter_tree_items():
+                run = it.data(0, _UR10)
+                if not run or run.get("run_type") != "FE" or not run.get("is_comp"):
+                    continue
+                key = (run.get("block", ""), run.get("rtl", ""))
+                groups.setdefault(key, []).append((it, run))
+            for key, vals in groups.items():
+                vals.sort(key=lambda pair:
+                          self._parse_dashboard_time(
+                              pair[1].get("info", {}).get("start", ""))
+                          or datetime.datetime.max)
+                prev_run = None
+                for it, run in vals:
+                    if prev_run:
+                        msg = self._compare_regression_entries(
+                            self._run_regression_entry(prev_run),
+                            self._run_regression_entry(run))
+                        if msg:
+                            sibling_regressions[run.get("path", "")] = msg
+                    prev_run = run
+        except Exception:
+            sibling_regressions = {}
 
         def _walk(node):
             for i in range(node.childCount()):
@@ -3278,9 +3332,13 @@ class PDDashboard(QMainWindow):
                     continue
                 # Closure scorecard
                 self._update_closure_on_item(child)
+                child.setData(0, Qt.UserRole + 30, None)
                 # Regression check (only for completed runs with history)
                 if run.get("is_comp"):
                     has_reg, msg = self._check_regression(run)
+                    if not has_reg:
+                        msg = sibling_regressions.get(run.get("path", ""), "")
+                        has_reg = bool(msg)
                     if has_reg:
                         child.setToolTip(
                             0, child.toolTip(0) + f"\n[REGRESSION] {msg}")
@@ -3419,17 +3477,6 @@ class PDDashboard(QMainWindow):
         self.view_combo.currentIndexChanged.connect(self._on_view_changed)
         top_layout.addWidget(self.view_combo)
 
-        self._add_separator(top_layout)
-        top_layout.addWidget(self._label("Sort:"))
-        self.sort_combo = QComboBox()
-        self.sort_combo.addItems(["Date Old->New", "Date New->Old", "Run Name A-Z"])
-        self.sort_combo.setMinimumWidth(125)
-        self.sort_combo.setToolTip("Sort visible run rows by start date or run name")
-        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
-        top_layout.addWidget(self.sort_combo)
-
-        self._add_separator(top_layout)
-
         self.search = QLineEdit()
         self.search.setPlaceholderText(
             "Search runs, blocks, status, runtime...  [Ctrl+F]")
@@ -3466,47 +3513,51 @@ class PDDashboard(QMainWindow):
         self.actions_btn  = QPushButton("Utilities  v")
         self.actions_menu = QMenu(self)
 
-        self.actions_menu.addAction("Fit Columns",             self.fit_all_columns)
-        self.actions_menu.addAction("Expand All",              self.safe_expand_all)
-        self.actions_menu.addAction("Collapse All",            self.safe_collapse_all)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Calculate All Run Sizes", self.calculate_all_sizes)
-        self.actions_menu.addAction("Export to CSV",           self.export_csv)
-        self.actions_menu.addAction("Compare QoR",             self.run_qor_comparison)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Block Summary Table",     self.open_block_summary)
-        self.actions_menu.addSeparator()
+        view_menu = self.actions_menu.addMenu("Tree View")
+        view_menu.addAction("Fit Columns", self.fit_all_columns)
+        view_menu.addAction("Expand All", self.safe_expand_all)
+        view_menu.addAction("Collapse All", self.safe_collapse_all)
+        view_menu.addAction("Deselect All Checked Runs",
+                            self.deselect_all_checked_runs)
 
-        mail_menu = self.actions_menu.addMenu("Send Mail...")
+        export_menu = self.actions_menu.addMenu("Export / Mail")
+        export_menu.addAction("Export to CSV", self.export_csv)
+        mail_menu = export_menu.addMenu("Send Mail...")
         mail_menu.addAction("Cleanup Mail (Selected Runs)", self.send_cleanup_mail_action)
         mail_menu.addAction("Send Compare QoR Mail",        self.send_qor_mail_action)
         mail_menu.addAction("Send Custom Mail",             self.send_custom_mail_action)
-        self.actions_menu.addSeparator()
+        export_menu.addAction("Failed Runs Digest", self.show_failed_digest)
 
-        filt_menu = self.actions_menu.addMenu("Filter Configs...")
+        analysis_menu = self.actions_menu.addMenu("Run Analysis")
+        analysis_menu.addAction("Compare QoR", self.run_qor_comparison)
+        analysis_menu.addAction("Compare Selected Runs", self.show_run_diff)
+        analysis_menu.addAction("RoR Metric Diff", self.show_ror_metric_diff)
+        analysis_menu.addAction("Golden Benchmark", self.show_golden_benchmark)
+        analysis_menu.addAction("App Options Diff", self.show_app_options_diff)
+
+        summary_menu = self.actions_menu.addMenu("Summaries / Timeline")
+        summary_menu.addAction("Block Summary Table", self.open_block_summary)
+        summary_menu.addAction("BE Stage Summary Table",
+                               self.show_be_stage_summary_table)
+        summary_menu.addAction("Timeline Overview",
+                               self.show_selected_timeline_overview)
+        summary_menu.addAction("Analytics / Charts", self.show_analytics)
+
+        filt_menu = self.actions_menu.addMenu("Config / Filters")
         filt_menu.addAction("Load Run Filter Config...", self.load_filter_config)
         self.ignore_run_filter_act = filt_menu.addAction("Ignore Run Filter")
         self.ignore_run_filter_act.setCheckable(True)
         self.ignore_run_filter_act.triggered.connect(self.toggle_ignore_run_filter)
         filt_menu.addAction("Clear Run Filter Config",   self.clear_filter_config)
         filt_menu.addAction("Generate Sample Config",    self.generate_sample_config)
-        self.actions_menu.addSeparator()
+        filt_menu.addAction("Add Checked Runs to Active Filter Config",
+                            self.add_checked_runs_to_filter_config)
 
-        self.actions_menu.addAction("Disk Space",              self.open_disk_usage)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Failed Runs Digest",      self.show_failed_digest)
-        self.actions_menu.addAction("Timeline Overview",       self.show_selected_timeline_overview)
-        self.actions_menu.addAction("Deselect All Checked Runs", self.deselect_all_checked_runs)
-        self.actions_menu.addAction("Add Checked Runs to Active Filter Config", self.add_checked_runs_to_filter_config)
-
-        self.actions_menu.addAction("Compare Selected Runs",   self.show_run_diff)
-        self.actions_menu.addAction("BE Stage Summary Table",  self.show_be_stage_summary_table)
-        self.actions_menu.addAction("App Options Diff",        self.show_app_options_diff)
-        self.actions_menu.addAction("RoR Metric Diff",         self.show_ror_metric_diff)
-        self.actions_menu.addAction("Golden Benchmark",        self.show_golden_benchmark)
-        self.actions_menu.addSeparator()
-        self.actions_menu.addAction("Analytics / Charts",      self.show_analytics)
-        self.actions_menu.addAction("Team Workload View",       self.show_team_workload)
+        resource_menu = self.actions_menu.addMenu("Storage / Team")
+        resource_menu.addAction("Calculate All Run Sizes",
+                                self.calculate_all_sizes)
+        resource_menu.addAction("Disk Space", self.open_disk_usage)
+        resource_menu.addAction("Team Workload View", self.show_team_workload)
 
         self.actions_btn.setMenu(self.actions_menu)
         top_layout.addWidget(self.actions_btn)
@@ -5158,7 +5209,8 @@ class PDDashboard(QMainWindow):
             view = prefs.get('UI', 'last_view',   fallback='All Runs')
             if view == 'BE Only':
                 view = 'All Runs'
-            sort_mode = prefs.get('UI', 'last_sort', fallback='Date Old->New')
+            sort_mode = prefs.get(
+                'UI', 'last_sort', fallback='Start Date Old->New')
             srch = prefs.get('UI', 'last_search', fallback='')
             auto = prefs.get('UI', 'last_auto',   fallback='Off')
             idx = self.src_combo.findText(src)
@@ -5179,12 +5231,7 @@ class PDDashboard(QMainWindow):
                 self.search.blockSignals(True)
                 self.search.setText(srch)
                 self.search.blockSignals(False)
-            if hasattr(self, "sort_combo"):
-                idx = self.sort_combo.findText(sort_mode)
-                if idx >= 0:
-                    self.sort_combo.blockSignals(True)
-                    self.sort_combo.setCurrentIndex(idx)
-                    self.sort_combo.blockSignals(False)
+            self._tree_sort_mode = sort_mode
             idx = self.auto_combo.findText(auto)
             if idx >= 0:
                 self.auto_combo.blockSignals(True)
@@ -5786,19 +5833,59 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # REFRESH VIEW (pure hide/show -- zero item creation)
     # ------------------------------------------------------------------
+    def _iter_tree_items(self):
+        out = []
+        def collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                out.append(child)
+                collect(child)
+        collect(self.tree.invisibleRootItem())
+        return out
+
+    def _cache_modified_times_for_sort(self):
+        for item in self._iter_tree_items():
+            role = item.data(0, Qt.UserRole)
+            if role in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT",
+                        "STANDALONE_ROOT", "__PLACEHOLDER__"):
+                continue
+            path = item.text(15)
+            val = 0.0
+            if path and path not in ("N/A", "-"):
+                try:
+                    val = os.path.getmtime(path)
+                except Exception:
+                    val = 0.0
+            item.setData(0, Qt.UserRole + 60, val)
+
     def _apply_tree_sort(self):
-        mode = (self.sort_combo.currentText()
-                if hasattr(self, "sort_combo") else "Date Old->New")
-        if mode == "Date New->Old":
+        mode = getattr(self, "_tree_sort_mode", "Start Date Old->New")
+        self.tree.setProperty("flow_sort_mode", "")
+        if mode == "Start Date New->Old":
             col, order = 13, Qt.DescendingOrder
+        elif mode == "End Date Old->New":
+            col, order = 14, Qt.AscendingOrder
+        elif mode == "End Date New->Old":
+            col, order = 14, Qt.DescendingOrder
+        elif mode == "Modified Date Old->New":
+            self.tree.setProperty("flow_sort_mode", "modified")
+            self._cache_modified_times_for_sort()
+            col, order = 0, Qt.AscendingOrder
+        elif mode == "Modified Date New->Old":
+            self.tree.setProperty("flow_sort_mode", "modified")
+            self._cache_modified_times_for_sort()
+            col, order = 0, Qt.DescendingOrder
         elif mode == "Run Name A-Z":
+            self.tree.setProperty("flow_sort_mode", "")
             col, order = 0, Qt.AscendingOrder
         else:
+            self.tree.setProperty("flow_sort_mode", "")
             col, order = 13, Qt.AscendingOrder
         self.tree.sortByColumn(col, order)
         self.tree.header().setSortIndicator(col, order)
 
-    def _on_sort_changed(self):
+    def _set_tree_sort_mode(self, mode):
+        self._tree_sort_mode = mode
         self._apply_tree_sort()
         self._fit_run_name_column()
 
@@ -6116,6 +6203,7 @@ class PDDashboard(QMainWindow):
         act_gold = act_good = act_red = act_later = act_clear = None
         gantt_act = None
         timeline_act = None
+        sort_actions = {}
 
         if (run_path and run_path != "N/A") or is_stage:
             pin_menu  = m.addMenu("Pin as...")
@@ -6128,10 +6216,21 @@ class PDDashboard(QMainWindow):
             m.addSeparator()
             if (item.childCount() > 0
                     and item.child(0).data(0, Qt.UserRole) == "STAGE"):
-                gantt_act = m.addAction("Show Timeline (Gantt Chart)")
+                gantt_act = m.addAction("Show Timeline Overview")
                 m.addSeparator()
-            timeline_act = m.addAction("Run Timeline Overview")
-            m.addSeparator()
+            else:
+                timeline_act = m.addAction("Run Timeline Overview")
+                m.addSeparator()
+
+        sort_menu = m.addMenu("Sort Tree By")
+        for label in [
+                "Run Name A-Z",
+                "Start Date Old->New", "Start Date New->Old",
+                "End Date Old->New", "End Date New->Old",
+                "Modified Date Old->New", "Modified Date New->Old"]:
+            act = sort_menu.addAction(label)
+            sort_actions[act] = label
+        m.addSeparator()
 
         edit_note_act = None; note_identifier = ""
         if run_path and run_path != "N/A" and not is_stage:
@@ -6259,18 +6358,12 @@ class PDDashboard(QMainWindow):
                 # Also walk all items in case same path appears multiple times
                 self._apply_pin_icons()
 
+        elif res in sort_actions:
+            self._set_tree_sort_mode(sort_actions[res])
+            return
+
         elif gantt_act and res == gantt_act:
-            stages = []
-            for i in range(item.childCount()):
-                c = item.child(i)
-                if c.data(0, Qt.UserRole) == "STAGE":
-                    rt = c.text(12)
-                    stages.append({
-                        'name': c.text(0),
-                        'time_str': rt,
-                        'sec': self._time_to_seconds(rt)})
-            dlg = GanttChartDialog(item.text(0), stages, self)
-            dlg.exec_()
+            self.show_timeline_overview(item)
 
         elif timeline_act and res == timeline_act:
             self.show_timeline_overview(item)
@@ -8694,9 +8787,10 @@ class PDDashboard(QMainWindow):
         stage = item.text(0)
         patterns = [
             "{}.opt.options.rpt".format(stage),
-            "{}env.app_options.full.rpt".format(stage),
             "{}.env.app_options.full.rpt".format(stage),
+            "{}env.app_options.full.rpt".format(stage),
             "*.opt.options.rpt",
+            "*.env.app_options.full.rpt",
             "*env.app_options.full.rpt",
             "*.app_options.full.rpt",
         ]
@@ -8841,7 +8935,7 @@ class PDDashboard(QMainWindow):
     def show_app_options_diff(self):
         checked = []
         seen = set()
-        for item in self._checked_run_items():
+        for item in list(self._checked_run_items()) + list(self._checked_stage_items()):
             run = item.data(0, Qt.UserRole + 10) or {}
             path = item.text(15)
             role = item.data(0, Qt.UserRole)
@@ -9123,7 +9217,7 @@ class PDDashboard(QMainWindow):
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setApplicationName("Singularity PD")
+    app.setApplicationName("Flow Pulse")
     window = PDDashboard()
     window.showMaximized()
     sys.exit(app.exec_())
