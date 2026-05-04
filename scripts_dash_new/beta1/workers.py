@@ -1075,6 +1075,67 @@ class StageDetailWorker(QThread):
         self.finished.emit(self.be_item, enriched)
 
 
+class QuickStatusRefreshWorker(QThread):
+    finished = pyqtSignal(list)
+    progress = pyqtSignal(int, int)
+
+    def __init__(self, tasks):
+        super().__init__()
+        self.tasks = list(tasks or [])
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def _status_for_run(self, run_path, source):
+        info = parse_runtime_rpt(os.path.join(run_path, "reports", "runtime.V2.rpt"))
+        is_comp = True if source == "OUTFEED" else os.path.exists(
+            os.path.join(run_path, "pass", "compile_opt.pass"))
+        status = "COMPLETED" if is_comp else "RUNNING"
+        if not is_comp:
+            log_file = os.path.join(run_path, "logs", "compile_opt.log")
+            if not os.path.exists(log_file):
+                status = "NOT STARTED"
+            else:
+                try:
+                    with open(log_file, "r", encoding="utf-8", errors="ignore") as lf:
+                        for line in lf:
+                            if "Stack trace for crashing thread" in line:
+                                status = "FATAL ERROR"
+                                break
+                            if "Information: Process terminated by interrupt. (INT-4)" in line:
+                                status = "INTERRUPTED"
+                                break
+                except Exception:
+                    pass
+        return is_comp, status, info
+
+    def run(self):
+        clear_path_cache()
+        out = []
+        total = len(self.tasks)
+        for idx, task in enumerate(self.tasks, 1):
+            if self._cancelled or self.isInterruptionRequested():
+                break
+            row = dict(task)
+            try:
+                is_comp, status, info = self._status_for_run(
+                    task.get("path", ""), task.get("source", "WS"))
+                row["is_comp"] = is_comp
+                row["fe_status"] = status
+                row["info"] = info
+            except Exception as e:
+                row["_error"] = str(e)
+            out.append(row)
+            self.progress.emit(idx, total)
+        if not (self._cancelled or self.isInterruptionRequested()):
+            self.finished.emit(out)
+
+
 # ===========================================================================
 # QoR WORKER -- calls summary.py as subprocess, opens HTML output in Firefox
 # summary.py call signature: python3 summary.py <dir1> <dir2> ...

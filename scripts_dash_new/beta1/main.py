@@ -2910,6 +2910,8 @@ class PDDashboard(QMainWindow):
         self._stage_metric_request_token = 0
         self._running_items = []
         self._visible_run_item_cache = None
+        self._quick_refresh_worker = None
+        self._quick_refresh_items = {}
         self._stage_metric_last_key = None
 
         # -- theme/display ------------------------------------------------
@@ -3023,7 +3025,7 @@ class PDDashboard(QMainWindow):
         self.search_timer.timeout.connect(self.refresh_view)
 
         self.auto_refresh_timer = QTimer(self)
-        self.auto_refresh_timer.timeout.connect(self.start_fs_scan)
+        self.auto_refresh_timer.timeout.connect(self.start_quick_refresh)
 
         self._smart_poll_timer = QTimer(self)
         self._smart_poll_timer.setSingleShot(False)
@@ -3120,7 +3122,7 @@ class PDDashboard(QMainWindow):
         for name in (
                 "worker", "_signoff_worker", "_metric_worker",
                 "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
-                "_hover_metric_worker"):
+                "_hover_metric_worker", "_quick_refresh_worker"):
             self._stop_worker_if_running(getattr(self, name, None))
 
     def closeEvent(self, event):
@@ -3714,7 +3716,9 @@ class PDDashboard(QMainWindow):
         top_layout.addStretch()
 
         self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self.start_fs_scan)
+        self.refresh_btn.setToolTip(
+            "Quick refresh checks only in-progress FE runs. Use Utilities > Tree View > Full Rescan to rediscover all runs.")
+        self.refresh_btn.clicked.connect(self.start_quick_refresh)
         top_layout.addWidget(self.refresh_btn)
 
         self.auto_combo = QComboBox()
@@ -3731,6 +3735,7 @@ class PDDashboard(QMainWindow):
 
         view_menu = self.actions_menu.addMenu("Tree View")
         view_menu.addAction("Fit Columns", self.fit_all_columns)
+        view_menu.addAction("Full Rescan", self.start_fs_scan)
         view_menu.addAction("Expand All", self.safe_expand_all)
         view_menu.addAction("Collapse All", self.safe_collapse_all)
         view_menu.addAction("Deselect All Checked Runs",
@@ -4146,8 +4151,8 @@ class PDDashboard(QMainWindow):
             self.sb_selected, "Click to show only selected (checked) runs",
             self._toggle_selected_only)
         self._make_status_label_clickable(
-            self.sb_scan_time, "Click to refresh scan",
-            self.start_fs_scan)
+            self.sb_scan_time, "Click to quick refresh in-progress runs",
+            self.start_quick_refresh)
         self._make_status_label_clickable(
             self.sb_config, "Click to load or open active filter config",
             self._on_status_config_clicked)
@@ -4254,7 +4259,8 @@ class PDDashboard(QMainWindow):
     # SHORTCUTS
     # ------------------------------------------------------------------
     def _setup_shortcuts(self):
-        QShortcut(QKeySequence("Ctrl+R"), self,      self.start_fs_scan)
+        QShortcut(QKeySequence("Ctrl+R"), self,      self.start_quick_refresh)
+        QShortcut(QKeySequence("Ctrl+Shift+R"), self, self.start_fs_scan)
         QShortcut(QKeySequence("Ctrl+F"), self,      lambda: self.search.setFocus())
         QShortcut(QKeySequence("Ctrl+E"), self,      self.safe_expand_all)
         QShortcut(QKeySequence("Ctrl+W"), self,      self.safe_collapse_all)
@@ -5315,8 +5321,145 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # SCAN
     # ------------------------------------------------------------------
+    def _collect_quick_refresh_tasks(self):
+        tasks = []
+        seen = set()
+        for item in self._iter_tree_items():
+            run = item.data(0, Qt.UserRole + 10)
+            if not run or run.get("run_type") != "FE":
+                continue
+            path = run.get("path") or item.text(15)
+            if not path or path in ("N/A", "-") or path in seen:
+                continue
+            status = run.get("fe_status") or item.text(3)
+            if run.get("is_comp") or status == "COMPLETED":
+                continue
+            seen.add(path)
+            tasks.append({
+                "path": path,
+                "source": run.get("source", item.text(2) or "WS"),
+                "item": item,
+            })
+        return tasks
+
+    def start_quick_refresh(self):
+        if hasattr(self, 'worker') and self._worker_is_running(self.worker):
+            return
+        if self._worker_is_running(getattr(self, "_quick_refresh_worker", None)):
+            return
+        tasks = self._collect_quick_refresh_tasks()
+        if not tasks:
+            if not (self.ws_data or self.out_data):
+                self.start_fs_scan()
+                return
+            self._smart_poll_running()
+            self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
+            self.sb_scan_time.setText("Last refresh: " + self._last_scan_time)
+            return
+        self.prog_container.setVisible(True)
+        self.prog.setRange(0, len(tasks))
+        self.prog.setValue(0)
+        self.prog_lbl.setText(
+            "Quick refresh: checking " + str(len(tasks)) + " in-progress run(s)...")
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.setText("Checking...")
+        try:
+            from workers import QuickStatusRefreshWorker
+            self._quick_refresh_items = {}
+            worker_tasks = []
+            for task in tasks:
+                path = task.get("path", "")
+                self._quick_refresh_items[path] = task.get("item")
+                worker_tasks.append({
+                    "path": path,
+                    "source": task.get("source", "WS"),
+                })
+            self._quick_refresh_worker = QuickStatusRefreshWorker(worker_tasks)
+            self._quick_refresh_worker.progress.connect(
+                self._on_quick_refresh_progress)
+            self._quick_refresh_worker.finished.connect(
+                self._on_quick_refresh_finished)
+            self._quick_refresh_worker.finished.connect(
+                lambda *_: setattr(self, "_quick_refresh_worker", None))
+            self._quick_refresh_worker.start()
+        except Exception as e:
+            self.prog_container.setVisible(False)
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("Refresh")
+            QMessageBox.warning(self, "Quick Refresh", str(e))
+
+    def _on_quick_refresh_progress(self, done, total):
+        self.prog.setRange(0, total)
+        self.prog.setValue(done)
+        self.prog_lbl.setText(
+            "Quick refresh: " + str(done) + "/" + str(total))
+
+    def _on_quick_refresh_finished(self, rows):
+        changed = False
+        for row in rows:
+            item = self._quick_refresh_items.get(row.get("path", ""))
+            if item is None:
+                continue
+            run = item.data(0, Qt.UserRole + 10)
+            if not run:
+                continue
+            status = row.get("fe_status", run.get("fe_status", item.text(3)))
+            is_comp = bool(row.get("is_comp", run.get("is_comp", False)))
+            info = row.get("info") or run.get("info", {})
+            old_status = run.get("fe_status")
+            run["fe_status"] = status
+            run["is_comp"] = is_comp
+            run["info"] = info
+            item.setData(0, Qt.UserRole + 10, run)
+            _dot_map = {
+                "COMPLETED":   "#388e3c", "RUNNING":    "#1976d2",
+                "NOT STARTED": "#9e9e9e", "INTERRUPTED":"#e65100",
+                "FAILED":      "#d32f2f", "FATAL ERROR":"#b71c1c",
+            }
+            dc = _dot_map.get(status, "#9e9e9e")
+            item.setIcon(3, self._create_dot_icon(dc, dc))
+            item.setText(3, status)
+            item.setText(4, "COMPLETED" if is_comp else info.get("last_stage", item.text(4)))
+            item.setText(12, info.get("runtime", item.text(12)))
+            start_raw = info.get("start", item.data(0, Qt.UserRole + 40) or "")
+            end_raw = info.get("end", item.data(0, Qt.UserRole + 41) or "")
+            item.setData(0, Qt.UserRole + 40, start_raw)
+            item.setData(0, Qt.UserRole + 41, end_raw)
+            item.setText(13, self._fmt_ts(start_raw))
+            item.setText(14, self._fmt_ts(end_raw))
+            item.setToolTip(13, start_raw)
+            item.setToolTip(14, end_raw)
+            self._apply_status_color(item, 3, status)
+            if old_status != status:
+                changed = True
+        self._running_items = [
+            item for item in getattr(self, "_running_items", [])
+            if item is not None and item.text(3) == "RUNNING"
+        ]
+        for row in rows:
+            item = self._quick_refresh_items.get(row.get("path", ""))
+            if item is not None and item.text(3) == "RUNNING" and item not in self._running_items:
+                self._running_items.append(item)
+        self._quick_refresh_items = {}
+        self.prog_container.setVisible(False)
+        self.refresh_btn.setEnabled(True)
+        self.refresh_btn.setText("Refresh")
+        self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
+        self.sb_scan_time.setText("Last refresh: " + self._last_scan_time)
+        if changed:
+            self.refresh_view()
+        else:
+            visible = []
+            for item in self._iter_tree_items():
+                run = item.data(0, Qt.UserRole + 10)
+                if run and not item.isHidden():
+                    visible.append(run)
+            self._update_status_bar(visible)
+
     def start_fs_scan(self):
         if hasattr(self, 'worker') and self._worker_is_running(self.worker):
+            return
+        if self._worker_is_running(getattr(self, "_quick_refresh_worker", None)):
             return
         clear_path_cache()
         self.size_workers = self._cancel_worker_list_keep_running(
@@ -7388,7 +7531,8 @@ class PDDashboard(QMainWindow):
         sc_tbl.setAlternatingRowColors(True)
         sc_tbl.verticalHeader().setVisible(False)
         shortcuts_list = [
-            ("Ctrl+R",       "Refresh / rescan all workspaces"),
+            ("Ctrl+R",       "Quick refresh in-progress runs"),
+            ("Ctrl+Shift+R", "Full rescan all workspaces"),
             ("Ctrl+F",       "Focus the search bar"),
             ("Ctrl+E",       "Expand all tree nodes"),
             ("Ctrl+W",       "Collapse all tree nodes"),
