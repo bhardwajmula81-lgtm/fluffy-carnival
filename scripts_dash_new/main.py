@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Flow Pulse | Pro Edition -- main.py
+# Flow Pulse | Beta 1 -- main.py
 # Pure ASCII comments only (Python 3.6 compatible on Linux)
 
 import os
@@ -2140,6 +2140,7 @@ class BlockSummaryDialog(QDialog):
         self._run_list = run_list
         self._pending  = []
         self._active_worker = None
+        self._cancelled = False
 
         layout = QVBoxLayout(self)
 
@@ -2248,6 +2249,7 @@ class BlockSummaryDialog(QDialog):
     def _start_loading(self):
         if not self._run_list:
             return
+        self._cancelled = False
         self.gen_btn.setEnabled(False)
         self.tbl.setRowCount(0)
         self._done_count = 0
@@ -2259,6 +2261,8 @@ class BlockSummaryDialog(QDialog):
         self._load_next()
 
     def _load_next(self):
+        if self._cancelled:
+            return
         if not self._pending:
             self.status_lbl.setText(
                 "Done. " + str(self.tbl.rowCount()) + " rows loaded.")
@@ -2276,6 +2280,10 @@ class BlockSummaryDialog(QDialog):
             w.finished.connect(
                 lambda m, b=blk, rn=run_name, rt=runtime:
                 self._on_row_done(b, rn, rt, m))
+            w.finished.connect(
+                lambda *_args, ww=w:
+                setattr(self, "_active_worker", None)
+                if getattr(self, "_active_worker", None) is ww else None)
             w.start()
             self._active_worker = w
         except Exception as e:
@@ -2285,10 +2293,38 @@ class BlockSummaryDialog(QDialog):
             QTimer.singleShot(10, self._load_next)
 
     def _on_row_done(self, blk, run_name, runtime, metrics):
+        if self._cancelled:
+            return
         self._add_row(blk, run_name, runtime, metrics)
         self._done_count += 1
         self.prog.setValue(self._done_count)
         QTimer.singleShot(10, self._load_next)
+
+    def closeEvent(self, event):
+        self._stop_active_worker()
+        event.accept()
+
+    def accept(self):
+        self._stop_active_worker()
+        super().accept()
+
+    def reject(self):
+        self._stop_active_worker()
+        super().reject()
+
+    def _stop_active_worker(self):
+        self._cancelled = True
+        w = getattr(self, "_active_worker", None)
+        try:
+            if w and w.isRunning():
+                if hasattr(w, "cancel"):
+                    w.cancel()
+                w.wait(1000)
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(300)
+        except Exception:
+            pass
 
     # -- Row builder ------------------------------------------------------
 
@@ -2485,6 +2521,7 @@ class BEStageSummaryDialog(QDialog):
         self.resize(1500, 650)
         self._tasks = list(tasks or [])
         self._worker = None
+        self._cancelled = False
         self.is_dark = is_dark
         layout = QVBoxLayout(self)
 
@@ -2584,6 +2621,7 @@ class BEStageSummaryDialog(QDialog):
     def _start_loading(self):
         if not self._tasks:
             return
+        self._cancelled = False
         self.tbl.setSortingEnabled(False)
         self.tbl.setRowCount(0)
         self.tbl.setSortingEnabled(True)
@@ -2594,12 +2632,16 @@ class BEStageSummaryDialog(QDialog):
         try:
             self._worker = MetricBatchWorker(self._tasks)
             self._worker.finished.connect(self._on_metrics_done)
+            self._worker.finished.connect(
+                lambda *_: setattr(self, "_worker", None))
             self._worker.start()
         except Exception as e:
             self.gen_btn.setEnabled(True)
             QMessageBox.warning(self, "BE Stage Summary", str(e))
 
     def _on_metrics_done(self, rows):
+        if self._cancelled:
+            return
         self.tbl.setSortingEnabled(False)
         self.tbl.setRowCount(0)
         headers = list(self.HEADERS)
@@ -2613,6 +2655,32 @@ class BEStageSummaryDialog(QDialog):
         self.prog.setVisible(False)
         self.gen_btn.setEnabled(True)
         self.status_lbl.setText("Done. {} row(s) loaded.".format(self.tbl.rowCount()))
+
+    def closeEvent(self, event):
+        self._stop_active_worker()
+        event.accept()
+
+    def accept(self):
+        self._stop_active_worker()
+        super().accept()
+
+    def reject(self):
+        self._stop_active_worker()
+        super().reject()
+
+    def _stop_active_worker(self):
+        self._cancelled = True
+        w = getattr(self, "_worker", None)
+        try:
+            if w and w.isRunning():
+                if hasattr(w, "cancel"):
+                    w.cancel()
+                w.wait(1000)
+                if w.isRunning():
+                    w.terminate()
+                    w.wait(300)
+        except Exception:
+            pass
 
     def _add_row(self, task, metrics):
         values = [
@@ -2631,7 +2699,9 @@ class BEStageSummaryDialog(QDialog):
             self._metric_value(metrics, "vt_area"),
             self._metric_value(metrics, "skew_latency"),
             self._metric_value(metrics, "clock_repeater_count_area"),
-            self._metric_value(metrics, "runtime"),
+            (self._metric_value(metrics, "runtime")
+             if self._metric_value(metrics, "runtime") not in ("", "-", "N/A")
+             else task.get("runtime", "-")),
         ]
         r = self.tbl.rowCount()
         self.tbl.insertRow(r)
@@ -2668,41 +2738,6 @@ class BEStageSummaryDialog(QDialog):
                 for c in range(nc)) + "</tr>")
         html_lines.append("</table>")
         return "\n".join(html_lines)
-
-    def _send_mail(self):
-        if self.tbl.rowCount() == 0:
-            QMessageBox.information(self, "Mail", "Generate table first.")
-            return
-        html_body = self._html_table()
-        parent = self.parent()
-        if parent and hasattr(parent, "_open_mail_compose_dialog"):
-            parent._open_mail_compose_dialog(
-                subject="BE Stage Summary: " + self.windowTitle(),
-                body=html_body,
-                html_body=html_body)
-        else:
-            QMessageBox.information(self, "Mail Body", html_body[:3000])
-
-    def _export_csv(self):
-        if self.tbl.rowCount() == 0:
-            QMessageBox.information(self, "Export", "No data yet. Click Generate first.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export", "be_stage_summary.csv", "CSV Files (*.csv)")
-        if not path:
-            return
-        try:
-            with open(path, "w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([self.tbl.horizontalHeaderItem(c).text()
-                            for c in range(self.tbl.columnCount())])
-                for r in range(self.tbl.rowCount()):
-                    w.writerow([self.tbl.item(r, c).text()
-                                if self.tbl.item(r, c) else ""
-                                for c in range(self.tbl.columnCount())])
-            QMessageBox.information(self, "Export", "Saved: " + path)
-        except Exception as e:
-            QMessageBox.warning(self, "Error", str(e))
 
     # -- Mail -------------------------------------------------------------
 
@@ -2754,7 +2789,7 @@ class PDDashboard(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Flow Pulse | Pro Edition")
+        self.setWindowTitle("Flow Pulse | Beta 1")
         self.resize(1280, 720)
         self.setMinimumSize(800, 600)
 
@@ -3179,7 +3214,7 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _update_title(self):
         import datetime
-        base = "Flow Pulse | Pro Edition"
+        base = "Flow Pulse | Beta 1"
         if self._tapeout_date:
             delta = self._tapeout_date - datetime.datetime.now()
             days  = delta.days
@@ -3221,22 +3256,27 @@ class PDDashboard(QMainWindow):
             be_run_path = parent.text(15) if parent else run_path
             run_type = "BE"
             actual_path = be_run_path
+            stage_path = run_path
         else:
             stage_name  = None
             run_type    = "FE"
             actual_path = run_path
+            stage_path = None
 
         # Show progress indicator in status bar
         self.status_bar.showMessage(
             f"Extracting QoR metrics for {run_name}...")
         self.setEnabled(False)
 
+        self._stop_worker_if_running(getattr(self, "_metric_worker", None))
         self._metric_worker = MetricWorker(
             actual_path, item.data(0, Qt.UserRole + 2) or "",
-            run_type, source, stage_name)
+            run_type, source, stage_name, stage_path)
         self._metric_item_name = run_name
         self._metric_dark      = dark
         self._metric_worker.finished.connect(self._on_metric_done)
+        self._metric_worker.finished.connect(
+            lambda *_: setattr(self, "_metric_worker", None))
         self._metric_worker.start()
 
     def _on_metric_done(self, metrics):
@@ -3636,7 +3676,7 @@ class PDDashboard(QMainWindow):
         resource_menu.addAction("Disk Space", self.open_disk_usage)
         resource_menu.addAction("Team Workload View", self.show_team_workload)
 
-        self.actions_btn.clicked.connect(self._show_utilities_menu)
+        self.actions_btn.setMenu(self.actions_menu)
         top_layout.addWidget(self.actions_btn)
 
         # Settings button -- always visible in toolbar
@@ -3662,7 +3702,7 @@ class PDDashboard(QMainWindow):
         self._add_separator(top_layout)
 
         # Notes toggle button
-        self.notes_toggle_btn = QPushButton("[ Notes >> ]")
+        self.notes_toggle_btn = QPushButton("Notes  >")
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
@@ -4052,10 +4092,10 @@ class PDDashboard(QMainWindow):
     def toggle_notes_dock(self):
         if self.inspector_dock.isVisible():
             self.inspector_dock.hide()
-            self.notes_toggle_btn.setText("[ Notes >> ]")
+            self.notes_toggle_btn.setText("Notes  >")
         else:
             self.inspector_dock.show()
-            self.notes_toggle_btn.setText("[ << Notes ]")
+            self.notes_toggle_btn.setText("<  Notes")
 
     def safe_expand_all(self):
         # Populate all lazy BE placeholders first, then expand
@@ -7472,6 +7512,8 @@ class PDDashboard(QMainWindow):
         if (not force and hasattr(self, '_disk_scan_worker')
                 and self._worker_is_running(self._disk_scan_worker)):
             return
+        if force:
+            self._stop_worker_if_running(getattr(self, "_disk_scan_worker", None))
         # Disable disk button while scanning
         if hasattr(self, 'disk_btn'):
             self.disk_btn.setEnabled(False)
@@ -7518,6 +7560,7 @@ class PDDashboard(QMainWindow):
         script = self._resolve_qor_script()
         if not script: return
 
+        self._stop_worker_if_running(getattr(self, "_qor_worker", None))
         worker = QoRWorker(script, sel, _PYTHON_BIN)
         worker.finished.connect(self._on_qor_done)
         worker.start()
@@ -7556,6 +7599,7 @@ class PDDashboard(QMainWindow):
         if be_run_path and not be_run_path.endswith("/"):
             be_run_path += "/"
 
+        self._stop_worker_if_running(getattr(self, "_qor_worker", None))
         worker = QoRWorker(script, [be_run_path, "-stage", stage_name],
                             _PYTHON_BIN)
         worker.finished.connect(self._on_qor_done)
@@ -8855,9 +8899,17 @@ class PDDashboard(QMainWindow):
                 self, "RoR Metric Diff",
                 "Check exactly two FE runs or two stage rows for metric diff.")
             return
+        if len(set(t.get("run_type") for t in tasks)) != 1:
+            QMessageBox.information(
+                self, "RoR Metric Diff",
+                "Compare FE runs with FE runs, or PNR stage rows with PNR stage rows.")
+            return
         self.status_bar.showMessage("Extracting metrics for RoR diff...")
+        self._stop_worker_if_running(getattr(self, "_metric_batch_worker", None))
         self._metric_batch_worker = MetricBatchWorker(tasks)
         self._metric_batch_worker.finished.connect(self._on_ror_metric_done)
+        self._metric_batch_worker.finished.connect(
+            lambda *_: setattr(self, "_metric_batch_worker", None))
         self._metric_batch_worker.start()
 
     def _on_ror_metric_done(self, rows):
@@ -8866,26 +8918,36 @@ class PDDashboard(QMainWindow):
 
     def _find_golden_item_for(self, target_item):
         target_run = target_item.data(0, Qt.UserRole + 10) or {}
-        target_block = target_run.get("block") or target_item.data(0, Qt.UserRole + 2)
-        golden_path = None
-        for path, pin in self.user_pins.items():
-            if pin == "golden":
-                golden_path = path
-                break
+        target_role = target_item.data(0, Qt.UserRole)
+        target_block = (target_run.get("block")
+                        or target_item.data(0, Qt.UserRole + 2)
+                        or (target_item.parent().data(0, Qt.UserRole + 2)
+                            if target_item.parent() else ""))
+        target_metric = self._metric_task_from_item(target_item) or {}
+        target_type = target_metric.get("run_type")
         found = [None]
         def walk(node):
             for i in range(node.childCount()):
                 c = node.child(i)
-                run = c.data(0, Qt.UserRole + 10)
-                if run and self.user_pins.get(c.text(15)) == "golden":
-                    if not found[0] or run.get("block") == target_block:
+                if self.user_pins.get(c.text(15)) == "golden":
+                    c_metric = self._metric_task_from_item(c) or {}
+                    c_run = c.data(0, Qt.UserRole + 10) or {}
+                    c_block = (c_run.get("block")
+                               or c.data(0, Qt.UserRole + 2)
+                               or (c.parent().data(0, Qt.UserRole + 2)
+                                   if c.parent() else ""))
+                    same_type = (not target_type
+                                 or c_metric.get("run_type") == target_type)
+                    same_block = (not target_block or c_block == target_block)
+                    if same_type and (same_block or not found[0]):
                         found[0] = c
                 walk(c)
         walk(self.tree.invisibleRootItem())
         return found[0]
 
     def show_golden_benchmark(self):
-        checked = [i for i in self._checked_run_items()
+        checked = [i for i in (self._checked_run_items()
+                               + self._checked_stage_items())
                    if self._metric_task_from_item(i)]
         if not checked:
             QMessageBox.information(
@@ -8919,8 +8981,11 @@ class PDDashboard(QMainWindow):
                 "Select at least one non-golden run to compare.")
             return
         self.status_bar.showMessage("Extracting metrics for golden benchmark...")
+        self._stop_worker_if_running(getattr(self, "_metric_batch_worker", None))
         self._metric_batch_worker = MetricBatchWorker(tasks)
         self._metric_batch_worker.finished.connect(self._on_golden_metric_done)
+        self._metric_batch_worker.finished.connect(
+            lambda *_: setattr(self, "_metric_batch_worker", None))
         self._metric_batch_worker.start()
 
     def _on_golden_metric_done(self, rows):
@@ -9321,7 +9386,7 @@ class PDDashboard(QMainWindow):
         self._add_standard_dialog_buttons(layout, dlg)
         dlg.exec_()
     def show_run_diff(self):
-        """Compare N checked runs side-by-side."""
+        """Compare N checked FE/BE run or PNR stage rows side-by-side."""
         checked = []
         def collect(node):
             for i in range(node.childCount()):
@@ -9329,7 +9394,7 @@ class PDDashboard(QMainWindow):
                 if (c.checkState(0) == Qt.Checked
                         and c.data(0, Qt.UserRole) not in
                         ("BLOCK","MILESTONE","RTL","IGNORED_ROOT",
-                         "STAGE","__PLACEHOLDER__")):
+                         "__PLACEHOLDER__")):
                     checked.append(c)
                 collect(c)
         collect(self.tree.invisibleRootItem())
@@ -9337,8 +9402,8 @@ class PDDashboard(QMainWindow):
         if len(checked) < 2:
             QMessageBox.information(
                 self, "Compare Runs",
-                "Please check 2 or more runs using the checkboxes,\n"
-                "then click Compare Runs.")
+                "Please check 2 or more FE/BE run or PNR stage rows\n"
+                "using the checkboxes, then click Compare Runs.")
             return
 
         fields = [
@@ -9425,13 +9490,6 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
         return 0
-
-    def fit_all_columns(self):
-        for i in range(self.tree.columnCount()):
-            if not self.tree.isColumnHidden(i):
-                self.tree.resizeColumnToContents(i)
-        self._fit_run_name_column()
-
 
 # ----------------------------------------------------------------------
 # ENTRY POINT

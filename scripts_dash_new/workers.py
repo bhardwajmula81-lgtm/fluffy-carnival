@@ -1089,16 +1089,28 @@ class MetricWorker(QThread):
     finished = pyqtSignal(dict)  # emits metrics dict when done
 
     def __init__(self, run_path, b_name, run_type, source,
-                 stage_name=None):
+                 stage_name=None, stage_path=None):
         super().__init__()
         self.run_path   = run_path
         self.b_name     = b_name
         self.run_type   = run_type
         self.source     = source
         self.stage_name = stage_name  # None for FE, stage name for BE
+        self.stage_path = stage_path
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
 
     def run(self):
         if not _METRICS_AVAILABLE:
+            self.finished.emit({})
+            return
+        if self._cancelled or self.isInterruptionRequested():
             self.finished.emit({})
             return
         try:
@@ -1111,7 +1123,10 @@ class MetricWorker(QThread):
                 m = extract_pnr_stage_metrics(
                     self.run_path, self.stage_name,
                     source=self.source,
-                    block=self.b_name)
+                    block=self.b_name,
+                    stage_path=self.stage_path)
+            if self._cancelled or self.isInterruptionRequested():
+                return
             self.finished.emit(m)
         except Exception as e:
             self.finished.emit({"_error": str(e)})
@@ -1123,6 +1138,14 @@ class MetricBatchWorker(QThread):
     def __init__(self, tasks):
         super().__init__()
         self.tasks = list(tasks or [])
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
 
     def run(self):
         out = []
@@ -1130,6 +1153,8 @@ class MetricBatchWorker(QThread):
             self.finished.emit(out)
             return
         for task in self.tasks:
+            if self._cancelled or self.isInterruptionRequested():
+                break
             row = dict(task)
             try:
                 if task.get("run_type") == "FE":
@@ -1142,13 +1167,17 @@ class MetricBatchWorker(QThread):
                         task.get("path", ""),
                         task.get("stage_name", ""),
                         source=task.get("source", "WS"),
-                        block=task.get("block", ""))
-                    if task.get("runtime"):
+                        block=task.get("block", ""),
+                        stage_path=task.get("stage_path", ""))
+                    if (task.get("runtime")
+                            and str(task.get("runtime")).strip() not in ("", "-", "N/A")
+                            and row["metrics"].get("runtime", "-") in ("", "-", "N/A")):
                         row["metrics"]["runtime"] = task.get("runtime")
             except Exception as e:
                 row["metrics"] = {"_error": str(e)}
             out.append(row)
-        self.finished.emit(out)
+        if not (self._cancelled or self.isInterruptionRequested()):
+            self.finished.emit(out)
 
 
 class QoRWorker(QThread):

@@ -299,8 +299,11 @@ def parse_logic_depth(file_path):
     return "-"
 
 
-def _stage_report_dirs(run_dir, stage_name, source="WS"):
+def _stage_report_dirs(run_dir, stage_name, source="WS", stage_path=None):
     dirs = [
+        os.path.join(stage_path or "", "reports"),
+        os.path.join(stage_path or "", "reports", stage_name),
+        stage_path or "",
         os.path.join(run_dir, "reports", stage_name),
         os.path.join(run_dir, stage_name, "reports", stage_name),
         os.path.join(run_dir, stage_name, "reports"),
@@ -313,8 +316,8 @@ def _stage_report_dirs(run_dir, stage_name, source="WS"):
     return out
 
 
-def _find_stage_rpt(run_dir, stage_name, source, patterns):
-    for d in _stage_report_dirs(run_dir, stage_name, source):
+def _find_stage_rpt(run_dir, stage_name, source, patterns, stage_path=None):
+    for d in _stage_report_dirs(run_dir, stage_name, source, stage_path):
         hit = _find_rpt(d, patterns)
         if hit:
             return hit
@@ -482,6 +485,9 @@ def _parse_stage_runtime(text):
             if re.match(r"\d+d\.\d+h\.\d+m\.\d+s", tok):
                 runtime = tok
                 break
+            if re.match(r"\d+d:\d+h:\d+m:\d+s", tok):
+                runtime = tok
+                break
             if re.match(r"\d+h:\d+m:\d+s", tok):
                 runtime = tok
                 break
@@ -586,7 +592,8 @@ def extract_fe_metrics(run_dir, source="WS", block=None):
     return result
 
 
-def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
+def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
+                              stage_path=None):
     """Extract QoR metrics for a single PNR stage."""
     result = {"stage": stage_name, "run_dir": run_dir}
     b = block or _get_block_name(run_dir)
@@ -595,7 +602,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
     # Keep old FE-like fallbacks for compatibility with older runs.
     qor_sum = _find_stage_rpt(
         run_dir, stage_name, source,
-        ["{}.qor_sum.rpt".format(stage_name), "*.qor_sum.rpt"])
+        ["{}.qor_sum.rpt".format(stage_name), "*.qor_sum.rpt"],
+        stage_path=stage_path)
     qor_path = qor_sum
     if qor_sum:
         text = _read_stage_text(qor_sum)
@@ -612,7 +620,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
             run_dir, stage_name, source,
             ["{}_p*.summary.gz".format(stage_name),
              "{}_p*.summary".format(stage_name),
-             "*_p*.summary.gz"])
+             "*_p*.summary.gz"],
+            stage_path=stage_path)
         if setup_path:
             text = _read_stage_text(setup_path)
             setup_total, setup_r2r = _parse_stage_innovus_setup(text)
@@ -622,7 +631,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
             qor_path = setup_path
         hold_path = _find_stage_rpt(
             run_dir, stage_name, source,
-            ["{}.qor.snap.rpt".format(stage_name), "*.qor.snap.rpt"])
+            ["{}.qor.snap.rpt".format(stage_name), "*.qor.snap.rpt"],
+            stage_path=stage_path)
         if hold_path:
             hold_all = _parse_stage_innovus_hold(_read_stage_text(hold_path))
             result["hold_all"] = hold_all
@@ -633,7 +643,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
     if "r2r_setup" not in result:
         old_qor = _find_stage_rpt(
             run_dir, stage_name, source,
-            ["qor.{}.*.rpt".format(b), "qor.*.rpt"])
+            ["qor.{}.*.rpt".format(b), "qor.*.rpt"],
+            stage_path=stage_path)
         qor_data = parse_qor(old_qor)
         result["r2r_setup"] = qor_data.get("r2r_setup", "-")
         result["r2r_hold"] = qor_data.get("r2r_hold", "-")
@@ -641,12 +652,14 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
 
     area_path = _find_stage_rpt(
         run_dir, stage_name, source,
-        ["{}.sec_get_area.rpt".format(stage_name), "*.sec_get_area.rpt"])
+        ["{}.sec_get_area.rpt".format(stage_name), "*.sec_get_area.rpt"],
+        stage_path=stage_path)
     stage_area = _parse_stage_area(_read_stage_text(area_path)) if area_path else {}
     if not stage_area:
         area_path = _find_stage_rpt(
             run_dir, stage_name, source,
-            ["area.{}.*.rpt".format(b), "area.*.rpt"])
+            ["area.{}.*.rpt".format(b), "area.*.rpt"],
+            stage_path=stage_path)
         stage_area = parse_area(area_path)
     result["area"] = {
         "total_area":     stage_area.get("total_area",     "-"),
@@ -662,7 +675,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
     if result["area"].get("std_cell_area", "-") == "-":
         util_path = _find_stage_rpt(
             run_dir, stage_name, source,
-            ["utilization.{}.*.rpt".format(b), "utilization.*.rpt"])
+            ["utilization.{}.*.rpt".format(b), "utilization.*.rpt"],
+            stage_path=stage_path)
         util_data = parse_utilization(util_path)
         result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
         result["area"]["memory_area"] = util_data.get("memory_area", "-")
@@ -680,53 +694,60 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None):
 
     cell_path = _find_stage_rpt(
         run_dir, stage_name, source,
-        ["{}.sec_vth_use.rpt".format(stage_name), "*.sec_vth_use.rpt"])
+        ["{}.sec_vth_use.rpt".format(stage_name), "*.sec_vth_use.rpt"],
+        stage_path=stage_path)
     vth_data = _parse_stage_vth(_read_stage_text(cell_path)) if cell_path else {}
     if not vth_data:
         cell_path = _find_stage_rpt(
             run_dir, stage_name, source,
             ["cell_usage.summary.{}.*.rpt".format(b),
-             "cell_usage.summary.*.rpt"])
+             "cell_usage.summary.*.rpt"],
+            stage_path=stage_path)
         vth_data = parse_cell_usage(cell_path)
     result["vth"] = vth_data
 
     cgc_path = _find_stage_rpt(run_dir, stage_name, source, [
         "clock_gating_info.mission.rpt",
         "clock_gating_info.{}.*.rpt".format(b),
-        "clock_gating_info*.rpt"])
+        "clock_gating_info*.rpt"], stage_path=stage_path)
     result["cgc"] = parse_clock_gating(cgc_path)
 
     mbit_path = _find_stage_rpt(run_dir, stage_name, source, [
         "multibit_banking_ratio.{}.*.rpt".format(b),
-        "multibit_banking_ratio.*.rpt"])
+        "multibit_banking_ratio.*.rpt"], stage_path=stage_path)
     result["mbit"] = parse_multibit(mbit_path)
 
     cong_path = _find_stage_rpt(
         run_dir, stage_name, source,
         ["{}.grc.rpt".format(stage_name), "*.grc.rpt",
-         "congestion.{}.*.rpt".format(b), "congestion.*.rpt"])
+         "congestion.{}.*.rpt".format(b), "congestion.*.rpt"],
+        stage_path=stage_path)
     if cong_path and os.path.basename(cong_path).endswith(".grc.rpt"):
         result["congestion"] = {"cong_both": _parse_stage_grc(_read_stage_text(cong_path))}
     else:
         result["congestion"] = parse_congestion(cong_path)
 
     pwr_path = _find_stage_rpt(run_dir, stage_name, source, [
-        "report_power_info.mission.ss*.rpt", "report_power*.rpt"])
+        "report_power_info.mission.ss*.rpt", "report_power*.rpt"],
+        stage_path=stage_path)
     result["power"] = parse_power(pwr_path)
 
     ld_path = _find_stage_rpt(
-        run_dir, stage_name, source, ["report_logic_depth.summary.*.rpt"])
+        run_dir, stage_name, source, ["report_logic_depth.summary.*.rpt"],
+        stage_path=stage_path)
     result["logic_depth"] = parse_logic_depth(ld_path)
 
     cts_path = _find_stage_rpt(
         run_dir, stage_name, source,
-        ["{}.cts.qor.final.rpt".format(stage_name), "*.cts.qor.final.rpt"])
+        ["{}.cts.qor.final.rpt".format(stage_name), "*.cts.qor.final.rpt"],
+        stage_path=stage_path)
     if cts_path:
         result.update(_parse_stage_cts(_read_stage_text(cts_path)))
 
     runtime_path = _find_stage_rpt(
         run_dir, stage_name, source,
-        ["{}.runtime.rpt".format(stage_name), "*.runtime.rpt"])
+        ["{}.runtime.rpt".format(stage_name), "*.runtime.rpt"],
+        stage_path=stage_path)
     result["runtime"] = _parse_stage_runtime(
         _read_stage_text(runtime_path)) if runtime_path else "-"
 
