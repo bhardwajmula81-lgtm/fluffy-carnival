@@ -86,10 +86,16 @@ class CustomTreeItem(QTreeWidgetItem):
         t2 = other.text(col).strip() if other.text(col) else ""
 
         if col in (13, 14):
-            raw1 = self.data(0, Qt.UserRole + (40 if col == 13 else 41)) or t1
-            raw2 = other.data(0, Qt.UserRole + (40 if col == 13 else 41)) or t2
-            k1 = self._date_sort_key(raw1)
-            k2 = self._date_sort_key(raw2)
+            key_role = Qt.UserRole + (42 if col == 13 else 43)
+            raw_role = Qt.UserRole + (40 if col == 13 else 41)
+            k1 = self.data(0, key_role)
+            k2 = other.data(0, key_role)
+            if k1 is None:
+                raw1 = self.data(0, raw_role) or t1
+                k1 = self._date_sort_key(raw1)
+            if k2 is None:
+                raw2 = other.data(0, raw_role) or t2
+                k2 = self._date_sort_key(raw2)
             if (k1 is None) != (k2 is None):
                 return False if k1 is None else True
             if k1 is None and k2 is None:

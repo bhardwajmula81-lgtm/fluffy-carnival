@@ -243,6 +243,16 @@ def _save_mail_users(new_users):
         pass
 
 
+def _save_mail_users_async(new_users):
+    try:
+        users = list(new_users or [])
+        t = threading.Thread(target=_save_mail_users, args=(users,))
+        t.daemon = True
+        t.start()
+    except Exception:
+        pass
+
+
 # ===========================================================================
 # PIN PERSISTENCE -- inline so no dependency on utils.py version
 # ===========================================================================
@@ -459,7 +469,7 @@ def _send_mail_via_util(dlg):
         QMessageBox.warning(None, "No Recipients",
                              "Please add at least one email address in To or CC.")
         return
-    _save_mail_users(to_raw + cc_raw + to_list + cc_list)
+    _save_mail_users_async(to_raw + cc_raw + to_list + cc_list)
     cmd = [MAIL_UTIL, "-sd", sender, "-s", subject, "-fm", fmt]
     if fmt == "html":
         try:
@@ -2912,6 +2922,8 @@ class PDDashboard(QMainWindow):
         self._visible_run_item_cache = None
         self._quick_refresh_worker = None
         self._quick_refresh_items = {}
+        self._owner_lookup_worker = None
+        self._owner_items_by_path = {}
         self._stage_metric_last_key = None
 
         # -- theme/display ------------------------------------------------
@@ -3122,7 +3134,8 @@ class PDDashboard(QMainWindow):
         for name in (
                 "worker", "_signoff_worker", "_metric_worker",
                 "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
-                "_hover_metric_worker", "_quick_refresh_worker"):
+                "_hover_metric_worker", "_quick_refresh_worker",
+                "_owner_lookup_worker"):
             self._stop_worker_if_running(getattr(self, name, None))
 
     def closeEvent(self, event):
@@ -3423,6 +3436,18 @@ class PDDashboard(QMainWindow):
                     item.setText(14, self._fmt_ts(e_raw))
                 _walk(item)
         _walk(self.tree.invisibleRootItem())
+
+    def _set_item_time_data(self, item, start_raw, end_raw):
+        item.setData(0, Qt.UserRole + 40, start_raw)
+        item.setData(0, Qt.UserRole + 41, end_raw)
+        try:
+            item.setData(0, Qt.UserRole + 42,
+                         CustomTreeItem._date_sort_key(start_raw))
+            item.setData(0, Qt.UserRole + 43,
+                         CustomTreeItem._date_sort_key(end_raw))
+        except Exception:
+            item.setData(0, Qt.UserRole + 42, None)
+            item.setData(0, Qt.UserRole + 43, None)
         if hasattr(self, "mode_combo"):
             self._set_col_preset(
                 {"Standard": 2, "Compact": 1, "Full": 3}.get(current_mode, 2))
@@ -3666,6 +3691,9 @@ class PDDashboard(QMainWindow):
         root_layout.setSpacing(4)
 
         # ---- TOOLBAR ----
+        toolbar_layout = QVBoxLayout()
+        toolbar_layout.setContentsMargins(0, 0, 0, 0)
+        toolbar_layout.setSpacing(4)
         top_layout = QHBoxLayout()
         top_layout.setSpacing(6)
 
@@ -3699,6 +3727,7 @@ class PDDashboard(QMainWindow):
         self.search.setPlaceholderText(
             "Search runs, blocks, status, runtime...  [Ctrl+F]")
         self.search.setMinimumWidth(260)
+        self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.textChanged.connect(lambda: self.search_timer.start(250))
         self.search.setContextMenuPolicy(Qt.CustomContextMenu)
         self.search.customContextMenuRequested.connect(
@@ -3713,7 +3742,12 @@ class PDDashboard(QMainWindow):
         self.search_count_lbl.setVisible(False)
         top_layout.addWidget(self.search_count_lbl)
 
-        top_layout.addStretch()
+        toolbar_layout.addLayout(top_layout)
+
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(6)
+        action_layout.addStretch()
+        top_layout = action_layout
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setToolTip(
@@ -3810,7 +3844,8 @@ class PDDashboard(QMainWindow):
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
-        root_layout.addLayout(top_layout)
+        toolbar_layout.addLayout(action_layout)
+        root_layout.addLayout(toolbar_layout)
 
         # ---- PROGRESS BAR ----
         self.prog_container = QWidget()
@@ -5423,8 +5458,7 @@ class PDDashboard(QMainWindow):
             item.setText(12, info.get("runtime", item.text(12)))
             start_raw = info.get("start", item.data(0, Qt.UserRole + 40) or "")
             end_raw = info.get("end", item.data(0, Qt.UserRole + 41) or "")
-            item.setData(0, Qt.UserRole + 40, start_raw)
-            item.setData(0, Qt.UserRole + 41, end_raw)
+            self._set_item_time_data(item, start_raw, end_raw)
             item.setText(13, self._fmt_ts(start_raw))
             item.setText(14, self._fmt_ts(end_raw))
             item.setToolTip(13, start_raw)
@@ -5692,7 +5726,11 @@ class PDDashboard(QMainWindow):
                     info = parse_runtime_rpt(
                         os.path.join(run_path, "reports", "runtime.V2.rpt"))
                     item.setText(12, info.get("runtime", item.text(12)))
-                    item.setText(14, info.get("end", item.text(14)))
+                    start_raw = item.data(0, Qt.UserRole + 40) or item.toolTip(13)
+                    end_raw = info.get("end", item.text(14))
+                    self._set_item_time_data(item, start_raw, end_raw)
+                    item.setText(14, self._fmt_ts(end_raw))
+                    item.setToolTip(14, end_raw)
                 except Exception:
                     pass
                 changed = True
@@ -5754,6 +5792,9 @@ class PDDashboard(QMainWindow):
             self._stage_screenshot_workers)
         self._stage_metric_workers = self._stop_worker_list_now(
             self._stage_metric_workers)
+        self._stop_worker_if_running(getattr(self, "_owner_lookup_worker", None))
+        self._owner_lookup_worker = None
+        self._owner_items_by_path = {}
         self.item_map.clear()
         self._signoff_items_by_path.clear()
         self._running_items = []
@@ -5943,9 +5984,13 @@ class PDDashboard(QMainWindow):
             if r.get("owner") and r["owner"] != "Unknown":
                 all_owners.add(r["owner"])
         if all_owners:
-            _save_mail_users(all_owners)
+            _save_mail_users_async(all_owners)
 
         self.refresh_view()
+
+        # Fill real Unix owners after the tree is visible. This avoids using
+        # unreliable run-name guesses while keeping startup responsive.
+        QTimer.singleShot(250, self.start_bg_owner_lookup)
 
         # --- Deferred post-build work so UI is interactive immediately ---
         # fit_all_columns: 23-column resize is expensive on main thread;
@@ -6002,9 +6047,6 @@ class PDDashboard(QMainWindow):
         owner = (run.get("owner") or "").strip()
         if owner and owner != "Unknown":
             return owner
-        guessed = self._guess_owner_from_run_name(run.get("r_name", ""))
-        if guessed and guessed != "Unknown":
-            return guessed
         return "Unknown"
 
     def _create_run_item(self, parent_item, run):
@@ -6015,12 +6057,11 @@ class PDDashboard(QMainWindow):
 
         r_name = run["r_name"]
         display_owner = self._display_owner_for_run(run)
-        if display_owner != "Unknown" and not (run.get("owner") and run.get("owner") != "Unknown"):
-            run["owner"] = display_owner
         child.setText(0, r_name)
         child.setText(1, run["rtl"])
         child.setText(2, run["source"])
         child.setText(5, display_owner)
+        child.setToolTip(5, display_owner)
         child.setText(15, run["path"])
         child.setText(22, "")
         child.setData(0, Qt.UserRole + 2, run["block"])
@@ -6061,8 +6102,7 @@ class PDDashboard(QMainWindow):
 
             start_raw = run["info"]["start"]
             end_raw   = run["info"]["end"]
-            child.setData(0, Qt.UserRole + 40, start_raw)
-            child.setData(0, Qt.UserRole + 41, end_raw)
+            self._set_item_time_data(child, start_raw, end_raw)
             child.setText(13, self._fmt_ts(start_raw))
             child.setText(14, self._fmt_ts(end_raw))
             child.setToolTip(13, start_raw)
@@ -6097,8 +6137,7 @@ class PDDashboard(QMainWindow):
             child.setText(12, "-")
             be_start_raw = "-"
             be_end_raw   = "-"
-            child.setData(0, Qt.UserRole + 40, be_start_raw)
-            child.setData(0, Qt.UserRole + 41, be_end_raw)
+            self._set_item_time_data(child, be_start_raw, be_end_raw)
             child.setText(13, self._fmt_ts(be_start_raw))
             child.setText(14, self._fmt_ts(be_end_raw))
 
@@ -6172,14 +6211,16 @@ class PDDashboard(QMainWindow):
                 Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
             s_item.setCheckState(0, Qt.Unchecked)
             s_item.setText(0,  stage.get("name", ""))
+            stage_owner = be_item.text(5) if be_item else "Unknown"
+            s_item.setText(5, stage_owner)
+            s_item.setToolTip(5, stage_owner)
             s_item.setText(7,  f"NONUPF - {stage.get('st_n', '')}")
             s_item.setText(8,  f"UPF - {stage.get('st_u', '')}")
             s_item.setText(9,  stage.get("vslp_status", ""))
             s_item.setText(12, stage.get("info", {}).get("runtime", ""))
             s_start_raw = stage.get("info", {}).get("start", "")
             s_end_raw   = stage.get("info", {}).get("end", "")
-            s_item.setData(0, Qt.UserRole + 40, s_start_raw)
-            s_item.setData(0, Qt.UserRole + 41, s_end_raw)
+            self._set_item_time_data(s_item, s_start_raw, s_end_raw)
             s_item.setText(13, self._fmt_ts(s_start_raw))
             s_item.setText(14, self._fmt_ts(s_end_raw))
             # Col 15 = stage directory path, Col 16 = stage log file
@@ -6236,8 +6277,7 @@ class PDDashboard(QMainWindow):
                     if s["name"] == sname:
                         s_start = s.get("info", {}).get("start", "")
                         s_end   = s.get("info", {}).get("end", "")
-                        ch.setData(0, Qt.UserRole + 40, s_start)
-                        ch.setData(0, Qt.UserRole + 41, s_end)
+                        self._set_item_time_data(ch, s_start, s_end)
                         ch.setText(12, s.get("info", {}).get("runtime", "-"))
                         ch.setText(13, self._fmt_ts(s_start))
                         ch.setText(14, self._fmt_ts(s_end))
@@ -7001,6 +7041,80 @@ class PDDashboard(QMainWindow):
             self.update_item_size(item_id, size_str)
 
     # ------------------------------------------------------------------
+    # BACKGROUND OWNER LOOKUP
+    # ------------------------------------------------------------------
+    def start_bg_owner_lookup(self):
+        if self._building_tree:
+            return
+        if self._worker_is_running(self._owner_lookup_worker):
+            return
+        tasks = []
+        seen = set()
+        self._owner_items_by_path = {}
+        for item in self._iter_tree_items():
+            run = item.data(0, Qt.UserRole + 10)
+            if not run:
+                continue
+            if run.get("run_type") not in ("FE", "BE"):
+                continue
+            path = run.get("path") or item.text(15)
+            if not path or path in ("N/A", "-"):
+                continue
+            owner = (run.get("owner") or item.text(5) or "").strip()
+            if owner and owner != "Unknown":
+                item.setToolTip(5, owner)
+                continue
+            self._owner_items_by_path.setdefault(path, []).append(item)
+            if path not in seen:
+                seen.add(path)
+                tasks.append({"path": path})
+        if not tasks:
+            return
+        self._owner_lookup_worker = OwnerLookupWorker(tasks)
+        self._owner_lookup_worker.batch_ready.connect(self._on_owner_lookup_batch)
+        self._owner_lookup_worker.finished.connect(self._on_owner_lookup_finished)
+        self._owner_lookup_worker.start()
+
+    def _set_item_owner_text(self, item, owner):
+        if not item or not owner or owner == "Unknown":
+            return
+        try:
+            item.setText(5, owner)
+            item.setToolTip(5, owner)
+            run = item.data(0, Qt.UserRole + 10)
+            if run:
+                run["owner"] = owner
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if ch and ch.data(0, Qt.UserRole) == "STAGE":
+                    ch.setText(5, owner)
+                    ch.setToolTip(5, owner)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _on_owner_lookup_batch(self, batch):
+        owners = set()
+        updated = False
+        for row in batch or []:
+            path = row.get("path")
+            owner = (row.get("owner") or "").strip()
+            if not path or not owner or owner == "Unknown":
+                continue
+            owners.add(owner)
+            for item in list(self._owner_items_by_path.get(path, []) or []):
+                self._set_item_owner_text(item, owner)
+                updated = True
+        if owners:
+            _save_mail_users_async(owners)
+        if updated and self.search.text().strip():
+            self.refresh_view()
+
+    def _on_owner_lookup_finished(self):
+        self._owner_lookup_worker = None
+
+    # ------------------------------------------------------------------
     # BACKGROUND FE SIGNOFF SCAN
     # ------------------------------------------------------------------
     def start_bg_signoff_scan(self):
@@ -7034,7 +7148,7 @@ class PDDashboard(QMainWindow):
             if run:
                 if row.get("owner") and row.get("owner") != "Unknown":
                     run["owner"] = row["owner"]
-                    item.setText(5, row["owner"])
+                    self._set_item_owner_text(item, row["owner"])
                 if run.get("run_type") == "FE":
                     run["st_n"] = row.get("st_n", "N/A")
                     run["st_u"] = row.get("st_u", "N/A")

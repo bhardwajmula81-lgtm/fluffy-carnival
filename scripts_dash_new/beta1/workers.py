@@ -83,6 +83,8 @@ def _BLOCKS():
 # ---------------------------------------------------------------------------
 _path_cache      = {}
 _path_cache_lock = threading.Lock()
+_owner_cache      = {}
+_owner_cache_lock = threading.Lock()
 
 def cached_exists(path):
     with _path_cache_lock:
@@ -96,6 +98,8 @@ def cached_exists(path):
 def clear_path_cache():
     with _path_cache_lock:
         _path_cache.clear()
+    with _owner_cache_lock:
+        _owner_cache.clear()
 
 def prefetch_path_cache(paths):
     unique = [p for p in set(paths) if p]
@@ -111,10 +115,17 @@ def prefetch_path_cache(paths):
 def get_owner(path):
     if not path or not cached_exists(path):
         return "Unknown"
+    norm = os.path.normpath(path)
+    with _owner_cache_lock:
+        if norm in _owner_cache:
+            return _owner_cache[norm]
     try:
-        return pwd.getpwuid(os.stat(path).st_uid).pw_name
+        owner = pwd.getpwuid(os.stat(norm).st_uid).pw_name or "Unknown"
     except Exception:
-        return "Unknown"
+        owner = "Unknown"
+    with _owner_cache_lock:
+        _owner_cache[norm] = owner
+    return owner
 
 def normalize_rtl(rtl_str):
     pfx = _PROJECT()
@@ -400,6 +411,48 @@ class SignoffStatusWorker(QThread):
 
 
 # ===========================================================================
+# OwnerLookupWorker -- lightweight background Unix owner lookup
+# ===========================================================================
+class OwnerLookupWorker(QThread):
+    batch_ready = pyqtSignal(list)
+
+    def __init__(self, tasks):
+        super().__init__()
+        self.tasks = list(tasks or [])
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        if not self.tasks:
+            return
+        max_w = min(8, max(1, len(self.tasks)))
+        batch = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
+            futures = {
+                executor.submit(get_owner, t.get("path", "")): t
+                for t in self.tasks
+            }
+            for future in concurrent.futures.as_completed(futures):
+                if self._is_cancelled:
+                    break
+                task = futures[future]
+                try:
+                    owner = future.result()
+                except Exception:
+                    owner = "Unknown"
+                row = dict(task)
+                row["owner"] = owner
+                batch.append(row)
+                if len(batch) >= 50:
+                    self.batch_ready.emit(batch)
+                    batch = []
+        if batch and not self._is_cancelled:
+            self.batch_ready.emit(batch)
+
+
+# ===========================================================================
 # SingleSizeWorker -- calculates folder size for one item on demand
 # ===========================================================================
 class SingleSizeWorker(QThread):
@@ -474,10 +527,7 @@ class DiskScannerWorker(QThread):
                 if len(parts) >= 2:
                     sz_kb     = int(parts[0])
                     full_path = parts[1]
-                    try:
-                        owner = pwd.getpwuid(os.stat(full_path).st_uid).pw_name
-                    except:
-                        owner = "Unknown"
+                    owner = get_owner(full_path)
                     results.append((owner, sz_kb, full_path))
         except:
             pass
