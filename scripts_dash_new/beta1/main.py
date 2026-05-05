@@ -3448,9 +3448,6 @@ class PDDashboard(QMainWindow):
         except Exception:
             item.setData(0, Qt.UserRole + 42, None)
             item.setData(0, Qt.UserRole + 43, None)
-        if hasattr(self, "mode_combo"):
-            self._set_col_preset(
-                {"Standard": 2, "Compact": 1, "Full": 3}.get(current_mode, 2))
 
     def _ensure_standalone_root(self, root):
         """Get or create the Standalone PNR Runs top-level node."""
@@ -3691,10 +3688,10 @@ class PDDashboard(QMainWindow):
         root_layout.setSpacing(4)
 
         # ---- TOOLBAR ----
-        toolbar_layout = QVBoxLayout()
+        toolbar_layout = QHBoxLayout()
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
-        toolbar_layout.setSpacing(4)
-        top_layout = QHBoxLayout()
+        toolbar_layout.setSpacing(6)
+        top_layout = toolbar_layout
         top_layout.setSpacing(6)
 
         top_layout.addWidget(self._label("Source:"))
@@ -3742,12 +3739,7 @@ class PDDashboard(QMainWindow):
         self.search_count_lbl.setVisible(False)
         top_layout.addWidget(self.search_count_lbl)
 
-        toolbar_layout.addLayout(top_layout)
-
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(6)
-        action_layout.addStretch()
-        top_layout = action_layout
+        top_layout.addStretch(1)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setToolTip(
@@ -3844,7 +3836,6 @@ class PDDashboard(QMainWindow):
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
-        toolbar_layout.addLayout(action_layout)
         root_layout.addLayout(toolbar_layout)
 
         # ---- PROGRESS BAR ----
@@ -5399,7 +5390,21 @@ class PDDashboard(QMainWindow):
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Checking...")
         try:
-            from workers import QuickStatusRefreshWorker
+            worker_cls = globals().get("QuickStatusRefreshWorker")
+            if worker_cls is None:
+                try:
+                    from workers import QuickStatusRefreshWorker as worker_cls
+                except Exception:
+                    worker_cls = None
+            if worker_cls is None:
+                self.prog_container.setVisible(False)
+                self.refresh_btn.setEnabled(True)
+                self.refresh_btn.setText("Refresh")
+                self.status_bar.showMessage(
+                    "Quick refresh worker is unavailable. Running full rescan.",
+                    5000)
+                QTimer.singleShot(0, self.start_fs_scan)
+                return
             self._quick_refresh_items = {}
             worker_tasks = []
             for task in tasks:
@@ -5409,7 +5414,7 @@ class PDDashboard(QMainWindow):
                     "path": path,
                     "source": task.get("source", "WS"),
                 })
-            self._quick_refresh_worker = QuickStatusRefreshWorker(worker_tasks)
+            self._quick_refresh_worker = worker_cls(worker_tasks)
             self._quick_refresh_worker.progress.connect(
                 self._on_quick_refresh_progress)
             self._quick_refresh_worker.finished.connect(
