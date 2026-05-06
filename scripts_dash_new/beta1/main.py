@@ -3083,19 +3083,19 @@ class PDDashboard(QMainWindow):
 
     def _stop_worker_if_running(self, worker, timeout_ms=1200):
         if not worker:
-            return
+            return True
         try:
             if not worker.isRunning():
-                return
+                return True
         except RuntimeError:
-            return
+            return True
         except Exception:
-            return
+            return True
         self._cancel_worker_if_possible(worker)
         try:
             worker.wait(timeout_ms)
         except RuntimeError:
-            return
+            return True
         except Exception:
             pass
         try:
@@ -3103,9 +3103,27 @@ class PDDashboard(QMainWindow):
                 worker.terminate()
                 worker.wait(500)
         except RuntimeError:
-            pass
+            return True
         except Exception:
             pass
+        return not self._worker_is_running(worker)
+
+    def _stop_worker_attr(self, name, timeout_ms=1200):
+        worker = getattr(self, name, None)
+        stopped = self._stop_worker_if_running(worker, timeout_ms)
+        if stopped:
+            try:
+                setattr(self, name, None)
+            except Exception:
+                pass
+        return stopped
+
+    def _clear_worker_attr_if_current(self, name, worker):
+        if getattr(self, name, None) is worker:
+            try:
+                setattr(self, name, None)
+            except Exception:
+                pass
 
     def _cancel_worker_list_keep_running(self, workers):
         kept = []
@@ -3136,7 +3154,7 @@ class PDDashboard(QMainWindow):
                 "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
                 "_hover_metric_worker", "_quick_refresh_worker",
                 "_owner_lookup_worker"):
-            self._stop_worker_if_running(getattr(self, name, None))
+            self._stop_worker_attr(name)
 
     def closeEvent(self, event):
         if not prefs.has_section('UI'):
@@ -3377,26 +3395,41 @@ class PDDashboard(QMainWindow):
             actual_path = run_path
             stage_path = None
 
+        if self._worker_is_running(getattr(self, "_metric_worker", None)):
+            self.status_bar.showMessage("Stopping previous QoR extraction...", 3000)
+            if not self._stop_worker_attr("_metric_worker"):
+                QMessageBox.information(
+                    self, "QoR Summary",
+                    "Previous QoR extraction is still running. Please try again in a moment.")
+                return
+
         # Show progress indicator in status bar
         self.status_bar.showMessage(
             f"Extracting QoR metrics for {run_name}...")
         self.setEnabled(False)
 
-        self._stop_worker_if_running(getattr(self, "_metric_worker", None))
-        self._metric_worker = MetricWorker(
+        worker = MetricWorker(
             actual_path, item.data(0, Qt.UserRole + 2) or "",
             run_type, source, stage_name, stage_path)
+        self._metric_worker = worker
         self._metric_item_name = run_name
         self._metric_dark      = dark
-        self._metric_worker.finished.connect(self._on_metric_done)
-        self._metric_worker.finished.connect(
-            lambda *_: setattr(self, "_metric_worker", None))
-        self._metric_worker.start()
+        worker.finished.connect(self._on_metric_done)
+        worker.finished.connect(
+            lambda *_args, ww=worker:
+            self._clear_worker_attr_if_current("_metric_worker", ww))
+        worker.start()
 
     def _on_metric_done(self, metrics):
         """Called when MetricWorker finishes -- show the summary dialog."""
+        sender = self.sender()
+        if sender is not None and sender is not getattr(self, "_metric_worker", None):
+            return
         self.setEnabled(True)
         self.status_bar.clearMessage()
+
+        if metrics.get("_cancelled"):
+            return
 
         if "_error" in metrics:
             err_msg = str(metrics.get("_error", "Unknown"))
@@ -5414,14 +5447,16 @@ class PDDashboard(QMainWindow):
                     "path": path,
                     "source": task.get("source", "WS"),
                 })
-            self._quick_refresh_worker = worker_cls(worker_tasks)
-            self._quick_refresh_worker.progress.connect(
+            worker = worker_cls(worker_tasks)
+            self._quick_refresh_worker = worker
+            worker.progress.connect(
                 self._on_quick_refresh_progress)
-            self._quick_refresh_worker.finished.connect(
+            worker.finished.connect(
                 self._on_quick_refresh_finished)
-            self._quick_refresh_worker.finished.connect(
-                lambda *_: setattr(self, "_quick_refresh_worker", None))
-            self._quick_refresh_worker.start()
+            worker.finished.connect(
+                lambda *_args, ww=worker:
+                self._clear_worker_attr_if_current("_quick_refresh_worker", ww))
+            worker.start()
         except Exception as e:
             self.prog_container.setVisible(False)
             self.refresh_btn.setEnabled(True)
@@ -5435,6 +5470,9 @@ class PDDashboard(QMainWindow):
             "Quick refresh: " + str(done) + "/" + str(total))
 
     def _on_quick_refresh_finished(self, rows):
+        sender = self.sender()
+        if sender is not None and sender is not getattr(self, "_quick_refresh_worker", None):
+            return
         changed = False
         for row in rows:
             item = self._quick_refresh_items.get(row.get("path", ""))
@@ -7941,13 +7979,23 @@ class PDDashboard(QMainWindow):
         script = self._resolve_qor_script()
         if not script: return
 
-        self._stop_worker_if_running(getattr(self, "_qor_worker", None))
+        if not self._stop_worker_attr("_qor_worker"):
+            QMessageBox.information(
+                self, "QoR Compare",
+                "Previous QoR compare is still running. Please try again in a moment.")
+            return
         worker = QoRWorker(script, sel, _PYTHON_BIN)
-        worker.finished.connect(self._on_qor_done)
-        worker.start()
         self._qor_worker = worker
+        worker.finished.connect(self._on_qor_done)
+        worker.finished.connect(
+            lambda *_args, ww=worker:
+            self._clear_worker_attr_if_current("_qor_worker", ww))
+        worker.start()
 
     def _on_qor_done(self, html_path):
+        sender = self.sender()
+        if sender is not None and sender is not getattr(self, "_qor_worker", None):
+            return
         if html_path and os.path.exists(html_path):
             subprocess.Popen([FIREFOX_PATH, html_path])
         else:
@@ -7980,12 +8028,19 @@ class PDDashboard(QMainWindow):
         if be_run_path and not be_run_path.endswith("/"):
             be_run_path += "/"
 
-        self._stop_worker_if_running(getattr(self, "_qor_worker", None))
+        if not self._stop_worker_attr("_qor_worker"):
+            QMessageBox.information(
+                self, "QoR Compare",
+                "Previous QoR compare is still running. Please try again in a moment.")
+            return
         worker = QoRWorker(script, [be_run_path, "-stage", stage_name],
                             _PYTHON_BIN)
-        worker.finished.connect(self._on_qor_done)
-        worker.start()
         self._qor_worker = worker
+        worker.finished.connect(self._on_qor_done)
+        worker.finished.connect(
+            lambda *_args, ww=worker:
+            self._clear_worker_attr_if_current("_qor_worker", ww))
+        worker.start()
 
     def _resolve_qor_script(self):
         """Find summary.py from QOR_SUMMARY_SCRIPT / prefs / project_config.ini."""
@@ -9286,15 +9341,29 @@ class PDDashboard(QMainWindow):
                 "Compare FE runs with FE runs, or PNR stage rows with PNR stage rows.")
             return
         self.status_bar.showMessage("Extracting metrics for RoR diff...")
-        self._stop_worker_if_running(getattr(self, "_metric_batch_worker", None))
-        self._metric_batch_worker = MetricBatchWorker(tasks)
-        self._metric_batch_worker.finished.connect(self._on_ror_metric_done)
-        self._metric_batch_worker.finished.connect(
-            lambda *_: setattr(self, "_metric_batch_worker", None))
-        self._metric_batch_worker.start()
+        if not self._stop_worker_attr("_metric_batch_worker"):
+            QMessageBox.information(
+                self, "RoR Metric Diff",
+                "Previous metric extraction is still running. Please try again in a moment.")
+            return
+        worker = MetricBatchWorker(tasks)
+        self._metric_batch_worker = worker
+        worker.finished.connect(self._on_ror_metric_done)
+        worker.finished.connect(
+            lambda *_args, ww=worker:
+            self._clear_worker_attr_if_current("_metric_batch_worker", ww))
+        worker.start()
 
     def _on_ror_metric_done(self, rows):
+        sender = self.sender()
+        if sender is not None and sender is not getattr(self, "_metric_batch_worker", None):
+            return
         self.status_bar.showMessage("RoR metric diff ready", 3000)
+        if not rows:
+            QMessageBox.information(
+                self, "RoR Metric Diff",
+                "No metric rows were returned. The extraction may have been cancelled or no reports were found.")
+            return
         self._show_metric_diff_dialog("RoR Metric Diff", rows)
 
     def _find_golden_item_for(self, target_item):
@@ -9362,15 +9431,29 @@ class PDDashboard(QMainWindow):
                 "Select at least one non-golden run to compare.")
             return
         self.status_bar.showMessage("Extracting metrics for golden benchmark...")
-        self._stop_worker_if_running(getattr(self, "_metric_batch_worker", None))
-        self._metric_batch_worker = MetricBatchWorker(tasks)
-        self._metric_batch_worker.finished.connect(self._on_golden_metric_done)
-        self._metric_batch_worker.finished.connect(
-            lambda *_: setattr(self, "_metric_batch_worker", None))
-        self._metric_batch_worker.start()
+        if not self._stop_worker_attr("_metric_batch_worker"):
+            QMessageBox.information(
+                self, "Golden Benchmark",
+                "Previous metric extraction is still running. Please try again in a moment.")
+            return
+        worker = MetricBatchWorker(tasks)
+        self._metric_batch_worker = worker
+        worker.finished.connect(self._on_golden_metric_done)
+        worker.finished.connect(
+            lambda *_args, ww=worker:
+            self._clear_worker_attr_if_current("_metric_batch_worker", ww))
+        worker.start()
 
     def _on_golden_metric_done(self, rows):
+        sender = self.sender()
+        if sender is not None and sender is not getattr(self, "_metric_batch_worker", None):
+            return
         self.status_bar.showMessage("Golden benchmark ready", 3000)
+        if not rows:
+            QMessageBox.information(
+                self, "Golden Benchmark",
+                "No metric rows were returned. The extraction may have been cancelled or no reports were found.")
+            return
         self._show_metric_diff_dialog(
             "Golden Benchmark", rows, baseline_name=rows[0].get("name", "Golden"))
 

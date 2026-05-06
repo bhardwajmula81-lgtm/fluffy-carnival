@@ -1182,8 +1182,10 @@ class QuickStatusRefreshWorker(QThread):
                 row["_error"] = str(e)
             out.append(row)
             self.progress.emit(idx, total)
-        if not (self._cancelled or self.isInterruptionRequested()):
-            self.finished.emit(out)
+        if self._cancelled or self.isInterruptionRequested():
+            self.finished.emit([])
+            return
+        self.finished.emit(out)
 
 
 # ===========================================================================
@@ -1237,6 +1239,7 @@ class MetricWorker(QThread):
                     block=self.b_name,
                     stage_path=self.stage_path)
             if self._cancelled or self.isInterruptionRequested():
+                self.finished.emit({"_cancelled": True})
                 return
             self.finished.emit(m)
         except Exception as e:
@@ -1289,8 +1292,10 @@ class MetricBatchWorker(QThread):
                 row["metrics"] = {"_error": str(e)}
             out.append(row)
             self.progress.emit(len(out), len(self.tasks))
-        if not (self._cancelled or self.isInterruptionRequested()):
-            self.finished.emit(out)
+        if self._cancelled or self.isInterruptionRequested():
+            self.finished.emit([])
+            return
+        self.finished.emit(out)
 
 
 class QoRWorker(QThread):
