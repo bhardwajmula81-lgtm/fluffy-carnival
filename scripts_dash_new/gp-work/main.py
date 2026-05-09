@@ -65,6 +65,11 @@ def _load_project_config():
             'BACKGROUND_SIGNOFF_AFTER_SCAN': 'true',
             'SIGNOFF_BG_WORKERS': '6',
         },
+        'SCAN_IGNORE': {
+            'FE_RUN_PATTERNS': '',
+            'BE_RUN_PATTERNS': '',
+            'PNR_STAGE_PATTERNS': 'backup_*',
+        },
         'TOOLS': {
             'PNR_TOOL_NAMES':  'fc innovus',
             'SUMMARY_SCRIPT':  '',
@@ -76,6 +81,21 @@ def _load_project_config():
     }
     if os.path.exists(cfg_file):
         cfg.read(cfg_file)
+        changed = False
+        for sec, vals in defaults.items():
+            if not cfg.has_section(sec):
+                cfg.add_section(sec)
+                changed = True
+            for key, val in vals.items():
+                if not cfg.has_option(sec, key):
+                    cfg.set(sec, key, val)
+                    changed = True
+        if changed:
+            try:
+                with open(cfg_file, 'w') as f:
+                    cfg.write(f)
+            except Exception:
+                pass
     else:
         cfg.read_dict(defaults)
         try:
@@ -130,6 +150,12 @@ AUTO_SIZE_ON_START    = _proj_cfg.getboolean('PERFORMANCE', 'AUTO_SIZE_ON_START'
 BACKGROUND_SIGNOFF_AFTER_SCAN = _proj_cfg.getboolean(
     'PERFORMANCE', 'BACKGROUND_SIGNOFF_AFTER_SCAN', fallback=True)
 SIGNOFF_BG_WORKERS = _proj_cfg.getint('PERFORMANCE', 'SIGNOFF_BG_WORKERS', fallback=6)
+IGNORE_FE_RUN_PATTERNS = _proj_cfg.get(
+    'SCAN_IGNORE', 'FE_RUN_PATTERNS', fallback='')
+IGNORE_BE_RUN_PATTERNS = _proj_cfg.get(
+    'SCAN_IGNORE', 'BE_RUN_PATTERNS', fallback='')
+IGNORE_PNR_STAGE_PATTERNS = _proj_cfg.get(
+    'SCAN_IGNORE', 'PNR_STAGE_PATTERNS', fallback='backup_*')
 _blocks_raw      = _proj_cfg.get('PROJECT', 'BLOCKS',           fallback='')
 BLOCKS           = set(b.strip() for b in _blocks_raw.split(',') if b.strip())
 
@@ -165,6 +191,9 @@ _bt.SCAN_SIGNOFF_ON_START = SCAN_SIGNOFF_ON_START
 _bt.AUTO_SIZE_ON_START    = AUTO_SIZE_ON_START
 _bt.BACKGROUND_SIGNOFF_AFTER_SCAN = BACKGROUND_SIGNOFF_AFTER_SCAN
 _bt.SIGNOFF_BG_WORKERS = SIGNOFF_BG_WORKERS
+_bt.IGNORE_FE_RUN_PATTERNS = IGNORE_FE_RUN_PATTERNS
+_bt.IGNORE_BE_RUN_PATTERNS = IGNORE_BE_RUN_PATTERNS
+_bt.IGNORE_PNR_STAGE_PATTERNS = IGNORE_PNR_STAGE_PATTERNS
 
 
 def _get_user_email(username):
@@ -2939,9 +2968,12 @@ class PDDashboard(QMainWindow):
         self.custom_fg_color       = "#dfe1e5"
         self.custom_sel_color      = "#2f65ca"
         self.row_spacing           = 2
-        self.show_relative_time    = False
-        self.convert_to_ist        = False
-        self.hide_block_nodes      = False
+        self.show_relative_time    = prefs.get(
+            'UI', 'show_relative_time', fallback='false').lower() == 'true'
+        self.convert_to_ist        = prefs.get(
+            'UI', 'convert_to_ist', fallback='false').lower() == 'true'
+        self.hide_block_nodes      = prefs.get(
+            'UI', 'hide_block_nodes', fallback='false').lower() == 'true'
         self.gate_count_unit_area  = prefs.getfloat('UI', 'gate_count_unit_area', fallback=0.2419)
 
         # -- worker/state -------------------------------------------------
@@ -3577,6 +3609,7 @@ class PDDashboard(QMainWindow):
         self.sb_scan_time.setText("     Loaded snapshot: " + str(payload.get("created_at", "-")) + "   ")
         self._rebuild_filter_dropdowns()
         self._restore_filter_state()
+        self._force_default_expand = True
         QTimer.singleShot(0, self._build_tree)
 
     def export_latest_snapshot(self):
@@ -3812,7 +3845,6 @@ class PDDashboard(QMainWindow):
     def _refresh_timestamps(self):
         """Re-apply IST/relative format to all timestamp columns using stored
         raw values (UserRole+40/41). No tree rebuild needed."""
-        current_mode = self.mode_combo.currentText() if hasattr(self, "mode_combo") else "Standard"
         GROUP = frozenset(("BLOCK", "MILESTONE", "RTL",
                            "IGNORED_ROOT", "STANDALONE_ROOT", "__PLACEHOLDER__"))
         def _walk(node):
@@ -4151,6 +4183,7 @@ class PDDashboard(QMainWindow):
         view_menu = self.actions_menu.addMenu("Tree View")
         view_menu.addAction("Fit Columns", self.fit_all_columns)
         view_menu.addAction("Full Rescan", self.start_fs_scan)
+        view_menu.addAction("Reset View to Default", self.reset_view_defaults)
         view_menu.addAction("Expand All", self.safe_expand_all)
         view_menu.addAction("Collapse All", self.safe_collapse_all)
         view_menu.addAction("Deselect All Checked Runs",
@@ -4170,6 +4203,10 @@ class PDDashboard(QMainWindow):
         analysis_menu.addAction("RoR Metric Diff", self.show_ror_metric_diff)
         analysis_menu.addAction("Golden Benchmark", self.show_golden_benchmark)
         analysis_menu.addAction("App Options Diff", self.show_app_options_diff)
+        self.fe_hover_metrics_act = analysis_menu.addAction("Enable FE Hover Metrics")
+        self.fe_hover_metrics_act.setCheckable(True)
+        self.fe_hover_metrics_act.setChecked(self.enable_fe_hover_metrics)
+        self.fe_hover_metrics_act.triggered.connect(self.toggle_fe_hover_metrics)
 
         summary_menu = self.actions_menu.addMenu("Summaries / Timeline")
         summary_menu.addAction("FE Block Summary Table", self.open_block_summary)
@@ -4655,6 +4692,83 @@ class PDDashboard(QMainWindow):
     def safe_collapse_all(self):
         self.tree.collapseAll()
 
+    def reset_view_defaults(self):
+        if QMessageBox.question(
+                self, "Reset View",
+                "Reset view/filter settings to the first-open dashboard layout?\n\n"
+                "Notes, pins, snapshots and metric cache will not be deleted.",
+                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        self.search.clear()
+        self.active_col_filters.clear()
+        self.ignored_paths.clear()
+        self._checked_paths.clear()
+        self.run_filter_config = None
+        self.current_config_path = None
+        self.ignore_run_filter = False
+        self.hide_block_nodes = False
+        self.show_relative_time = False
+        self.convert_to_ist = False
+        self._tree_sort_mode = "Start Date Old->New"
+        self._last_view_preset = "All Runs"
+        self.is_dark_mode = False
+        self.use_custom_colors = False
+        self.custom_bg_color = "#2b2d30"
+        self.custom_fg_color = "#dfe1e5"
+        self.custom_sel_color = "#2f65ca"
+        self.row_spacing = 2
+        self.gate_count_unit_area = 0.2419
+        self._closure_enabled = True
+        self.enable_fe_hover_metrics = False
+        self._clear_fe_hover_metric_tooltips()
+        try:
+            self.auto_refresh_timer.stop()
+        except Exception:
+            pass
+        if hasattr(self, "ignore_run_filter_act"):
+            self.ignore_run_filter_act.setChecked(False)
+        if hasattr(self, "fe_hover_metrics_act"):
+            self.fe_hover_metrics_act.setChecked(False)
+        for combo, text in ((getattr(self, "src_combo", None), "ALL"),
+                            (getattr(self, "view_combo", None), "All Runs"),
+                            (getattr(self, "auto_combo", None), "Off")):
+            if combo:
+                combo.blockSignals(True)
+                idx = combo.findText(text)
+                if idx >= 0:
+                    combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+        if hasattr(self, "rel_combo"):
+            self.rel_combo.blockSignals(True)
+            idx = self.rel_combo.findText("[ SHOW ALL ]")
+            if idx >= 0:
+                self.rel_combo.setCurrentIndex(idx)
+            self.rel_combo.blockSignals(False)
+        if not prefs.has_section('UI'):
+            prefs.add_section('UI')
+        for key, val in (
+                ('last_source', 'ALL'),
+                ('last_rtl', '[ SHOW ALL ]'),
+                ('last_view', 'All Runs'),
+                ('last_sort', 'Start Date Old->New'),
+                ('last_search', ''),
+                ('last_auto', 'Off'),
+                ('hide_block_nodes', 'false'),
+                ('show_relative_time', 'false'),
+                ('convert_to_ist', 'false'),
+                ('closure_enabled', 'true'),
+                ('enable_fe_hover_metrics', 'false'),
+                ('gate_count_unit_area', '0.241900')):
+            prefs.set('UI', key, val)
+        try:
+            with open(USER_PREFS_FILE, 'w') as f:
+                prefs.write(f)
+        except Exception:
+            pass
+        self.apply_theme_and_spacing()
+        self._set_col_preset(2)
+        QTimer.singleShot(0, self._build_tree)
+
     def _ensure_ign_root(self, root):
         for i in range(root.childCount()):
             if root.child(i).data(0, Qt.UserRole) == "IGNORED_ROOT":
@@ -4662,14 +4776,13 @@ class PDDashboard(QMainWindow):
         return self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
 
     def _expand_to_rtl_level(self):
-        """Expand to RTL/EVT level only -- BLOCK, MILESTONE, RTL open."""
-        RTL_TYPES = frozenset(("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT"))
+        """First-open layout: show blocks and milestone labels only."""
         self.tree.setUpdatesEnabled(False)
         def _expand(node):
             for i in range(node.childCount()):
                 child = node.child(i)
                 nt = child.data(0, Qt.UserRole)
-                if nt in RTL_TYPES:
+                if nt in ("BLOCK", "IGNORED_ROOT", "STANDALONE_ROOT"):
                     child.setExpanded(True)
                     _expand(child)
                 else:
@@ -4844,7 +4957,20 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # STATUS BAR
     # ------------------------------------------------------------------
-    def _update_status_bar(self, runs):
+    def _visible_runs_for_status(self):
+        out = []
+        try:
+            for item in self._iter_tree_items():
+                run = item.data(0, Qt.UserRole + 10)
+                if run and not item.isHidden():
+                    out.append(run)
+        except Exception:
+            pass
+        return out
+
+    def _update_status_bar(self, runs=None):
+        if runs is None:
+            runs = self._visible_runs_for_status()
         total = completed = running = not_started = failed = 0
         for r in runs:
             if r.get("run_type") != "FE":
@@ -4921,7 +5047,7 @@ class PDDashboard(QMainWindow):
             self._checked_paths.add(path)
         else:
             self._checked_paths.discard(path)
-        self._update_status_bar([])
+        self._update_status_bar()
 
     def _on_tree_item_hovered(self, item, column):
         """Optional FE hover hook. Keep it lightweight; no report parsing on hover."""
@@ -4936,29 +5062,27 @@ class PDDashboard(QMainWindow):
             run = item.data(0, Qt.UserRole + 10) or {}
             if run.get("run_type") != "FE":
                 return
-            base = item.toolTip(0) or item.text(0)
-            marker = "\n[FE Hover Metrics]"
-            if marker in base:
-                return
             path = item.text(15)
             cached = self._hover_metric_cache.get(path, {}) if path else {}
-            lines = []
             if cached:
-                area = cached.get("area", {}) if isinstance(cached.get("area", {}), dict) else {}
-                vth = cached.get("vth", {}) if isinstance(cached.get("vth", {}), dict) else {}
-                std_area = area.get("std_cell_area", "-")
-                gate_count = self._metric_value(cached, "gate_count") if hasattr(self, "_metric_value") else "-"
-                lines.extend([
-                    "WNS: " + str(self._metric_value(cached, "wns")),
-                    "Gate Count: " + str(gate_count),
-                    "Instance Count: " + str(area.get("instance_count", "-")),
-                    "VT L/R/H Area %: " + str(vth.get("lvt_rvt_hvt_area", "-")),
-                    "Logic Depth: " + str(cached.get("logic_depth", "-")),
-                    "Std Cell Area: " + str(std_area),
-                ])
-            else:
-                lines.append("Use QoR Summary or FE Block Summary to load detailed FE metrics.")
-            item.setToolTip(0, base + marker + "\n" + "\n".join(lines))
+                self._set_fe_hover_tooltip(item, self._format_fe_hover_metrics(cached))
+                return
+            self._set_fe_hover_tooltip(item, ["Loading FE metrics..."])
+            if not path or path == "N/A":
+                return
+            if self._worker_is_running(getattr(self, "_hover_metric_worker", None)):
+                return
+            worker = MetricWorker(
+                path, run.get("block", "") or item.data(0, Qt.UserRole + 2) or "",
+                "FE", run.get("source", item.text(2) or "WS"),
+                None, None)
+            self._hover_metric_worker = worker
+            self._hover_metric_path = path
+            worker.finished.connect(
+                lambda metrics, p=path, it=item:
+                self._on_fe_hover_metric_done(p, it, metrics))
+            worker.finished.connect(worker.deleteLater)
+            worker.start()
         except Exception:
             return
 
@@ -4967,6 +5091,77 @@ class PDDashboard(QMainWindow):
             pos = self.actions_btn.mapToGlobal(
                 QPoint(0, self.actions_btn.height()))
             self.actions_menu.exec_(pos)
+        except Exception:
+            pass
+
+    def toggle_fe_hover_metrics(self, checked):
+        self.enable_fe_hover_metrics = bool(checked)
+        if hasattr(self, "fe_hover_metrics_act"):
+            self.fe_hover_metrics_act.setChecked(self.enable_fe_hover_metrics)
+        if not prefs.has_section('UI'):
+            prefs.add_section('UI')
+        prefs.set('UI', 'enable_fe_hover_metrics',
+                  'true' if self.enable_fe_hover_metrics else 'false')
+        try:
+            with open(USER_PREFS_FILE, 'w') as f:
+                prefs.write(f)
+        except Exception:
+            pass
+        if not self.enable_fe_hover_metrics:
+            self._clear_fe_hover_metric_tooltips()
+
+    def _format_fe_hover_metrics(self, metrics):
+        if not isinstance(metrics, dict) or not metrics:
+            return ["FE metrics unavailable."]
+        area = metrics.get("area", {})
+        if not isinstance(area, dict):
+            area = {}
+        vth = metrics.get("vth", {})
+        if not isinstance(vth, dict):
+            vth = {}
+        gc = self._metric_value(metrics, "gate_count")
+        if gc in ("", "-", "N/A"):
+            gc = self._metric_value(metrics, "gc")
+        inst = area.get("instance_count", "-")
+        if inst in ("", "-", "N/A"):
+            inst = self._metric_value(metrics, "instance_count")
+        vt_area = vth.get("lvt_rvt_hvt_area", "-")
+        if vt_area in ("", "-", "N/A"):
+            vt_area = self._metric_value(metrics, "vt_area")
+        lines = [
+            "WNS: " + str(self._metric_value(metrics, "wns")),
+            "Gate Count: " + str(gc),
+            "Instance Count: " + str(inst),
+            "VT L/R/H Area %: " + str(vt_area),
+            "Logic Depth: " + str(metrics.get("logic_depth", "-")),
+        ]
+        std_area = area.get("std_cell_area", "-")
+        if std_area not in ("", "-", "N/A"):
+            lines.append("Std Cell Area: " + str(std_area))
+        return lines
+
+    def _set_fe_hover_tooltip(self, item, lines):
+        marker = "\n[FE Hover Metrics]"
+        try:
+            base = self._strip_tooltip_block(item.toolTip(0) or item.text(0), marker)
+            item.setToolTip(0, base + marker + "\n" + "\n".join(lines))
+        except Exception:
+            pass
+
+    def _on_fe_hover_metric_done(self, path, item, metrics):
+        sender = self.sender()
+        if sender is not None and sender is not getattr(self, "_hover_metric_worker", None):
+            return
+        self._hover_metric_worker = None
+        self._hover_metric_path = ""
+        if isinstance(metrics, dict) and not metrics.get("_error"):
+            self._hover_metric_cache[path] = metrics
+        lines = self._format_fe_hover_metrics(metrics)
+        try:
+            if item and item.text(15) == path:
+                self._set_fe_hover_tooltip(item, lines)
+        except RuntimeError:
+            pass
         except Exception:
             pass
 
@@ -5165,6 +5360,7 @@ class PDDashboard(QMainWindow):
         is_stage = item.data(0, Qt.UserRole) == "STAGE"
         is_rtl   = item.data(0, Qt.UserRole) == "RTL"
         path     = item.text(15)
+        run_data = None
 
         self.meta_path.setText(path)
         log_val = item.text(16)
@@ -5222,9 +5418,10 @@ class PDDashboard(QMainWindow):
             self._hide_stage_metric_panel()
             self._update_fe_congestion_panel(item, run_data if not is_rtl else None)
 
-        # Keep selection instant: do not cold-stat/read error logs here.
-        # The context/open actions validate paths when explicitly requested.
-        if len(sel) == 1 and not is_stage and path and path != "N/A":
+        # FE error count is loaded lazily on first selection and then cached
+        # on the item, so the error button is visible without scan-time cost.
+        if (len(sel) == 1 and not is_stage and path and path != "N/A"
+                and run_data and run_data.get("run_type") == "FE"):
             err_count = item.data(0, Qt.UserRole + 12)
             err_path  = os.path.join(path, "logs", "compile_opt.error.log")
             if err_count is not None:
@@ -5235,6 +5432,20 @@ class PDDashboard(QMainWindow):
                 color = (("#81c784" if dark else "#388e3c")
                          if err_count == 0
                          else ("#e57373" if dark else "#d32f2f"))
+                self.fe_error_btn.setStyleSheet(
+                    f"QPushButton#errorLinkBtn {{ border: none; "
+                    f"background: transparent; color: {color}; "
+                    f"font-weight: bold; text-align: left; padding: 6px 0px; }} "
+                    f"QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
+                self.fe_error_btn.setText(f"compile_opt errors: {err_count}")
+                self.fe_error_btn.setVisible(True)
+            else:
+                err_count = self._count_compile_error_lines(err_path)
+                item.setData(0, Qt.UserRole + 12, err_count)
+                self.current_error_log_path = err_path
+                color = "#388e3c" if err_count == 0 else "#d32f2f"
+                if self.is_dark_mode:
+                    color = "#81c784" if err_count == 0 else "#e57373"
                 self.fe_error_btn.setStyleSheet(
                     f"QPushButton#errorLinkBtn {{ border: none; "
                     f"background: transparent; color: {color}; "
@@ -5558,6 +5769,21 @@ class PDDashboard(QMainWindow):
                 self.current_error_log_path):
             subprocess.Popen(['gvim', self.current_error_log_path])
 
+    def _count_compile_error_lines(self, err_path):
+        if not err_path:
+            return 0
+        try:
+            if not os.path.exists(err_path):
+                return 0
+            count = 0
+            with open(err_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    if line.strip():
+                        count += 1
+            return count
+        except Exception:
+            return 0
+
     def save_inspector_note(self):
         if not hasattr(self, "_current_note_id"):
             return
@@ -5566,7 +5792,7 @@ class PDDashboard(QMainWindow):
         sel = self.tree.selectedItems()
         if sel:
             self._apply_note_display_to_item(sel[0], self._current_note_id)
-        self._update_status_bar([])
+        self._update_status_bar()
 
     def save_shared_inspector_note(self):
         if not hasattr(self, "_current_note_id"):
@@ -5581,7 +5807,7 @@ class PDDashboard(QMainWindow):
             sel = self.tree.selectedItems()
             if sel:
                 self._apply_note_display_to_item(sel[0], self._current_note_id)
-        self._update_status_bar([])
+        self._update_status_bar()
 
     # ------------------------------------------------------------------
     # THEME
@@ -6358,11 +6584,14 @@ class PDDashboard(QMainWindow):
                 if run.get("path"):
                     self._signoff_items_by_path[run["path"]] = be_item
                 if run.get("stages"):
-                    ph = QTreeWidgetItem(be_item)
-                    ph.setText(0, "Loading stages...")
-                    ph.setData(0, Qt.UserRole, "__PLACEHOLDER__")
-                    ph.setFlags(Qt.NoItemFlags)
                     be_item.setData(0, Qt.UserRole + 11, run)
+                    if _build_be_only:
+                        self._add_stages(be_item, run, ign_root)
+                    else:
+                        ph = QTreeWidgetItem(be_item)
+                        ph.setText(0, "Loading stages...")
+                        ph.setData(0, Qt.UserRole, "__PLACEHOLDER__")
+                        ph.setFlags(Qt.NoItemFlags)
 
         if ign_root.childCount() == 0:
             root.removeChild(ign_root)
@@ -6420,8 +6649,11 @@ class PDDashboard(QMainWindow):
         # Closure+regression scan deferred 300ms (after fit_all_columns)
         if self._closure_enabled:
             QTimer.singleShot(300, self._run_closure_pass)
-        # Auto-expand to RTL level on first load only
-        if not hasattr(self, '_auto_expanded_once'):
+        if getattr(self, "_force_default_expand", False):
+            self._force_default_expand = False
+            QTimer.singleShot(50, self._expand_to_rtl_level)
+        # Auto-expand to milestone level on first load only
+        elif not hasattr(self, '_auto_expanded_once'):
             self._auto_expanded_once = True
             QTimer.singleShot(50, self._expand_to_rtl_level)
         # Pre-warm log paths later so it does not compete with the FM/VSLP
@@ -6644,6 +6876,19 @@ class PDDashboard(QMainWindow):
             self._apply_vslp_color(s_item, 9, s_item.text(9))
 
     def on_item_expanded(self, item):
+        def _start_stage_detail_worker(be_run):
+            if not be_run or be_run.get("_stage_detail_loading"):
+                return
+            if not any(s.get("_lazy") for s in be_run.get("stages", [])):
+                return
+            from workers import StageDetailWorker
+            be_run["_stage_detail_loading"] = True
+            w = StageDetailWorker(be_run, item)
+            w.finished.connect(self._on_stage_details_loaded)
+            w.finished.connect(w.deleteLater)
+            w.start()
+            self._stage_workers.append(w)
+
         if item.childCount() == 1:
             ph = item.child(0)
             if ph.data(0, Qt.UserRole) == "__PLACEHOLDER__":
@@ -6663,12 +6908,11 @@ class PDDashboard(QMainWindow):
                                 ch.setCheckState(0, Qt.Checked)
                         self.tree.blockSignals(False)
                     # Load stage timing/FM/VSLP in background if deferred
-                    if any(s.get("_lazy") for s in be_run.get("stages", [])):
-                        from workers import StageDetailWorker
-                        w = StageDetailWorker(be_run, item)
-                        w.finished.connect(self._on_stage_details_loaded)
-                        w.start()
-                        self._stage_workers.append(w)
+                    _start_stage_detail_worker(be_run)
+                    return
+        be_run = item.data(0, Qt.UserRole + 11)
+        if be_run:
+            _start_stage_detail_worker(be_run)
 
     def _on_stage_details_loaded(self, be_item, enriched_stages):
         """Called by StageDetailWorker when stage timing/FM/VSLP is ready."""
@@ -6676,6 +6920,8 @@ class PDDashboard(QMainWindow):
             be_run = be_item.data(0, Qt.UserRole + 11)
             if be_run:
                 be_run["stages"] = enriched_stages
+                be_run["_stage_detail_loading"] = False
+                be_run["_stage_detail_loaded"] = True
             for i in range(be_item.childCount()):
                 ch = be_item.child(i)
                 if ch.data(0, Qt.UserRole) != "STAGE":
@@ -6743,7 +6989,73 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
 
+    def _reorder_milestones_by_map(self):
+        label_order = {}
+        try:
+            for idx, label in enumerate(self._milestone_map.values()):
+                if label not in label_order:
+                    label_order[label] = idx
+        except Exception:
+            return
+
+        def _walk(parent):
+            count = parent.childCount()
+            milestone_idxs = [
+                i for i in range(count)
+                if parent.child(i).data(0, Qt.UserRole) == "MILESTONE"
+            ]
+            if len(milestone_idxs) > 1:
+                children = [parent.takeChild(0) for _ in range(count)]
+                children.sort(key=lambda it: (
+                    0 if it.data(0, Qt.UserRole) == "MILESTONE" else 1,
+                    label_order.get(it.text(0), 999),
+                    it.text(0)))
+                for child in children:
+                    parent.addChild(child)
+            for i in range(parent.childCount()):
+                _walk(parent.child(i))
+
+        try:
+            _walk(self.tree.invisibleRootItem())
+        except Exception:
+            pass
+
+    def _refresh_group_start_sort_keys(self):
+        label_order = {}
+        try:
+            for idx, label in enumerate(self._milestone_map.values()):
+                if label not in label_order:
+                    label_order[label] = idx
+        except Exception:
+            label_order = {}
+
+        def _walk(item):
+            best = None
+            for i in range(item.childCount()):
+                child = item.child(i)
+                ck = _walk(child)
+                if ck is not None and (best is None or ck < best):
+                    best = ck
+            role = item.data(0, Qt.UserRole)
+            if role not in ("BLOCK", "MILESTONE", "RTL",
+                            "IGNORED_ROOT", "STANDALONE_ROOT"):
+                own = item.data(0, Qt.UserRole + 42)
+                if own is not None:
+                    best = own if best is None or own < best else best
+            elif role == "MILESTONE" and item.text(0) in label_order:
+                best = (0, label_order.get(item.text(0), 999))
+            if best is not None:
+                item.setData(0, Qt.UserRole + 42, best)
+            return best
+        try:
+            root = self.tree.invisibleRootItem()
+            for i in range(root.childCount()):
+                _walk(root.child(i))
+        except Exception:
+            pass
+
     def _apply_tree_sort(self):
+        self._refresh_group_start_sort_keys()
         mode = getattr(self, "_tree_sort_mode", "Start Date Old->New")
         self.tree.setProperty("flow_sort_mode", "")
         if mode == "Start Date New->Old":
@@ -6769,6 +7081,7 @@ class PDDashboard(QMainWindow):
         self.tree.sortByColumn(col, order)
         self.tree.header().setSortIndicator(col, order)
         self._move_special_roots_to_bottom()
+        self._reorder_milestones_by_map()
 
     def _set_tree_sort_mode(self, mode):
         self._tree_sort_mode = mode
@@ -7952,10 +8265,6 @@ class PDDashboard(QMainWindow):
         closure_cb.setChecked(getattr(self, '_closure_enabled', True))
         gen_l.addRow("", closure_cb)
 
-        fe_hover_cb = QCheckBox("Enable FE hover metrics in FE Only view")
-        fe_hover_cb.setChecked(getattr(self, 'enable_fe_hover_metrics', False))
-        gen_l.addRow("", fe_hover_cb)
-
         gate_factor_spin = QDoubleSpinBox()
         gate_factor_spin.setDecimals(6)
         gate_factor_spin.setRange(0.000001, 100.0)
@@ -8189,20 +8498,20 @@ class PDDashboard(QMainWindow):
         old_ist      = self.convert_to_ist
         self.show_relative_time = rel_time_cb.isChecked()
         self.convert_to_ist     = ist_cb.isChecked()
+        prefs.set('UI', 'show_relative_time',
+                  'true' if self.show_relative_time else 'false')
+        prefs.set('UI', 'convert_to_ist',
+                  'true' if self.convert_to_ist else 'false')
         if old_rel_time != self.show_relative_time or old_ist != self.convert_to_ist:
             QTimer.singleShot(50, self._refresh_timestamps)
         old_hide_blk = self.hide_block_nodes
         self.hide_block_nodes   = hide_blk_cb.isChecked()
+        prefs.set('UI', 'hide_block_nodes',
+                  'true' if self.hide_block_nodes else 'false')
         _need_rebuild = _need_rebuild or (old_hide_blk != self.hide_block_nodes)
         self._closure_enabled   = closure_cb.isChecked()
         prefs.set('UI', 'closure_enabled',
                   'true' if self._closure_enabled else 'false')
-        old_fe_hover = self.enable_fe_hover_metrics
-        self.enable_fe_hover_metrics = fe_hover_cb.isChecked()
-        prefs.set('UI', 'enable_fe_hover_metrics',
-                  'true' if self.enable_fe_hover_metrics else 'false')
-        if old_fe_hover and not self.enable_fe_hover_metrics:
-            self._clear_fe_hover_metric_tooltips()
         self.gate_count_unit_area = gate_factor_spin.value()
         prefs.set('UI', 'gate_count_unit_area',
                   "{:.6f}".format(self.gate_count_unit_area))
@@ -8468,7 +8777,7 @@ class PDDashboard(QMainWindow):
         finally:
             self.tree.blockSignals(False)
         self._checked_paths.clear()
-        self._update_status_bar([])
+        self._update_status_bar()
         if self.view_combo.currentText() == "Selected Only":
             self.refresh_view()
 

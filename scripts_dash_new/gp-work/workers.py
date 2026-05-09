@@ -285,6 +285,12 @@ def _BASE_OUTFEED(): return _g("BASE_OUTFEED_DIR")
 def _BASE_IR():      return _g("BASE_IR_DIR", "")
 def _PROJECT():      return _g("PROJECT_PREFIX", "S5K2P5SP")
 def _PNR_TOOLS():    return _g("PNR_TOOL_NAMES", "fc innovus")
+def _IGNORE_FE_RUN_PATTERNS():
+    return _pattern_list(_g("IGNORE_FE_RUN_PATTERNS", ""))
+def _IGNORE_BE_RUN_PATTERNS():
+    return _pattern_list(_g("IGNORE_BE_RUN_PATTERNS", ""))
+def _IGNORE_PNR_STAGE_PATTERNS():
+    return _pattern_list(_g("IGNORE_PNR_STAGE_PATTERNS", "backup_*"))
 def _bool_cfg(name, default=False):
     val = _g(name, default)
     if isinstance(val, bool):
@@ -305,6 +311,29 @@ def _BLOCKS():
         return frozenset(b)
     # If injected as a string (edge case), parse it
     return frozenset(s.strip() for s in str(b).split(',') if s.strip())
+
+def _pattern_list(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    parts = re.split(r'[,;\s]+', str(raw))
+    return [p.strip() for p in parts if p.strip()]
+
+def _ignored_by_pattern(name, patterns):
+    base = os.path.basename(str(name or ""))
+    clean = base
+    for suffix in ("-FE", "-BE"):
+        if clean.endswith(suffix):
+            clean = clean[:-len(suffix)]
+            break
+    for pat in patterns or []:
+        try:
+            if fnmatch.fnmatch(base, pat) or fnmatch.fnmatch(clean, pat):
+                return True
+        except Exception:
+            pass
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -931,16 +960,25 @@ class ScannerWorker(QThread):
             ent_name = os.path.basename(ent_path)
             if ws_base == _BASE_WS_FE():
                 for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
+                    if _ignored_by_pattern(os.path.basename(rd),
+                                           _IGNORE_FE_RUN_PATTERNS()):
+                        continue
                     tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
             if "fc" in tools_to_scan:
                 for pat in ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]:
                     for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
+                        if _ignored_by_pattern(os.path.basename(rd),
+                                               _IGNORE_BE_RUN_PATTERNS()):
+                            continue
                         tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
             if "innovus" in tools_to_scan:
                 # Catch all innovus run dirs -- not just EVT* named ones
                 # TOP runs (S5K2P5SP SOC level) may have different naming
                 for rd in glob.glob(os.path.join(ent_path, "innovus", "*")):
                     if os.path.isdir(rd) and not os.path.basename(rd).startswith('.'):
+                        if _ignored_by_pattern(os.path.basename(rd),
+                                               _IGNORE_BE_RUN_PATTERNS()):
+                            continue
                         tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
         return tasks, releases_found
@@ -1004,13 +1042,22 @@ class ScannerWorker(QThread):
                         phys_evt = os.path.basename(evt_dir)
                         blk_name = ent_name
                         for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
+                            if _ignored_by_pattern(os.path.basename(rd),
+                                                   _IGNORE_FE_RUN_PATTERNS()):
+                                continue
                             tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
                         if "fc" in tools_to_scan:
                             for rd in glob.glob(os.path.join(evt_dir, "fc", "*-BE")):
+                                if _ignored_by_pattern(os.path.basename(rd),
+                                                       _IGNORE_BE_RUN_PATTERNS()):
+                                    continue
                                 tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
                         if "innovus" in tools_to_scan:
                             for rd in glob.glob(os.path.join(evt_dir, "innovus", "*")):
                                 if os.path.isdir(rd):
+                                    if _ignored_by_pattern(os.path.basename(rd),
+                                                           _IGNORE_BE_RUN_PATTERNS()):
+                                        continue
                                     tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
         # --- Prefetch path cache ---
@@ -1180,6 +1227,8 @@ class ScannerWorker(QThread):
                 if step_name in ["logs", "pass", "fail", "outputs"]:
                     continue
                 if source == "OUTFEED" and step_name in ["reports", "logs", "pass", "fail", "outputs"]:
+                    continue
+                if _ignored_by_pattern(step_name, _IGNORE_PNR_STAGE_PATTERNS()):
                     continue
 
                 is_fc = "/innovus/" not in rd.replace("\\", "/")
