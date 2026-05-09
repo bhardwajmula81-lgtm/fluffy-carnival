@@ -31,7 +31,8 @@ from PyQt5.QtWidgets import (
     QHeaderView, QFileDialog, QGroupBox, QTextEdit, QDockWidget,
     QFormLayout, QDialog, QDialogButtonBox, QFontComboBox,
     QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QColorDialog, QTabWidget, QTableWidget,
-    QTableWidgetItem, QScrollArea, QAbstractItemView, QSizePolicy
+    QTableWidgetItem, QScrollArea, QAbstractItemView, QSizePolicy,
+    QToolTip
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint, QRect
 from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
@@ -1808,8 +1809,11 @@ class _PieChartWidget(QWidget):
                        Qt.AlignVCenter | Qt.AlignLeft, text)
 
 
+
 class _BarChartWidget(QWidget):
-    """Bar chart (vertical or horizontal) using QPainter."""
+    """Interactive signed bar chart using QPainter."""
+    bar_clicked = pyqtSignal(int)
+
     def __init__(self, title="", horizontal=False):
         super().__init__()
         self.title      = title
@@ -1819,78 +1823,216 @@ class _BarChartWidget(QWidget):
         self.bar_colors = []
         self.is_dark    = False
         self.y_label    = ""
-        self.setMinimumSize(180, 160)
+        self.row_indices = []
+        self.tooltips = []
+        self.value_format = "{:.3g}"
+        self._bar_rects = []
+        self.setMouseTracking(True)
+        self.setMinimumSize(260, 190)
 
-    def set_data(self, labels, values, colors=None, is_dark=False, y_label=""):
-        self.labels     = labels
-        self.values     = values
-        self.bar_colors = colors or [QColor("#42a5f5")] * len(values)
-        self.is_dark    = is_dark
-        self.y_label    = y_label
+    def set_data(self, labels, values, colors=None, is_dark=False, y_label="",
+                 row_indices=None, tooltips=None, value_format="{:.3g}"):
+        self.labels = list(labels or [])
+        clean_vals = []
+        for v in values or []:
+            try:
+                fv = float(v)
+                if math.isnan(fv) or math.isinf(fv):
+                    fv = 0.0
+            except Exception:
+                fv = 0.0
+            clean_vals.append(fv)
+        self.values = clean_vals
+        self.bar_colors = list(colors or [QColor("#42a5f5")] * len(clean_vals))
+        self.is_dark = is_dark
+        self.y_label = y_label or ""
+        self.row_indices = list(row_indices or range(len(clean_vals)))
+        self.tooltips = list(tooltips or [])
+        self.value_format = value_format or "{:.3g}"
+        self._bar_rects = []
         self.update()
+
+    def _fmt_value(self, val):
+        try:
+            return self.value_format.format(float(val))
+        except Exception:
+            return str(val)
+
+    def _hit_index(self, pos):
+        for rect, row_idx, tip in self._bar_rects:
+            if rect.contains(pos):
+                return row_idx, tip
+        return None, ""
+
+    def mouseMoveEvent(self, event):
+        row_idx, tip = self._hit_index(event.pos())
+        if tip:
+            QToolTip.showText(event.globalPos(), tip, self)
+        else:
+            QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        row_idx, tip = self._hit_index(event.pos())
+        if row_idx is not None:
+            self.bar_clicked.emit(int(row_idx))
+            return
+        super().mousePressEvent(event)
 
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        fg  = QColor("#dfe1e5" if self.is_dark else "#333333")
-        bg  = QColor("#2b2d30" if self.is_dark else "#ffffff")
-        ax  = QColor("#888888")
+        fg = QColor("#dfe1e5" if self.is_dark else "#263238")
+        muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
+        bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
+        grid = QColor("#55585c" if self.is_dark else "#d7dbe0")
         p.fillRect(self.rect(), bg)
-        r   = self.rect()
+        r = self.rect()
+        self._bar_rects = []
         if not self.values:
-            p.setPen(fg); p.drawText(r, Qt.AlignCenter, "No Data"); return
-        # Title
-        p.setPen(fg)
-        p.drawText(r.adjusted(0, 4, 0, 0), Qt.AlignHCenter | Qt.AlignTop, self.title)
-        margin_t = 22; margin_b = 36; margin_l = 12; margin_r = 8
-        area_w = r.width()  - margin_l - margin_r
-        area_h = r.height() - margin_t - margin_b
-        if area_w <= 0 or area_h <= 0: return
-        n    = len(self.values)
-        vmax = max(abs(v) for v in self.values) or 1
-        vmin = min(self.values)
-        zero_y = margin_t + area_h if vmin >= 0 else (
-            margin_t + int(area_h * max(self.values) / (max(self.values) - vmin)))
-        # Axis line
-        p.setPen(QPen(ax, 1))
-        p.drawLine(margin_l, margin_t, margin_l, margin_t + area_h)
-        p.drawLine(margin_l, zero_y,   margin_l + area_w, zero_y)
-        # Bars
-        bar_w = max(2, area_w // n - 2)
-        for i, (val, col) in enumerate(zip(self.values, self.bar_colors)):
-            x = margin_l + i * (area_w // n) + (area_w // n - bar_w) // 2
-            if val >= 0:
-                h   = int(area_h * val / (vmax if vmax != 0 else 1))
-                top = zero_y - h
-            else:
-                h   = int(area_h * abs(val) / (vmax if vmax != 0 else 1))
-                top = zero_y
-            p.setBrush(QBrush(col)); p.setPen(Qt.NoPen)
-            p.drawRect(x, top, bar_w, max(1, h))
-            # X label
-            lbl = self.labels[i] if i < len(self.labels) else ""
             p.setPen(fg)
-            fm  = p.fontMetrics()
-            lbl_short = lbl[:8] + ".." if fm.width(lbl) > bar_w + 12 else lbl
-            p.drawText(x - 4, zero_y + 2, bar_w + 8, 32,
-                       Qt.AlignHCenter | Qt.AlignTop, lbl_short)
+            p.drawText(r, Qt.AlignCenter, "No chart data")
+            return
+
+        p.setPen(fg)
+        p.drawText(r.adjusted(0, 5, 0, 0), Qt.AlignHCenter | Qt.AlignTop, self.title)
+        margin_t = 28
+        margin_b = 44
+        margin_l = 42
+        margin_r = 16
+        area_w = r.width() - margin_l - margin_r
+        area_h = r.height() - margin_t - margin_b
+        if area_w <= 4 or area_h <= 4:
+            return
+
+        vals = list(self.values)
+        vmax = max(vals)
+        vmin = min(vals)
+        if vmax == vmin:
+            if vmax == 0:
+                axis_min, axis_max = -1.0, 1.0
+            elif vmax > 0:
+                axis_min, axis_max = 0.0, vmax * 1.15
+            else:
+                axis_min, axis_max = vmin * 1.15, 0.0
+        else:
+            axis_min = min(0.0, vmin)
+            axis_max = max(0.0, vmax)
+        span = axis_max - axis_min
+        if abs(span) < 1e-12:
+            span = 1.0
+
+        def _y(value):
+            return margin_t + int((axis_max - value) / span * area_h)
+
+        zero_y = _y(0.0)
+        p.setPen(QPen(grid, 1))
+        p.drawLine(margin_l, margin_t, margin_l, margin_t + area_h)
+        p.drawLine(margin_l, zero_y, margin_l + area_w, zero_y)
+        # Light reference lines.
+        for frac in (0.25, 0.5, 0.75):
+            yy = margin_t + int(area_h * frac)
+            p.setPen(QPen(grid, 1, Qt.DotLine))
+            p.drawLine(margin_l, yy, margin_l + area_w, yy)
+
+        n = max(1, len(vals))
+        slot = max(1, area_w // n)
+        bar_w = max(4, min(34, slot - 4))
+        for i, val in enumerate(vals):
+            col = self.bar_colors[i] if i < len(self.bar_colors) else QColor("#42a5f5")
+            x = margin_l + i * slot + max(1, (slot - bar_w) // 2)
+            y_val = _y(val)
+            top = min(y_val, zero_y)
+            h = abs(y_val - zero_y)
+            if h < 1:
+                h = 1
+                top = zero_y - 1 if val >= 0 else zero_y
+            rect = QRect(x, top, bar_w, h)
+            p.setBrush(QBrush(col))
+            p.setPen(Qt.NoPen)
+            p.drawRect(rect)
+            row_idx = self.row_indices[i] if i < len(self.row_indices) else i
+            label = self.labels[i] if i < len(self.labels) else ""
+            tip = self.tooltips[i] if i < len(self.tooltips) else (
+                "{}\n{}: {}".format(label, self.title, self._fmt_value(val)))
+            self._bar_rects.append((rect, row_idx, tip))
+
+            p.setPen(fg)
+            val_txt = self._fmt_value(val)
+            if val >= 0:
+                vy = max(margin_t, top - 17)
+            else:
+                vy = min(margin_t + area_h + 2, top + h + 2)
+            p.drawText(x - 18, vy, bar_w + 36, 16, Qt.AlignCenter, val_txt)
+
+            if slot > 28:
+                p.setPen(muted)
+                short = label
+                if len(short) > 9:
+                    short = short[:7] + ".."
+                p.drawText(x - 18, margin_t + area_h + 4, bar_w + 36, 34,
+                           Qt.AlignHCenter | Qt.AlignTop, short)
+
+        p.setPen(muted)
+        p.drawText(4, margin_t - 2, margin_l - 8, 18,
+                   Qt.AlignRight | Qt.AlignVCenter, self._fmt_value(axis_max))
+        p.drawText(4, margin_t + area_h - 16, margin_l - 8, 18,
+                   Qt.AlignRight | Qt.AlignVCenter, self._fmt_value(axis_min))
 
 
 class _StackedVtChartWidget(QWidget):
-    """Per-run stacked VT distribution. Clearer than averaging into a pie."""
+    """Interactive per-run stacked VT percentage chart."""
+    row_clicked = pyqtSignal(int)
+    _PALETTE = [
+        QColor("#3949ab"), QColor("#00897b"), QColor("#7cb342"),
+        QColor("#f9a825"), QColor("#fb8c00"), QColor("#e53935"),
+        QColor("#8e24aa"), QColor("#00acc1"), QColor("#6d4c41")
+    ]
+
     def __init__(self, title="VT Area Distribution per Run"):
         super().__init__()
         self.title = title
         self.labels = []
         self.rows = []
+        self.vt_names = []
+        self.row_indices = []
         self.is_dark = False
-        self.setMinimumSize(320, 220)
+        self._segments = []
+        self.setMouseTracking(True)
+        self.setMinimumSize(420, 250)
 
-    def set_data(self, labels, rows, is_dark=False):
-        self.labels = labels or []
-        self.rows = rows or []
+    def set_data(self, labels, rows, is_dark=False, vt_names=None, row_indices=None):
+        self.labels = list(labels or [])
+        self.rows = [list(r or []) for r in (rows or [])]
+        self.vt_names = list(vt_names or [])
+        if not self.vt_names:
+            max_len = max([len(r) for r in self.rows] or [0])
+            self.vt_names = ["VT{}".format(i + 1) for i in range(max_len)]
+        self.row_indices = list(row_indices or range(len(self.rows)))
         self.is_dark = is_dark
+        self._segments = []
         self.update()
+
+    def _hit_segment(self, pos):
+        for rect, row_idx, tip in self._segments:
+            if rect.contains(pos):
+                return row_idx, tip
+        return None, ""
+
+    def mouseMoveEvent(self, event):
+        row_idx, tip = self._hit_segment(event.pos())
+        if tip:
+            QToolTip.showText(event.globalPos(), tip, self)
+        else:
+            QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        row_idx, tip = self._hit_segment(event.pos())
+        if row_idx is not None:
+            self.row_clicked.emit(int(row_idx))
+            return
+        super().mousePressEvent(event)
 
     def paintEvent(self, event):
         p = QPainter(self)
@@ -1898,64 +2040,87 @@ class _StackedVtChartWidget(QWidget):
         bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
         fg = QColor("#dfe1e5" if self.is_dark else "#263238")
         muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
-        colors = [QColor("#43a047"), QColor("#1e88e5"), QColor("#fb8c00")]
-        names = ["LVT", "RVT", "HVT"]
+        border = QColor("#59616a" if self.is_dark else "#cfd8dc")
         p.fillRect(self.rect(), bg)
         r = self.rect()
+        self._segments = []
         p.setPen(fg)
-        p.drawText(8, 6, r.width() - 16, 20,
+        p.drawText(8, 6, r.width() - 16, 22,
                    Qt.AlignHCenter | Qt.AlignVCenter, self.title)
+
         valid = []
-        for label, row in zip(self.labels, self.rows):
-            vals = [max(0.0, float(v or 0.0)) for v in row]
+        for idx, row in enumerate(self.rows):
+            vals = []
+            for v in row:
+                try:
+                    vals.append(max(0.0, float(v)))
+                except Exception:
+                    vals.append(0.0)
             if sum(vals) > 0:
-                valid.append((label, vals))
+                label = self.labels[idx] if idx < len(self.labels) else ""
+                row_idx = self.row_indices[idx] if idx < len(self.row_indices) else idx
+                valid.append((label, vals, row_idx))
         if not valid:
             p.drawText(r, Qt.AlignCenter, "No VT data")
             return
-        left = 96
-        right = 18
-        top = 38
-        row_h = 22
-        gap = 10
-        max_rows = max(1, min(len(valid), int((r.height() - top - 34) / (row_h + gap))))
-        bar_w = max(80, r.width() - left - right)
-        for i, (label, vals) in enumerate(valid[:max_rows]):
+
+        left = 130
+        right = 22
+        top = 42
+        row_h = 26
+        gap = 9
+        legend_h = 34
+        avail_rows = max(1, int((r.height() - top - legend_h - 10) / (row_h + gap)))
+        shown = valid[:avail_rows]
+        bar_w = max(90, r.width() - left - right)
+
+        for i, (label, vals, row_idx) in enumerate(shown):
             y = top + i * (row_h + gap)
-            lbl = label
-            if len(lbl) > 14:
-                lbl = lbl[:11] + "..."
+            short = label if len(label) <= 18 else label[:15] + "..."
             p.setPen(fg)
-            p.drawText(6, y, left - 12, row_h,
-                       Qt.AlignRight | Qt.AlignVCenter, lbl)
+            p.drawText(6, y, left - 14, row_h,
+                       Qt.AlignRight | Qt.AlignVCenter, short)
             total = sum(vals) or 1.0
             x = left
-            for idx, val in enumerate(vals):
+            for j, val in enumerate(vals):
                 w = int(bar_w * val / total)
-                if idx == len(vals) - 1:
+                if j == len(vals) - 1:
                     w = left + bar_w - x
                 if w <= 0:
                     continue
-                p.setBrush(QBrush(colors[idx]))
-                p.setPen(Qt.NoPen)
-                p.drawRect(x, y + 3, w, row_h - 6)
+                color = self._PALETTE[j % len(self._PALETTE)]
+                rect = QRect(x, y + 3, w, row_h - 6)
+                p.setBrush(QBrush(color))
+                p.setPen(QPen(border, 1))
+                p.drawRect(rect)
+                name = self.vt_names[j] if j < len(self.vt_names) else "VT{}".format(j + 1)
                 pct = val / total * 100.0
-                if w > 44:
+                tip = "{}\n{}: {:.2f}%".format(label, name, pct)
+                self._segments.append((rect, row_idx, tip))
+                if w > 46:
                     p.setPen(QColor("#ffffff"))
-                    p.drawText(x, y, w, row_h, Qt.AlignCenter,
-                               "{:.0f}%".format(pct))
+                    p.drawText(rect, Qt.AlignCenter, "{:.1f}%".format(pct))
                 x += w
-        ly = r.height() - 24
-        lx = left
-        for i, name in enumerate(names):
-            p.setBrush(QBrush(colors[i]))
-            p.setPen(Qt.NoPen)
-            p.drawRect(lx, ly + 5, 10, 10)
+        if len(valid) > len(shown):
             p.setPen(muted)
-            p.drawText(lx + 14, ly, 60, 20,
-                       Qt.AlignLeft | Qt.AlignVCenter, name)
-            lx += 64
+            p.drawText(left, top + len(shown) * (row_h + gap),
+                       bar_w, 20, Qt.AlignRight,
+                       "+{} more run(s) in table".format(len(valid) - len(shown)))
 
+        lx = left
+        ly = r.height() - 28
+        for i, name in enumerate(self.vt_names):
+            color = self._PALETTE[i % len(self._PALETTE)]
+            p.setBrush(QBrush(color))
+            p.setPen(Qt.NoPen)
+            p.drawRect(lx, ly + 6, 10, 10)
+            p.setPen(muted)
+            txt = str(name)
+            width = max(46, min(90, p.fontMetrics().width(txt) + 18))
+            p.drawText(lx + 14, ly, width, 22, Qt.AlignLeft | Qt.AlignVCenter, txt)
+            lx += width + 18
+            if lx > r.width() - 90:
+                break
 
 class _TimelineChartWidget(QWidget):
     """Timeline chart with one FE trunk and one row per child BE/Innovus run."""
@@ -2161,7 +2326,7 @@ class BlockSummaryDialog(QDialog):
     HEADERS = [
         "BLK Name", "Run Name", "MBIT%", "CG%",
         "Instance Count", "Std Area (um2)", "Gate Count",
-        "VT L/R/H Area%",
+        "VT Area%",
         "R2R Setup (W/T/F)",
         "R2R Hold (W/T/F)",
         "Logic Depth",
@@ -2235,23 +2400,32 @@ class BlockSummaryDialog(QDialog):
         # -- Tab 2: Charts (PyQt5 native, no matplotlib) ------------------
         tab_charts = QWidget()
         tab_charts_layout = QVBoxLayout(tab_charts)
-        tab_charts_layout.setContentsMargins(4, 4, 4, 4)
+        tab_charts_layout.setContentsMargins(6, 6, 6, 6)
 
+        chart_top = QHBoxLayout()
+        chart_hint = QLabel(
+            "Timing histograms are clickable. Hover bars for exact run details.")
+        chart_hint.setStyleSheet("color: #607d8b;")
         refresh_charts_btn = QPushButton("Refresh Charts")
         refresh_charts_btn.clicked.connect(self._draw_charts)
-        tab_charts_layout.addWidget(refresh_charts_btn, 0)
+        chart_top.addWidget(chart_hint, 1)
+        chart_top.addWidget(refresh_charts_btn, 0)
+        tab_charts_layout.addLayout(chart_top)
 
-        self._chart_vt   = _StackedVtChartWidget("VT Area Distribution per Run")
-        self._chart_area = _BarChartWidget("Std Cell Area per Run")
-        self._chart_wns  = _BarChartWidget("R2R Setup WNS per Run")
-        self._chart_cgc  = _BarChartWidget("Clock Gating % per Run")
-        from PyQt5.QtWidgets import QGridLayout as _QGL
-        charts_grid = _QGL()
-        charts_grid.addWidget(self._chart_vt,   0, 0)
-        charts_grid.addWidget(self._chart_area, 0, 1)
-        charts_grid.addWidget(self._chart_wns,  1, 0)
-        charts_grid.addWidget(self._chart_cgc,  1, 1)
-        tab_charts_layout.addLayout(charts_grid, 1)
+        self._timing_tabs = QTabWidget()
+        self._chart_wns = _BarChartWidget("R2R Setup WNS")
+        self._chart_tns = _BarChartWidget("R2R Setup TNS")
+        self._chart_nve = _BarChartWidget("R2R Setup NVE")
+        for _chart in (self._chart_wns, self._chart_tns, self._chart_nve):
+            _chart.bar_clicked.connect(self._select_chart_row)
+        self._timing_tabs.addTab(self._chart_wns, "WNS")
+        self._timing_tabs.addTab(self._chart_tns, "TNS")
+        self._timing_tabs.addTab(self._chart_nve, "NVE")
+        tab_charts_layout.addWidget(self._timing_tabs, 1)
+
+        self._chart_vt = _StackedVtChartWidget("VT Area % per Run")
+        self._chart_vt.row_clicked.connect(self._select_chart_row)
+        tab_charts_layout.addWidget(self._chart_vt, 1)
 
         self._tabs.addTab(tab_charts, "Charts")
 
@@ -2437,10 +2611,14 @@ class BlockSummaryDialog(QDialog):
             except Exception:
                 gc = "-"
 
-        # VTH - use new flat structure from parse_cell_usage
+        # VTH - dynamic if metric_extract provides labels, fallback compatible.
         vth_data = metrics.get("vth", {})
-        vth_str  = vth_data.get("lvt_rvt_hvt_area",
-                    vth_data.get("lvt_rvt_area", "-/-"))
+        vt_label_raw = vth_data.get("vt_labels", vth_data.get("stage_vt_label", "LVT*/RVT*/HVT*"))
+        vt_labels = [x.replace("*", "").strip() for x in str(vt_label_raw).split("/") if x.strip()]
+        vth_str = vth_data.get("vt_area",
+                  vth_data.get("stage_vt_area",
+                  vth_data.get("lvt_rvt_hvt_area",
+                  vth_data.get("lvt_rvt_area", "-/-"))))
 
         # R2R timing
         r2r_setup   = metrics.get("r2r_setup",    "-")
@@ -2482,50 +2660,132 @@ class BlockSummaryDialog(QDialog):
                         item.setForeground(self.pos_fg)
                 except Exception:
                     pass
+            if c == 7:
+                item.setData(Qt.UserRole + 1, vt_labels)
+                if vt_labels:
+                    item.setToolTip("VT order: " + "/".join(vt_labels))
             self.tbl.setItem(r, c, item)
         self.tbl.setSortingEnabled(True)
 
     # -- Charts (PyQt5 native) ---------------------------------------------
 
-    def _draw_charts(self):
-        if self.tbl.rowCount() == 0:
-            return
-        n = self.tbl.rowCount()
+    def _select_chart_row(self, row):
+        try:
+            row = int(row)
+            if row < 0 or row >= self.tbl.rowCount():
+                return
+            self.tbl.selectRow(row)
+            self.tbl.scrollToItem(
+                self.tbl.item(row, 1), QAbstractItemView.PositionAtCenter)
+            self._tabs.setCurrentIndex(0)
+        except Exception:
+            pass
 
-        def _cell(r, c):
-            it = self.tbl.item(r, c)
+    def _parse_metric_triplet(self, text):
+        vals = []
+        for part in str(text or "").replace("%", "").split("/"):
+            try:
+                vals.append(float(part.strip()))
+            except Exception:
+                vals.append(0.0)
+        while len(vals) < 3:
+            vals.append(0.0)
+        return vals[:3]
+
+    def _parse_vt_values(self, text):
+        vals = []
+        for part in str(text or "").replace("%", "").split("/"):
+            try:
+                vals.append(float(part.strip()))
+            except Exception:
+                vals.append(0.0)
+        return vals
+
+    def _draw_charts(self):
+        n = self.tbl.rowCount()
+        if n == 0:
+            empty = []
+            self._chart_wns.set_data(empty, empty, is_dark=self.is_dark)
+            self._chart_tns.set_data(empty, empty, is_dark=self.is_dark)
+            self._chart_nve.set_data(empty, empty, is_dark=self.is_dark)
+            self._chart_vt.set_data(empty, empty, is_dark=self.is_dark)
+            return
+
+        def _cell(row, col):
+            it = self.tbl.item(row, col)
             return it.text() if it else "-"
 
-        blks      = [_cell(r, 0) for r in range(n)]
-        run_names = [_cell(r, 1) for r in range(n)]
-        labels    = [rn[:14] + ".." if len(rn) > 16 else rn
-                     for rn in run_names]
-        std_areas, r2r_wns, cgc_vals = [], [], []
-        vth_lvt, vth_rvt, vth_hvt   = [], [], []
+        labels = []
+        full_names = []
+        row_ids = []
+        wns_vals = []
+        tns_vals = []
+        nve_vals = []
+        vt_rows = []
+        vt_names = []
 
-        for r in range(n):
-            try:   std_areas.append(float(_cell(r, 5)))
-            except: std_areas.append(0.0)
-            try:   r2r_wns.append(float(_cell(r, self._COL_R2R_SETUP).split("/")[0]))
-            except: r2r_wns.append(0.0)
-            try:   cgc_vals.append(float(_cell(r, 3).rstrip('%')))
-            except: cgc_vals.append(0.0)
-            parts = _cell(r, 7).replace('%', '').split('/')
-            try:
-                vth_lvt.append(float(parts[0]) if len(parts) > 0 else 0.0)
-                vth_rvt.append(float(parts[1]) if len(parts) > 1 else 0.0)
-                vth_hvt.append(float(parts[2]) if len(parts) > 2 else 0.0)
-            except:
-                vth_lvt.append(0.0); vth_rvt.append(0.0); vth_hvt.append(0.0)
+        for row in range(n):
+            name = _cell(row, 1)
+            full_names.append(name)
+            labels.append(name[:14] + ".." if len(name) > 16 else name)
+            row_ids.append(row)
+            wns, tns, nve = self._parse_metric_triplet(_cell(row, self._COL_R2R_SETUP))
+            wns_vals.append(wns)
+            tns_vals.append(tns)
+            nve_vals.append(nve)
+            vt_item = self.tbl.item(row, 7)
+            row_vt_names = []
+            if vt_item:
+                stored = vt_item.data(Qt.UserRole + 1)
+                if stored:
+                    row_vt_names = list(stored)
+            vals = self._parse_vt_values(_cell(row, 7))
+            if row_vt_names and len(row_vt_names) > len(vt_names):
+                vt_names = row_vt_names
+            vt_rows.append(vals)
 
-        wns_colors = [QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in r2r_wns]
+        if not vt_names:
+            max_vt = max([len(x) for x in vt_rows] or [0])
+            default_names = ["LVT", "RVT", "HVT"]
+            vt_names = default_names[:max_vt]
+            while len(vt_names) < max_vt:
+                vt_names.append("VT{}".format(len(vt_names) + 1))
+        for vals in vt_rows:
+            while len(vals) < len(vt_names):
+                vals.append(0.0)
 
-        vt_rows = list(zip(vth_lvt, vth_rvt, vth_hvt))
-        self._chart_vt.set_data(labels, vt_rows, self.is_dark)
-        self._chart_area.set_data(labels, std_areas, is_dark=self.is_dark)
-        self._chart_wns.set_data(labels, r2r_wns, colors=wns_colors, is_dark=self.is_dark)
-        self._chart_cgc.set_data(labels, cgc_vals,
-                                  colors=[QColor("#ffa726")] * n, is_dark=self.is_dark)
+        def _timing_tips(metric_name, vals):
+            out = []
+            for i, val in enumerate(vals):
+                out.append("{}\n{}: {}\nR2R Setup: {}".format(
+                    full_names[i], metric_name, val,
+                    _cell(i, self._COL_R2R_SETUP)))
+            return out
+
+        self._chart_wns.set_data(
+            labels, wns_vals,
+            colors=[QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in wns_vals],
+            is_dark=self.is_dark,
+            row_indices=row_ids,
+            tooltips=_timing_tips("WNS", wns_vals),
+            value_format="{:.4g}")
+        self._chart_tns.set_data(
+            labels, tns_vals,
+            colors=[QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in tns_vals],
+            is_dark=self.is_dark,
+            row_indices=row_ids,
+            tooltips=_timing_tips("TNS", tns_vals),
+            value_format="{:.4g}")
+        self._chart_nve.set_data(
+            labels, nve_vals,
+            colors=[QColor("#ef5350") if v > 0 else QColor("#66bb6a") for v in nve_vals],
+            is_dark=self.is_dark,
+            row_indices=row_ids,
+            tooltips=_timing_tips("NVE", nve_vals),
+            value_format="{:.4g}")
+        self._chart_vt.set_data(
+            labels, vt_rows, self.is_dark, vt_names=vt_names,
+            row_indices=row_ids)
 
     # -- Open cell report in gvim ------------------------------------------
 
@@ -2730,11 +2990,11 @@ class BEStageSummaryDialog(QDialog):
         if key == "vt_inst":
             if vth.get("stage_vt_inst"):
                 return vth.get("stage_vt_inst")
-            return vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-"))
+            return vth.get("vt_inst", vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-")))
         if key == "vt_area":
             if vth.get("stage_vt_area"):
                 return vth.get("stage_vt_area")
-            return vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-"))
+            return vth.get("vt_area", vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-")))
         if key == "cong":
             return cong.get("cong_both", metrics.get("congestion", "-"))
         if key == "runtime":
@@ -2997,7 +3257,11 @@ class PDDashboard(QMainWindow):
         self._building_tree         = False
         self._last_stylesheet       = ""
         self._closure_enabled       = prefs.get(
-            'UI', 'closure_enabled', fallback='true').lower() != 'false'
+            'UI', 'closure_enabled', fallback='false').lower() == 'true'
+        self._status_regression_enabled = prefs.get(
+            'UI', 'status_regression_enabled', fallback='false').lower() == 'true'
+        self._qor_regression_enabled = prefs.get(
+            'UI', 'qor_regression_enabled', fallback='false').lower() == 'true'
         self.enable_fe_hover_metrics = prefs.get(
             'UI', 'enable_fe_hover_metrics', fallback='false').lower() == 'true'
         self._hover_metric_cache     = {}
@@ -3719,6 +3983,119 @@ class PDDashboard(QMainWindow):
         msg = self._compare_regression_entries(prev, curr)
         return (True, msg) if msg else (False, "")
 
+
+    def _cached_metrics_for_task(self, task):
+        if not task:
+            return None
+        try:
+            import workers
+            key = workers._metric_cache_key(
+                task.get("path", ""),
+                task.get("block", ""),
+                task.get("run_type", ""),
+                task.get("source", "WS"),
+                task.get("stage_name", None),
+                task.get("stage_path", None))
+            payload = workers.get_metric_cache_payload()
+            entry = (payload.get("entries", {}) or {}).get(key)
+            if isinstance(entry, dict) and isinstance(entry.get("metrics"), dict):
+                return dict(entry.get("metrics"))
+        except Exception:
+            pass
+        return None
+
+    def _triplet_number(self, value, index):
+        parts = str(value or "").split("/")
+        if index >= len(parts):
+            return None
+        try:
+            return float(parts[index].replace("%", "").strip())
+        except Exception:
+            return None
+
+    def _congestion_number(self, value):
+        nums = []
+        for m in re.finditer(r'([-+]?\d+(?:\.\d+)?)\s*%', str(value or "")):
+            try:
+                nums.append(float(m.group(1)))
+            except Exception:
+                pass
+        if nums:
+            return sum(nums)
+        return self._num(value)
+
+    def _qor_regression_message(self, prev_metrics, curr_metrics):
+        prev_metrics = prev_metrics or {}
+        curr_metrics = curr_metrics or {}
+        issues = []
+
+        p_setup = prev_metrics.get("setup_r2r", prev_metrics.get("r2r_setup", "-"))
+        c_setup = curr_metrics.get("setup_r2r", curr_metrics.get("r2r_setup", "-"))
+        p_wns = self._triplet_number(p_setup, 0)
+        c_wns = self._triplet_number(c_setup, 0)
+        if p_wns is not None and c_wns is not None and c_wns < p_wns - 0.010:
+            issues.append("WNS {:.4g}->{:.4g}".format(p_wns, c_wns))
+        p_tns = self._triplet_number(p_setup, 1)
+        c_tns = self._triplet_number(c_setup, 1)
+        if p_tns is not None and c_tns is not None:
+            tol = max(abs(p_tns) * 0.05, 0.001)
+            if c_tns < p_tns - tol:
+                issues.append("TNS {:.4g}->{:.4g}".format(p_tns, c_tns))
+        p_nve = self._triplet_number(p_setup, 2)
+        c_nve = self._triplet_number(c_setup, 2)
+        if p_nve is not None and c_nve is not None:
+            if c_nve > p_nve + max(abs(p_nve) * 0.05, 1.0):
+                issues.append("NVE {:.4g}->{:.4g}".format(p_nve, c_nve))
+
+        for key, label, pct in (
+                ("std_cell_area", "Std Area", 0.02),
+                ("gate_count", "Gate Count", 0.02)):
+            pv = self._num(self._metric_value(prev_metrics, key))
+            cv = self._num(self._metric_value(curr_metrics, key))
+            if pv is not None and cv is not None and pv > 0 and cv > pv * (1.0 + pct):
+                issues.append("{} +{:.1f}%".format(label, (cv - pv) / pv * 100.0))
+
+        pc = self._congestion_number(self._metric_value(prev_metrics, "congestion"))
+        cc = self._congestion_number(self._metric_value(curr_metrics, "congestion"))
+        if pc is not None and cc is not None and cc > pc + 0.05:
+            issues.append("Congestion {:.3g}%->{:.3g}%".format(pc, cc))
+        return " | ".join(issues)
+
+    def _collect_qor_regressions_from_cache(self):
+        out = {}
+        if not getattr(self, "_qor_regression_enabled", False):
+            return out
+        groups = {}
+        try:
+            for it in self._iter_tree_items():
+                role = it.data(0, Qt.UserRole)
+                run = it.data(0, Qt.UserRole + 10) or {}
+                if role == "STAGE":
+                    task = self._metric_task_from_item(it)
+                    key = ("BE", task.get("block", ""), task.get("stage_name", "")) if task else None
+                elif run and run.get("run_type") == "FE":
+                    task = self._metric_task_from_item(it)
+                    key = ("FE", run.get("block", ""), run.get("rtl", ""))
+                else:
+                    continue
+                metrics = self._cached_metrics_for_task(task)
+                if not task or not metrics:
+                    continue
+                sort_key = it.data(0, Qt.UserRole + 42)
+                groups.setdefault(key, []).append((sort_key, it, metrics))
+            for key, rows in groups.items():
+                rows.sort(key=lambda x: x[0] if x[0] is not None else (9999, 99, 99, 99, 99))
+                prev_metrics = None
+                for sort_key, item, metrics in rows:
+                    if prev_metrics is not None:
+                        msg = self._qor_regression_message(prev_metrics, metrics)
+                        if msg:
+                            out[id(item)] = msg
+                    prev_metrics = metrics
+        except Exception:
+            return out
+        return out
+
     def _get_run_history_text(self, run):
         """Return formatted history string for inspector panel."""
         key = f"{run['block']}|{run['r_name']}"
@@ -3943,69 +4320,78 @@ class PDDashboard(QMainWindow):
     # CLOSURE PASS (deferred -- runs after tree is fully painted)
     # ------------------------------------------------------------------
     def _run_closure_pass(self):
-        """Apply closure scorecard + regression detection to all FE items.
-        Deferred via QTimer so it doesn't block the initial tree paint.
-        Only walks run items (skips group nodes) for maximum speed."""
+        """Apply optional scorecard and regression annotations after paint."""
+        closure_on = bool(getattr(self, "_closure_enabled", False))
+        status_reg_on = bool(getattr(self, "_status_regression_enabled", False))
+        qor_reg_on = bool(getattr(self, "_qor_regression_enabled", False))
+        if not (closure_on or status_reg_on or qor_reg_on):
+            return
+
         GROUP = frozenset(("BLOCK","MILESTONE","RTL",
                            "IGNORED_ROOT","STANDALONE_ROOT","STAGE","__PLACEHOLDER__"))
-        _UR   = Qt.UserRole
+        _UR = Qt.UserRole
         _UR10 = Qt.UserRole + 10
         count = [0]
         sibling_regressions = {}
-        try:
-            groups = {}
-            for it in self._iter_tree_items():
-                run = it.data(0, _UR10)
-                if not run or run.get("run_type") != "FE" or not run.get("is_comp"):
-                    continue
-                key = (run.get("block", ""), run.get("rtl", ""))
-                groups.setdefault(key, []).append((it, run))
-            for key, vals in groups.items():
-                vals.sort(key=lambda pair:
-                          self._parse_dashboard_time(
-                              pair[1].get("info", {}).get("start", ""))
-                          or datetime.datetime.max)
-                prev_run = None
-                for it, run in vals:
-                    if prev_run:
-                        msg = self._compare_regression_entries(
-                            self._run_regression_entry(prev_run),
-                            self._run_regression_entry(run))
-                        if msg:
-                            sibling_regressions[run.get("path", "")] = msg
-                    prev_run = run
-        except Exception:
-            sibling_regressions = {}
+        if status_reg_on:
+            try:
+                groups = {}
+                for it in self._iter_tree_items():
+                    run = it.data(0, _UR10)
+                    if not run or run.get("run_type") != "FE" or not run.get("is_comp"):
+                        continue
+                    key = (run.get("block", ""), run.get("rtl", ""))
+                    groups.setdefault(key, []).append((it, run))
+                for key, vals in groups.items():
+                    vals.sort(key=lambda pair:
+                              self._parse_dashboard_time(
+                                  pair[1].get("info", {}).get("start", ""))
+                              or datetime.datetime.max)
+                    prev_run = None
+                    for it, run in vals:
+                        if prev_run:
+                            msg = self._compare_regression_entries(
+                                self._run_regression_entry(prev_run),
+                                self._run_regression_entry(run))
+                            if msg:
+                                sibling_regressions[run.get("path", "")] = msg
+                        prev_run = run
+            except Exception:
+                sibling_regressions = {}
+
+        qor_regressions = self._collect_qor_regressions_from_cache() if qor_reg_on else {}
+
+        def _annotate_regression(item, msg, label):
+            if not msg:
+                return
+            old = item.toolTip(0) or ""
+            marker = "[{}]".format(label)
+            if marker not in old:
+                item.setToolTip(0, old + "\n{} {}".format(marker, msg))
+            item.setForeground(0, QColor("#f57c00"))
+            item.setData(0, Qt.UserRole + 30, msg)
 
         def _walk(node):
             for i in range(node.childCount()):
                 child = node.child(i)
                 nt = child.data(0, _UR)
-                if nt in GROUP:
+                if nt in GROUP and nt != "STAGE":
                     _walk(child)
                     continue
-                if nt is not None:
-                    continue
-                # FE run item only
                 run = child.data(0, _UR10)
-                if not run or run.get("run_type") != "FE":
-                    _walk(child)
-                    continue
-                # Closure scorecard
-                self._update_closure_on_item(child)
-                child.setData(0, Qt.UserRole + 30, None)
-                # Regression check (only for completed runs with history)
-                if run.get("is_comp"):
+                if closure_on and run and run.get("run_type") == "FE":
+                    self._update_closure_on_item(child)
+                if status_reg_on and run and run.get("run_type") == "FE" and run.get("is_comp"):
                     has_reg, msg = self._check_regression(run)
                     if not has_reg:
                         msg = sibling_regressions.get(run.get("path", ""), "")
                         has_reg = bool(msg)
                     if has_reg:
-                        child.setToolTip(
-                            0, child.toolTip(0) + f"\n[REGRESSION] {msg}")
-                        child.setForeground(0, QColor("#f57c00"))
-                        child.setData(0, Qt.UserRole + 30, msg)
-                # Yield to Qt every 50 items to keep UI responsive
+                        _annotate_regression(child, msg, "REGRESSION")
+                if qor_reg_on:
+                    msg = qor_regressions.get(id(child), "")
+                    if msg:
+                        _annotate_regression(child, msg, "QOR REGRESSION")
                 count[0] += 1
                 if count[0] % 50 == 0:
                     QApplication.processEvents()
@@ -4718,7 +5104,9 @@ class PDDashboard(QMainWindow):
         self.custom_sel_color = "#2f65ca"
         self.row_spacing = 2
         self.gate_count_unit_area = 0.2419
-        self._closure_enabled = True
+        self._closure_enabled = False
+        self._status_regression_enabled = False
+        self._qor_regression_enabled = False
         self.enable_fe_hover_metrics = False
         self._clear_fe_hover_metric_tooltips()
         try:
@@ -4756,7 +5144,9 @@ class PDDashboard(QMainWindow):
                 ('hide_block_nodes', 'false'),
                 ('show_relative_time', 'false'),
                 ('convert_to_ist', 'false'),
-                ('closure_enabled', 'true'),
+                ('closure_enabled', 'false'),
+                ('status_regression_enabled', 'false'),
+                ('qor_regression_enabled', 'false'),
                 ('enable_fe_hover_metrics', 'false'),
                 ('gate_count_unit_area', '0.241900')):
             prefs.set('UI', key, val)
@@ -4782,7 +5172,10 @@ class PDDashboard(QMainWindow):
             for i in range(node.childCount()):
                 child = node.child(i)
                 nt = child.data(0, Qt.UserRole)
-                if nt in ("BLOCK", "IGNORED_ROOT", "STANDALONE_ROOT"):
+                if nt == "STANDALONE_ROOT":
+                    child.setExpanded(False)
+                    continue
+                if nt in ("BLOCK", "IGNORED_ROOT"):
                     child.setExpanded(True)
                     _expand(child)
                 else:
@@ -5132,7 +5525,7 @@ class PDDashboard(QMainWindow):
             "WNS: " + str(self._metric_value(metrics, "wns")),
             "Gate Count: " + str(gc),
             "Instance Count: " + str(inst),
-            "VT L/R/H Area %: " + str(vt_area),
+            "VT Area %: " + str(vt_area),
             "Logic Depth: " + str(metrics.get("logic_depth", "-")),
         ]
         std_area = area.get("std_cell_area", "-")
@@ -6646,8 +7039,9 @@ class PDDashboard(QMainWindow):
                 and not self._signoff_bg_done):
             QTimer.singleShot(1200, self.start_bg_signoff_scan)
 
-        # Closure+regression scan deferred 300ms (after fit_all_columns)
-        if self._closure_enabled:
+        # Optional scorecard/regression pass deferred until after the tree paints.
+        if (self._closure_enabled or self._status_regression_enabled
+                or self._qor_regression_enabled):
             QTimer.singleShot(300, self._run_closure_pass)
         if getattr(self, "_force_default_expand", False):
             self._force_default_expand = False
@@ -8262,8 +8656,20 @@ class PDDashboard(QMainWindow):
         gen_l.addRow("", hide_blk_cb)
 
         closure_cb = QCheckBox("Enable Closure Scorecard (colors run names by sign-off status)")
-        closure_cb.setChecked(getattr(self, '_closure_enabled', True))
+        closure_cb.setChecked(getattr(self, '_closure_enabled', False))
         gen_l.addRow("", closure_cb)
+
+        status_reg_cb = QCheckBox("Enable Status Regression Detection")
+        status_reg_cb.setChecked(getattr(self, '_status_regression_enabled', False))
+        status_reg_cb.setToolTip(
+            "Checks runtime, FM and VSLP regressions from run history. Default: off.")
+        gen_l.addRow("", status_reg_cb)
+
+        qor_reg_cb = QCheckBox("Enable QoR Regression Detection")
+        qor_reg_cb.setChecked(getattr(self, '_qor_regression_enabled', False))
+        qor_reg_cb.setToolTip(
+            "Uses already cached metrics only. It does not parse QoR reports during scan. Default: off.")
+        gen_l.addRow("", qor_reg_cb)
 
         gate_factor_spin = QDoubleSpinBox()
         gate_factor_spin.setDecimals(6)
@@ -8509,9 +8915,15 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'hide_block_nodes',
                   'true' if self.hide_block_nodes else 'false')
         _need_rebuild = _need_rebuild or (old_hide_blk != self.hide_block_nodes)
-        self._closure_enabled   = closure_cb.isChecked()
+        self._closure_enabled = closure_cb.isChecked()
+        self._status_regression_enabled = status_reg_cb.isChecked()
+        self._qor_regression_enabled = qor_reg_cb.isChecked()
         prefs.set('UI', 'closure_enabled',
                   'true' if self._closure_enabled else 'false')
+        prefs.set('UI', 'status_regression_enabled',
+                  'true' if self._status_regression_enabled else 'false')
+        prefs.set('UI', 'qor_regression_enabled',
+                  'true' if self._qor_regression_enabled else 'false')
         self.gate_count_unit_area = gate_factor_spin.value()
         prefs.set('UI', 'gate_count_unit_area',
                   "{:.6f}".format(self.gate_count_unit_area))
@@ -9825,11 +10237,11 @@ class PDDashboard(QMainWindow):
         if key == "vth_area":
             if vth.get("stage_vt_area"):
                 return vth.get("stage_vt_area")
-            return vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-"))
+            return vth.get("vt_area", vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-")))
         if key == "vth_inst":
             if vth.get("stage_vt_inst"):
                 return vth.get("stage_vt_inst")
-            return vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-"))
+            return vth.get("vt_inst", vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-")))
         if key == "wns":
             return str(metrics.get("setup_r2r", metrics.get("r2r_setup", "-"))).split('/')[0]
         if key == "hold_wns":
@@ -9973,7 +10385,7 @@ class PDDashboard(QMainWindow):
                 ("CGC %", "cgc"),
                 ("MBIT %", "mbit"),
                 ("Logic Depth", "logic_depth"),
-                ("VT L/R/H Area %", "vth_area"),
+                ("VT Area %", "vth_area"),
             ]
         dlg = QDialog(self)
         self._prepare_utility_dialog(dlg)
