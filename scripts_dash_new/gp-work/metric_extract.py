@@ -531,10 +531,13 @@ def _parse_stage_vth(text):
 
 def _parse_stage_cts(text):
     for line in text.splitlines():
-        if not re.match(r"^\s*All\s+Clocks\b", line):
+        if not re.search(r"\bAll\s+Clocks\b", line, re.I):
             continue
         nums = re.findall(r"[-+]?\d+(?:\.\d+)?", line)
         if len(nums) >= 7:
+            # Columns after "All Clocks":
+            # Sinks, Levels, Clock Repeater Count, Clock Repeater Area,
+            # Clock Stdcell Area, Max Latency, Global Skew, ...
             return {
                 "skew_latency": "{}/{}".format(nums[6], nums[5]),
                 "clock_repeater_count_area": "{}/{}".format(nums[2], nums[3]),
@@ -891,6 +894,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         stage_path=stage_path, finder=finder)
     if cts_path:
         result.update(_parse_stage_cts(_read_stage_text(cts_path)))
+        result["cts_report"] = cts_path
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True

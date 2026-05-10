@@ -207,7 +207,7 @@ _SUMMARY_SCRIPT = _proj_cfg.get('TOOLS', 'SUMMARY_SCRIPT', fallback='')
 # Project paths -- defined here so they are available even without config.py
 SCRIPT_DIR       = os.path.dirname(os.path.abspath(__file__))
 NOTES_DIR        = os.path.join(SCRIPT_DIR, 'dashboard_notes')
-SNAPSHOT_DIR     = os.path.join(NOTES_DIR, 'snapshots')
+OLD_SNAPSHOT_DIR = os.path.join(NOTES_DIR, 'snapshots')
 def _safe_user_name():
     try:
         name = getpass.getuser()
@@ -215,10 +215,15 @@ def _safe_user_name():
         name = "user"
     return re.sub(r'[^A-Za-z0-9_.-]+', '_', name or "user")
 
+def _safe_path_token(value):
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', str(value or "project"))
+
 OLD_USER_PREFS_FILE = os.path.join(SCRIPT_DIR, 'user_prefs.ini')
 USER_PREFS_FILE  = os.path.join(
     NOTES_DIR, 'user_prefs_{}.ini'.format(_safe_user_name()))
 PROJECT_PREFIX   = _proj_cfg.get('PROJECT', 'PROJECT_PREFIX',   fallback='S5K2P5SP')
+SNAPSHOT_DIR     = os.path.join(
+    NOTES_DIR, _safe_path_token(PROJECT_PREFIX), _safe_user_name(), 'snapshot')
 BASE_WS_FE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_FE_DIR',   fallback='')
 BASE_WS_BE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_BE_DIR',   fallback='')
 BASE_OUTFEED_DIR = _proj_cfg.get('PROJECT', 'BASE_OUTFEED_DIR', fallback='')
@@ -2207,10 +2212,10 @@ class _TimingOverviewWidget(QWidget):
                 row_idx = self.row_indices[i] if i < len(self.row_indices) else i
                 tip = self.tooltips.get((metric, i), "")
                 self._bar_rects.append((rect, row_idx, tip))
-                if slot >= 54:
+                if slot >= 80 and bar_w >= 10:
                     p.setPen(fg)
                     vy = max(top0, bar_top - 15) if val >= 0 else min(bottom - 14, bar_top + h + 1)
-                    p.drawText(x - 18, vy, bar_w + 36, 14,
+                    p.drawText(x - 24, vy, bar_w + 48, 14,
                                Qt.AlignCenter, self._fmt(val))
             p.setPen(muted)
             p.drawText(4, top0 + 18, margin_l - 10, 16,
@@ -2804,12 +2809,31 @@ class BlockSummaryDialog(QDialog):
             super().accept()
 
     def _toggle_maximize(self):
-        if self.isMaximized():
-            self.showNormal()
+        if getattr(self, "_flowpulse_manual_maximized", False):
+            geom = getattr(self, "_flowpulse_restore_geometry", None)
+            try:
+                self.setWindowState(Qt.WindowNoState)
+            except Exception:
+                pass
+            if geom is not None:
+                self.setGeometry(geom)
+            else:
+                self.showNormal()
+            self._flowpulse_manual_maximized = False
             self.max_btn.setText("Maximize")
-        else:
-            self.showMaximized()
-            self.max_btn.setText("Restore")
+            return
+        self._flowpulse_restore_geometry = self.geometry()
+        try:
+            avail = QApplication.desktop().availableGeometry(self)
+        except Exception:
+            avail = QApplication.desktop().availableGeometry()
+        try:
+            self.setWindowState(Qt.WindowNoState)
+        except Exception:
+            pass
+        self.setGeometry(avail)
+        self._flowpulse_manual_maximized = True
+        self.max_btn.setText("Restore")
 
     def reject(self):
         if self._stop_active_worker():
@@ -3052,9 +3076,14 @@ class BlockSummaryDialog(QDialog):
             row_indices=row_ids,
             tooltips=timing_tips,
             is_dark=self.is_dark)
+        self._chart_timing.resize(self._chart_timing.minimumSize())
         self._chart_vt.set_data(
             labels, vt_rows, self.is_dark, vt_names=vt_names,
             row_indices=row_ids)
+        self._chart_vt.resize(self._chart_vt.minimumSize())
+        if hasattr(self, "_vt_scroll"):
+            self._vt_scroll.setMinimumHeight(
+                min(520, max(260, 92 + min(max(1, n), 10) * 35)))
 
     # -- Open cell report in gvim ------------------------------------------
 
@@ -3557,7 +3586,7 @@ class PDDashboard(QMainWindow):
             except Exception:
                 pass
 
-        def stop_worker(self, worker, timeout_ms=1200):
+        def stop_worker(self, worker, timeout_ms=3000):
             if not worker:
                 return True
             if not self._is_running(worker):
@@ -3571,7 +3600,7 @@ class PDDashboard(QMainWindow):
                 pass
             return not self._is_running(worker)
 
-        def stop_attr(self, attr_name, timeout_ms=1200):
+        def stop_attr(self, attr_name, timeout_ms=3000):
             worker = getattr(self.owner, attr_name, None)
             stopped = self.stop_worker(worker, timeout_ms)
             if stopped:
@@ -3594,7 +3623,7 @@ class PDDashboard(QMainWindow):
             self.groups[group] = kept
             return kept
 
-        def cancel_all(self, timeout_ms=1200):
+        def cancel_all(self, timeout_ms=3000):
             for group in list(self.groups.keys()):
                 self.cancel_group(group, timeout_ms)
 
@@ -3611,6 +3640,11 @@ class PDDashboard(QMainWindow):
         self.resize(1280, 720)
         self.setMinimumSize(800, 600)
         self._workers = self.WorkerRegistry(self)
+        self._closing_wait_for_workers = False
+        self._allow_final_close = False
+        self._close_wait_timer = QTimer(self)
+        self._close_wait_timer.setInterval(300)
+        self._close_wait_timer.timeout.connect(self._finish_deferred_close)
 
         # -- data ---------------------------------------------------------
         self.ws_data      = {}
@@ -3820,13 +3854,24 @@ class PDDashboard(QMainWindow):
                 pass
         self._io_threads = alive
 
+    def _has_running_io_threads(self):
+        alive = []
+        for t in list(getattr(self, "_io_threads", [])):
+            try:
+                if t.is_alive():
+                    alive.append(t)
+            except Exception:
+                pass
+        self._io_threads = alive
+        return bool(alive)
+
     def _cancel_worker_if_possible(self, worker):
         self._workers._cancel(worker)
 
-    def _stop_worker_if_running(self, worker, timeout_ms=1200):
+    def _stop_worker_if_running(self, worker, timeout_ms=3000):
         return self._workers.stop_worker(worker, timeout_ms)
 
-    def _stop_worker_attr(self, name, timeout_ms=1200):
+    def _stop_worker_attr(self, name, timeout_ms=3000):
         return self._workers.stop_attr(name, timeout_ms)
 
     def _clear_worker_attr_if_current(self, name, worker):
@@ -3844,7 +3889,7 @@ class PDDashboard(QMainWindow):
                 kept.append(worker)
         return kept
 
-    def _stop_worker_list_now(self, workers, timeout_ms=500):
+    def _stop_worker_list_now(self, workers, timeout_ms=3000):
         kept = []
         for worker in list(workers or []):
             if not self._stop_worker_if_running(worker, timeout_ms):
@@ -3852,12 +3897,46 @@ class PDDashboard(QMainWindow):
         return kept
 
     def _has_running_workers(self):
-        return self._workers.has_running()
+        try:
+            if self._workers.has_running():
+                return True
+        except Exception:
+            pass
+        for list_name in (
+                "size_workers", "_stage_workers", "_fe_cong_workers",
+                "_stage_screenshot_workers", "_stage_metric_workers"):
+            for worker in list(getattr(self, list_name, []) or []):
+                if self._worker_is_running(worker):
+                    return True
+        for attr_name in (
+                "worker", "_quick_refresh_worker", "_metric_worker",
+                "_metric_batch_worker", "_hover_metric_worker",
+                "_owner_lookup_worker", "_signoff_worker",
+                "_disk_scan_worker", "_qor_worker"):
+            if self._worker_is_running(getattr(self, attr_name, None)):
+                return True
+        return False
 
     def _shutdown_all_workers(self):
-        self._workers.cancel_all(1200)
+        self._workers.cancel_all(3000)
+        self.size_workers = self._stop_worker_list_now(
+            getattr(self, "size_workers", []), 3000)
+        self._stage_workers = self._stop_worker_list_now(
+            getattr(self, "_stage_workers", []), 3000)
+        self._fe_cong_workers = self._stop_worker_list_now(
+            getattr(self, "_fe_cong_workers", []), 3000)
+        self._stage_screenshot_workers = self._stop_worker_list_now(
+            getattr(self, "_stage_screenshot_workers", []), 3000)
+        self._stage_metric_workers = self._stop_worker_list_now(
+            getattr(self, "_stage_metric_workers", []), 3000)
+        for attr_name in (
+                "worker", "_quick_refresh_worker", "_metric_worker",
+                "_metric_batch_worker", "_hover_metric_worker",
+                "_owner_lookup_worker", "_signoff_worker",
+                "_disk_scan_worker", "_qor_worker"):
+            self._stop_worker_attr(attr_name, 3000)
 
-    def closeEvent(self, event):
+    def _save_ui_preferences_for_close(self):
         if not prefs.has_section('UI'):
             prefs.add_section('UI')
         prefs.set('UI', 'main_splitter', ','.join(
@@ -3879,14 +3958,40 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'col_widths', col_widths)
         prefs.set('UI', 'col_hidden', col_hidden)
         _write_config_atomic(prefs, USER_PREFS_FILE)
-        self._shutdown_all_workers()
-        self._wait_for_io_threads(1500)
-        if self._has_running_workers():
+
+    def _finish_deferred_close(self):
+        if self._has_running_workers() or self._has_running_io_threads():
+            try:
+                self.status_bar.showMessage(
+                    "Waiting for background workers to stop before closing...",
+                    1000)
+            except Exception:
+                pass
+            return
+        try:
+            self._close_wait_timer.stop()
+        except Exception:
+            pass
+        self._allow_final_close = True
+        self.close()
+
+    def closeEvent(self, event):
+        self._save_ui_preferences_for_close()
+        if getattr(self, "_allow_final_close", False):
+            self._wait_for_io_threads(3000)
+            event.accept()
+            return
+        if not getattr(self, "_closing_wait_for_workers", False):
+            self._closing_wait_for_workers = True
+            self._shutdown_all_workers()
+            self._wait_for_io_threads(3000)
+        if self._has_running_workers() or self._has_running_io_threads():
             try:
                 self.status_bar.showMessage(
                     "Waiting for background workers to stop before closing...",
                     3000)
-                QTimer.singleShot(1000, self.close)
+                if not self._close_wait_timer.isActive():
+                    self._close_wait_timer.start()
             except Exception:
                 pass
             event.ignore()
@@ -3984,6 +4089,9 @@ class PDDashboard(QMainWindow):
 
     def _snapshot_latest_file(self):
         return os.path.join(self._snapshot_dir(), "latest_snapshot.json.gz")
+
+    def _old_snapshot_latest_file(self):
+        return os.path.join(OLD_SNAPSHOT_DIR, "latest_snapshot.json.gz")
 
     def _json_safe(self, obj):
         if obj is None or isinstance(obj, (str, int, float, bool)):
@@ -4189,7 +4297,12 @@ class PDDashboard(QMainWindow):
                 "Could not save snapshot:\n" + str(e))
 
     def _read_snapshot(self, fp=None):
-        fp = fp or self._snapshot_latest_file()
+        if fp is None:
+            fp = self._snapshot_latest_file()
+            if not os.path.exists(fp):
+                old_fp = self._old_snapshot_latest_file()
+                if os.path.exists(old_fp):
+                    fp = old_fp
         if not os.path.exists(fp):
             return None
         try:
@@ -4219,7 +4332,11 @@ class PDDashboard(QMainWindow):
 
     def show_snapshot_status(self):
         fp = self._snapshot_latest_file()
-        payload = self._read_snapshot(fp)
+        payload = self._read_snapshot()
+        if payload and not os.path.exists(fp):
+            old_fp = self._old_snapshot_latest_file()
+            if os.path.exists(old_fp):
+                fp = old_fp
         if not payload:
             QMessageBox.information(
                 self, "Lightweight Snapshot",
@@ -4246,7 +4363,10 @@ class PDDashboard(QMainWindow):
             self, "Lightweight Snapshot", "\n".join(lines))
 
     def load_latest_snapshot_view(self):
-        self._load_snapshot_view_from_path(self._snapshot_latest_file())
+        fp = self._snapshot_latest_file()
+        if not os.path.exists(fp) and os.path.exists(self._old_snapshot_latest_file()):
+            fp = self._old_snapshot_latest_file()
+        self._load_snapshot_view_from_path(fp)
 
     def load_snapshot_file_view(self):
         fp, _ = QFileDialog.getOpenFileName(
@@ -4292,6 +4412,8 @@ class PDDashboard(QMainWindow):
 
     def export_latest_snapshot(self):
         src = self._snapshot_latest_file()
+        if not os.path.exists(src) and os.path.exists(self._old_snapshot_latest_file()):
+            src = self._old_snapshot_latest_file()
         if not os.path.exists(src):
             QMessageBox.information(
                 self, "Lightweight Snapshot",
@@ -5842,6 +5964,61 @@ class PDDashboard(QMainWindow):
         return out
 
     def _update_status_bar(self, runs=None):
+        be_only = False
+        try:
+            be_only = self.view_combo.currentText() == "BE Only"
+        except Exception:
+            be_only = False
+        if be_only:
+            total = completed = running = failed = 0
+            try:
+                for item in self._iter_tree_items():
+                    if item.isHidden():
+                        continue
+                    run = item.data(0, Qt.UserRole + 10)
+                    if not run or run.get("run_type") != "BE":
+                        continue
+                    total += 1
+                    st = (item.text(3) or run.get("fe_status", "") or "").upper()
+                    has_running_stage = False
+                    has_failed_stage = False
+                    for i in range(item.childCount()):
+                        ch = item.child(i)
+                        ch_status = ((ch.text(3) or "") + " " + (ch.text(4) or "")).upper()
+                        if "RUNNING" in ch_status:
+                            has_running_stage = True
+                        if ("FAILED" in ch_status or "FATAL" in ch_status
+                                or "INTERRUPTED" in ch_status):
+                            has_failed_stage = True
+                    if has_running_stage or st == "RUNNING":
+                        running += 1
+                    elif has_failed_stage or st in ("FAILED", "FATAL ERROR", "INTERRUPTED"):
+                        failed += 1
+                    elif st in ("COMPLETED", "-"):
+                        completed += 1
+            except Exception:
+                pass
+            self.sb_total.setText(f"     Total: {total}")
+            self.sb_complete.setText(f"     Completed: {completed}")
+            self.sb_running.setText(f"    Running: {running}")
+            self.sb_selected.setText(f"     Selected: {len(self._checked_paths)}")
+            if self._last_scan_time:
+                self.sb_scan_time.setText(
+                    f"     Last scan: {self._last_scan_time}   ")
+            def _restyle_be(btn, label, color):
+                btn.setText(label)
+                btn.setStyleSheet(
+                    "QPushButton#healthBadge { background: " + color + "18; color: " + color + "; "
+                    "border: 1px solid " + color + "55; border-radius: 10px; "
+                    "padding: 0 10px; font-size: 11px; font-weight: bold; }"
+                    "QPushButton#healthBadge:hover { background: " + color + "33; }")
+            _restyle_be(self.badge_completed, f"Completed: {completed}", "#388e3c")
+            _restyle_be(self.badge_running, f"Running: {running}",
+                        "#1976d2" if running == 0 else "#f57c00")
+            _restyle_be(self.badge_failed, f"Failed: {failed}",
+                        "#757575" if failed == 0 else "#d32f2f")
+            return
+
         if runs is None:
             runs = self._visible_runs_for_status()
         total = completed = running = not_started = failed = 0
@@ -6026,7 +6203,7 @@ class PDDashboard(QMainWindow):
             return
         self._hover_metric_path = ""
         if isinstance(metrics, dict) and not metrics.get("_error"):
-            self._hover_metric_cache[path] = metrics
+            self._cache_put_limited(self._hover_metric_cache, path, metrics)
         lines = self._format_fe_hover_metrics(metrics)
         try:
             item = self.item_map.get(item_id)
@@ -6081,6 +6258,14 @@ class PDDashboard(QMainWindow):
     def _worker_is_running(self, worker):
         return self._workers._is_running(worker)
 
+    def _cache_put_limited(self, cache_obj, key, value, limit=500):
+        try:
+            cache_obj[key] = value
+            while len(cache_obj) > limit:
+                cache_obj.pop(next(iter(cache_obj)))
+        except Exception:
+            pass
+
     def _hide_stage_metric_panel(self):
         self._stage_metric_request_token += 1
         if hasattr(self, "stage_metric_box"):
@@ -6116,6 +6301,10 @@ class PDDashboard(QMainWindow):
         if rpt_dir and rpt_dir != "-":
             lines.append("")
             lines.append("Report dir: {}".format(rpt_dir))
+        paths = metrics.get("_paths") if isinstance(metrics.get("_paths"), dict) else {}
+        cts_report = metrics.get("cts_report") or paths.get("skew_latency")
+        if cts_report and cts_report != "-":
+            lines.append("CTS report: {}".format(cts_report))
         if metrics.get("error"):
             lines.append("")
             lines.append("Parser warning: {}".format(metrics.get("error")))
@@ -6174,7 +6363,9 @@ class PDDashboard(QMainWindow):
         except Exception:
             cache_key = None
         if cache_key:
-            self._stage_metric_cache[cache_key] = metrics if isinstance(metrics, dict) else {}
+            self._cache_put_limited(
+                self._stage_metric_cache, cache_key,
+                metrics if isinstance(metrics, dict) else {})
         self._stage_metric_workers = self._keep_running_workers(
             self._stage_metric_workers)
         if token != self._stage_metric_request_token:
@@ -6344,7 +6535,7 @@ class PDDashboard(QMainWindow):
                     hit = matches[0]
         except Exception:
             hit = None
-        self._cong_img_cache[key] = hit
+        self._cache_put_limited(self._cong_img_cache, key, hit)
         return hit
 
     def _extract_fe_fp_ver(self, run_path):
@@ -6365,7 +6556,7 @@ class PDDashboard(QMainWindow):
                             break
         except Exception:
             val = "-"
-        self._fp_ver_cache[run_path] = val
+        self._cache_put_limited(self._fp_ver_cache, run_path, val)
         return val
 
     def _update_fe_congestion_panel(self, item, run_data):
@@ -6452,9 +6643,10 @@ class PDDashboard(QMainWindow):
         except Exception:
             key = ""
         if key:
-            self._stage_screenshot_cache[key] = (
-                found if isinstance(found, dict) else {},
-                img if isinstance(img, QImage) else QImage())
+            self._cache_put_limited(
+                self._stage_screenshot_cache, key,
+                (found if isinstance(found, dict) else {},
+                 img if isinstance(img, QImage) else QImage()))
         self._stage_screenshot_workers = self._keep_running_workers(
             self._stage_screenshot_workers)
         if token != self._stage_screenshot_request_token:
@@ -6499,9 +6691,11 @@ class PDDashboard(QMainWindow):
 
     def _on_fe_congestion_lookup_done(self, token, run_path, block, fp_ver, img_path, img):
         key = (run_path or "", block or "")
-        self._fp_ver_cache[run_path] = fp_ver or "-"
-        self._cong_img_cache[key] = img_path or ""
-        self._cong_image_cache[key] = img if isinstance(img, QImage) else QImage()
+        self._cache_put_limited(self._fp_ver_cache, run_path, fp_ver or "-")
+        self._cache_put_limited(self._cong_img_cache, key, img_path or "")
+        self._cache_put_limited(
+            self._cong_image_cache, key,
+            img if isinstance(img, QImage) else QImage())
         self._fe_cong_workers = self._keep_running_workers(
             self._fe_cong_workers)
         if token != self._fe_cong_request_token:
@@ -7631,11 +7825,10 @@ class PDDashboard(QMainWindow):
             self._apply_fm_color(child, 8, child.text(8))
             self._apply_vslp_color(child, 9, child.text(9))
 
-            ir_info = self.ir_data.get(run["block"], {})
-            static_val  = ir_info.get("static", "N/A")
-            dynamic_val = ir_info.get("dynamic", "N/A")
-            child.setText(10, static_val)
-            child.setText(11, dynamic_val)
+            # IR is stage-level RedHawk data keyed by run-BE/stage.
+            # FE rows do not have a direct IR result.
+            child.setText(10, "N/A")
+            child.setText(11, "N/A")
 
         elif run["run_type"] == "BE":
             child.setText(3, "COMPLETED" if run.get("is_comp") else "-")
@@ -7737,7 +7930,17 @@ class PDDashboard(QMainWindow):
             s_item.setText(15, stage.get("stage_path", "N/A"))
             s_item.setText(16, stage.get("log",        "N/A"))
             s_item.setText(20, stage.get("sta_rpt_path",  "N/A"))
-            s_item.setText(21, stage.get("qor_path",      "N/A"))
+            ir_log = "N/A"
+            if (be_run.get("block") or "") == PROJECT_PREFIX:
+                ir_key = "{}/{}".format(be_run.get("r_name", ""), stage.get("name", ""))
+                ir_info = self.ir_data.get(ir_key, {}) if isinstance(self.ir_data, dict) else {}
+                s_item.setText(10, ir_info.get("static", "N/A"))
+                s_item.setText(11, ir_info.get("dynamic", "N/A"))
+                ir_log = ir_info.get("log", "N/A")
+            else:
+                s_item.setText(10, "N/A")
+                s_item.setText(11, "N/A")
+            s_item.setText(21, ir_log)
 
 
 

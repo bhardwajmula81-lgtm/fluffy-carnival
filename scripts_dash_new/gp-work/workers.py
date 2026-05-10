@@ -367,6 +367,16 @@ _path_cache      = {}
 _path_cache_lock = threading.Lock()
 _owner_cache      = {}
 _owner_cache_lock = threading.Lock()
+_PATH_CACHE_MAX = 50000
+_OWNER_CACHE_MAX = 10000
+
+def _bounded_cache_put(cache, key, value, limit):
+    cache[key] = value
+    try:
+        while len(cache) > limit:
+            cache.pop(next(iter(cache)))
+    except Exception:
+        cache.clear()
 
 def cached_exists(path):
     with _path_cache_lock:
@@ -374,7 +384,7 @@ def cached_exists(path):
             return _path_cache[path]
     result = os.path.exists(path)
     with _path_cache_lock:
-        _path_cache[path] = result
+        _bounded_cache_put(_path_cache, path, result, _PATH_CACHE_MAX)
     return result
 
 def clear_path_cache():
@@ -392,7 +402,7 @@ def prefetch_path_cache(paths):
         results = list(ex.map(os.path.exists, unique))
     with _path_cache_lock:
         for p, r in zip(unique, results):
-            _path_cache[p] = r
+            _bounded_cache_put(_path_cache, p, r, _PATH_CACHE_MAX)
 
 def get_owner(path):
     if not path or not cached_exists(path):
@@ -406,7 +416,7 @@ def get_owner(path):
     except Exception:
         owner = "Unknown"
     with _owner_cache_lock:
-        _owner_cache[norm] = owner
+        _bounded_cache_put(_owner_cache, norm, owner, _OWNER_CACHE_MAX)
     return owner
 
 def normalize_rtl(rtl_str):
