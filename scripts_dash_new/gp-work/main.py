@@ -206,9 +206,18 @@ _SUMMARY_SCRIPT = _proj_cfg.get('TOOLS', 'SUMMARY_SCRIPT', fallback='')
 
 # Project paths -- defined here so they are available even without config.py
 SCRIPT_DIR       = os.path.dirname(os.path.abspath(__file__))
-USER_PREFS_FILE  = os.path.join(SCRIPT_DIR, 'user_prefs.ini')
 NOTES_DIR        = os.path.join(SCRIPT_DIR, 'dashboard_notes')
 SNAPSHOT_DIR     = os.path.join(NOTES_DIR, 'snapshots')
+def _safe_user_name():
+    try:
+        name = getpass.getuser()
+    except Exception:
+        name = "user"
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', name or "user")
+
+OLD_USER_PREFS_FILE = os.path.join(SCRIPT_DIR, 'user_prefs.ini')
+USER_PREFS_FILE  = os.path.join(
+    NOTES_DIR, 'user_prefs_{}.ini'.format(_safe_user_name()))
 PROJECT_PREFIX   = _proj_cfg.get('PROJECT', 'PROJECT_PREFIX',   fallback='S5K2P5SP')
 BASE_WS_FE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_FE_DIR',   fallback='')
 BASE_WS_BE_DIR   = _proj_cfg.get('PROJECT', 'BASE_WS_BE_DIR',   fallback='')
@@ -230,11 +239,6 @@ IGNORE_PNR_STAGE_PATTERNS = _proj_cfg.get(
     'SCAN_IGNORE', 'PNR_STAGE_PATTERNS', fallback='backup_*')
 _blocks_raw      = _proj_cfg.get('PROJECT', 'BLOCKS',           fallback='')
 BLOCKS           = set(b.strip() for b in _blocks_raw.split(',') if b.strip())
-
-# Load user preferences
-prefs = configparser.ConfigParser()
-if os.path.exists(USER_PREFS_FILE):
-    prefs.read(USER_PREFS_FILE)
 
 # Ensure notes dir exists
 if not os.path.exists(NOTES_DIR):
@@ -393,6 +397,16 @@ def save_user_pins(pins_dict):
         _atomic_write_json(_get_pins_file(), pins_dict, indent=4)
     except Exception:
         pass
+
+# Load per-user preferences. Migrate the old shared prefs once per user.
+if (not os.path.exists(USER_PREFS_FILE)) and os.path.exists(OLD_USER_PREFS_FILE):
+    try:
+        shutil.copy2(OLD_USER_PREFS_FILE, USER_PREFS_FILE)
+    except Exception:
+        pass
+prefs = configparser.ConfigParser()
+if os.path.exists(USER_PREFS_FILE):
+    prefs.read(USER_PREFS_FILE)
 
 
 def _ensure_notes_dir():
@@ -2047,6 +2061,164 @@ class _BarChartWidget(QWidget):
                    Qt.AlignRight | Qt.AlignVCenter, self._fmt_value(axis_min))
 
 
+class _TimingOverviewWidget(QWidget):
+    """Combined WNS/TNS/NVE chart with one row per metric."""
+    bar_clicked = pyqtSignal(int)
+
+    def __init__(self, title="Timing Overview"):
+        super().__init__()
+        self.title = title
+        self.labels = []
+        self.series = []
+        self.row_indices = []
+        self.tooltips = {}
+        self.is_dark = False
+        self._bar_rects = []
+        self.setMouseTracking(True)
+        self.setMinimumSize(620, 260)
+
+    def set_data(self, labels, series, row_indices=None, tooltips=None, is_dark=False):
+        self.labels = list(labels or [])
+        cleaned = []
+        for name, vals, colors in list(series or []):
+            out_vals = []
+            for v in vals or []:
+                try:
+                    fv = float(v)
+                    if math.isnan(fv) or math.isinf(fv):
+                        fv = 0.0
+                except Exception:
+                    fv = 0.0
+                out_vals.append(fv)
+            cleaned.append((name, out_vals, list(colors or [])))
+        self.series = cleaned
+        self.row_indices = list(row_indices or range(len(self.labels)))
+        self.tooltips = dict(tooltips or {})
+        self.is_dark = is_dark
+        self._bar_rects = []
+        self.setMinimumWidth(max(620, 110 + max(1, len(self.labels)) * 58))
+        self.setMinimumHeight(88 + max(1, len(self.series)) * 86)
+        self.update()
+
+    def _fmt(self, val):
+        try:
+            return "{:.4g}".format(float(val))
+        except Exception:
+            return str(val)
+
+    def _hit_index(self, pos):
+        for rect, row_idx, tip in self._bar_rects:
+            if rect.contains(pos):
+                return row_idx, tip
+        return None, ""
+
+    def mouseMoveEvent(self, event):
+        row_idx, tip = self._hit_index(event.pos())
+        if tip:
+            QToolTip.showText(event.globalPos(), tip, self)
+        else:
+            QToolTip.hideText()
+        super().mouseMoveEvent(event)
+
+    def mousePressEvent(self, event):
+        row_idx, tip = self._hit_index(event.pos())
+        if row_idx is not None:
+            self.bar_clicked.emit(int(row_idx))
+            return
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        fg = QColor("#dfe1e5" if self.is_dark else "#263238")
+        muted = QColor("#9aa0a6" if self.is_dark else "#6b7280")
+        bg = QColor("#2b2d30" if self.is_dark else "#ffffff")
+        grid = QColor("#55585c" if self.is_dark else "#d7dbe0")
+        p.fillRect(self.rect(), bg)
+        r = self.rect()
+        self._bar_rects = []
+        if not self.series or not self.labels:
+            p.setPen(fg)
+            p.drawText(r, Qt.AlignCenter, "No timing data")
+            return
+
+        p.setPen(fg)
+        p.drawText(r.adjusted(0, 6, 0, 0),
+                   Qt.AlignHCenter | Qt.AlignTop, self.title)
+        margin_l = 72
+        margin_r = 18
+        margin_t = 38
+        lane_gap = 20
+        lane_h = max(58, int((r.height() - margin_t - 22 -
+                              lane_gap * (len(self.series) - 1)) /
+                             max(1, len(self.series))))
+        area_w = r.width() - margin_l - margin_r
+        n = max(1, len(self.labels))
+        slot = max(1, area_w // n)
+        bar_w = max(4, min(30, slot - 8))
+
+        for lane_idx, (metric, vals, colors) in enumerate(self.series):
+            top0 = margin_t + lane_idx * (lane_h + lane_gap)
+            bottom = top0 + lane_h
+            local = vals or [0.0]
+            vmax = max(local)
+            vmin = min(local)
+            if vmax == vmin:
+                if vmax == 0:
+                    axis_min, axis_max = -1.0, 1.0
+                elif vmax > 0:
+                    axis_min, axis_max = 0.0, vmax * 1.15
+                else:
+                    axis_min, axis_max = vmin * 1.15, 0.0
+            else:
+                axis_min = min(0.0, vmin)
+                axis_max = max(0.0, vmax)
+            span = axis_max - axis_min
+            if abs(span) < 1e-12:
+                span = 1.0
+
+            def _y(value):
+                return top0 + int((axis_max - value) / span * lane_h)
+
+            zero_y = _y(0.0)
+            p.setPen(fg)
+            p.drawText(4, top0, margin_l - 10, 18,
+                       Qt.AlignRight | Qt.AlignVCenter, metric)
+            p.setPen(QPen(grid, 1))
+            p.drawLine(margin_l, zero_y, margin_l + area_w, zero_y)
+            p.drawLine(margin_l, top0, margin_l, bottom)
+            p.setPen(QPen(grid, 1, Qt.DotLine))
+            p.drawLine(margin_l, top0 + lane_h // 2,
+                       margin_l + area_w, top0 + lane_h // 2)
+
+            for i, val in enumerate(vals):
+                color = colors[i] if i < len(colors) else QColor("#42a5f5")
+                x = margin_l + i * slot + max(1, (slot - bar_w) // 2)
+                y_val = _y(val)
+                bar_top = min(y_val, zero_y)
+                h = abs(y_val - zero_y)
+                if h < 1:
+                    h = 1
+                    bar_top = zero_y - 1 if val >= 0 else zero_y
+                rect = QRect(x, bar_top, bar_w, h)
+                p.setBrush(QBrush(color))
+                p.setPen(Qt.NoPen)
+                p.drawRect(rect)
+                row_idx = self.row_indices[i] if i < len(self.row_indices) else i
+                tip = self.tooltips.get((metric, i), "")
+                self._bar_rects.append((rect, row_idx, tip))
+                if slot >= 54:
+                    p.setPen(fg)
+                    vy = max(top0, bar_top - 15) if val >= 0 else min(bottom - 14, bar_top + h + 1)
+                    p.drawText(x - 18, vy, bar_w + 36, 14,
+                               Qt.AlignCenter, self._fmt(val))
+            p.setPen(muted)
+            p.drawText(4, top0 + 18, margin_l - 10, 16,
+                       Qt.AlignRight | Qt.AlignVCenter, self._fmt(axis_max))
+            p.drawText(4, bottom - 16, margin_l - 10, 16,
+                       Qt.AlignRight | Qt.AlignVCenter, self._fmt(axis_min))
+
+
 class _StackedVtChartWidget(QWidget):
     """Interactive per-run stacked VT percentage chart."""
     row_clicked = pyqtSignal(int)
@@ -2078,6 +2250,8 @@ class _StackedVtChartWidget(QWidget):
         self.row_indices = list(row_indices or range(len(self.rows)))
         self.is_dark = is_dark
         self._segments = []
+        self.setMinimumWidth(760)
+        self.setMinimumHeight(84 + max(1, len(self.rows)) * 35 + 42)
         self.update()
 
     def _hit_segment(self, pos):
@@ -2137,8 +2311,7 @@ class _StackedVtChartWidget(QWidget):
         row_h = 26
         gap = 9
         legend_h = 34
-        avail_rows = max(1, int((r.height() - top - legend_h - 10) / (row_h + gap)))
-        shown = valid[:avail_rows]
+        shown = valid
         bar_w = max(90, r.width() - left - right)
 
         for i, (label, vals, row_idx) in enumerate(shown):
@@ -2168,12 +2341,6 @@ class _StackedVtChartWidget(QWidget):
                     p.setPen(QColor("#ffffff"))
                     p.drawText(rect, Qt.AlignCenter, "{:.1f}%".format(pct))
                 x += w
-        if len(valid) > len(shown):
-            p.setPen(muted)
-            p.drawText(left, top + len(shown) * (row_h + gap),
-                       bar_w, 20, Qt.AlignRight,
-                       "+{} more run(s) in table".format(len(valid) - len(shown)))
-
         lx = left
         ly = r.height() - 28
         for i, name in enumerate(self.vt_names):
@@ -2479,20 +2646,21 @@ class BlockSummaryDialog(QDialog):
         chart_top.addWidget(refresh_charts_btn, 0)
         tab_charts_layout.addLayout(chart_top)
 
-        self._timing_tabs = QTabWidget()
-        self._chart_wns = _BarChartWidget("R2R Setup WNS")
-        self._chart_tns = _BarChartWidget("R2R Setup TNS")
-        self._chart_nve = _BarChartWidget("R2R Setup NVE")
-        for _chart in (self._chart_wns, self._chart_tns, self._chart_nve):
-            _chart.bar_clicked.connect(self._select_chart_row)
-        self._timing_tabs.addTab(self._chart_wns, "WNS")
-        self._timing_tabs.addTab(self._chart_tns, "TNS")
-        self._timing_tabs.addTab(self._chart_nve, "NVE")
-        tab_charts_layout.addWidget(self._timing_tabs, 1)
+        self._chart_timing = _TimingOverviewWidget("R2R Setup Timing")
+        self._chart_timing.bar_clicked.connect(self._select_chart_row)
+        self._timing_scroll = QScrollArea()
+        self._timing_scroll.setWidgetResizable(False)
+        self._timing_scroll.setMinimumHeight(285)
+        self._timing_scroll.setWidget(self._chart_timing)
+        tab_charts_layout.addWidget(self._timing_scroll, 1)
 
         self._chart_vt = _StackedVtChartWidget("VT Area % per Run")
         self._chart_vt.row_clicked.connect(self._select_chart_row)
-        tab_charts_layout.addWidget(self._chart_vt, 1)
+        self._vt_scroll = QScrollArea()
+        self._vt_scroll.setWidgetResizable(False)
+        self._vt_scroll.setMinimumHeight(260)
+        self._vt_scroll.setWidget(self._chart_vt)
+        tab_charts_layout.addWidget(self._vt_scroll, 1)
         self._chart_run_map = QTableWidget(0, 2)
         self._chart_run_map.setHorizontalHeaderLabels(["Alias", "Run Name"])
         self._chart_run_map.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
@@ -2526,6 +2694,10 @@ class BlockSummaryDialog(QDialog):
         mail_btn = QPushButton("Send as Mail")
         mail_btn.clicked.connect(self._send_mail)
         btn_row.addWidget(mail_btn)
+
+        self.max_btn = QPushButton("Maximize")
+        self.max_btn.clicked.connect(self._toggle_maximize)
+        btn_row.addWidget(self.max_btn)
 
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
@@ -2618,16 +2790,26 @@ class BlockSummaryDialog(QDialog):
         QTimer.singleShot(10, self._load_next)
 
     def closeEvent(self, event):
-        self._stop_active_worker()
-        event.accept()
+        if self._stop_active_worker():
+            event.accept()
+        else:
+            event.ignore()
 
     def accept(self):
         self._stop_active_worker()
         super().accept()
 
+    def _toggle_maximize(self):
+        if self.isMaximized():
+            self.showNormal()
+            self.max_btn.setText("Maximize")
+        else:
+            self.showMaximized()
+            self.max_btn.setText("Restore")
+
     def reject(self):
-        self._stop_active_worker()
-        super().reject()
+        if self._stop_active_worker():
+            super().reject()
 
     def _stop_active_worker(self):
         self._cancelled = True
@@ -2638,10 +2820,12 @@ class BlockSummaryDialog(QDialog):
                     w.cancel()
                 w.wait(1000)
                 if w.isRunning():
-                    w.terminate()
-                    w.wait(300)
+                    self.status_lbl.setText(
+                        "Stopping metric extraction... please close again in a moment.")
+                    return False
         except Exception:
-            pass
+            return True
+        return True
 
     # -- Row builder ------------------------------------------------------
 
@@ -2781,9 +2965,7 @@ class BlockSummaryDialog(QDialog):
             empty = []
             if hasattr(self, "_chart_run_map"):
                 self._chart_run_map.setRowCount(0)
-            self._chart_wns.set_data(empty, empty, is_dark=self.is_dark)
-            self._chart_tns.set_data(empty, empty, is_dark=self.is_dark)
-            self._chart_nve.set_data(empty, empty, is_dark=self.is_dark)
+            self._chart_timing.set_data(empty, [], is_dark=self.is_dark)
             self._chart_vt.set_data(empty, empty, is_dark=self.is_dark)
             return
 
@@ -2843,35 +3025,29 @@ class BlockSummaryDialog(QDialog):
             while len(vals) < len(vt_names):
                 vals.append(0.0)
 
-        def _timing_tips(metric_name, vals):
-            out = []
+        timing_tips = {}
+        def _add_timing_tips(metric_name, vals):
             for i, val in enumerate(vals):
-                out.append("{}: {}\n{}: {}\nR2R Setup: {}".format(
+                timing_tips[(metric_name, i)] = "{}: {}\n{}: {}\nR2R Setup: {}".format(
                     labels[i], full_names[i], metric_name, val,
-                    _cell(i, self._COL_R2R_SETUP)))
-            return out
+                    _cell(i, self._COL_R2R_SETUP))
+        _add_timing_tips("WNS", wns_vals)
+        _add_timing_tips("TNS", tns_vals)
+        _add_timing_tips("NVE", nve_vals)
 
-        self._chart_wns.set_data(
-            labels, wns_vals,
-            colors=[QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in wns_vals],
-            is_dark=self.is_dark,
+        self._chart_timing.set_data(
+            labels,
+            [
+                ("WNS", wns_vals,
+                 [QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in wns_vals]),
+                ("TNS", tns_vals,
+                 [QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in tns_vals]),
+                ("NVE", nve_vals,
+                 [QColor("#ef5350") if v > 0 else QColor("#66bb6a") for v in nve_vals]),
+            ],
             row_indices=row_ids,
-            tooltips=_timing_tips("WNS", wns_vals),
-            value_format="{:.4g}")
-        self._chart_tns.set_data(
-            labels, tns_vals,
-            colors=[QColor("#ef5350") if v < 0 else QColor("#66bb6a") for v in tns_vals],
-            is_dark=self.is_dark,
-            row_indices=row_ids,
-            tooltips=_timing_tips("TNS", tns_vals),
-            value_format="{:.4g}")
-        self._chart_nve.set_data(
-            labels, nve_vals,
-            colors=[QColor("#ef5350") if v > 0 else QColor("#66bb6a") for v in nve_vals],
-            is_dark=self.is_dark,
-            row_indices=row_ids,
-            tooltips=_timing_tips("NVE", nve_vals),
-            value_format="{:.4g}")
+            tooltips=timing_tips,
+            is_dark=self.is_dark)
         self._chart_vt.set_data(
             labels, vt_rows, self.is_dark, vt_names=vt_names,
             row_indices=row_ids)
@@ -3148,16 +3324,18 @@ class BEStageSummaryDialog(QDialog):
         self.status_lbl.setText("Done. {} row(s) loaded.".format(self.tbl.rowCount()))
 
     def closeEvent(self, event):
-        self._stop_active_worker()
-        event.accept()
+        if self._stop_active_worker():
+            event.accept()
+        else:
+            event.ignore()
 
     def accept(self):
         self._stop_active_worker()
         super().accept()
 
     def reject(self):
-        self._stop_active_worker()
-        super().reject()
+        if self._stop_active_worker():
+            super().reject()
 
     def _stop_active_worker(self):
         self._cancelled = True
@@ -3168,10 +3346,12 @@ class BEStageSummaryDialog(QDialog):
                     w.cancel()
                 w.wait(1000)
                 if w.isRunning():
-                    w.terminate()
-                    w.wait(300)
+                    self.status_lbl.setText(
+                        "Stopping metric extraction... please close again in a moment.")
+                    return False
         except Exception:
-            pass
+            return True
+        return True
 
     def _add_row(self, task, metrics):
         values = [
@@ -3328,6 +3508,8 @@ class PDDashboard(QMainWindow):
         # -- worker/state -------------------------------------------------
         self.size_workers           = []
         self._stage_workers         = []
+        self._io_threads            = []
+        self._closure_pass_token    = 0
         self.worker                 = None
         self._metric_worker          = None
         self._qor_worker             = None
@@ -3523,12 +3705,11 @@ class PDDashboard(QMainWindow):
             pass
         try:
             if worker.isRunning():
-                worker.terminate()
-                worker.wait(500)
+                return False
         except RuntimeError:
             return True
         except Exception:
-            pass
+            return False
         return not self._worker_is_running(worker)
 
     def _stop_worker_attr(self, name, timeout_ms=1200):
@@ -3557,19 +3738,35 @@ class PDDashboard(QMainWindow):
         return kept
 
     def _stop_worker_list_now(self, workers, timeout_ms=500):
+        kept = []
         for worker in list(workers or []):
-            self._stop_worker_if_running(worker, timeout_ms)
-        return []
+            if not self._stop_worker_if_running(worker, timeout_ms):
+                kept.append(worker)
+        return kept
+
+    def _has_running_workers(self):
+        for seq_name in (
+                "size_workers", "_stage_workers", "_fe_cong_workers",
+                "_stage_screenshot_workers", "_stage_metric_workers"):
+            for worker in list(getattr(self, seq_name, []) or []):
+                if self._worker_is_running(worker):
+                    return True
+        for name in (
+                "worker", "_signoff_worker", "_metric_worker",
+                "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
+                "_hover_metric_worker", "_quick_refresh_worker",
+                "_owner_lookup_worker"):
+            if self._worker_is_running(getattr(self, name, None)):
+                return True
+        return False
 
     def _shutdown_all_workers(self):
         for seq_name in (
                 "size_workers", "_stage_workers", "_fe_cong_workers",
                 "_stage_screenshot_workers", "_stage_metric_workers"):
             seq = getattr(self, seq_name, [])
-            for worker in list(seq or []):
-                self._stop_worker_if_running(worker)
             try:
-                setattr(self, seq_name, [])
+                setattr(self, seq_name, self._stop_worker_list_now(seq, 1200))
             except Exception:
                 pass
         for name in (
@@ -3603,6 +3800,16 @@ class PDDashboard(QMainWindow):
         _write_config_atomic(prefs, USER_PREFS_FILE)
         self._shutdown_all_workers()
         self._wait_for_io_threads(1500)
+        if self._has_running_workers():
+            try:
+                self.status_bar.showMessage(
+                    "Waiting for background workers to stop before closing...",
+                    3000)
+                QTimer.singleShot(1000, self.close)
+            except Exception:
+                pass
+            event.ignore()
+            return
         event.accept()
 
     # ------------------------------------------------------------------
@@ -3649,16 +3856,25 @@ class PDDashboard(QMainWindow):
     def _history_file(self):
         """JSON file storing per-run completion history."""
         try:
-            base = os.path.dirname(USER_PREFS_FILE)
+            base = NOTES_DIR
         except Exception:
-            base = os.path.expanduser("~")
-        return os.path.join(base, "run_history.json")
+            base = os.path.dirname(USER_PREFS_FILE)
+        return os.path.join(
+            base, "run_history_{}.json".format(_safe_user_name()))
 
     def _load_run_history(self):
         """Load run history dict: {run_key: [{status, runtime, fm, vslp, ts}]}"""
         import json
+        fp = self._history_file()
+        old_fp = os.path.join(SCRIPT_DIR, "run_history.json")
+        if (not os.path.exists(fp)) and os.path.exists(old_fp):
+            try:
+                _ensure_notes_dir()
+                shutil.copy2(old_fp, fp)
+            except Exception:
+                pass
         try:
-            with open(self._history_file(), 'r', encoding='utf-8', errors='ignore') as f:
+            with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
                 return json.load(f)
         except Exception:
             return {}
@@ -4474,7 +4690,7 @@ class PDDashboard(QMainWindow):
         if not (closure_on or status_reg_on or qor_reg_on):
             return
 
-        self._closure_pass_token += 1
+        self._closure_pass_token = getattr(self, "_closure_pass_token", 0) + 1
         token = self._closure_pass_token
         _UR = Qt.UserRole
         _UR10 = Qt.UserRole + 10
@@ -6995,6 +7211,7 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _build_tree(self):
         """Build the full tree once. Filtering done by setHidden() only."""
+        self._closure_pass_token = getattr(self, "_closure_pass_token", 0) + 1
         self.size_workers = self._cancel_worker_list_keep_running(
             self.size_workers)
         self._stage_workers = self._stop_worker_list_now(self._stage_workers)
@@ -8292,17 +8509,8 @@ class PDDashboard(QMainWindow):
             item.setText(6, "Calc...")
             item_id = f"{item.text(0)}|{item.text(1)}|{item.text(15)}"
             self.item_map[item_id] = item
-            worker = SingleSizeWorker(item, run_path)
-            def _safe_set_size(it, sz):
-                try:
-                    it.setText(6, sz)
-                    old_tip = it.toolTip(0)
-                    if old_tip:
-                        it.setToolTip(0, re.sub(
-                            r'Size: .*?\n', f'Size: {sz}\n', old_tip))
-                except RuntimeError:
-                    pass
-            worker.result.connect(_safe_set_size)
+            worker = SingleSizeWorker(item_id, run_path)
+            worker.result.connect(self.update_item_size)
             self.size_workers.append(worker)
             worker.finished.connect(
                 lambda w=worker: self.size_workers.remove(w)

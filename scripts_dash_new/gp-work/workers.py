@@ -738,28 +738,28 @@ class OwnerLookupWorker(QThread):
 # SingleSizeWorker -- calculates folder size for one item on demand
 # ===========================================================================
 class SingleSizeWorker(QThread):
-    result = pyqtSignal(object, str)
+    result = pyqtSignal(str, str)
 
-    def __init__(self, item, path):
+    def __init__(self, item_id, path):
         super().__init__()
-        self.item = item
+        self.item_id = item_id
         self.path = path
         self._is_cancelled = False
 
     def run(self):
         if self._is_cancelled or not self.path or not os.path.exists(self.path):
-            self.result.emit(self.item, "N/A")
+            self.result.emit(self.item_id, "N/A")
             return
         fast = _du_size(self.path, timeout_sec=180)
         if fast is not None:
             if not self._is_cancelled:
-                self.result.emit(self.item, fast)
+                self.result.emit(self.item_id, fast)
             return
         total_size = 0
         try:
             for entry in os.scandir(self.path):
                 if self._is_cancelled:
-                    self.result.emit(self.item, "N/A")
+                    self.result.emit(self.item_id, "N/A")
                     return
                 try:
                     if entry.is_file(follow_symlinks=False):
@@ -768,10 +768,10 @@ class SingleSizeWorker(QThread):
                         total_size += self._calc_dir(entry.path)
                 except Exception:
                     continue
-            self.result.emit(self.item, _format_size_bytes(total_size))
+            self.result.emit(self.item_id, _format_size_bytes(total_size))
         except Exception:
             if not self._is_cancelled:
-                self.result.emit(self.item, "N/A")
+                self.result.emit(self.item_id, "N/A")
 
     def _calc_dir(self, path):
         total = 0
