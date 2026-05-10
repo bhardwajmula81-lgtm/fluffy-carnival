@@ -21,6 +21,7 @@ import concurrent.futures
 import tempfile
 import gzip
 import html
+import io
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -42,6 +43,79 @@ from PyQt5.QtGui import (QColor, QFont, QKeySequence, QBrush,
 # ===========================================================================
 # CONFIG + MAIL HELPERS (module-level, loaded once at startup)
 # ===========================================================================
+
+
+_ATOMIC_WRITE_LOCKS = {}
+_ATOMIC_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _atomic_lock_for(path):
+    key = os.path.abspath(path)
+    with _ATOMIC_WRITE_LOCKS_GUARD:
+        lock = _ATOMIC_WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _ATOMIC_WRITE_LOCKS[key] = lock
+        return lock
+
+
+def _atomic_replace_path(path, writer_func):
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    if directory and not os.path.exists(directory):
+        try:
+            os.makedirs(directory)
+        except Exception:
+            pass
+    tmp = path + ".tmp.{}.{}".format(os.getpid(), int(time.time() * 1000000))
+    lock = _atomic_lock_for(path)
+    with lock:
+        try:
+            writer_func(tmp)
+            os.replace(tmp, path)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+
+def _atomic_write_text(path, text, encoding="utf-8"):
+    def _write(tmp):
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(text)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    _atomic_replace_path(path, _write)
+
+
+def _atomic_write_json(path, data, indent=None, sort_keys=False):
+    def _write(tmp):
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=indent, sort_keys=sort_keys)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+    _atomic_replace_path(path, _write)
+
+
+def _atomic_write_gzip_json(path, data, indent=None, sort_keys=False):
+    def _write(tmp):
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(data, f, indent=indent, sort_keys=sort_keys)
+    _atomic_replace_path(path, _write)
+
+
+def _write_config_atomic(config, path):
+    buf = io.StringIO()
+    config.write(buf)
+    _atomic_write_text(path, buf.getvalue())
 
 def _load_project_config():
     """Load project_config.ini if present, else use hardcoded defaults."""
@@ -93,15 +167,13 @@ def _load_project_config():
                     changed = True
         if changed:
             try:
-                with open(cfg_file, 'w') as f:
-                    cfg.write(f)
+                _write_config_atomic(cfg, cfg_file)
             except Exception:
                 pass
     else:
         cfg.read_dict(defaults)
         try:
-            with open(cfg_file, 'w') as f:
-                cfg.write(f)
+            _write_config_atomic(cfg, cfg_file)
         except Exception:
             pass
     return cfg
@@ -116,8 +188,7 @@ def _load_mail_config():
                                              'always_cc': ''},
                        'KNOWN_USERS':       {'users': ''}})
         try:
-            with open(mc_file, 'w') as f:
-                mc.write(f)
+            _write_config_atomic(mc, mc_file)
         except Exception:
             pass
     else:
@@ -273,8 +344,7 @@ def _save_mail_users(new_users):
             mail_config.add_section('KNOWN_USERS')
         mail_config.set('KNOWN_USERS', 'users',
                          ', '.join(sorted(existing)))
-        with open(_MAIL_USERS_FILE, 'w') as f:
-            mail_config.write(f)
+        _write_config_atomic(mail_config, _MAIL_USERS_FILE)
     except Exception:
         pass
 
@@ -283,7 +353,7 @@ def _save_mail_users_async(new_users):
     try:
         users = list(new_users or [])
         t = threading.Thread(target=_save_mail_users, args=(users,))
-        t.daemon = True
+        t.daemon = False
         t.start()
     except Exception:
         pass
@@ -320,8 +390,7 @@ def load_user_pins():
 
 def save_user_pins(pins_dict):
     try:
-        with open(_get_pins_file(), 'w') as f:
-            json.dump(pins_dict, f, indent=4)
+        _atomic_write_json(_get_pins_file(), pins_dict, indent=4)
     except Exception:
         pass
 
@@ -379,8 +448,7 @@ def save_personal_note(identifier, note_text):
     else:
         notes.pop(identifier, None)
     try:
-        with open(_get_personal_notes_file(), 'w') as f:
-            json.dump(notes, f, indent=4, sort_keys=True)
+        _atomic_write_json(_get_personal_notes_file(), notes, indent=4, sort_keys=True)
         return True
     except Exception:
         return False
@@ -462,8 +530,7 @@ def save_shared_note(identifier, note_text):
         "updated_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     })
     try:
-        with open(_get_shared_notes_file(), 'w') as f:
-            json.dump(data, f, indent=4, sort_keys=True)
+        _atomic_write_json(_get_shared_notes_file(), data, indent=4, sort_keys=True)
         return True
     except Exception:
         return False
@@ -2426,6 +2493,13 @@ class BlockSummaryDialog(QDialog):
         self._chart_vt = _StackedVtChartWidget("VT Area % per Run")
         self._chart_vt.row_clicked.connect(self._select_chart_row)
         tab_charts_layout.addWidget(self._chart_vt, 1)
+        self._chart_run_map = QTableWidget(0, 2)
+        self._chart_run_map.setHorizontalHeaderLabels(["Alias", "Run Name"])
+        self._chart_run_map.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._chart_run_map.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._chart_run_map.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._chart_run_map.setMaximumHeight(130)
+        tab_charts_layout.addWidget(self._chart_run_map)
 
         self._tabs.addTab(tab_charts, "Charts")
 
@@ -2705,6 +2779,8 @@ class BlockSummaryDialog(QDialog):
         n = self.tbl.rowCount()
         if n == 0:
             empty = []
+            if hasattr(self, "_chart_run_map"):
+                self._chart_run_map.setRowCount(0)
             self._chart_wns.set_data(empty, empty, is_dark=self.is_dark)
             self._chart_tns.set_data(empty, empty, is_dark=self.is_dark)
             self._chart_nve.set_data(empty, empty, is_dark=self.is_dark)
@@ -2727,7 +2803,8 @@ class BlockSummaryDialog(QDialog):
         for row in range(n):
             name = _cell(row, 1)
             full_names.append(name)
-            labels.append(name[:14] + ".." if len(name) > 16 else name)
+            alias = "run{}".format(row + 1)
+            labels.append(alias)
             row_ids.append(row)
             wns, tns, nve = self._parse_metric_triplet(_cell(row, self._COL_R2R_SETUP))
             wns_vals.append(wns)
@@ -2744,6 +2821,18 @@ class BlockSummaryDialog(QDialog):
                 vt_names = row_vt_names
             vt_rows.append(vals)
 
+        if hasattr(self, "_chart_run_map"):
+            self._chart_run_map.setRowCount(0)
+            for row, name in enumerate(full_names):
+                alias = "run{}".format(row + 1)
+                self._chart_run_map.insertRow(row)
+                a_item = QTableWidgetItem(alias)
+                n_item = QTableWidgetItem(name)
+                a_item.setToolTip(name)
+                n_item.setToolTip(name)
+                self._chart_run_map.setItem(row, 0, a_item)
+                self._chart_run_map.setItem(row, 1, n_item)
+
         if not vt_names:
             max_vt = max([len(x) for x in vt_rows] or [0])
             default_names = ["LVT", "RVT", "HVT"]
@@ -2757,8 +2846,8 @@ class BlockSummaryDialog(QDialog):
         def _timing_tips(metric_name, vals):
             out = []
             for i, val in enumerate(vals):
-                out.append("{}\n{}: {}\nR2R Setup: {}".format(
-                    full_names[i], metric_name, val,
+                out.append("{}: {}\n{}: {}\nR2R Setup: {}".format(
+                    labels[i], full_names[i], metric_name, val,
                     _cell(i, self._COL_R2R_SETUP)))
             return out
 
@@ -3369,6 +3458,38 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CLOSE
     # ------------------------------------------------------------------
+    def _start_io_thread(self, target):
+        """Start a tracked non-daemon writer thread for critical JSON data."""
+        try:
+            self._io_threads = [t for t in getattr(self, "_io_threads", []) if t.is_alive()]
+            t = threading.Thread(target=target)
+            t.daemon = False
+            t.start()
+            self._io_threads.append(t)
+            return t
+        except Exception:
+            try:
+                target()
+            except Exception:
+                pass
+            return None
+
+    def _wait_for_io_threads(self, timeout_ms=1500):
+        deadline = time.time() + (float(timeout_ms) / 1000.0)
+        alive = []
+        for t in list(getattr(self, "_io_threads", [])):
+            try:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    alive.append(t)
+                    continue
+                t.join(remaining)
+                if t.is_alive():
+                    alive.append(t)
+            except Exception:
+                pass
+        self._io_threads = alive
+
     def _cancel_worker_if_possible(self, worker):
         if not worker:
             return
@@ -3479,9 +3600,9 @@ class PDDashboard(QMainWindow):
             for i in range(self.tree.columnCount()))
         prefs.set('UI', 'col_widths', col_widths)
         prefs.set('UI', 'col_hidden', col_hidden)
-        with open(USER_PREFS_FILE, 'w') as f:
-            prefs.write(f)
+        _write_config_atomic(prefs, USER_PREFS_FILE)
         self._shutdown_all_workers()
+        self._wait_for_io_threads(1500)
         event.accept()
 
     # ------------------------------------------------------------------
@@ -3513,8 +3634,7 @@ class PDDashboard(QMainWindow):
         if not prefs.has_section('MILESTONES'):
             prefs.add_section('MILESTONES')
         prefs.set('MILESTONES', 'map', json.dumps(m))
-        with open(USER_PREFS_FILE, 'w') as f:
-            prefs.write(f)
+        _write_config_atomic(prefs, USER_PREFS_FILE)
 
     def get_milestone_label(self, rtl_str):
         """Apply user-defined milestone map to an RTL string."""
@@ -3544,17 +3664,15 @@ class PDDashboard(QMainWindow):
             return {}
 
     def _save_run_history(self):
-        """Save run history in a daemon thread - never block the main thread on NFS write."""
-        import json, threading
-        data = dict(self._run_history)   # shallow snapshot is safe (values are lists)
-        fp   = self._history_file()
+        """Save run history in a tracked writer thread with atomic replace."""
+        data = dict(self._run_history)
+        fp = self._history_file()
         def _write():
             try:
-                with open(fp, 'w') as f:
-                    json.dump(data, f, indent=2)
+                _atomic_write_json(fp, data, indent=2)
             except Exception:
                 pass
-        threading.Thread(target=_write, daemon=True).start()
+        self._start_io_thread(_write)
 
     # ------------------------------------------------------------------
     # LIGHTWEIGHT SNAPSHOTS
@@ -3679,8 +3797,7 @@ class PDDashboard(QMainWindow):
         try:
             fp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "dashboard_notes", "metrics_cache.json.gz")
-            with gzip.open(fp, "wt", encoding="utf-8") as f:
-                json.dump(cache, f, sort_keys=True)
+            _atomic_write_gzip_json(fp, cache, sort_keys=True)
         except Exception:
             pass
 
@@ -3729,8 +3846,10 @@ class PDDashboard(QMainWindow):
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         dated = os.path.join(snap_dir, "snapshot_{}.json.gz".format(stamp))
         for fp in (latest, dated):
-            with gzip.open(fp, "wt", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, sort_keys=True)
+            try:
+                _atomic_write_gzip_json(fp, payload, indent=2, sort_keys=True)
+            except Exception:
+                pass
         self._prune_old_snapshots(snap_dir, keep=25)
         return latest
 
@@ -3754,9 +3873,7 @@ class PDDashboard(QMainWindow):
                 self._write_snapshot_payload(payload)
             except Exception:
                 pass
-        t = threading.Thread(target=_write)
-        t.daemon = True
-        t.start()
+        self._start_io_thread(_write)
 
     def save_snapshot_now(self):
         if not (self.ws_data or self.out_data):
@@ -4319,47 +4436,109 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CLOSURE PASS (deferred -- runs after tree is fully painted)
     # ------------------------------------------------------------------
+    def _find_tree_item_by_path(self, path, node_type=None, name=None):
+        """Resolve a current tree item by stable path/name; never keep old item refs."""
+        if not path:
+            return None
+        for item in self._iter_tree_items():
+            try:
+                if node_type and item.data(0, Qt.UserRole) != node_type:
+                    continue
+                if name and item.text(0) != name:
+                    continue
+                run = item.data(0, Qt.UserRole + 10) or item.data(0, Qt.UserRole + 11)
+                if run and run.get("path") == path:
+                    return item
+                if item.text(15) == path:
+                    return item
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
+        return None
+
+    def _qor_regression_key_for_item(self, item):
+        try:
+            run = item.data(0, Qt.UserRole + 10)
+            if run:
+                return (run.get("path", ""), item.data(0, Qt.UserRole), item.text(0))
+            return (item.text(15), item.data(0, Qt.UserRole), item.text(0))
+        except Exception:
+            return ("", "", "")
+
     def _run_closure_pass(self):
-        """Apply optional scorecard and regression annotations after paint."""
+        """Apply optional scorecard/regression annotations in small GUI-safe chunks."""
         closure_on = bool(getattr(self, "_closure_enabled", False))
         status_reg_on = bool(getattr(self, "_status_regression_enabled", False))
         qor_reg_on = bool(getattr(self, "_qor_regression_enabled", False))
         if not (closure_on or status_reg_on or qor_reg_on):
             return
 
-        GROUP = frozenset(("BLOCK","MILESTONE","RTL",
-                           "IGNORED_ROOT","STANDALONE_ROOT","STAGE","__PLACEHOLDER__"))
+        self._closure_pass_token += 1
+        token = self._closure_pass_token
         _UR = Qt.UserRole
         _UR10 = Qt.UserRole + 10
-        count = [0]
+        entries = []
         sibling_regressions = {}
+
+        try:
+            for it in self._iter_tree_items():
+                try:
+                    nt = it.data(0, _UR)
+                    run = it.data(0, _UR10)
+                    path = run.get("path", "") if run else ""
+                    if not path:
+                        path = it.text(15)
+                    if path and nt not in ("BLOCK", "MILESTONE", "RTL",
+                                           "IGNORED_ROOT", "STANDALONE_ROOT",
+                                           "__PLACEHOLDER__"):
+                        entries.append((path, nt, it.text(0)))
+                except RuntimeError:
+                    continue
+                except Exception:
+                    continue
+        except Exception:
+            entries = []
+
         if status_reg_on:
             try:
                 groups = {}
-                for it in self._iter_tree_items():
-                    run = it.data(0, _UR10)
+                for path, nt, name in entries:
+                    item = self._find_tree_item_by_path(path, nt, name)
+                    if item is None:
+                        continue
+                    run = item.data(0, _UR10)
                     if not run or run.get("run_type") != "FE" or not run.get("is_comp"):
                         continue
                     key = (run.get("block", ""), run.get("rtl", ""))
-                    groups.setdefault(key, []).append((it, run))
+                    groups.setdefault(key, []).append((path, run))
                 for key, vals in groups.items():
                     vals.sort(key=lambda pair:
-                              self._parse_dashboard_time(
-                                  pair[1].get("info", {}).get("start", ""))
+                              self._parse_dashboard_time(pair[1].get("info", {}).get("start", ""))
                               or datetime.datetime.max)
                     prev_run = None
-                    for it, run in vals:
+                    for path, run in vals:
                         if prev_run:
                             msg = self._compare_regression_entries(
                                 self._run_regression_entry(prev_run),
                                 self._run_regression_entry(run))
                             if msg:
-                                sibling_regressions[run.get("path", "")] = msg
+                                sibling_regressions[path] = msg
                         prev_run = run
             except Exception:
                 sibling_regressions = {}
 
-        qor_regressions = self._collect_qor_regressions_from_cache() if qor_reg_on else {}
+        qor_regressions = {}
+        if qor_reg_on:
+            try:
+                raw = self._collect_qor_regressions_from_cache()
+                for item_id, msg in raw.items():
+                    for it in self._iter_tree_items():
+                        if id(it) == item_id:
+                            qor_regressions[self._qor_regression_key_for_item(it)] = msg
+                            break
+            except Exception:
+                qor_regressions = {}
 
         def _annotate_regression(item, msg, label):
             if not msg:
@@ -4371,33 +4550,44 @@ class PDDashboard(QMainWindow):
             item.setForeground(0, QColor("#f57c00"))
             item.setData(0, Qt.UserRole + 30, msg)
 
-        def _walk(node):
-            for i in range(node.childCount()):
-                child = node.child(i)
-                nt = child.data(0, _UR)
-                if nt in GROUP and nt != "STAGE":
-                    _walk(child)
-                    continue
-                run = child.data(0, _UR10)
-                if closure_on and run and run.get("run_type") == "FE":
-                    self._update_closure_on_item(child)
-                if status_reg_on and run and run.get("run_type") == "FE" and run.get("is_comp"):
-                    has_reg, msg = self._check_regression(run)
-                    if not has_reg:
-                        msg = sibling_regressions.get(run.get("path", ""), "")
-                        has_reg = bool(msg)
-                    if has_reg:
-                        _annotate_regression(child, msg, "REGRESSION")
-                if qor_reg_on:
-                    msg = qor_regressions.get(id(child), "")
-                    if msg:
-                        _annotate_regression(child, msg, "QOR REGRESSION")
-                count[0] += 1
-                if count[0] % 50 == 0:
-                    QApplication.processEvents()
-                _walk(child)
+        index = [0]
+        batch_size = 80
 
-        _walk(self.tree.invisibleRootItem())
+        def _process_batch():
+            if token != getattr(self, "_closure_pass_token", 0):
+                return
+            if getattr(self, "_building_tree", False):
+                return
+            end_i = min(len(entries), index[0] + batch_size)
+            while index[0] < end_i:
+                path, nt, name = entries[index[0]]
+                index[0] += 1
+                item = self._find_tree_item_by_path(path, nt, name)
+                if item is None:
+                    continue
+                try:
+                    run = item.data(0, _UR10)
+                    if closure_on and run and run.get("run_type") == "FE":
+                        self._update_closure_on_item(item)
+                    if status_reg_on and run and run.get("run_type") == "FE" and run.get("is_comp"):
+                        has_reg, msg = self._check_regression(run)
+                        if not has_reg:
+                            msg = sibling_regressions.get(run.get("path", ""), "")
+                            has_reg = bool(msg)
+                        if has_reg:
+                            _annotate_regression(item, msg, "REGRESSION")
+                    if qor_reg_on:
+                        msg = qor_regressions.get((path, nt, name), "")
+                        if msg:
+                            _annotate_regression(item, msg, "QOR REGRESSION")
+                except RuntimeError:
+                    continue
+                except Exception:
+                    continue
+            if index[0] < len(entries):
+                QTimer.singleShot(0, _process_batch)
+
+        QTimer.singleShot(0, _process_batch)
 
     # ------------------------------------------------------------------
     # SIGN-OFF CLOSURE SCORECARD
@@ -5066,8 +5256,6 @@ class PDDashboard(QMainWindow):
                             child.removeChild(ph)
                             self._add_stages(child, be_run, ign_root)
                             _lazy_count[0] += 1
-                            if _lazy_count[0] % 20 == 0:
-                                QApplication.processEvents()
                 _load_all_lazy(child)
         _load_all_lazy(root)
         self.tree.setUpdatesEnabled(True)
@@ -5151,8 +5339,7 @@ class PDDashboard(QMainWindow):
                 ('gate_count_unit_area', '0.241900')):
             prefs.set('UI', key, val)
         try:
-            with open(USER_PREFS_FILE, 'w') as f:
-                prefs.write(f)
+            _write_config_atomic(prefs, USER_PREFS_FILE)
         except Exception:
             pass
         self.apply_theme_and_spacing()
@@ -5496,8 +5683,7 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'enable_fe_hover_metrics',
                   'true' if self.enable_fe_hover_metrics else 'false')
         try:
-            with open(USER_PREFS_FILE, 'w') as f:
-                prefs.write(f)
+            _write_config_atomic(prefs, USER_PREFS_FILE)
         except Exception:
             pass
         if not self.enable_fe_hover_metrics:
@@ -6557,8 +6743,6 @@ class PDDashboard(QMainWindow):
         self.tree.blockSignals(False)
         self.tree.setEnabled(False)
 
-        QApplication.processEvents()
-
         self.worker = ScannerWorker()
         self.worker.progress_update.connect(self.update_progress)
         self.worker.status_update.connect(self.update_status_lbl)
@@ -7277,7 +7461,7 @@ class PDDashboard(QMainWindow):
                 return
             from workers import StageDetailWorker
             be_run["_stage_detail_loading"] = True
-            w = StageDetailWorker(be_run, item)
+            w = StageDetailWorker(be_run)
             w.finished.connect(self._on_stage_details_loaded)
             w.finished.connect(w.deleteLater)
             w.start()
@@ -7308,10 +7492,28 @@ class PDDashboard(QMainWindow):
         if be_run:
             _start_stage_detail_worker(be_run)
 
-    def _on_stage_details_loaded(self, be_item, enriched_stages):
-        """Called by StageDetailWorker when stage timing/FM/VSLP is ready."""
+    def _on_stage_details_loaded(self, be_path, run_name, enriched_stages):
+        """Called by StageDetailWorker using stable identifiers only."""
         try:
+            be_item = None
+            for item in self._iter_tree_items():
+                try:
+                    be_run = item.data(0, Qt.UserRole + 11)
+                    if be_run and be_run.get("path") == be_path:
+                        if not run_name or be_run.get("r_name") == run_name or item.text(0) == run_name:
+                            be_item = item
+                            break
+                except RuntimeError:
+                    continue
+                except Exception:
+                    continue
+            if be_item is None:
+                return
             be_run = be_item.data(0, Qt.UserRole + 11)
+            if not enriched_stages:
+                if be_run:
+                    be_run["_stage_detail_loading"] = False
+                return
             if be_run:
                 be_run["stages"] = enriched_stages
                 be_run["_stage_detail_loading"] = False
@@ -7324,14 +7526,14 @@ class PDDashboard(QMainWindow):
                 for s in enriched_stages:
                     if s["name"] == sname:
                         s_start = s.get("info", {}).get("start", "")
-                        s_end   = s.get("info", {}).get("end", "")
+                        s_end = s.get("info", {}).get("end", "")
                         self._set_item_time_data(ch, s_start, s_end)
                         ch.setText(12, s.get("info", {}).get("runtime", "-"))
                         ch.setText(13, self._fmt_ts(s_start))
                         ch.setText(14, self._fmt_ts(s_end))
-                        ch.setText(7,  "NONUPF - " + s["st_n"])
-                        ch.setText(8,  "UPF - "    + s["st_u"])
-                        ch.setText(9,  s["vslp_status"])
+                        ch.setText(7, "NONUPF - " + s["st_n"])
+                        ch.setText(8, "UPF - " + s["st_u"])
+                        ch.setText(9, s["vslp_status"])
                         self._apply_fm_color(ch, 7, ch.text(7))
                         self._apply_fm_color(ch, 8, ch.text(8))
                         self._apply_vslp_color(ch, 9, ch.text(9))
@@ -7383,6 +7585,14 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
 
+    def _rtl_release_sort_key(self, text):
+        s = str(text or "")
+        m = re.search(r'EVT(\d+)_ML(\d+)_DEV(\d+)', s)
+        if m:
+            return (0, int(m.group(1)), int(m.group(2)), int(m.group(3)), s)
+        nums = [int(x) for x in re.findall(r'\d+', s)]
+        return (1,) + tuple(nums[:6]) + (s,)
+
     def _reorder_milestones_by_map(self):
         label_order = {}
         try:
@@ -7405,6 +7615,11 @@ class PDDashboard(QMainWindow):
                     label_order.get(it.text(0), 999),
                     it.text(0)))
                 for child in children:
+                    parent.addChild(child)
+            if parent.data(0, Qt.UserRole) == "MILESTONE" and parent.childCount() > 1:
+                rtl_children = [parent.takeChild(0) for _ in range(parent.childCount())]
+                rtl_children.sort(key=lambda it: self._rtl_release_sort_key(it.text(0)))
+                for child in rtl_children:
                     parent.addChild(child)
             for i in range(parent.childCount()):
                 _walk(parent.child(i))
@@ -8960,8 +9175,7 @@ class PDDashboard(QMainWindow):
                   ','.join(str(i) for i in sorted(standard_set)))
         prefs.set('PRESETS', 'full',
                   ','.join(str(i) for i in sorted(full_set)))
-        with open(USER_PREFS_FILE, 'w') as f:
-            prefs.write(f)
+        _write_config_atomic(prefs, USER_PREFS_FILE)
 
         self._preset_compact  = compact_set
         self._preset_standard = standard_set

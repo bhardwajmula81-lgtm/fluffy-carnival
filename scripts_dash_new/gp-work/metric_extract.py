@@ -80,6 +80,13 @@ def _find_rpt(rpt_dir, patterns, finder=None):
     return finder.find(rpt_dir, patterns)
 
 
+def _cancelled(cancel_check):
+    try:
+        return bool(cancel_check and cancel_check())
+    except Exception:
+        return False
+
+
 # ===========================================================================
 # PARSERS
 # ===========================================================================
@@ -563,7 +570,7 @@ def _parse_stage_runtime(text):
 # ===========================================================================
 # MAIN EXTRACTION WRAPPERS
 # ===========================================================================
-def extract_fe_metrics(run_dir, source="WS", block=None):
+def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     """
     Extract all QoR metrics for a FE run.
     block: e.g. "BLK_ISP1" -- passed from dashboard tree.
@@ -580,6 +587,10 @@ def extract_fe_metrics(run_dir, source="WS", block=None):
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"]  = qor_data.get("r2r_hold",  "-")
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     # Area
     area_path = _find_rpt(
         rpt_dir, ["area.{}.*.rpt".format(b), "area.*.rpt"], finder)
@@ -588,6 +599,10 @@ def extract_fe_metrics(run_dir, source="WS", block=None):
         "total_area":     area_data.get("total_area",     "-"),
         "instance_count": area_data.get("instance_count", "-"),
     }
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     # Utilization
     util_path = _find_rpt(rpt_dir, [
@@ -599,11 +614,19 @@ def extract_fe_metrics(run_dir, source="WS", block=None):
     result["util"]         = util_data
     result["std_util_str"] = util_data.get("std_util_str", "-/-")
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     # Cell Usage (LVT/RVT/HVT)
     cell_path = _find_rpt(rpt_dir, [
         "cell_usage.summary.{}.*.rpt".format(b),
         "cell_usage.summary.*.rpt"], finder)
     result["vth"] = parse_cell_usage(cell_path)
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     # Clock Gating
     cgc_path = _find_rpt(rpt_dir, [
@@ -612,25 +635,45 @@ def extract_fe_metrics(run_dir, source="WS", block=None):
         "clock_gating_info*.rpt"], finder)
     result["cgc"] = parse_clock_gating(cgc_path)
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     # Multi-bit
     mbit_path = _find_rpt(rpt_dir, [
         "multibit_banking_ratio.{}.*.rpt".format(b),
         "multibit_banking_ratio.*.rpt"], finder)
     result["mbit"] = parse_multibit(mbit_path)
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     # Congestion
     cong_path = _find_rpt(rpt_dir, [
         "congestion.{}.*.rpt".format(b), "congestion.*.rpt"], finder)
     result["congestion"] = parse_congestion(cong_path)
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     # Power
     pwr_path = _find_rpt(rpt_dir, [
         "report_power_info.mission.ss*.rpt", "report_power*.rpt"], finder)
     result["power"] = parse_power(pwr_path)
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     # Runtime
     result["runtime"] = parse_fe_runtime(
         os.path.join(run_dir, "reports", "runtime.V2.rpt"))
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     # Logic Depth
     ld_path = _find_rpt(
@@ -661,11 +704,15 @@ def extract_fe_metrics(run_dir, source="WS", block=None):
 
 
 def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
-                              stage_path=None):
+                              stage_path=None, cancel_check=None):
     """Extract QoR metrics for a single PNR stage."""
     result = {"stage": stage_name, "run_dir": run_dir}
     b = block or _get_block_name(run_dir)
     finder = _ReportFinder()
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     # New BE stage reports are stage-local and tool-specific.
     # Keep old FE-like fallbacks for compatibility with older runs.
@@ -719,6 +766,10 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         result["r2r_hold"] = qor_data.get("r2r_hold", "-")
         qor_path = old_qor
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     area_path = _find_stage_rpt(
         run_dir, stage_name, source,
         ["{}.sec_get_area.rpt".format(stage_name), "*.sec_get_area.rpt"],
@@ -761,6 +812,10 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
             "std_util_str": result["std_util_str"],
         }
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     cell_path = _find_stage_rpt(
         run_dir, stage_name, source,
         ["{}.sec_vth_use.rpt".format(stage_name), "*.sec_vth_use.rpt"],
@@ -775,16 +830,28 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         vth_data = parse_cell_usage(cell_path)
     result["vth"] = vth_data
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     cgc_path = _find_stage_rpt(run_dir, stage_name, source, [
         "clock_gating_info.mission.rpt",
         "clock_gating_info.{}.*.rpt".format(b),
         "clock_gating_info*.rpt"], stage_path=stage_path, finder=finder)
     result["cgc"] = parse_clock_gating(cgc_path)
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     mbit_path = _find_stage_rpt(run_dir, stage_name, source, [
         "multibit_banking_ratio.{}.*.rpt".format(b),
         "multibit_banking_ratio.*.rpt"], stage_path=stage_path, finder=finder)
     result["mbit"] = parse_multibit(mbit_path)
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     cong_path = _find_stage_rpt(
         run_dir, stage_name, source,
@@ -796,15 +863,27 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
     else:
         result["congestion"] = parse_congestion(cong_path)
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     pwr_path = _find_stage_rpt(run_dir, stage_name, source, [
         "report_power_info.mission.ss*.rpt", "report_power*.rpt"],
         stage_path=stage_path, finder=finder)
     result["power"] = parse_power(pwr_path)
 
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
+
     ld_path = _find_stage_rpt(
         run_dir, stage_name, source, ["report_logic_depth.summary.*.rpt"],
         stage_path=stage_path, finder=finder)
     result["logic_depth"] = parse_logic_depth(ld_path)
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     cts_path = _find_stage_rpt(
         run_dir, stage_name, source,
@@ -812,6 +891,10 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         stage_path=stage_path, finder=finder)
     if cts_path:
         result.update(_parse_stage_cts(_read_stage_text(cts_path)))
+
+    if _cancelled(cancel_check):
+        result["_cancelled"] = True
+        return result
 
     runtime_path = _find_stage_rpt(
         run_dir, stage_name, source,

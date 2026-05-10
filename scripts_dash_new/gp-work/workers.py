@@ -10,6 +10,7 @@ import concurrent.futures
 import threading
 import datetime
 import getpass
+import time
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -24,6 +25,26 @@ _METRIC_CACHE_LOCK = threading.Lock()
 _METRIC_CACHE_DATA = None
 _METRIC_CACHE_DIRTY = False
 _METRIC_CACHE_VERSION = 1
+
+def _atomic_write_gzip_json(path, data, sort_keys=False):
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    if directory and not os.path.exists(directory):
+        try:
+            os.makedirs(directory)
+        except Exception:
+            pass
+    tmp = path + ".tmp.{}.{}".format(os.getpid(), int(time.time() * 1000000))
+    try:
+        with gzip.open(tmp, "wt", encoding="utf-8") as f:
+            json.dump(data, f, sort_keys=sort_keys)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
 
 def _metric_cache_file():
     base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -66,8 +87,7 @@ def _save_metric_cache():
         _METRIC_CACHE_DIRTY = False
     try:
         fp = _metric_cache_file()
-        with gzip.open(fp, "wt", encoding="utf-8") as f:
-            json.dump(payload, f, sort_keys=True)
+        _atomic_write_gzip_json(fp, payload, sort_keys=True)
     except Exception:
         with _METRIC_CACHE_LOCK:
             _METRIC_CACHE_DIRTY = True
@@ -176,7 +196,9 @@ def _metric_cache_put(key, sig, metrics):
         _METRIC_CACHE_DIRTY = True
 
 def _extract_metrics_cached(run_path, block, run_type, source,
-                            stage_name=None, stage_path=None):
+                            stage_name=None, stage_path=None, cancel_check=None):
+    if cancel_check and cancel_check():
+        return {"_cancelled": True}
     sig = _metric_signature(run_path, run_type, source, stage_name, stage_path)
     key = _metric_cache_key(run_path, block, run_type, source,
                             stage_name, stage_path)
@@ -186,12 +208,14 @@ def _extract_metrics_cached(run_path, block, run_type, source,
         out["_cache"] = "hit"
         return out
     if run_type == "FE":
-        metrics = extract_fe_metrics(run_path, source=source, block=block)
+        metrics = extract_fe_metrics(run_path, source=source, block=block, cancel_check=cancel_check)
     else:
         metrics = extract_pnr_stage_metrics(
             run_path, stage_name, source=source, block=block,
-            stage_path=stage_path)
+            stage_path=stage_path, cancel_check=cancel_check)
     if isinstance(metrics, dict):
+        if metrics.get("_cancelled"):
+            return metrics
         metrics["_cache"] = "miss"
         _metric_cache_put(key, sig, metrics)
     return metrics
@@ -965,12 +989,11 @@ class ScannerWorker(QThread):
                         continue
                     tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
             if "fc" in tools_to_scan:
-                for pat in ["*-BE", "EVT*_ML*_DEV*_*_*-BE"]:
-                    for rd in glob.glob(os.path.join(ent_path, "fc", pat)):
-                        if _ignored_by_pattern(os.path.basename(rd),
-                                               _IGNORE_BE_RUN_PATTERNS()):
-                            continue
-                        tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                for rd in glob.glob(os.path.join(ent_path, "fc", "*-BE")):
+                    if _ignored_by_pattern(os.path.basename(rd),
+                                           _IGNORE_BE_RUN_PATTERNS()):
+                        continue
+                    tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
             if "innovus" in tools_to_scan:
                 # Catch all innovus run dirs -- not just EVT* named ones
                 # TOP runs (S5K2P5SP SOC level) may have different naming
@@ -1059,6 +1082,21 @@ class ScannerWorker(QThread):
                                                            _IGNORE_BE_RUN_PATTERNS()):
                                         continue
                                     tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+
+        # --- Dedupe discovered tasks by normalized real path before processing ---
+        seen_task_paths = set()
+        deduped_tasks = []
+        for task in tasks:
+            try:
+                key = (task[4], task[5],
+                       os.path.normcase(os.path.realpath(os.path.normpath(task[1]))))
+            except Exception:
+                key = (task[4], task[5], task[1])
+            if key in seen_task_paths:
+                continue
+            seen_task_paths.add(key)
+            deduped_tasks.append(task)
+        tasks = deduped_tasks
 
         # --- Prefetch path cache ---
         paths_to_prefetch = []
@@ -1239,7 +1277,7 @@ class ScannerWorker(QThread):
                     stage_path = (os.path.join(rd, "outputs", step_name)
                                   if is_fc else os.path.join(rd, "reports", step_name))
                     if is_fc:
-                        log = os.path.join(rd, step_name, "logs", f"{step_name}.log")
+                        log = os.path.join(rd, "logs", f"{step_name}.log")
                         rpt_cands = [os.path.join(rd, "reports", step_name,
                                                    f"{step_name}.runtime.rpt")]
                     else:
@@ -1330,35 +1368,51 @@ class ScannerWorker(QThread):
 # Fired when user expands a BE run node. Deferred so scan stays fast.
 # ===========================================================================
 class StageDetailWorker(QThread):
-    finished = pyqtSignal(object, list)   # (be_item_ref, enriched_stages)
+    finished = pyqtSignal(str, str, list)   # (be_path, run_name, enriched_stages)
 
-    def __init__(self, be_run, be_item):
+    def __init__(self, be_run):
         super().__init__()
-        self.be_run  = be_run
-        self.be_item = be_item
+        self.be_run = dict(be_run or {})
+        self.be_path = self.be_run.get("path", "")
+        self.run_name = self.be_run.get("r_name", "")
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
 
     def run(self):
         enriched = []
         for s in self.be_run.get("stages", []):
+            if self._cancelled or self.isInterruptionRequested():
+                self.finished.emit(self.be_path, self.run_name, [])
+                return
             if not s.get("_lazy"):
                 enriched.append(s)
                 continue
             s2 = dict(s)
 
-            # --- Runtime rpt: try candidates in order, pick first existing ---
             rpt_file = s["rpt"]
             for cand in s.get("_rpt_cands", [rpt_file]):
+                if self._cancelled or self.isInterruptionRequested():
+                    self.finished.emit(self.be_path, self.run_name, [])
+                    return
                 if cached_exists(cand):
                     rpt_file = cand
                     break
             s2["info"] = parse_pnr_runtime_rpt(rpt_file)
 
-            # --- FM paths: glob at expand time (deferred from scan) ---
             fm_base = s.get("_fm_base", "")
-            step    = s.get("_fm_step", s["name"])
+            step = s.get("_fm_step", s["name"])
             fm_u_path = fm_n_path = ""
             if fm_base:
                 for be_dir in s.get("_fm_dirs", []):
+                    if self._cancelled or self.isInterruptionRequested():
+                        self.finished.emit(self.be_path, self.run_name, [])
+                        return
                     blk = self.be_run.get("block", "")
                     u_exact = os.path.join(
                         fm_base, "fm", be_dir, step, "n2upf_func", "reports",
@@ -1375,8 +1429,6 @@ class StageDetailWorker(QThread):
                         fm_n_path = n_hits[0] if n_hits else ""
                         break
 
-            # --- VSLP: try candidates in order, pick first existing ---
-            # Path: {fm_base}/fm/{run_dir}/{step}/pgnet/reports/report_lp.rpt
             vslp_path = ""
             if fm_base:
                 for be_dir in s.get("_fm_dirs", []):
@@ -1386,21 +1438,20 @@ class StageDetailWorker(QThread):
                         vslp_path = cand
                         break
                 if not vslp_path:
-                    # Default to first dir variant - get_vslp_info will return N/A if missing
                     dirs = s.get("_fm_dirs", [])
                     if dirs:
                         vslp_path = os.path.join(
                             fm_base, "fm", dirs[0], step, "pgnet", "reports", "report_lp.rpt")
 
-            s2["fm_u_path"]     = fm_u_path
-            s2["fm_n_path"]     = fm_n_path
+            s2["fm_u_path"] = fm_u_path
+            s2["fm_n_path"] = fm_n_path
             s2["vslp_rpt_path"] = vslp_path
-            s2["st_n"]          = get_fm_info(fm_n_path)
-            s2["st_u"]          = get_fm_info(fm_u_path)
-            s2["vslp_status"]   = get_vslp_info(vslp_path)
-            s2["_lazy"]         = False
+            s2["st_n"] = get_fm_info(fm_n_path)
+            s2["st_u"] = get_fm_info(fm_u_path)
+            s2["vslp_status"] = get_vslp_info(vslp_path)
+            s2["_lazy"] = False
             enriched.append(s2)
-        self.finished.emit(self.be_item, enriched)
+        self.finished.emit(self.be_path, self.run_name, enriched)
 
 
 class QuickStatusRefreshWorker(QThread):
@@ -1507,7 +1558,8 @@ class MetricWorker(QThread):
         try:
             m = _extract_metrics_cached(
                 self.run_path, self.b_name, self.run_type, self.source,
-                self.stage_name, self.stage_path)
+                self.stage_name, self.stage_path,
+                cancel_check=lambda: self._cancelled or self.isInterruptionRequested())
             _save_metric_cache()
             if self._cancelled or self.isInterruptionRequested():
                 self.finished.emit({"_cancelled": True})
@@ -1550,7 +1602,8 @@ class MetricBatchWorker(QThread):
                         "FE",
                         source=task.get("source", "WS"),
                         stage_name=None,
-                        stage_path=None)
+                        stage_path=None,
+                        cancel_check=lambda: self._cancelled or self.isInterruptionRequested())
                 else:
                     row["metrics"] = _extract_metrics_cached(
                         task.get("path", ""),
@@ -1558,7 +1611,8 @@ class MetricBatchWorker(QThread):
                         "BE",
                         source=task.get("source", "WS"),
                         stage_name=task.get("stage_name", ""),
-                        stage_path=task.get("stage_path", ""))
+                        stage_path=task.get("stage_path", ""),
+                        cancel_check=lambda: self._cancelled or self.isInterruptionRequested())
                     if (task.get("runtime")
                             and str(task.get("runtime")).strip() not in ("", "-", "N/A")
                             and row["metrics"].get("runtime", "-") in ("", "-", "N/A")):
