@@ -2622,17 +2622,25 @@ class BlockSummaryDialog(QDialog):
         self.tbl.setHorizontalHeaderLabels(self.HEADERS)
         hh = self.tbl.horizontalHeader()
         hh.setSectionsMovable(True)
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
+        hh.setStretchLastSection(False)
+        for c in range(len(self.HEADERS)):
+            hh.setSectionResizeMode(c, QHeaderView.Interactive)
+        self.tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.tbl.setColumnWidth(0, 120)
+        self.tbl.setColumnWidth(1, 360)
         for c in range(2, len(self.HEADERS)):
-            if c != 1:
-                hh.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+            self.tbl.setColumnWidth(c, 120)
         self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tbl.setAlternatingRowColors(True)
         self.tbl.verticalHeader().setVisible(False)
         self.tbl.setSortingEnabled(True)
         self.tbl.setToolTip("Double-click a metric cell to open its report in gvim")
         self.tbl.itemDoubleClicked.connect(self._open_cell_report)
+        try:
+            if hasattr(self.parent(), "_make_table_user_adjustable"):
+                self.parent()._make_table_user_adjustable(self.tbl)
+        except Exception:
+            pass
         tab_tbl_layout.addWidget(self.tbl)
         self._tabs.addTab(tab_tbl, "Table")
 
@@ -3944,6 +3952,7 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'last_source',  self.src_combo.currentText())
         prefs.set('UI', 'last_rtl',     self.rel_combo.currentText())
         prefs.set('UI', 'last_view',    self.view_combo.currentText())
+        prefs.set('UI', 'last_mode',    self.mode_combo.currentText())
         prefs.set('UI', 'last_sort', getattr(
             self, "_tree_sort_mode", "Start Date Old->New"))
         prefs.set('UI', 'last_search',  self.search.text())
@@ -5366,7 +5375,7 @@ class PDDashboard(QMainWindow):
         self.meta_run_name = QLabel("")
         self.meta_run_name.setWordWrap(True)
         self.meta_run_name.setStyleSheet(
-            "font-weight: bold; font-size: 11px; color: #1976d2;")
+            "font-weight: bold; color: #1976d2;")
         meta_layout.addWidget(self.meta_run_name)
 
         def _field_row(label_txt):
@@ -5379,7 +5388,7 @@ class PDDashboard(QMainWindow):
             hdr.setSpacing(4)
             lbl = QLabel(label_txt)
             lbl.setStyleSheet(
-                "font-size: 11px; font-weight: bold; color: gray;")
+                "font-weight: bold; color: gray;")
             copy_btn = QPushButton("Copy")
             copy_btn.setFixedHeight(18)
             copy_btn.setFixedWidth(40)
@@ -5393,7 +5402,6 @@ class PDDashboard(QMainWindow):
             gl.addLayout(hdr)
             field = QLineEdit()
             field.setReadOnly(True)
-            field.setStyleSheet("font-size: 11px;")
             field.setAlignment(Qt.AlignLeft)
             copy_btn.clicked.connect(
                 lambda _, f=field: QApplication.clipboard().setText(f.text())
@@ -5741,6 +5749,7 @@ class PDDashboard(QMainWindow):
                 ('last_source', 'ALL'),
                 ('last_rtl', '[ SHOW ALL ]'),
                 ('last_view', 'All Runs'),
+                ('last_mode', 'Standard'),
                 ('last_sort', 'Start Date Old->New'),
                 ('last_search', ''),
                 ('last_auto', 'Off'),
@@ -5758,7 +5767,7 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
         self.apply_theme_and_spacing()
-        self._set_col_preset(2)
+        self._set_col_preset(2, persist=False)
         QTimer.singleShot(0, self._build_tree)
 
     def _ensure_ign_root(self, root):
@@ -5932,7 +5941,7 @@ class PDDashboard(QMainWindow):
                                      {0, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14})
         self._preset_full     = _get('full',     set(range(15)) | {22})
 
-    def _set_col_preset(self, preset):
+    def _set_col_preset(self, preset, persist=True):
         if not hasattr(self, '_preset_compact'):
             self._load_preset_sets()
         always_hidden = {15, 16, 17, 18, 19, 20, 21, 23}
@@ -5948,6 +5957,14 @@ class PDDashboard(QMainWindow):
             if idx >= 0:
                 self.mode_combo.setCurrentIndex(idx)
             self.mode_combo.blockSignals(False)
+        if persist:
+            try:
+                if not prefs.has_section('UI'):
+                    prefs.add_section('UI')
+                prefs.set('UI', 'last_mode', name_map.get(preset, "Standard"))
+                _write_config_atomic(prefs, USER_PREFS_FILE)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # STATUS BAR
@@ -7328,6 +7345,7 @@ class PDDashboard(QMainWindow):
                 view = 'All Runs'
             sort_mode = prefs.get(
                 'UI', 'last_sort', fallback='Start Date Old->New')
+            mode = prefs.get('UI', 'last_mode', fallback='Standard')
             srch = prefs.get('UI', 'last_search', fallback='')
             auto = prefs.get('UI', 'last_auto',   fallback='Off')
             idx = self.src_combo.findText(src)
@@ -7349,6 +7367,12 @@ class PDDashboard(QMainWindow):
                 self.search.setText(srch)
                 self.search.blockSignals(False)
             self._tree_sort_mode = sort_mode
+            if hasattr(self, "mode_combo"):
+                idx = self.mode_combo.findText(mode)
+                if idx >= 0:
+                    self._set_col_preset(
+                        {"Compact": 1, "Standard": 2, "Full": 3}.get(mode, 2),
+                        persist=False)
             idx = self.auto_combo.findText(auto)
             if idx >= 0:
                 self.auto_combo.blockSignals(True)
