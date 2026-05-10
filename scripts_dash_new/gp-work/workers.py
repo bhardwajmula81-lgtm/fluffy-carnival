@@ -630,6 +630,8 @@ class BatchSizeWorker(QThread):
         total = 0
         try:
             for entry in os.scandir(path):
+                if self._is_cancelled or self.isInterruptionRequested():
+                    return total
                 if entry.is_file(follow_symlinks=False):
                     total += entry.stat().st_size
                 elif entry.is_dir(follow_symlinks=False):
@@ -640,6 +642,10 @@ class BatchSizeWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
 
 
 # ===========================================================================
@@ -655,6 +661,10 @@ class SignoffStatusWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
 
     def run(self):
         max_w = min(_SIGNOFF_BG_WORKERS(), len(self.runs))
@@ -705,6 +715,10 @@ class OwnerLookupWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
 
     def run(self):
         if not self.tasks:
@@ -777,6 +791,8 @@ class SingleSizeWorker(QThread):
         total = 0
         try:
             for entry in os.scandir(path):
+                if self._is_cancelled or self.isInterruptionRequested():
+                    return total
                 if entry.is_file(follow_symlinks=False):
                     total += entry.stat().st_size
                 elif entry.is_dir(follow_symlinks=False):
@@ -787,6 +803,10 @@ class SingleSizeWorker(QThread):
 
     def cancel(self):
         self._is_cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
 
 
 # ===========================================================================
@@ -795,14 +815,27 @@ class SingleSizeWorker(QThread):
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
 
+    def __init__(self):
+        super().__init__()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
     def _get_batch_dir_info(self, paths):
         results = []
-        if not paths:
+        if self._is_cancelled or self.isInterruptionRequested() or not paths:
             return results
         try:
             cmd    = ['du', '-sk'] + paths
             output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=300).decode('utf-8', errors='ignore')
             for line in output.strip().split('\n'):
+                if self._is_cancelled or self.isInterruptionRequested():
+                    return results
                 if not line:
                     continue
                 parts = line.split('\t')
@@ -817,6 +850,9 @@ class DiskScannerWorker(QThread):
 
     def run(self):
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
+        if self._is_cancelled or self.isInterruptionRequested():
+            self.finished_scan.emit(results)
+            return
 
         # OUTFEED: outfeed/{BLOCK}/EVT*/fc/* and innovus/*
         outfeed_targets = glob.glob(os.path.join(_BASE_OUTFEED(), "*", "EVT*", "fc", "*"))
@@ -832,6 +868,9 @@ class DiskScannerWorker(QThread):
 
         tasks = []
         for cat, paths in targets_map.items():
+            if self._is_cancelled or self.isInterruptionRequested():
+                self.finished_scan.emit(results)
+                return
             valid_paths = [p for p in paths if os.path.isdir(p)]
             for i in range(0, len(valid_paths), 50):
                 chunk = valid_paths[i:i + 50]
@@ -840,6 +879,8 @@ class DiskScannerWorker(QThread):
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
             future_to_cat = {executor.submit(self._get_batch_dir_info, t[1]): t[0] for t in tasks}
             for future in concurrent.futures.as_completed(future_to_cat):
+                if self._is_cancelled or self.isInterruptionRequested():
+                    break
                 cat = future_to_cat[future]
                 try:
                     batch_results = future.result()
@@ -858,7 +899,8 @@ class DiskScannerWorker(QThread):
             for owner in results[cat]:
                 results[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
 
-        self.finished_scan.emit(results)
+        if not self._is_cancelled and not self.isInterruptionRequested():
+            self.finished_scan.emit(results)
 
 
 # ===========================================================================
@@ -880,6 +922,20 @@ class ScannerWorker(QThread):
     progress_update = pyqtSignal(int, int)
     status_update   = pyqtSignal(str)
 
+    def __init__(self):
+        super().__init__()
+        self._is_cancelled = False
+
+    def cancel(self):
+        self._is_cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def _cancel_requested(self):
+        return self._is_cancelled or self.isInterruptionRequested()
+
     # -----------------------------------------------------------------------
     # IR directory scanner -- called as a parallel future inside run()
     # -----------------------------------------------------------------------
@@ -889,10 +945,16 @@ class ScannerWorker(QThread):
         ir_dirs    = _BASE_IR().split()
 
         for ir_base in ir_dirs:
+            if self._cancel_requested():
+                return {}
             if not os.path.exists(ir_base):
                 continue
             for root_dir, dirs, files in os.walk(ir_base):
+                if self._cancel_requested():
+                    return {}
                 for f_name in files:
+                    if self._cancel_requested():
+                        return {}
                     if not f_name.startswith("redhawk.log"):
                         continue
                     log_path = os.path.join(root_dir, f_name)
@@ -1025,6 +1087,9 @@ class ScannerWorker(QThread):
         disc_futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=disc_max_w) as disc_ex:
             for ws_base in [_BASE_WS_FE(), _BASE_WS_BE()]:
+                if self._cancel_requested():
+                    self.finished.emit(ws_data, out_data, {}, scan_stats)
+                    return
                 if not os.path.exists(ws_base):
                     continue
                 try:
@@ -1037,6 +1102,9 @@ class ScannerWorker(QThread):
                     )
 
             for future in concurrent.futures.as_completed(disc_futures):
+                if self._cancel_requested():
+                    self.finished.emit(ws_data, out_data, {}, scan_stats)
+                    return
                 try:
                     new_tasks, new_releases = future.result()
                     tasks.extend(new_tasks)
@@ -1050,6 +1118,9 @@ class ScannerWorker(QThread):
         self.status_update.emit("Discovering OUTFEED directories...")
         if os.path.exists(_BASE_OUTFEED()):
             for ent_name in os.listdir(_BASE_OUTFEED()):
+                if self._cancel_requested():
+                    self.finished.emit(ws_data, out_data, {}, scan_stats)
+                    return
                 ent_path = os.path.join(_BASE_OUTFEED(), ent_name)
                 if not os.path.isdir(ent_path):
                     continue
@@ -1087,6 +1158,9 @@ class ScannerWorker(QThread):
         seen_task_paths = set()
         deduped_tasks = []
         for task in tasks:
+            if self._cancel_requested():
+                self.finished.emit(ws_data, out_data, {}, scan_stats)
+                return
             try:
                 key = (task[4], task[5],
                        os.path.normcase(os.path.realpath(os.path.normpath(task[1]))))
@@ -1101,6 +1175,9 @@ class ScannerWorker(QThread):
         # --- Prefetch path cache ---
         paths_to_prefetch = []
         for t in tasks:
+            if self._cancel_requested():
+                self.finished.emit(ws_data, out_data, {}, scan_stats)
+                return
             rd = t[1]
             paths_to_prefetch.append(os.path.join(rd, "pass/compile_opt.pass"))
             paths_to_prefetch.append(os.path.join(rd, "logs/compile_opt.log"))
@@ -1122,6 +1199,9 @@ class ScannerWorker(QThread):
             future_to_task = {executor.submit(self._thread_process_run, t): t for t in tasks}
 
             for future in concurrent.futures.as_completed(future_to_task):
+                if self._cancel_requested():
+                    self.finished.emit(ws_data, out_data, {}, scan_stats)
+                    return
                 try:
                     result = future.result()
                     if result:
@@ -1157,18 +1237,23 @@ class ScannerWorker(QThread):
 
             if ir_future:
                 try:
-                    ir_data = ir_future.result()
+                    ir_data = {} if self._cancel_requested() else ir_future.result()
                 except:
                     ir_data = {}
             else:
                 ir_data = {}
 
+        if self._cancel_requested():
+            self.finished.emit(ws_data, out_data, {}, scan_stats)
+            return
         self.finished.emit(ws_data, out_data, ir_data, scan_stats)
 
     # -----------------------------------------------------------------------
     # Per-task run processor (called in thread pool)
     # -----------------------------------------------------------------------
     def _thread_process_run(self, task_tuple):
+        if self._cancel_requested():
+            return None
         b_name, rd, parent_path, base_rtl, source, run_type, phys_evt = task_tuple
         if source == "OUTFEED":
             rtl = self._resolve_outfeed_rtl(rd, phys_evt)
@@ -1188,6 +1273,8 @@ class ScannerWorker(QThread):
         return normalize_rtl(rtl)
 
     def _process_run(self, b_name, rd, parent_path, rtl, source, run_type):
+        if self._cancel_requested():
+            return None
         r_name       = os.path.basename(rd)
         clean_run    = r_name.replace("-FE", "").replace("-BE", "")
         clean_be_run = re.sub(r'^EVT\d+_ML\d+_DEV\d+(_syn\d+)?_', '', r_name)
@@ -1636,6 +1723,21 @@ class QoRWorker(QThread):
         self.script_path = script_path
         self.run_dirs    = run_dirs
         self.python_bin  = python_bin
+        self._cancelled  = False
+        self._proc       = None
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+        proc = getattr(self, "_proc", None)
+        try:
+            if proc and proc.poll() is None:
+                proc.kill()
+        except Exception:
+            pass
 
     def run(self):
         try:
@@ -1643,14 +1745,24 @@ class QoRWorker(QThread):
             # Run from the script's directory so relative paths work
             script_dir = os.path.dirname(os.path.abspath(self.script_path))
             cmd = [self.python_bin, self.script_path] + self.run_dirs
-            result = subprocess.run(
+            self._proc = subprocess.Popen(
                 cmd,
                 cwd=script_dir,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=300
+                stderr=subprocess.PIPE
             )
-            output = result.stdout.decode("utf-8", errors="ignore")
+            try:
+                stdout, stderr = self._proc.communicate(timeout=300)
+            except subprocess.TimeoutExpired:
+                self.cancel()
+                try:
+                    stdout, stderr = self._proc.communicate(timeout=5)
+                except Exception:
+                    stdout, stderr = b"", b""
+            if self._cancelled or self.isInterruptionRequested():
+                self.finished.emit("")
+                return
+            output = stdout.decode("utf-8", errors="ignore")
             # summary.py prints: [Info]: Refer to output html file: <path>
             html_path = ""
             for line in output.splitlines():

@@ -2746,8 +2746,12 @@ class BlockSummaryDialog(QDialog):
                 lambda *_args, ww=w:
                 setattr(self, "_active_worker", None)
                 if getattr(self, "_active_worker", None) is ww else None)
-            w.start()
             self._active_worker = w
+            owner = self.parent()
+            if owner is not None and hasattr(owner, "_workers"):
+                owner._workers.start("summary", w)
+            else:
+                w.start()
         except Exception as e:
             self.status_lbl.setText("Metric extraction failed: " + str(e))
             self.prog.setVisible(False)
@@ -2796,8 +2800,8 @@ class BlockSummaryDialog(QDialog):
             event.ignore()
 
     def accept(self):
-        self._stop_active_worker()
-        super().accept()
+        if self._stop_active_worker():
+            super().accept()
 
     def _toggle_maximize(self):
         if self.isMaximized():
@@ -3293,7 +3297,11 @@ class BEStageSummaryDialog(QDialog):
             self._worker.finished.connect(self._on_metrics_done)
             self._worker.finished.connect(
                 lambda *_: setattr(self, "_worker", None))
-            self._worker.start()
+            owner = self.parent()
+            if owner is not None and hasattr(owner, "_workers"):
+                owner._workers.start("summary", self._worker)
+            else:
+                self._worker.start()
         except Exception as e:
             self.gen_btn.setEnabled(True)
             QMessageBox.warning(self, "BE Stage Summary", str(e))
@@ -3330,8 +3338,8 @@ class BEStageSummaryDialog(QDialog):
             event.ignore()
 
     def accept(self):
-        self._stop_active_worker()
-        super().accept()
+        if self._stop_active_worker():
+            super().accept()
 
     def reject(self):
         if self._stop_active_worker():
@@ -3458,11 +3466,151 @@ class BEStageSummaryDialog(QDialog):
 
 class PDDashboard(QMainWindow):
 
+    class WorkerRegistry(object):
+        """Own QThread references until the Qt thread has actually finished."""
+
+        def __init__(self, owner):
+            self.owner = owner
+            self.groups = {}
+
+        def _is_running(self, worker):
+            try:
+                return bool(worker and worker.isRunning())
+            except RuntimeError:
+                return False
+            except Exception:
+                return False
+
+        def _cancel(self, worker):
+            if not worker:
+                return
+            try:
+                if hasattr(worker, "cancel"):
+                    worker.cancel()
+            except Exception:
+                pass
+            try:
+                if hasattr(worker, "requestInterruption"):
+                    worker.requestInterruption()
+            except Exception:
+                pass
+
+        def start(self, group, worker, attr_name=None, list_name=None):
+            if not worker:
+                return None
+            group = str(group or "default")
+            self.groups.setdefault(group, [])
+            if worker not in self.groups[group]:
+                self.groups[group].append(worker)
+            if attr_name:
+                try:
+                    setattr(self.owner, attr_name, worker)
+                except Exception:
+                    pass
+            if list_name:
+                try:
+                    lst = getattr(self.owner, list_name, None)
+                    if lst is None:
+                        lst = []
+                        setattr(self.owner, list_name, lst)
+                    if worker not in lst:
+                        lst.append(worker)
+                except Exception:
+                    pass
+            try:
+                worker.finished.connect(
+                    lambda *_args, w=worker, g=group, a=attr_name, l=list_name:
+                    self._finished(g, w, a, l))
+            except Exception:
+                pass
+            try:
+                worker.start()
+            except Exception:
+                self._finished(group, worker, attr_name, list_name)
+                raise
+            return worker
+
+        def _finished(self, group, worker, attr_name=None, list_name=None):
+            try:
+                arr = self.groups.get(group, [])
+                if worker in arr:
+                    arr.remove(worker)
+            except Exception:
+                pass
+            if attr_name:
+                try:
+                    if getattr(self.owner, attr_name, None) is worker:
+                        setattr(self.owner, attr_name, None)
+                except Exception:
+                    pass
+            if list_name:
+                try:
+                    arr = getattr(self.owner, list_name, [])
+                    if worker in arr:
+                        arr.remove(worker)
+                except Exception:
+                    pass
+            try:
+                worker.deleteLater()
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+
+        def stop_worker(self, worker, timeout_ms=1200):
+            if not worker:
+                return True
+            if not self._is_running(worker):
+                return True
+            self._cancel(worker)
+            try:
+                worker.wait(timeout_ms)
+            except RuntimeError:
+                return True
+            except Exception:
+                pass
+            return not self._is_running(worker)
+
+        def stop_attr(self, attr_name, timeout_ms=1200):
+            worker = getattr(self.owner, attr_name, None)
+            stopped = self.stop_worker(worker, timeout_ms)
+            if stopped:
+                try:
+                    setattr(self.owner, attr_name, None)
+                except Exception:
+                    pass
+            return stopped
+
+        def cancel_group(self, group, timeout_ms=0):
+            kept = []
+            for worker in list(self.groups.get(group, []) or []):
+                if timeout_ms:
+                    stopped = self.stop_worker(worker, timeout_ms)
+                else:
+                    self._cancel(worker)
+                    stopped = not self._is_running(worker)
+                if not stopped:
+                    kept.append(worker)
+            self.groups[group] = kept
+            return kept
+
+        def cancel_all(self, timeout_ms=1200):
+            for group in list(self.groups.keys()):
+                self.cancel_group(group, timeout_ms)
+
+        def has_running(self):
+            for group in list(self.groups.keys()):
+                for worker in list(self.groups.get(group, []) or []):
+                    if self._is_running(worker):
+                        return True
+            return False
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Flow Pulse | Beta 1")
         self.resize(1280, 720)
         self.setMinimumSize(800, 600)
+        self._workers = self.WorkerRegistry(self)
 
         # -- data ---------------------------------------------------------
         self.ws_data      = {}
@@ -3673,54 +3821,13 @@ class PDDashboard(QMainWindow):
         self._io_threads = alive
 
     def _cancel_worker_if_possible(self, worker):
-        if not worker:
-            return
-        try:
-            if hasattr(worker, "cancel"):
-                worker.cancel()
-        except Exception:
-            pass
-        try:
-            if hasattr(worker, "requestInterruption"):
-                worker.requestInterruption()
-        except Exception:
-            pass
+        self._workers._cancel(worker)
 
     def _stop_worker_if_running(self, worker, timeout_ms=1200):
-        if not worker:
-            return True
-        try:
-            if not worker.isRunning():
-                return True
-        except RuntimeError:
-            return True
-        except Exception:
-            return True
-        self._cancel_worker_if_possible(worker)
-        try:
-            worker.wait(timeout_ms)
-        except RuntimeError:
-            return True
-        except Exception:
-            pass
-        try:
-            if worker.isRunning():
-                return False
-        except RuntimeError:
-            return True
-        except Exception:
-            return False
-        return not self._worker_is_running(worker)
+        return self._workers.stop_worker(worker, timeout_ms)
 
     def _stop_worker_attr(self, name, timeout_ms=1200):
-        worker = getattr(self, name, None)
-        stopped = self._stop_worker_if_running(worker, timeout_ms)
-        if stopped:
-            try:
-                setattr(self, name, None)
-            except Exception:
-                pass
-        return stopped
+        return self._workers.stop_attr(name, timeout_ms)
 
     def _clear_worker_attr_if_current(self, name, worker):
         if getattr(self, name, None) is worker:
@@ -3745,36 +3852,10 @@ class PDDashboard(QMainWindow):
         return kept
 
     def _has_running_workers(self):
-        for seq_name in (
-                "size_workers", "_stage_workers", "_fe_cong_workers",
-                "_stage_screenshot_workers", "_stage_metric_workers"):
-            for worker in list(getattr(self, seq_name, []) or []):
-                if self._worker_is_running(worker):
-                    return True
-        for name in (
-                "worker", "_signoff_worker", "_metric_worker",
-                "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
-                "_hover_metric_worker", "_quick_refresh_worker",
-                "_owner_lookup_worker"):
-            if self._worker_is_running(getattr(self, name, None)):
-                return True
-        return False
+        return self._workers.has_running()
 
     def _shutdown_all_workers(self):
-        for seq_name in (
-                "size_workers", "_stage_workers", "_fe_cong_workers",
-                "_stage_screenshot_workers", "_stage_metric_workers"):
-            seq = getattr(self, seq_name, [])
-            try:
-                setattr(self, seq_name, self._stop_worker_list_now(seq, 1200))
-            except Exception:
-                pass
-        for name in (
-                "worker", "_signoff_worker", "_metric_worker",
-                "_qor_worker", "_disk_scan_worker", "_metric_batch_worker",
-                "_hover_metric_worker", "_quick_refresh_worker",
-                "_owner_lookup_worker"):
-            self._stop_worker_attr(name)
+        self._workers.cancel_all(1200)
 
     def closeEvent(self, event):
         if not prefs.has_section('UI'):
@@ -4510,14 +4591,10 @@ class PDDashboard(QMainWindow):
         worker = MetricWorker(
             actual_path, item.data(0, Qt.UserRole + 2) or "",
             run_type, source, stage_name, stage_path)
-        self._metric_worker = worker
         self._metric_item_name = run_name
         self._metric_dark      = dark
         worker.finished.connect(self._on_metric_done)
-        worker.finished.connect(
-            lambda *_args, ww=worker:
-            self._clear_worker_attr_if_current("_metric_worker", ww))
-        worker.start()
+        self._workers.start("metrics", worker, attr_name="_metric_worker")
 
     def _on_metric_done(self, metrics):
         """Called when MetricWorker finishes -- show the summary dialog."""
@@ -5872,13 +5949,13 @@ class PDDashboard(QMainWindow):
                 path, run.get("block", "") or item.data(0, Qt.UserRole + 2) or "",
                 "FE", run.get("source", item.text(2) or "WS"),
                 None, None)
-            self._hover_metric_worker = worker
             self._hover_metric_path = path
+            item_id = f"{item.text(0)}|{item.text(1)}|{item.text(15)}"
+            self.item_map[item_id] = item
             worker.finished.connect(
-                lambda metrics, p=path, it=item:
-                self._on_fe_hover_metric_done(p, it, metrics))
-            worker.finished.connect(worker.deleteLater)
-            worker.start()
+                lambda metrics, p=path, iid=item_id:
+                self._on_fe_hover_metric_done(p, iid, metrics))
+            self._workers.start("hover", worker, attr_name="_hover_metric_worker")
         except Exception:
             return
 
@@ -5943,16 +6020,16 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
 
-    def _on_fe_hover_metric_done(self, path, item, metrics):
+    def _on_fe_hover_metric_done(self, path, item_id, metrics):
         sender = self.sender()
         if sender is not None and sender is not getattr(self, "_hover_metric_worker", None):
             return
-        self._hover_metric_worker = None
         self._hover_metric_path = ""
         if isinstance(metrics, dict) and not metrics.get("_error"):
             self._hover_metric_cache[path] = metrics
         lines = self._format_fe_hover_metrics(metrics)
         try:
+            item = self.item_map.get(item_id)
             if item and item.text(15) == path:
                 self._set_fe_hover_tooltip(item, lines)
         except RuntimeError:
@@ -6002,12 +6079,7 @@ class PDDashboard(QMainWindow):
         return alive
 
     def _worker_is_running(self, worker):
-        try:
-            return bool(worker and worker.isRunning())
-        except RuntimeError:
-            return False
-        except Exception:
-            return False
+        return self._workers._is_running(worker)
 
     def _hide_stage_metric_panel(self):
         self._stage_metric_request_token += 1
@@ -6090,10 +6162,9 @@ class PDDashboard(QMainWindow):
             token, be_path, stage_path, stage_name, block, runtime,
             getattr(self, "gate_count_unit_area", 0.2419))
         worker._cache_key = key
-        self._stage_metric_workers.append(worker)
         worker.finished.connect(self._on_stage_metric_lookup_done)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+        self._workers.start("stage_metric", worker,
+                            list_name="_stage_metric_workers")
 
     def _on_stage_metric_lookup_done(self, token, be_path, stage_name, metrics):
         cache_key = None
@@ -6367,10 +6438,9 @@ class PDDashboard(QMainWindow):
         if token != self._stage_screenshot_request_token:
             return
         worker = StageScreenshotLookupWorker(token, be_path, stage_path, stage_name, block)
-        self._stage_screenshot_workers.append(worker)
         worker.finished.connect(self._on_stage_screenshot_lookup_done)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+        self._workers.start("stage_screenshot", worker,
+                            list_name="_stage_screenshot_workers")
 
     def _on_stage_screenshot_lookup_done(self, token, be_path, stage_name, block, found, img):
         key = ""
@@ -6423,10 +6493,9 @@ class PDDashboard(QMainWindow):
         if token != self._fe_cong_request_token:
             return
         worker = FeCongestionLookupWorker(token, run_path, block)
-        self._fe_cong_workers.append(worker)
         worker.finished.connect(self._on_fe_congestion_lookup_done)
-        worker.finished.connect(worker.deleteLater)
-        worker.start()
+        self._workers.start("fe_cong", worker,
+                            list_name="_fe_cong_workers")
 
     def _on_fe_congestion_lookup_done(self, token, run_path, block, fp_ver, img_path, img):
         key = (run_path or "", block or "")
@@ -6833,15 +6902,12 @@ class PDDashboard(QMainWindow):
                     "source": task.get("source", "WS"),
                 })
             worker = worker_cls(worker_tasks)
-            self._quick_refresh_worker = worker
             worker.progress.connect(
                 self._on_quick_refresh_progress)
             worker.finished.connect(
                 self._on_quick_refresh_finished)
-            worker.finished.connect(
-                lambda *_args, ww=worker:
-                self._clear_worker_attr_if_current("_quick_refresh_worker", ww))
-            worker.start()
+            self._workers.start("quick_refresh", worker,
+                                attr_name="_quick_refresh_worker")
         except Exception as e:
             self.prog_container.setVisible(False)
             self.refresh_btn.setEnabled(True)
@@ -6959,11 +7025,11 @@ class PDDashboard(QMainWindow):
         self.tree.blockSignals(False)
         self.tree.setEnabled(False)
 
-        self.worker = ScannerWorker()
-        self.worker.progress_update.connect(self.update_progress)
-        self.worker.status_update.connect(self.update_status_lbl)
-        self.worker.finished.connect(self.on_scan_finished)
-        self.worker.start()
+        worker = ScannerWorker()
+        worker.progress_update.connect(self.update_progress)
+        worker.status_update.connect(self.update_status_lbl)
+        worker.finished.connect(self.on_scan_finished)
+        self._workers.start("scan", worker, attr_name="worker")
 
     def update_progress(self, current, total):
         self.prog.setRange(0, total)
@@ -6973,6 +7039,15 @@ class PDDashboard(QMainWindow):
         self.prog_lbl.setText(message)
 
     def on_scan_finished(self, ws, out, ir, stats):
+        sender = self.sender()
+        if sender is not None and sender is not getattr(self, "worker", None):
+            return
+        if sender is not None and getattr(sender, "_is_cancelled", False):
+            self.prog_container.setVisible(False)
+            self.refresh_btn.setEnabled(True)
+            self.refresh_btn.setText("Refresh")
+            self.tree.setEnabled(True)
+            return
         self.ws_data  = ws
         self.out_data = out
         self.ir_data  = ir
@@ -7680,9 +7755,8 @@ class PDDashboard(QMainWindow):
             be_run["_stage_detail_loading"] = True
             w = StageDetailWorker(be_run)
             w.finished.connect(self._on_stage_details_loaded)
-            w.finished.connect(w.deleteLater)
-            w.start()
-            self._stage_workers.append(w)
+            self._workers.start("stage_detail", w,
+                                list_name="_stage_workers")
 
         if item.childCount() == 1:
             ph = item.child(0)
@@ -8511,11 +8585,7 @@ class PDDashboard(QMainWindow):
             self.item_map[item_id] = item
             worker = SingleSizeWorker(item_id, run_path)
             worker.result.connect(self.update_item_size)
-            self.size_workers.append(worker)
-            worker.finished.connect(
-                lambda w=worker: self.size_workers.remove(w)
-                if w in self.size_workers else None)
-            worker.start()
+            self._workers.start("sizes", worker, list_name="size_workers")
 
         elif fm_n_act     and res == fm_n_act:     self._open_file_or_warn(fm_n_path, "NONUPF Formality Report")
         elif fm_u_act     and res == fm_u_act:     self._open_file_or_warn(fm_u_path, "UPF Formality Report")
@@ -8566,11 +8636,7 @@ class PDDashboard(QMainWindow):
             worker = BatchSizeWorker(size_tasks)
             # Use batch signal: ~10 deliveries instead of 500 individual signals
             worker.sizes_batch_ready.connect(self._on_batch_sizes)
-            self.size_workers.append(worker)
-            worker.finished.connect(
-                lambda w=worker: self.size_workers.remove(w)
-                if w in self.size_workers else None)
-            worker.start()
+            self._workers.start("sizes", worker, list_name="size_workers")
 
     def _on_batch_sizes(self, batch):
         """Handle a batch of (item_id, size_str) tuples from BatchSizeWorker.
@@ -8608,10 +8674,11 @@ class PDDashboard(QMainWindow):
                 tasks.append({"path": path})
         if not tasks:
             return
-        self._owner_lookup_worker = OwnerLookupWorker(tasks)
-        self._owner_lookup_worker.batch_ready.connect(self._on_owner_lookup_batch)
-        self._owner_lookup_worker.finished.connect(self._on_owner_lookup_finished)
-        self._owner_lookup_worker.start()
+        worker = OwnerLookupWorker(tasks)
+        worker.batch_ready.connect(self._on_owner_lookup_batch)
+        worker.finished.connect(self._on_owner_lookup_finished)
+        self._workers.start("owner", worker,
+                            attr_name="_owner_lookup_worker")
 
     def _set_item_owner_text(self, item, owner):
         if not item or not owner or owner == "Unknown":
@@ -8671,10 +8738,11 @@ class PDDashboard(QMainWindow):
         self.status_bar.showMessage(
             "Owner/FM/VSLP background scan started for {} runs".format(len(runs)),
             5000)
-        self._signoff_worker = SignoffStatusWorker(runs)
-        self._signoff_worker.batch_ready.connect(self._on_signoff_batch)
-        self._signoff_worker.finished.connect(self._on_signoff_finished)
-        self._signoff_worker.start()
+        worker = SignoffStatusWorker(runs)
+        worker.batch_ready.connect(self._on_signoff_batch)
+        worker.finished.connect(self._on_signoff_finished)
+        self._workers.start("signoff", worker,
+                            attr_name="_signoff_worker")
 
     def _on_signoff_batch(self, batch):
         for row in batch:
@@ -9445,13 +9513,14 @@ class PDDashboard(QMainWindow):
         if hasattr(self, 'disk_btn'):
             self.disk_btn.setEnabled(False)
             self.disk_btn.setText("Scanning Disk...")
-        self._disk_scan_worker = DiskScannerWorker()
+        worker = DiskScannerWorker()
         # DiskScannerWorker uses finished_scan signal
-        sig = getattr(self._disk_scan_worker, "finished_scan", None)
+        sig = getattr(worker, "finished_scan", None)
         if sig is None:
-            sig = self._disk_scan_worker.finished
+            sig = worker.finished
         sig.connect(self._on_bg_disk_scan_finished)
-        self._disk_scan_worker.start()
+        self._workers.start("disk", worker,
+                            attr_name="_disk_scan_worker")
 
     def _on_bg_disk_scan_finished(self, data):
         self._disk_data = data
@@ -9493,12 +9562,8 @@ class PDDashboard(QMainWindow):
                 "Previous QoR compare is still running. Please try again in a moment.")
             return
         worker = QoRWorker(script, sel, _PYTHON_BIN)
-        self._qor_worker = worker
         worker.finished.connect(self._on_qor_done)
-        worker.finished.connect(
-            lambda *_args, ww=worker:
-            self._clear_worker_attr_if_current("_qor_worker", ww))
-        worker.start()
+        self._workers.start("qor", worker, attr_name="_qor_worker")
 
     def _on_qor_done(self, html_path):
         sender = self.sender()
@@ -9543,12 +9608,8 @@ class PDDashboard(QMainWindow):
             return
         worker = QoRWorker(script, [be_run_path, "-stage", stage_name],
                             _PYTHON_BIN)
-        self._qor_worker = worker
         worker.finished.connect(self._on_qor_done)
-        worker.finished.connect(
-            lambda *_args, ww=worker:
-            self._clear_worker_attr_if_current("_qor_worker", ww))
-        worker.start()
+        self._workers.start("qor", worker, attr_name="_qor_worker")
 
     def _resolve_qor_script(self):
         """Find summary.py from QOR_SUMMARY_SCRIPT / prefs / project_config.ini."""
@@ -10896,12 +10957,9 @@ class PDDashboard(QMainWindow):
                 "Previous metric extraction is still running. Please try again in a moment.")
             return
         worker = MetricBatchWorker(tasks)
-        self._metric_batch_worker = worker
         worker.finished.connect(self._on_ror_metric_done)
-        worker.finished.connect(
-            lambda *_args, ww=worker:
-            self._clear_worker_attr_if_current("_metric_batch_worker", ww))
-        worker.start()
+        self._workers.start("metric_batch", worker,
+                            attr_name="_metric_batch_worker")
 
     def _on_ror_metric_done(self, rows):
         sender = self.sender()
@@ -10986,12 +11044,9 @@ class PDDashboard(QMainWindow):
                 "Previous metric extraction is still running. Please try again in a moment.")
             return
         worker = MetricBatchWorker(tasks)
-        self._metric_batch_worker = worker
         worker.finished.connect(self._on_golden_metric_done)
-        worker.finished.connect(
-            lambda *_args, ww=worker:
-            self._clear_worker_attr_if_current("_metric_batch_worker", ww))
-        worker.start()
+        self._workers.start("metric_batch", worker,
+                            attr_name="_metric_batch_worker")
 
     def _on_golden_metric_done(self, rows):
         sender = self.sender()
