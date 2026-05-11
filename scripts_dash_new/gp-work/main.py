@@ -20,6 +20,7 @@ import configparser
 import concurrent.futures
 import tempfile
 import gzip
+import tarfile
 import html
 import io
 
@@ -2954,6 +2955,9 @@ class BlockSummaryDialog(QDialog):
                         item.setForeground(self.pos_fg)
                 except Exception:
                     pass
+            path_key = self._COL_PATH_KEY.get(c)
+            if path_key and isinstance(metrics.get("_paths"), dict):
+                item.setData(Qt.UserRole + 2, metrics.get("_paths", {}).get(path_key))
             if c == 7:
                 item.setData(Qt.UserRole + 1, vt_labels)
                 if vt_labels:
@@ -3095,6 +3099,12 @@ class BlockSummaryDialog(QDialog):
 
     # -- Open cell report in gvim ------------------------------------------
 
+    _COL_PATH_KEY = {
+        2: "mbit", 3: "cgc", 4: "instance_count", 5: "std_cell_area",
+        7: "vth", 8: "r2r_setup", 9: "r2r_hold", 10: "logic_depth",
+        11: "runtime",
+    }
+
     _COL_REPORT = {
         2:  ["multibit_banking_ratio.*.rpt"],
         3:  ["clock_gating_info.mission.rpt", "clock_gating_info.*.rpt"],
@@ -3118,12 +3128,22 @@ class BlockSummaryDialog(QDialog):
                 except Exception as e:
                     QMessageBox.warning(self, "Open Path", str(e))
             return
+        rpt = item.data(Qt.UserRole + 2)
+        parent_obj = self.parent()
+        if rpt and parent_obj and hasattr(parent_obj, "_resolve_archive_path"):
+            rpt = parent_obj._resolve_archive_path(rpt)
+        if rpt and os.path.exists(rpt):
+            subprocess.Popen(['gvim', rpt])
+            return
         pats = self._COL_REPORT.get(c)
         if not pats or not run_path:
             return
         try:
             from metric_extract import _find_rpt
             rpt = _find_rpt(os.path.join(run_path, "reports"), pats)
+            parent_obj = self.parent()
+            if rpt and parent_obj and hasattr(parent_obj, "_resolve_archive_path"):
+                rpt = parent_obj._resolve_archive_path(rpt)
             if rpt and os.path.exists(rpt):
                 subprocess.Popen(['gvim', rpt])
             else:
@@ -3338,7 +3358,13 @@ class BEStageSummaryDialog(QDialog):
             if owner is not None and hasattr(owner, "_workers"):
                 owner._workers.start("summary", self._worker)
             else:
-                self._worker.start()
+                self._worker = None
+                self.gen_btn.setEnabled(True)
+                self.prog.setVisible(False)
+                QMessageBox.warning(
+                    self, "BE Stage Summary",
+                    "BE Stage Summary must be opened from the dashboard so its worker can be tracked safely.")
+                return
         except Exception as e:
             self.gen_btn.setEnabled(True)
             QMessageBox.warning(self, "BE Stage Summary", str(e))
@@ -3736,6 +3762,8 @@ class PDDashboard(QMainWindow):
         self.ignore_run_filter      = False
         self.active_col_filters     = {}
         self._tree_builder          = None
+        self._archive_tar_path      = ""
+        self._archive_file_map      = {}
 
         # -- milestone map (user-configurable in Settings > Milestones) --
         self._milestone_map = self._load_milestone_map()
@@ -4057,6 +4085,40 @@ class PDDashboard(QMainWindow):
         return os.path.join(
             base, "run_history_{}.json".format(_safe_user_name()))
 
+    def _run_history_cutoff(self, days=90):
+        try:
+            return datetime.datetime.now() - datetime.timedelta(days=days)
+        except Exception:
+            return None
+
+    def _parse_history_ts(self, value):
+        text = str(value or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.datetime.strptime(text, fmt)
+            except Exception:
+                pass
+        return None
+
+    def _prune_run_history(self, data, days=90):
+        cutoff = self._run_history_cutoff(days)
+        if not isinstance(data, dict) or cutoff is None:
+            return data if isinstance(data, dict) else {}
+        pruned = {}
+        for key, entries in data.items():
+            if not isinstance(entries, list):
+                continue
+            kept = []
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                ts = self._parse_history_ts(entry.get("ts"))
+                if ts is None or ts >= cutoff:
+                    kept.append(entry)
+            if kept:
+                pruned[str(key)] = kept[-20:]
+        return pruned
+
     def _load_run_history(self):
         """Load run history dict: {run_key: [{status, runtime, fm, vslp, ts}]}"""
         import json
@@ -4070,12 +4132,13 @@ class PDDashboard(QMainWindow):
                 pass
         try:
             with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
-                return json.load(f)
+                return self._prune_run_history(json.load(f), days=90)
         except Exception:
             return {}
 
     def _save_run_history(self):
         """Save run history in a tracked writer thread with atomic replace."""
+        self._run_history = self._prune_run_history(self._run_history, days=90)
         data = dict(self._run_history)
         fp = self._history_file()
         def _write():
@@ -4419,6 +4482,366 @@ class PDDashboard(QMainWindow):
         self._force_default_expand = True
         QTimer.singleShot(0, self._build_tree)
 
+    def _archive_latest_file(self):
+        return os.path.join(self._snapshot_dir(), "latest_archive.tar.gz")
+
+    def _archive_extract_dir(self):
+        path = os.path.join(self._snapshot_dir(), "archive_extract")
+        try:
+            if not os.path.exists(path):
+                os.makedirs(path)
+        except Exception:
+            pass
+        return path
+
+    def _archive_member_name(self, kind, label, src_path):
+        base = os.path.basename(src_path or "file")
+        return os.path.join(kind, _safe_path_token(label)[:80], base).replace(os.sep, "/")
+
+    def _archive_add_file(self, tar, manifest, src_path, arcname, max_size, kind):
+        try:
+            if not src_path or not os.path.isfile(src_path):
+                return False
+            size = os.path.getsize(src_path)
+            if size > max_size:
+                manifest["skipped"].append({
+                    "path": src_path, "kind": kind, "reason": "oversize",
+                    "size": size, "limit": max_size})
+                return False
+            tar.add(src_path, arcname=arcname)
+            manifest["files"][src_path] = {"archive": arcname, "kind": kind, "size": size}
+            return True
+        except Exception as e:
+            manifest["skipped"].append({
+                "path": src_path, "kind": kind, "reason": str(e)})
+            return False
+
+    def _archive_add_bytes(self, tar, manifest, original_path, arcname, data, kind):
+        try:
+            if isinstance(data, str):
+                data = data.encode("utf-8", "ignore")
+            info = tarfile.TarInfo(arcname)
+            info.size = len(data or b"")
+            info.mtime = time.time()
+            tar.addfile(info, io.BytesIO(data or b""))
+            manifest["files"][original_path] = {
+                "archive": arcname, "kind": kind, "size": info.size}
+            return True
+        except Exception as e:
+            manifest["skipped"].append({
+                "path": original_path, "kind": kind, "reason": str(e)})
+            return False
+
+    def _archive_find_matches(self, directory, patterns):
+        out = []
+        if not directory or not os.path.isdir(directory):
+            return out
+        try:
+            names = os.listdir(directory)
+        except Exception:
+            return out
+        seen = set()
+        for pat in patterns:
+            for name in fnmatch.filter(names, pat):
+                if name in seen:
+                    continue
+                seen.add(name)
+                fp = os.path.join(directory, name)
+                if os.path.isfile(fp):
+                    out.append(fp)
+        return out
+
+    def _archive_log_snippet(self, path, max_part=32768):
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                head = f.read(max_part)
+                tail = b""
+                if size > max_part:
+                    try:
+                        f.seek(max(0, size - max_part))
+                        tail = f.read(max_part)
+                    except Exception:
+                        tail = b""
+            marker = "\n\n--- FLOW PULSE LOG SNIPPET: middle omitted, original size {} bytes ---\n\n".format(size)
+            if tail:
+                return head + marker.encode("utf-8") + tail
+            return head
+        except Exception:
+            return b""
+
+    def _archive_report_candidates_for_run(self, run):
+        block = run.get("block", "*")
+        run_path = run.get("path", "")
+        run_name = run.get("r_name", os.path.basename(run_path))
+        out = []
+        rpt_dir = os.path.join(run_path, "reports")
+        fe_patterns = [
+            "runtime.V2.rpt",
+            "area.{}.*.rpt".format(block),
+            "utilization.{}.*.rpt".format(block),
+            "cell_usage.summary.{}.*.rpt".format(block),
+            "multibit_banking_ratio.{}.*.rpt".format(block),
+            "congestion.{}.*.rpt".format(block),
+            "qor.{}.*.rpt".format(block),
+            "clock_gating_info.mission.rpt",
+            "report_power_info.mission.*.rpt",
+            "report_app_options.full.{}.*.rpt".format(block),
+        ]
+        for fp in self._archive_find_matches(rpt_dir, fe_patterns):
+            out.append((fp, "reports", run_name))
+        log_path = os.path.join(run_path, "logs", "compile_opt.log")
+        if os.path.isfile(log_path):
+            out.append((log_path, "log_snippet", run_name))
+
+        for stage in run.get("stages", []) or []:
+            sname = stage.get("name") if isinstance(stage, dict) else str(stage)
+            if not sname:
+                continue
+            stage_dirs = [
+                os.path.join(run_path, "reports", sname),
+                os.path.join(run_path, sname, "reports", sname),
+                os.path.join(run_path, sname, "reports"),
+            ]
+            stage_patterns = [
+                sname + ".runtime.rpt",
+                sname + ".qor_sum.rpt",
+                sname + "_p*.summary.gz",
+                sname + ".qor.snap.rpt",
+                sname + ".grc.rpt",
+                sname + ".sec_get_area.rpt",
+                sname + ".sec_vth_use.rpt",
+                sname + ".cts.qor.final.rpt",
+                sname + ".env.app_options.full.rpt",
+                sname + "env.app_options.full.rpt",
+                sname + ".opt.options.rpt",
+            ]
+            for sdir in stage_dirs:
+                for fp in self._archive_find_matches(sdir, stage_patterns):
+                    out.append((fp, "reports", run_name + "__" + sname))
+            slog = os.path.join(run_path, "logs", sname + ".log")
+            if os.path.isfile(slog):
+                out.append((slog, "log_snippet", run_name + "__" + sname))
+        return out
+
+    def _archive_image_candidates_for_run(self, run):
+        block = run.get("block", "*")
+        run_path = run.get("path", "")
+        run_name = run.get("r_name", os.path.basename(run_path))
+        out = []
+        for fp in self._archive_find_matches(
+                os.path.join(run_path, "reports"),
+                ["congestion.window.{}.*.jpg".format(block), "*.jpg"]):
+            out.append((fp, "images", run_name))
+        for stage in run.get("stages", []) or []:
+            sname = stage.get("name") if isinstance(stage, dict) else str(stage)
+            if not sname:
+                continue
+            dirs = [
+                os.path.join(run_path, "screenshot"),
+                os.path.join(run_path, sname, "screenshot"),
+            ]
+            pats = [
+                "{}.{}.jpg".format(sname, block),
+                "{}.{}_pin_density.jpg".format(sname, block),
+                "{}.{}_cell_density.jpg".format(sname, block),
+                "{}.{}_Short*.jpg".format(sname, block),
+            ]
+            for d in dirs:
+                for fp in self._archive_find_matches(d, pats):
+                    out.append((fp, "images", run_name + "__" + sname))
+        return out
+
+    def _prune_old_archives(self, keep=10):
+        try:
+            snap_dir = self._snapshot_dir()
+            names = [os.path.join(snap_dir, n) for n in os.listdir(snap_dir)
+                     if n.startswith("archive_") and n.endswith(".tar.gz")]
+            names.sort(key=os.path.getmtime, reverse=True)
+            for fp in names[keep:]:
+                try:
+                    os.remove(fp)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def create_archive_snapshot(self):
+        if not (self.ws_data or self.out_data):
+            QMessageBox.information(
+                self, "Archive Snapshot",
+                "No scan data is loaded yet. Run a full scan first.")
+            return
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Create Archive Snapshot")
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(
+            "Archive snapshot stores the current dashboard snapshot plus selected source reports."))
+        report_cb = QCheckBox("Include report files")
+        report_cb.setChecked(True)
+        report_cb.setEnabled(False)
+        image_cb = QCheckBox("Include images (congestion/pin/cell/shorts maps)")
+        image_cb.setChecked(False)
+        lay.addWidget(report_cb)
+        lay.addWidget(image_cb)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        lay.addWidget(btns)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        try:
+            fp, manifest = self._write_archive_snapshot(include_images=image_cb.isChecked())
+            QMessageBox.information(
+                self, "Archive Snapshot",
+                "Archive saved:\n{}\n\nFiles: {}\nSkipped: {}".format(
+                    fp, len(manifest.get("files", {})), len(manifest.get("skipped", []))))
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Archive Snapshot",
+                "Could not create archive snapshot:\n" + str(e))
+
+    def _write_archive_snapshot(self, include_images=False):
+        snap_dir = self._snapshot_dir()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive = os.path.join(snap_dir, "archive_{}.tar.gz".format(stamp))
+        latest = self._archive_latest_file()
+        tmp = archive + ".tmp.{}.{}".format(os.getpid(), int(time.time() * 1000000))
+        payload = self._snapshot_payload({"archive": True, "include_images": bool(include_images)})
+        manifest = {
+            "schema": "flow_pulse_archive_snapshot_v1",
+            "project": PROJECT_PREFIX,
+            "created_at": payload.get("created_at"),
+            "created_by": payload.get("created_by"),
+            "include_images": bool(include_images),
+            "summary": payload.get("summary", {}),
+            "limits": {"report_max_bytes": 5 * 1024 * 1024,
+                       "image_max_bytes": 10 * 1024 * 1024},
+            "files": {},
+            "skipped": [],
+        }
+        report_limit = manifest["limits"]["report_max_bytes"]
+        image_limit = manifest["limits"]["image_max_bytes"]
+        runs = ((self.ws_data or {}).get("all_runs", []) +
+                (self.out_data or {}).get("all_runs", []))
+        seen = set()
+        with tarfile.open(tmp, "w:gz") as tar:
+            snap_bytes = io.BytesIO()
+            with gzip.GzipFile(fileobj=snap_bytes, mode="wb") as gz:
+                gz.write(json.dumps(payload, indent=2, sort_keys=True).encode("utf-8"))
+            self._archive_add_bytes(
+                tar, manifest, "snapshot.json.gz", "snapshot.json.gz",
+                snap_bytes.getvalue(), "snapshot")
+            for run in runs:
+                for src, kind, label in self._archive_report_candidates_for_run(run):
+                    key = os.path.abspath(src)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if kind == "log_snippet":
+                        arc = self._archive_member_name("reports", label, src + ".snippet.txt")
+                        self._archive_add_bytes(
+                            tar, manifest, src, arc,
+                            self._archive_log_snippet(src), kind)
+                    else:
+                        arc = self._archive_member_name("reports", label, src)
+                        self._archive_add_file(tar, manifest, src, arc, report_limit, kind)
+                if include_images:
+                    for src, kind, label in self._archive_image_candidates_for_run(run):
+                        key = os.path.abspath(src)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        arc = self._archive_member_name("images", label, src)
+                        self._archive_add_file(tar, manifest, src, arc, image_limit, kind)
+            self._archive_add_bytes(
+                tar, manifest, "manifest.json", "manifest.json",
+                json.dumps(manifest, indent=2, sort_keys=True), "manifest")
+        os.replace(tmp, archive)
+        try:
+            shutil.copy2(archive, latest)
+        except Exception:
+            pass
+        self._prune_old_archives(keep=10)
+        return archive, manifest
+
+    def _read_archive_manifest(self, archive_path):
+        try:
+            with tarfile.open(archive_path, "r:gz") as tar:
+                member = tar.extractfile("manifest.json")
+                if member:
+                    return json.loads(member.read().decode("utf-8", "ignore"))
+        except Exception:
+            pass
+        return None
+
+    def load_latest_archive_snapshot_view(self):
+        fp = self._archive_latest_file()
+        if not os.path.exists(fp):
+            QMessageBox.information(
+                self, "Archive Snapshot",
+                "No latest archive snapshot found.\n\nExpected:\n" + fp)
+            return
+        self._load_archive_snapshot_view_from_path(fp)
+
+    def load_archive_snapshot_file_view(self):
+        fp, _ = QFileDialog.getOpenFileName(
+            self, "Load Archive Snapshot", self._snapshot_dir(),
+            "Archive Snapshot (*.tar.gz);;All Files (*)")
+        if not fp:
+            return
+        self._load_archive_snapshot_view_from_path(fp)
+
+    def _load_archive_snapshot_view_from_path(self, fp):
+        try:
+            with tarfile.open(fp, "r:gz") as tar:
+                snap = tar.extractfile("snapshot.json.gz")
+                if not snap:
+                    raise RuntimeError("snapshot.json.gz missing from archive")
+                payload = json.loads(gzip.GzipFile(fileobj=snap).read().decode("utf-8", "ignore"))
+                manifest = self._read_archive_manifest(fp) or {}
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Archive Snapshot",
+                "Could not load archive snapshot:\n" + str(e))
+            return
+        self._archive_tar_path = fp
+        self._archive_file_map = manifest.get("files", {}) if isinstance(manifest, dict) else {}
+        self._load_snapshot_payload_view(payload)
+        self.sb_scan_time.setText("     Loaded archive: " + str(payload.get("created_at", "-")) + "   ")
+
+    def _resolve_archive_path(self, original_path):
+        if not original_path:
+            return original_path
+        if os.path.exists(original_path):
+            return original_path
+        archive = getattr(self, "_archive_tar_path", "")
+        file_map = getattr(self, "_archive_file_map", {}) or {}
+        rec = file_map.get(original_path) or file_map.get(os.path.abspath(original_path))
+        if not archive or not rec:
+            return original_path
+        arcname = rec.get("archive") if isinstance(rec, dict) else rec
+        if not arcname:
+            return original_path
+        out_dir = os.path.join(self._archive_extract_dir(), _safe_path_token(os.path.basename(archive)))
+        try:
+            if not os.path.exists(out_dir):
+                os.makedirs(out_dir)
+            out_path = os.path.join(out_dir, arcname.replace("/", os.sep))
+            out_parent = os.path.dirname(out_path)
+            if not os.path.exists(out_parent):
+                os.makedirs(out_parent)
+            if os.path.exists(out_path):
+                return out_path
+            with tarfile.open(archive, "r:gz") as tar:
+                src = tar.extractfile(arcname)
+                if not src:
+                    return original_path
+                with open(out_path, "wb") as f:
+                    shutil.copyfileobj(src, f)
+            return out_path
+        except Exception:
+            return original_path
     def export_latest_snapshot(self):
         src = self._snapshot_latest_file()
         if not os.path.exists(src) and os.path.exists(self._old_snapshot_latest_file()):
@@ -5239,6 +5662,10 @@ class PDDashboard(QMainWindow):
         snapshot_menu.addAction("Load Last Snapshot View", self.load_latest_snapshot_view)
         snapshot_menu.addAction("Load Snapshot File...", self.load_snapshot_file_view)
         snapshot_menu.addAction("Export Last Snapshot...", self.export_latest_snapshot)
+        snapshot_menu.addSeparator()
+        snapshot_menu.addAction("Create Archive Snapshot...", self.create_archive_snapshot)
+        snapshot_menu.addAction("Load Last Archive View", self.load_latest_archive_snapshot_view)
+        snapshot_menu.addAction("Load Archive File...", self.load_archive_snapshot_file_view)
 
         self.actions_btn.setMenu(self.actions_menu)
         top_layout.addWidget(self.actions_btn)
@@ -6822,6 +7249,7 @@ class PDDashboard(QMainWindow):
             f = item.font(0); f.setItalic(False); item.setFont(0, f)
     def _open_file_or_warn(self, path, label="File"):
         """Open path in gvim, or show a non-blocking warning if it doesn't exist."""
+        path = self._resolve_archive_path(path)
         if path and os.path.exists(path):
             subprocess.Popen(['gvim', path])
         else:
@@ -7203,11 +7631,11 @@ class PDDashboard(QMainWindow):
         clear_path_cache()
         self.size_workers = self._cancel_worker_list_keep_running(
             self.size_workers)
-        self._stage_workers = self._stop_worker_list_now(self._stage_workers)
-        self._fe_cong_workers = self._stop_worker_list_now(self._fe_cong_workers)
-        self._stage_screenshot_workers = self._stop_worker_list_now(
+        self._stage_workers = self._cancel_worker_list_keep_running(self._stage_workers)
+        self._fe_cong_workers = self._cancel_worker_list_keep_running(self._fe_cong_workers)
+        self._stage_screenshot_workers = self._cancel_worker_list_keep_running(
             self._stage_screenshot_workers)
-        self._stage_metric_workers = self._stop_worker_list_now(
+        self._stage_metric_workers = self._cancel_worker_list_keep_running(
             self._stage_metric_workers)
         self.item_map.clear()
         self._signoff_bg_done = False
@@ -7507,11 +7935,11 @@ class PDDashboard(QMainWindow):
         self._closure_pass_token = getattr(self, "_closure_pass_token", 0) + 1
         self.size_workers = self._cancel_worker_list_keep_running(
             self.size_workers)
-        self._stage_workers = self._stop_worker_list_now(self._stage_workers)
-        self._fe_cong_workers = self._stop_worker_list_now(self._fe_cong_workers)
-        self._stage_screenshot_workers = self._stop_worker_list_now(
+        self._stage_workers = self._cancel_worker_list_keep_running(self._stage_workers)
+        self._fe_cong_workers = self._cancel_worker_list_keep_running(self._fe_cong_workers)
+        self._stage_screenshot_workers = self._cancel_worker_list_keep_running(
             self._stage_screenshot_workers)
-        self._stage_metric_workers = self._stop_worker_list_now(
+        self._stage_metric_workers = self._cancel_worker_list_keep_running(
             self._stage_metric_workers)
         self._stop_worker_if_running(getattr(self, "_owner_lookup_worker", None))
         self._owner_lookup_worker = None
@@ -8013,21 +8441,14 @@ class PDDashboard(QMainWindow):
     def _on_stage_details_loaded(self, be_path, run_name, enriched_stages):
         """Called by StageDetailWorker using stable identifiers only."""
         try:
-            be_item = None
-            for item in self._iter_tree_items():
-                try:
-                    be_run = item.data(0, Qt.UserRole + 11)
-                    if be_run and be_run.get("path") == be_path:
-                        if not run_name or be_run.get("r_name") == run_name or item.text(0) == run_name:
-                            be_item = item
-                            break
-                except RuntimeError:
-                    continue
-                except Exception:
-                    continue
+            be_item = self._signoff_items_by_path.get(be_path)
             if be_item is None:
                 return
             be_run = be_item.data(0, Qt.UserRole + 11)
+            if not be_run or be_run.get("path") != be_path:
+                return
+            if run_name and be_run.get("r_name") != run_name and be_item.text(0) != run_name:
+                return
             if not enriched_stages:
                 if be_run:
                     be_run["_stage_detail_loading"] = False

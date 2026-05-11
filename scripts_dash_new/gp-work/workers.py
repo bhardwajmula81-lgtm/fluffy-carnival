@@ -1054,26 +1054,50 @@ class ScannerWorker(QThread):
 
         for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
             ent_name = os.path.basename(ent_path)
+
+            fc_path = os.path.join(ent_path, "fc")
+            fc_names = []
+            if os.path.isdir(fc_path):
+                try:
+                    fc_names = os.listdir(fc_path)
+                except Exception:
+                    fc_names = []
+
             if ws_base == _BASE_WS_FE():
-                for rd in glob.glob(os.path.join(ent_path, "fc", "*-FE")):
-                    if _ignored_by_pattern(os.path.basename(rd),
-                                           _IGNORE_FE_RUN_PATTERNS()):
+                for name in fc_names:
+                    if not name.endswith("-FE") or name.startswith('.'):
                         continue
-                    tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
+                    if _ignored_by_pattern(name, _IGNORE_FE_RUN_PATTERNS()):
+                        continue
+                    rd = os.path.join(fc_path, name)
+                    if os.path.isdir(rd):
+                        tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
+
             if "fc" in tools_to_scan:
-                for rd in glob.glob(os.path.join(ent_path, "fc", "*-BE")):
-                    if _ignored_by_pattern(os.path.basename(rd),
-                                           _IGNORE_BE_RUN_PATTERNS()):
+                for name in fc_names:
+                    if not name.endswith("-BE") or name.startswith('.'):
                         continue
-                    tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                    if _ignored_by_pattern(name, _IGNORE_BE_RUN_PATTERNS()):
+                        continue
+                    rd = os.path.join(fc_path, name)
+                    if os.path.isdir(rd):
+                        tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+
             if "innovus" in tools_to_scan:
-                # Catch all innovus run dirs -- not just EVT* named ones
-                # TOP runs (S5K2P5SP SOC level) may have different naming
-                for rd in glob.glob(os.path.join(ent_path, "innovus", "*")):
-                    if os.path.isdir(rd) and not os.path.basename(rd).startswith('.'):
-                        if _ignored_by_pattern(os.path.basename(rd),
-                                               _IGNORE_BE_RUN_PATTERNS()):
-                            continue
+                # Catch all innovus run dirs -- not just EVT* named ones.
+                # TOP runs may have different naming.
+                inv_path = os.path.join(ent_path, "innovus")
+                try:
+                    inv_names = os.listdir(inv_path) if os.path.isdir(inv_path) else []
+                except Exception:
+                    inv_names = []
+                for name in inv_names:
+                    if name.startswith('.'):
+                        continue
+                    if _ignored_by_pattern(name, _IGNORE_BE_RUN_PATTERNS()):
+                        continue
+                    rd = os.path.join(inv_path, name)
+                    if os.path.isdir(rd):
                         tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
         return tasks, releases_found
