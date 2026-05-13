@@ -483,6 +483,38 @@ def _format_shared_entry(entry):
         text = "; ".join(_note_lines(text))
     return "{}  {}: {}".format(ts, user, text).strip()
 
+def _shared_entry_id(note_id, entry, idx):
+    raw = "{}|{}|{}|{}|{}".format(
+        note_id, entry.get("user", ""), entry.get("updated_at", ""),
+        idx, entry.get("text", ""))
+    total = 0
+    for ch in raw:
+        total = ((total * 131) + ord(ch)) & 0xffffffff
+    return "n{:04d}_{:08x}".format(idx, total)
+
+def _normalize_shared_entry(note_id, entry, idx):
+    if isinstance(entry, dict):
+        text = entry.get("text", "")
+        if isinstance(text, (list, tuple)):
+            text = "\n".join(_note_lines(text))
+        text = str(text).strip()
+        if not text:
+            return None
+        out = {
+            "id": str(entry.get("id") or ""),
+            "user": str(entry.get("user", entry.get("updated_by", "unknown")) or "unknown"),
+            "text": text,
+            "updated_at": str(entry.get("updated_at", "") or ""),
+        }
+    else:
+        text = str(entry).strip()
+        if not text:
+            return None
+        out = {"id": "", "user": "unknown", "text": text, "updated_at": ""}
+    if not out.get("id"):
+        out["id"] = _shared_entry_id(note_id, out, idx)
+    return out
+
 def _note_lines(value):
     lines = []
     def _walk(v):
@@ -506,26 +538,18 @@ def load_shared_note_entries():
     for key, val in data.items():
         entries = []
         if isinstance(val, list):
-            for entry in val:
-                if isinstance(entry, dict):
-                    if str(entry.get("text", "")).strip():
-                        entries.append(entry)
-                elif str(entry).strip():
-                    entries.append({
-                        "user": "unknown",
-                        "text": str(entry).strip(),
-                        "updated_at": "",
-                    })
+            for idx, entry in enumerate(val):
+                norm = _normalize_shared_entry(key, entry, idx)
+                if norm:
+                    entries.append(norm)
         elif isinstance(val, dict):
-            txt = str(val.get("text", "")).strip()
-            if txt:
-                entries.append({
-                    "user": val.get("updated_by", val.get("user", "unknown")),
-                    "text": txt,
-                    "updated_at": val.get("updated_at", ""),
-                })
-        elif str(val).strip():
-            entries.append({"user": "unknown", "text": str(val).strip(), "updated_at": ""})
+            norm = _normalize_shared_entry(key, val, 0)
+            if norm:
+                entries.append(norm)
+        else:
+            norm = _normalize_shared_entry(key, val, 0)
+            if norm:
+                entries.append(norm)
         entries.sort(key=lambda e: e.get("updated_at", ""))
         if entries:
             out[key] = entries
@@ -544,11 +568,33 @@ def save_shared_note(identifier, note_text):
     if not text:
         return False
     data = load_shared_note_entries()
-    data.setdefault(identifier, []).append({
+    entry = {
         "user": _getpass.getuser(),
         "text": text,
         "updated_at": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-    })
+    }
+    entry["id"] = _shared_entry_id(identifier, entry, len(data.get(identifier, [])))
+    data.setdefault(identifier, []).append(entry)
+    try:
+        _atomic_write_json(_get_shared_notes_file(), data, indent=4, sort_keys=True)
+        return True
+    except Exception:
+        return False
+
+def save_shared_note_entries(identifier, entries):
+    if not identifier:
+        return False
+    data = load_shared_note_entries()
+    clean = []
+    for idx, entry in enumerate(entries or []):
+        norm = _normalize_shared_entry(identifier, entry, idx)
+        if norm:
+            clean.append(norm)
+    if clean:
+        clean.sort(key=lambda e: e.get("updated_at", ""))
+        data[identifier] = clean
+    else:
+        data.pop(identifier, None)
     try:
         _atomic_write_json(_get_shared_notes_file(), data, indent=4, sort_keys=True)
         return True
@@ -883,6 +929,56 @@ class EditNoteDialog(QDialog):
 
     def get_text(self):
         return self._edit.toPlainText().strip()
+
+
+class EditSharedNotesDialog(QDialog):
+    def __init__(self, entries, note_id, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit My Shared Notes: {}".format(note_id[:50]))
+        self.resize(700, 360)
+        self._entries = [dict(e) for e in (entries or [])]
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "<b>Shared notes for:</b> {}<br>Blank text deletes that note.".format(note_id)))
+        self._table = QTableWidget(0, 2)
+        self._table.setHorizontalHeaderLabels(["Updated", "Note"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._table.verticalHeader().setVisible(False)
+        self._table.setAlternatingRowColors(True)
+        for entry in self._entries:
+            row = self._table.rowCount()
+            self._table.insertRow(row)
+            ts_item = QTableWidgetItem(entry.get("updated_at", ""))
+            ts_item.setFlags(ts_item.flags() & ~Qt.ItemIsEditable)
+            ts_item.setData(Qt.UserRole, entry.get("id", ""))
+            self._table.setItem(row, 0, ts_item)
+            edit = QTextEdit()
+            edit.setPlainText(entry.get("text", ""))
+            self._table.setCellWidget(row, 1, edit)
+            self._table.setRowHeight(row, 72)
+        layout.addWidget(self._table)
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_entries(self):
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        out = []
+        for row, original in enumerate(self._entries):
+            edit = self._table.cellWidget(row, 1)
+            text = edit.toPlainText().strip() if edit else ""
+            if not text:
+                continue
+            entry = dict(original)
+            if text != str(original.get("text", "")):
+                entry["text"] = text
+                entry["updated_at"] = now
+            else:
+                entry["text"] = text
+            out.append(entry)
+        return out
 
 
 class FilterDialog(QDialog):
@@ -3732,6 +3828,7 @@ class PDDashboard(QMainWindow):
         self._disk_scan_worker       = None
         self._metric_batch_worker    = None
         self.item_map               = {}
+        self._items_by_path          = {}
         self._signoff_items_by_path  = {}
         self._signoff_worker         = None
         self._signoff_bg_done        = False
@@ -5226,28 +5323,56 @@ class PDDashboard(QMainWindow):
         node.setFont(0, f)
         return node
 
+    def _register_item_path(self, item, path):
+        if not path or path == "N/A":
+            return
+        self._items_by_path.setdefault(path, []).append(item)
+
+    def _set_pin_icon_for_item(self, item, pin_type):
+        if pin_type and pin_type in self.icons:
+            item.setIcon(0, self.icons[pin_type])
+            item.setData(0, Qt.UserRole + 5, pin_type)
+        else:
+            item.setIcon(0, QIcon())
+            item.setData(0, Qt.UserRole + 5, None)
+
+    def _update_pin_icons_for_path(self, path):
+        if not path or path == "N/A":
+            return False
+        pin_type = self.user_pins.get(path)
+        kept = []
+        updated = False
+        for item in list(self._items_by_path.get(path, [])):
+            try:
+                if item.text(15) == path:
+                    self._set_pin_icon_for_item(item, pin_type)
+                    kept.append(item)
+                    updated = True
+            except RuntimeError:
+                pass
+        if kept:
+            self._items_by_path[path] = kept
+        else:
+            self._items_by_path.pop(path, None)
+        return updated
+
     def _apply_pin_icons(self):
         """Walk all tree items and set/clear pin icons from self.user_pins.
-        Called after any pin change so icons appear immediately."""
+        Full-tree fallback used after rebuilds, not after each pin click."""
         GROUP = frozenset(("BLOCK","RTL","MILESTONE",
                            "IGNORED_ROOT","STANDALONE_ROOT","__PLACEHOLDER__"))
         _UR = Qt.UserRole
+        self._items_by_path = {}
         def _walk(node):
             for i in range(node.childCount()):
                 child = node.child(i)
                 nt    = child.data(0, _UR)
                 if nt not in GROUP:
-                    path     = child.text(15)
-                    pin_type = self.user_pins.get(path)
-                    if pin_type and pin_type in self.icons:
-                        child.setIcon(0, self.icons[pin_type])
-                        child.setData(0, Qt.UserRole + 5, pin_type)
-                    else:
-                        child.setIcon(0, QIcon())
-                        child.setData(0, Qt.UserRole + 5, None)
+                    path = child.text(15)
+                    self._register_item_path(child, path)
+                    self._set_pin_icon_for_item(child, self.user_pins.get(path))
                 _walk(child)
         _walk(self.tree.invisibleRootItem())
-
     # ------------------------------------------------------------------
     # BACKGROUND LOG-PATH CACHE WARM-UP
     # ------------------------------------------------------------------
@@ -7287,15 +7412,45 @@ class PDDashboard(QMainWindow):
         except Exception:
             return 0
 
+    def _refresh_current_note_widgets(self, note_id, item=None):
+        if item is None:
+            sel = self.tree.selectedItems()
+            item = sel[0] if sel else None
+        if item is not None:
+            self._apply_note_display_to_item(item, note_id)
+        if getattr(self, "_current_note_id", None) == note_id:
+            self.ins_note.setPlainText(self.personal_notes.get(note_id, ""))
+            self.shared_note_history.setPlainText(self._shared_notes_text(note_id))
+            self.shared_note_input.clear()
+        self._update_status_bar()
+
+    def _shared_entries_for_current_user(self, note_id):
+        user = _getpass.getuser()
+        return [e for e in load_shared_note_entries().get(note_id, [])
+                if e.get("user") == user]
+
+    def edit_my_shared_notes(self, note_id, item=None):
+        entries = load_shared_note_entries().get(note_id, [])
+        user = _getpass.getuser()
+        mine = [e for e in entries if e.get("user") == user]
+        if not mine:
+            QMessageBox.information(self, "Shared Notes",
+                                    "No shared notes from your user for this item.")
+            return
+        dlg = EditSharedNotesDialog(mine, note_id, self)
+        if dlg.exec_():
+            edited_ids = set(e.get("id") for e in mine)
+            others = [e for e in entries if e.get("id") not in edited_ids]
+            if save_shared_note_entries(note_id, others + dlg.get_entries()):
+                self.global_notes = load_all_notes()
+                self._refresh_current_note_widgets(note_id, item)
+
     def save_inspector_note(self):
         if not hasattr(self, "_current_note_id"):
             return
         save_personal_note(self._current_note_id, self.ins_note.toPlainText())
         self.personal_notes = load_personal_notes()
-        sel = self.tree.selectedItems()
-        if sel:
-            self._apply_note_display_to_item(sel[0], self._current_note_id)
-        self._update_status_bar()
+        self._refresh_current_note_widgets(self._current_note_id)
 
     def save_shared_inspector_note(self):
         if not hasattr(self, "_current_note_id"):
@@ -7305,11 +7460,7 @@ class PDDashboard(QMainWindow):
             return
         if save_shared_note(self._current_note_id, text):
             self.global_notes = load_all_notes()
-            self.shared_note_history.setPlainText(self._shared_notes_text(self._current_note_id))
-            self.shared_note_input.clear()
-            sel = self.tree.selectedItems()
-            if sel:
-                self._apply_note_display_to_item(sel[0], self._current_note_id)
+            self._refresh_current_note_widgets(self._current_note_id)
         self._update_status_bar()
 
     # ------------------------------------------------------------------
@@ -7638,6 +7789,7 @@ class PDDashboard(QMainWindow):
         self._stage_metric_workers = self._cancel_worker_list_keep_running(
             self._stage_metric_workers)
         self.item_map.clear()
+        self._items_by_path.clear()
         self._signoff_bg_done = False
         if self._worker_is_running(self._signoff_worker):
             if hasattr(self._signoff_worker, 'cancel'):
@@ -7945,6 +8097,7 @@ class PDDashboard(QMainWindow):
         self._owner_lookup_worker = None
         self._owner_items_by_path = {}
         self.item_map.clear()
+        self._items_by_path.clear()
         self._signoff_items_by_path.clear()
         self._running_items = []
         self._visible_run_item_cache = None
@@ -8219,6 +8372,7 @@ class PDDashboard(QMainWindow):
         child.setText(5, display_owner)
         child.setToolTip(5, display_owner)
         child.setText(15, run["path"])
+        self._register_item_path(child, run["path"])
         child.setText(22, "")
         child.setData(0, Qt.UserRole + 2, run["block"])
         child.setData(0, Qt.UserRole + 4,
@@ -8379,7 +8533,10 @@ class PDDashboard(QMainWindow):
             s_item.setText(13, self._fmt_ts(s_start_raw))
             s_item.setText(14, self._fmt_ts(s_end_raw))
             # Col 15 = stage directory path, Col 16 = stage log file
-            s_item.setText(15, stage.get("stage_path", "N/A"))
+            stage_path = stage.get("stage_path", "N/A")
+            s_item.setText(15, stage_path)
+            self._register_item_path(s_item, stage_path)
+            self._set_pin_icon_for_item(s_item, self.user_pins.get(stage_path))
             s_item.setText(16, stage.get("log",        "N/A"))
             s_item.setText(20, stage.get("sta_rpt_path",  "N/A"))
             ir_log = "N/A"
@@ -8980,6 +9137,7 @@ class PDDashboard(QMainWindow):
         item = self.tree.itemAt(pos)
         if not item or not item.parent():
             return
+        self.tree.setCurrentItem(item)
         m = QMenu()
 
         run_path  = item.text(15)
@@ -9030,14 +9188,18 @@ class PDDashboard(QMainWindow):
             sort_actions[act] = label
         m.addSeparator()
 
-        edit_note_act = None; note_identifier = ""
+        edit_note_act = None; edit_shared_note_act = None; note_identifier = ""
         if run_path and run_path != "N/A" and not is_stage:
             note_identifier = f"{r_rtl} : {item.text(0)}"
             edit_note_act   = m.addAction("Add / Edit Personal Note")
+            if self._shared_entries_for_current_user(note_identifier):
+                edit_shared_note_act = m.addAction("Edit My Shared Notes")
             m.addSeparator()
         elif is_rtl:
             note_identifier = item.text(0)
             edit_note_act   = m.addAction("Add / Edit Alias Note for RTL")
+            if self._shared_entries_for_current_user(note_identifier):
+                edit_shared_note_act = m.addAction("Edit My Shared Notes")
             m.addSeparator()
 
         add_config_act = None
@@ -9153,17 +9315,12 @@ class PDDashboard(QMainWindow):
                 elif res == act_later: self.user_pins[p_target] = 'later'
                 elif res == act_clear: self.user_pins.pop(p_target, None)
                 save_user_pins(self.user_pins)
-                # Apply icon immediately on the pinned item
-                pin_type = self.user_pins.get(p_target)
-                if pin_type and pin_type in self.icons:
-                    item.setIcon(0, self.icons[pin_type])
-                    item.setData(0, Qt.UserRole + 5, pin_type)
-                else:
-                    item.setIcon(0, QIcon())
-                    item.setData(0, Qt.UserRole + 5, None)
-                # Also walk all items in case same path appears multiple times
-                self._apply_pin_icons()
-
+                if not self._update_pin_icons_for_path(p_target):
+                    try:
+                        if item.text(15) == p_target:
+                            self._set_pin_icon_for_item(item, self.user_pins.get(p_target))
+                    except RuntimeError:
+                        pass
         elif res in sort_actions:
             self._set_tree_sort_mode(sort_actions[res])
             return
@@ -9180,7 +9337,10 @@ class PDDashboard(QMainWindow):
             if dlg.exec_():
                 save_personal_note(note_identifier, dlg.get_text())
                 self.personal_notes = load_personal_notes()
-                self.refresh_view()
+                self._refresh_current_note_widgets(note_identifier, item)
+
+        elif edit_shared_note_act and res == edit_shared_note_act:
+            self.edit_my_shared_notes(note_identifier, item)
 
         elif add_checked_config_act and res == add_checked_config_act:
             self.add_checked_runs_to_filter_config()
