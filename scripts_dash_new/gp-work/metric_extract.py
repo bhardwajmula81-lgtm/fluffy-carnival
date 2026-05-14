@@ -90,9 +90,9 @@ def _cancelled(cancel_check):
 # ===========================================================================
 # PARSERS
 # ===========================================================================
-def parse_area(file_path):
+def parse_area(file_path, verified=False):
     result = {"total_count": "-", "instance_count": "-", "total_area": "-"}
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -114,12 +114,12 @@ def parse_area(file_path):
     return result
 
 
-def parse_utilization(file_path):
+def parse_utilization(file_path, verified=False):
     result = {
         "std_cell_area": "-", "memory_area": "-", "macro_area": "-",
         "std_util_str": "-/-", "std_util": "-/-",
     }
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -148,7 +148,7 @@ def parse_utilization(file_path):
     return result
 
 
-def parse_cell_usage(file_path):
+def parse_cell_usage(file_path, verified=False):
     """
     Section-aware VT parser for FE reports.
     Preserves legacy LVT/RVT/HVT keys and also returns dynamic VT labels.
@@ -162,7 +162,7 @@ def parse_cell_usage(file_path):
         "vt_inst":          "",
         "vt_area":          "",
     }
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return result
     try:
         groups = {}
@@ -210,13 +210,13 @@ def parse_cell_usage(file_path):
     return result
 
 
-def parse_qor(file_path):
+def parse_qor(file_path, verified=False):
     """
     Extract reg->reg WNS/TNS/FEPs for Setup and Hold.
     Second column (group(2)) = reg->reg value.
     """
     result = {"r2r_setup": "-", "r2r_hold": "-"}
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -249,9 +249,9 @@ def parse_qor(file_path):
     return result
 
 
-def parse_clock_gating(file_path):
+def parse_clock_gating(file_path, verified=False):
     """Format: Number of Gated registers | 1234 (56.78%)"""
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return "-"
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -265,8 +265,8 @@ def parse_clock_gating(file_path):
     return "-"
 
 
-def parse_multibit(file_path):
-    if not file_path or not os.path.exists(file_path):
+def parse_multibit(file_path, verified=False):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return "-"
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -281,7 +281,7 @@ def parse_multibit(file_path):
     return "-"
 
 
-def parse_congestion(file_path):
+def parse_congestion(file_path, verified=False):
     """
     Real file format (from screenshot):
       Both Dirs |  56154 |  142 |  38832   ( 0.2002%) |  1
@@ -290,7 +290,7 @@ def parse_congestion(file_path):
     Returns "Both%/H%/V%" e.g. "0.2002%/0.3886%/0.0117%"
     """
     result = {"cong_both": "-"}
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -311,10 +311,10 @@ def parse_congestion(file_path):
     return result
 
 
-def parse_power(file_path):
+def parse_power(file_path, verified=False):
     """Extract Cell Leakage Power = X.XX uW from power report."""
     result = {"leakage": "-"}
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -334,9 +334,9 @@ def parse_power(file_path):
     return result
 
 
-def parse_fe_runtime(file_path):
+def parse_fe_runtime(file_path, verified=False):
     """Extract total runtime from reports/runtime.V2.rpt."""
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return "-"
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -351,12 +351,12 @@ def parse_fe_runtime(file_path):
     return "-"
 
 
-def parse_logic_depth(file_path):
+def parse_logic_depth(file_path, verified=False):
     """
     Extract max Logic Depth from report_logic_depth.summary.*.rpt.
     Each scenario has 'All Path Groups ... MAX_LEVEL'. Returns max.
     """
-    if not file_path or not os.path.exists(file_path):
+    if not file_path or ((not verified) and not os.path.exists(file_path)):
         return "-"
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -586,7 +586,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     # Timing
     qor_path = _find_rpt(
         rpt_dir, ["qor.{}.*.rpt".format(b), "qor.*.rpt"], finder)
-    qor_data = parse_qor(qor_path)
+    qor_data = parse_qor(qor_path, verified=True)
     result["r2r_setup"] = qor_data.get("r2r_setup", "-")
     result["r2r_hold"]  = qor_data.get("r2r_hold",  "-")
 
@@ -597,7 +597,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     # Area
     area_path = _find_rpt(
         rpt_dir, ["area.{}.*.rpt".format(b), "area.*.rpt"], finder)
-    area_data = parse_area(area_path)
+    area_data = parse_area(area_path, verified=True)
     result["area"] = {
         "total_area":     area_data.get("total_area",     "-"),
         "instance_count": area_data.get("instance_count", "-"),
@@ -610,7 +610,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     # Utilization
     util_path = _find_rpt(rpt_dir, [
         "utilization.{}.*.rpt".format(b), "utilization.*.rpt"], finder)
-    util_data = parse_utilization(util_path)
+    util_data = parse_utilization(util_path, verified=True)
     result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
     result["area"]["memory_area"]   = util_data.get("memory_area",   "-")
     result["area"]["macro_area"]    = util_data.get("macro_area",    "-")
@@ -625,7 +625,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     cell_path = _find_rpt(rpt_dir, [
         "cell_usage.summary.{}.*.rpt".format(b),
         "cell_usage.summary.*.rpt"], finder)
-    result["vth"] = parse_cell_usage(cell_path)
+    result["vth"] = parse_cell_usage(cell_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -636,7 +636,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
         "clock_gating_info.mission.rpt",
         "clock_gating_info.{}.*.rpt".format(b),
         "clock_gating_info*.rpt"], finder)
-    result["cgc"] = parse_clock_gating(cgc_path)
+    result["cgc"] = parse_clock_gating(cgc_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -646,7 +646,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     mbit_path = _find_rpt(rpt_dir, [
         "multibit_banking_ratio.{}.*.rpt".format(b),
         "multibit_banking_ratio.*.rpt"], finder)
-    result["mbit"] = parse_multibit(mbit_path)
+    result["mbit"] = parse_multibit(mbit_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -655,7 +655,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     # Congestion
     cong_path = _find_rpt(rpt_dir, [
         "congestion.{}.*.rpt".format(b), "congestion.*.rpt"], finder)
-    result["congestion"] = parse_congestion(cong_path)
+    result["congestion"] = parse_congestion(cong_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -664,7 +664,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     # Power
     pwr_path = _find_rpt(rpt_dir, [
         "report_power_info.mission.ss*.rpt", "report_power*.rpt"], finder)
-    result["power"] = parse_power(pwr_path)
+    result["power"] = parse_power(pwr_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -681,7 +681,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
     # Logic Depth
     ld_path = _find_rpt(
         rpt_dir, ["report_logic_depth.summary.*.rpt"], finder)
-    result["logic_depth"] = parse_logic_depth(ld_path)
+    result["logic_depth"] = parse_logic_depth(ld_path, verified=True)
 
     # Report file paths - for double-click "open in gvim" from dialogs
     _rt_path = os.path.join(run_dir, "reports", "runtime.V2.rpt")
@@ -764,7 +764,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
             run_dir, stage_name, source,
             ["qor.{}.*.rpt".format(b), "qor.*.rpt"],
             stage_path=stage_path, finder=finder)
-        qor_data = parse_qor(old_qor)
+        qor_data = parse_qor(old_qor, verified=True)
         result["r2r_setup"] = qor_data.get("r2r_setup", "-")
         result["r2r_hold"] = qor_data.get("r2r_hold", "-")
         qor_path = old_qor
@@ -783,7 +783,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
             run_dir, stage_name, source,
             ["area.{}.*.rpt".format(b), "area.*.rpt"],
             stage_path=stage_path, finder=finder)
-        stage_area = parse_area(area_path)
+        stage_area = parse_area(area_path, verified=True)
     result["area"] = {
         "total_area":     stage_area.get("total_area",     "-"),
         "instance_count": stage_area.get(
@@ -800,7 +800,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
             run_dir, stage_name, source,
             ["utilization.{}.*.rpt".format(b), "utilization.*.rpt"],
             stage_path=stage_path, finder=finder)
-        util_data = parse_utilization(util_path)
+        util_data = parse_utilization(util_path, verified=True)
         result["area"]["std_cell_area"] = util_data.get("std_cell_area", "-")
         result["area"]["memory_area"] = util_data.get("memory_area", "-")
         result["area"]["macro_area"] = util_data.get("macro_area", "-")
@@ -830,7 +830,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
             ["cell_usage.summary.{}.*.rpt".format(b),
              "cell_usage.summary.*.rpt"],
             stage_path=stage_path, finder=finder)
-        vth_data = parse_cell_usage(cell_path)
+        vth_data = parse_cell_usage(cell_path, verified=True)
     result["vth"] = vth_data
 
     if _cancelled(cancel_check):
@@ -841,7 +841,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         "clock_gating_info.mission.rpt",
         "clock_gating_info.{}.*.rpt".format(b),
         "clock_gating_info*.rpt"], stage_path=stage_path, finder=finder)
-    result["cgc"] = parse_clock_gating(cgc_path)
+    result["cgc"] = parse_clock_gating(cgc_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -850,7 +850,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
     mbit_path = _find_stage_rpt(run_dir, stage_name, source, [
         "multibit_banking_ratio.{}.*.rpt".format(b),
         "multibit_banking_ratio.*.rpt"], stage_path=stage_path, finder=finder)
-    result["mbit"] = parse_multibit(mbit_path)
+    result["mbit"] = parse_multibit(mbit_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -864,7 +864,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
     if cong_path and os.path.basename(cong_path).endswith(".grc.rpt"):
         result["congestion"] = {"cong_both": _parse_stage_grc(_read_stage_text(cong_path))}
     else:
-        result["congestion"] = parse_congestion(cong_path)
+        result["congestion"] = parse_congestion(cong_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -873,7 +873,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
     pwr_path = _find_stage_rpt(run_dir, stage_name, source, [
         "report_power_info.mission.ss*.rpt", "report_power*.rpt"],
         stage_path=stage_path, finder=finder)
-    result["power"] = parse_power(pwr_path)
+    result["power"] = parse_power(pwr_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -882,7 +882,7 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
     ld_path = _find_stage_rpt(
         run_dir, stage_name, source, ["report_logic_depth.summary.*.rpt"],
         stage_path=stage_path, finder=finder)
-    result["logic_depth"] = parse_logic_depth(ld_path)
+    result["logic_depth"] = parse_logic_depth(ld_path, verified=True)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True

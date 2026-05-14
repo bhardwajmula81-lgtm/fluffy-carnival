@@ -1555,6 +1555,72 @@ class FeCongestionLookupWorker(QThread):
         self.finished.emit(self.token, self.run_path, self.block, fp_ver, img_path, img)
 
 
+class SelectionInfoWorker(QThread):
+    finished = pyqtSignal(int, str, int, str)
+
+    def __init__(self, token, run_path):
+        super().__init__()
+        self.token = token
+        self.run_path = run_path or ""
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def run(self):
+        err_path = os.path.join(self.run_path, "logs", "compile_opt.error.log")
+        count = 0
+        try:
+            if not self._cancelled and not self.isInterruptionRequested():
+                if os.path.exists(err_path):
+                    with open(err_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if self._cancelled or self.isInterruptionRequested():
+                                return
+                            if line.strip():
+                                count += 1
+        except Exception:
+            count = 0
+        if not self._cancelled and not self.isInterruptionRequested():
+            self.finished.emit(self.token, self.run_path, count, err_path)
+
+
+class ModifiedTimeWorker(QThread):
+    finished = pyqtSignal(int, object)
+
+    def __init__(self, token, paths):
+        super().__init__()
+        self.token = token
+        self.paths = list(paths or [])
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def run(self):
+        out = {}
+        for path in self.paths:
+            if self._cancelled or self.isInterruptionRequested():
+                return
+            val = 0.0
+            if path and path not in ("N/A", "-"):
+                try:
+                    val = os.path.getmtime(path)
+                except Exception:
+                    val = 0.0
+            out[path] = val
+        if not self._cancelled and not self.isInterruptionRequested():
+            self.finished.emit(self.token, out)
+
+
 class StageScreenshotLookupWorker(QThread):
     finished = pyqtSignal(int, str, str, str, object, object)
 
@@ -3798,6 +3864,16 @@ class PDDashboard(QMainWindow):
         self._visible_run_item_cache = None
         self._quick_refresh_worker = None
         self._quick_refresh_items = {}
+        self._selection_info_worker = None
+        self._selection_info_token = 0
+        self._modified_sort_worker = None
+        self._modified_sort_token = 0
+        self._modified_sort_ready = False
+        self._hover_metric_timer = QTimer(self)
+        self._hover_metric_timer.setSingleShot(True)
+        self._hover_metric_timer.timeout.connect(self._run_pending_hover_metric_lookup)
+        self._pending_hover_metric = None
+        self._note_text_cache = {}
         self._owner_lookup_worker = None
         self._owner_items_by_path = {}
         self._stage_metric_last_key = None
@@ -6669,7 +6745,7 @@ class PDDashboard(QMainWindow):
         self._update_status_bar()
 
     def _on_tree_item_hovered(self, item, column):
-        """Optional FE hover hook. Keep it lightweight; no report parsing on hover."""
+        """Optional FE hover hook. Debounced so pointer movement does not queue NFS work."""
         if not getattr(self, 'enable_fe_hover_metrics', False):
             return
         if not item:
@@ -6686,24 +6762,48 @@ class PDDashboard(QMainWindow):
             if cached:
                 self._set_fe_hover_tooltip(item, self._format_fe_hover_metrics(cached))
                 return
-            self._set_fe_hover_tooltip(item, ["Loading FE metrics..."])
             if not path or path == "N/A":
                 return
-            if self._worker_is_running(getattr(self, "_hover_metric_worker", None)):
-                return
-            worker = MetricWorker(
-                path, run.get("block", "") or item.data(0, Qt.UserRole + 2) or "",
-                "FE", run.get("source", item.text(2) or "WS"),
-                None, None)
-            self._hover_metric_path = path
-            item_id = f"{item.text(0)}|{item.text(1)}|{item.text(15)}"
-            self.item_map[item_id] = item
-            worker.finished.connect(
-                lambda metrics, p=path, iid=item_id:
-                self._on_fe_hover_metric_done(p, iid, metrics))
-            self._workers.start("hover", worker, attr_name="_hover_metric_worker")
+            item_id = "{}|{}|{}".format(item.text(0), item.text(1), item.text(15))
+            self._cache_put_limited(self.item_map, item_id, item, limit=500)
+            self._pending_hover_metric = {
+                "path": path,
+                "block": run.get("block", "") or item.data(0, Qt.UserRole + 2) or "",
+                "source": run.get("source", item.text(2) or "WS"),
+                "item_id": item_id,
+            }
+            self._set_fe_hover_tooltip(item, ["Loading FE metrics..."])
+            self._hover_metric_timer.start(200)
         except Exception:
             return
+
+    def _run_pending_hover_metric_lookup(self):
+        pending = getattr(self, "_pending_hover_metric", None)
+        self._pending_hover_metric = None
+        if not pending:
+            return
+        if self._worker_is_running(getattr(self, "_hover_metric_worker", None)):
+            return
+        path = pending.get("path", "")
+        item_id = pending.get("item_id", "")
+        item = self.item_map.get(item_id)
+        if item is None:
+            return
+        try:
+            if item.text(15) != path:
+                return
+        except RuntimeError:
+            self.item_map.pop(item_id, None)
+            return
+        worker = MetricWorker(
+            path, pending.get("block", ""),
+            "FE", pending.get("source", "WS"),
+            None, None)
+        self._hover_metric_path = path
+        worker.finished.connect(
+            lambda metrics, p=path, iid=item_id:
+            self._on_fe_hover_metric_done(p, iid, metrics))
+        self._workers.start("hover", worker, attr_name="_hover_metric_worker")
 
     def _show_utilities_menu(self):
         try:
@@ -7051,34 +7151,47 @@ class PDDashboard(QMainWindow):
             err_count = item.data(0, Qt.UserRole + 12)
             err_path  = os.path.join(path, "logs", "compile_opt.error.log")
             if err_count is not None:
-                self.current_error_log_path = err_path
-                dark = (self.is_dark_mode or
-                        (self.use_custom_colors and
-                         self.custom_bg_color < "#888888"))
-                color = (("#81c784" if dark else "#388e3c")
-                         if err_count == 0
-                         else ("#e57373" if dark else "#d32f2f"))
-                self.fe_error_btn.setStyleSheet(
-                    f"QPushButton#errorLinkBtn {{ border: none; "
-                    f"background: transparent; color: {color}; "
-                    f"font-weight: bold; text-align: left; padding: 6px 0px; }} "
-                    f"QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
-                self.fe_error_btn.setText(f"compile_opt errors: {err_count}")
-                self.fe_error_btn.setVisible(True)
+                self._show_fe_error_count(err_count, err_path)
             else:
-                err_count = self._count_compile_error_lines(err_path)
-                item.setData(0, Qt.UserRole + 12, err_count)
                 self.current_error_log_path = err_path
-                color = "#388e3c" if err_count == 0 else "#d32f2f"
-                if self.is_dark_mode:
-                    color = "#81c784" if err_count == 0 else "#e57373"
+                self._selection_info_token += 1
+                token = self._selection_info_token
                 self.fe_error_btn.setStyleSheet(
-                    f"QPushButton#errorLinkBtn {{ border: none; "
-                    f"background: transparent; color: {color}; "
-                    f"font-weight: bold; text-align: left; padding: 6px 0px; }} "
-                    f"QPushButton#errorLinkBtn:hover {{ text-decoration: underline; }}")
-                self.fe_error_btn.setText(f"compile_opt errors: {err_count}")
+                    "QPushButton#errorLinkBtn { border: none; background: transparent; "
+                    "color: #757575; font-weight: bold; text-align: left; padding: 6px 0px; }")
+                self.fe_error_btn.setText("compile_opt errors: loading...")
                 self.fe_error_btn.setVisible(True)
+                worker = SelectionInfoWorker(token, path)
+                worker.finished.connect(self._on_selection_info_done)
+                self._workers.start("selection_info", worker,
+                                    attr_name="_selection_info_worker")
+
+    def _show_fe_error_count(self, err_count, err_path):
+        self.current_error_log_path = err_path
+        color = "#388e3c" if err_count == 0 else "#d32f2f"
+        if self.is_dark_mode:
+            color = "#81c784" if err_count == 0 else "#e57373"
+        self.fe_error_btn.setStyleSheet(
+            "QPushButton#errorLinkBtn { border: none; background: transparent; "
+            "color: %s; font-weight: bold; text-align: left; padding: 6px 0px; } "
+            "QPushButton#errorLinkBtn:hover { text-decoration: underline; }" % color)
+        self.fe_error_btn.setText("compile_opt errors: {}".format(err_count))
+        self.fe_error_btn.setVisible(True)
+
+    def _on_selection_info_done(self, token, run_path, err_count, err_path):
+        if token != getattr(self, "_selection_info_token", 0):
+            return
+        sel = self.tree.selectedItems()
+        if not sel:
+            return
+        item = sel[0]
+        try:
+            if item.text(15) != run_path:
+                return
+            item.setData(0, Qt.UserRole + 12, err_count)
+            self._show_fe_error_count(err_count, err_path)
+        except RuntimeError:
+            return
 
     def _find_fe_congestion_image(self, run_path, block):
         key = (run_path or "", block or "")
@@ -7443,6 +7556,7 @@ class PDDashboard(QMainWindow):
             others = [e for e in entries if e.get("id") not in edited_ids]
             if save_shared_note_entries(note_id, others + dlg.get_entries()):
                 self.global_notes = load_all_notes()
+                self._note_text_cache = {}
                 self._refresh_current_note_widgets(note_id, item)
 
     def save_inspector_note(self):
@@ -7450,6 +7564,7 @@ class PDDashboard(QMainWindow):
             return
         save_personal_note(self._current_note_id, self.ins_note.toPlainText())
         self.personal_notes = load_personal_notes()
+        self._note_text_cache = {}
         self._refresh_current_note_widgets(self._current_note_id)
 
     def save_shared_inspector_note(self):
@@ -7460,7 +7575,8 @@ class PDDashboard(QMainWindow):
             return
         if save_shared_note(self._current_note_id, text):
             self.global_notes = load_all_notes()
-            self._refresh_current_note_widgets(self._current_note_id)
+            self._note_text_cache = {}
+        self._refresh_current_note_widgets(self._current_note_id)
         self._update_status_bar()
 
     # ------------------------------------------------------------------
@@ -7849,6 +7965,7 @@ class PDDashboard(QMainWindow):
         self._last_scan_time = QDateTime.currentDateTime().toString("hh:mm:ss")
         self.global_notes    = load_all_notes()
         self.personal_notes  = load_personal_notes()
+        self._note_text_cache = {}
 
         # FEAT 3+5: Record history for all completed runs
         all_runs_for_history = (self.ws_data.get("all_runs", []) +
@@ -8001,54 +8118,41 @@ class PDDashboard(QMainWindow):
             self._smart_poll_timer.start(60000)
 
     def _smart_poll_running(self):
-        """Re-check only RUNNING FE runs -- no full NFS scan."""
-        running_items = [
-            item for item in getattr(self, "_running_items", [])
-            if item is not None and not item.isHidden()
-            and item.text(3) == "RUNNING"
-        ]
-        if not running_items:
+        """Re-check only RUNNING FE runs using a worker; no GUI-thread NFS."""
+        if self._worker_is_running(getattr(self, "_quick_refresh_worker", None)):
             return
-        changed = False
+        running_items = []
+        for item in list(getattr(self, "_running_items", []) or []):
+            try:
+                if item is not None and not item.isHidden() and item.text(3) == "RUNNING":
+                    running_items.append(item)
+            except RuntimeError:
+                pass
+        if not running_items:
+            self._running_items = []
+            return
+        worker_cls = globals().get("QuickStatusRefreshWorker")
+        if worker_cls is None:
+            try:
+                from workers import QuickStatusRefreshWorker as worker_cls
+            except Exception:
+                worker_cls = None
+        if worker_cls is None:
+            return
+        self._quick_refresh_items = {}
+        worker_tasks = []
         for item in running_items:
-            run_path = item.text(15)
-            if not run_path or run_path == "N/A":
+            run = item.data(0, Qt.UserRole + 10) or {}
+            path = run.get("path") or item.text(15)
+            if not path or path in ("N/A", "-"):
                 continue
-            pass_file = os.path.join(run_path, "pass", "compile_opt.pass")
-            if os.path.exists(pass_file):
-                item.setIcon(3, self._create_dot_icon(
-                    "#388e3c", "#388e3c"))
-                item.setText(3, "COMPLETED")
-                item.setForeground(3, self._colors["completed"])
-                item.setText(4, "COMPLETED")
-                try:
-                    from utils import parse_runtime_rpt
-                    info = parse_runtime_rpt(
-                        os.path.join(run_path, "reports", "runtime.V2.rpt"))
-                    item.setText(12, info.get("runtime", item.text(12)))
-                    start_raw = item.data(0, Qt.UserRole + 40) or item.toolTip(13)
-                    end_raw = info.get("end", item.text(14))
-                    self._set_item_time_data(item, start_raw, end_raw)
-                    item.setText(14, self._fmt_ts(end_raw))
-                    item.setToolTip(14, end_raw)
-                except Exception:
-                    pass
-                changed = True
-        if changed:
-            visible = []
-            def collect(node):
-                for i in range(node.childCount()):
-                    c = node.child(i)
-                    run = c.data(0, Qt.UserRole + 10)
-                    if run and not c.isHidden():
-                        visible.append(run)
-                    collect(c)
-            collect(self.tree.invisibleRootItem())
-            self._update_status_bar(visible)
-        self._running_items = [
-            item for item in getattr(self, "_running_items", [])
-            if item is not None and item.text(3) == "RUNNING"
-        ]
+            self._quick_refresh_items[path] = item
+            worker_tasks.append({"path": path, "source": run.get("source", item.text(2) or "WS")})
+        if not worker_tasks:
+            return
+        worker = worker_cls(worker_tasks)
+        worker.finished.connect(self._on_quick_refresh_finished)
+        self._workers.start("quick_refresh", worker, attr_name="_quick_refresh_worker")
 
     def _update_live_runtimes(self):
         """Update elapsed time display for RUNNING FE runs every 60s."""
@@ -8100,6 +8204,9 @@ class PDDashboard(QMainWindow):
         self._items_by_path.clear()
         self._signoff_items_by_path.clear()
         self._running_items = []
+        self._modified_sort_ready = False
+        self._modified_sort_token += 1
+        self._note_text_cache = {}
         self._visible_run_item_cache = None
         if self._worker_is_running(self._signoff_worker):
             if hasattr(self._signoff_worker, 'cancel'):
@@ -8205,6 +8312,11 @@ class PDDashboard(QMainWindow):
 
             m_node = self._get_node(base_attach, milestone, "MILESTONE")
             parent_for_run = self._get_node(m_node, base_rtl, "RTL")
+            try:
+                parent_for_run.setData(0, Qt.UserRole + 70,
+                                       self._rtl_release_sort_key(base_rtl))
+            except Exception:
+                pass
 
             if run["run_type"] == "FE":
                 if _build_be_only:
@@ -8372,6 +8484,13 @@ class PDDashboard(QMainWindow):
         child.setText(5, display_owner)
         child.setToolTip(5, display_owner)
         child.setText(15, run["path"])
+        run["_search_blob"] = (
+            "{} {} {} {} {} {} {} {} {} {} {}".format(
+                run.get("r_name", ""), run.get("rtl", ""), run.get("source", ""),
+                run.get("run_type", ""), run.get("owner", ""),
+                run.get("st_n", ""), run.get("st_u", ""),
+                run.get("vslp_status", ""), run.get("info", {}).get("runtime", ""),
+                run.get("info", {}).get("start", ""), run.get("info", {}).get("end", ""))).lower()
         self._register_item_path(child, run["path"])
         child.setText(22, "")
         child.setData(0, Qt.UserRole + 2, run["block"])
@@ -8654,19 +8773,69 @@ class PDDashboard(QMainWindow):
         return out
 
     def _cache_modified_times_for_sort(self):
+        """Legacy synchronous fallback; kept for direct callers only."""
         for item in self._iter_tree_items():
             role = item.data(0, Qt.UserRole)
             if role in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT",
                         "STANDALONE_ROOT", "__PLACEHOLDER__"):
                 continue
             path = item.text(15)
-            val = 0.0
-            if path and path not in ("N/A", "-"):
-                try:
-                    val = os.path.getmtime(path)
-                except Exception:
-                    val = 0.0
-            item.setData(0, Qt.UserRole + 60, val)
+            item.setData(0, Qt.UserRole + 60, 0.0)
+
+    def _start_modified_time_sort(self, col, order):
+        if self._worker_is_running(getattr(self, "_modified_sort_worker", None)):
+            return
+        paths = []
+        seen = set()
+        for item in self._iter_tree_items():
+            role = item.data(0, Qt.UserRole)
+            if role in ("BLOCK", "MILESTONE", "RTL", "IGNORED_ROOT",
+                        "STANDALONE_ROOT", "__PLACEHOLDER__"):
+                continue
+            path = item.text(15)
+            if path and path not in ("N/A", "-") and path not in seen:
+                seen.add(path)
+                paths.append(path)
+        if not paths:
+            self._modified_sort_ready = True
+            self.tree.sortByColumn(col, order)
+            self.tree.header().setSortIndicator(col, order)
+            return
+        self._modified_sort_token += 1
+        token = self._modified_sort_token
+        worker = ModifiedTimeWorker(token, paths)
+        worker.finished.connect(
+            lambda tok, mtimes, c=col, o=order:
+            self._on_modified_times_ready(tok, mtimes, c, o))
+        self.status_bar.showMessage("Loading modified times for sort...", 3000)
+        self._workers.start("modified_sort", worker,
+                            attr_name="_modified_sort_worker")
+
+    def _on_modified_times_ready(self, token, mtimes, col, order):
+        if token != getattr(self, "_modified_sort_token", 0):
+            return
+        for item in self._iter_tree_items():
+            path = item.text(15)
+            item.setData(0, Qt.UserRole + 60, mtimes.get(path, 0.0))
+        self._modified_sort_ready = True
+        self.tree.setProperty("flow_sort_mode", "modified")
+        if col in (13, 14):
+            self._ensure_date_sort_keys()
+        self.tree.sortByColumn(col, order)
+        self.tree.header().setSortIndicator(col, order)
+        self._move_special_roots_to_bottom()
+        self._reorder_milestones_by_map()
+
+    def _ensure_date_sort_keys(self):
+        for item in self._iter_tree_items():
+            if item.data(0, Qt.UserRole + 42) is None:
+                raw = item.data(0, Qt.UserRole + 40) or item.text(13)
+                item.setData(0, Qt.UserRole + 42,
+                             CustomTreeItem._date_sort_key(raw))
+            if item.data(0, Qt.UserRole + 43) is None:
+                raw = item.data(0, Qt.UserRole + 41) or item.text(14)
+                item.setData(0, Qt.UserRole + 43,
+                             CustomTreeItem._date_sort_key(raw))
 
     def _move_special_roots_to_bottom(self):
         try:
@@ -8771,18 +8940,24 @@ class PDDashboard(QMainWindow):
             col, order = 14, Qt.DescendingOrder
         elif mode == "Modified Date Old->New":
             self.tree.setProperty("flow_sort_mode", "modified")
-            self._cache_modified_times_for_sort()
             col, order = 0, Qt.AscendingOrder
+            if not getattr(self, "_modified_sort_ready", False):
+                self._start_modified_time_sort(col, order)
+                return
         elif mode == "Modified Date New->Old":
             self.tree.setProperty("flow_sort_mode", "modified")
-            self._cache_modified_times_for_sort()
             col, order = 0, Qt.DescendingOrder
+            if not getattr(self, "_modified_sort_ready", False):
+                self._start_modified_time_sort(col, order)
+                return
         elif mode == "Run Name A-Z":
             self.tree.setProperty("flow_sort_mode", "")
             col, order = 0, Qt.AscendingOrder
         else:
             self.tree.setProperty("flow_sort_mode", "")
             col, order = 13, Qt.AscendingOrder
+        if col in (13, 14):
+            self._ensure_date_sort_keys()
         self.tree.sortByColumn(col, order)
         self.tree.header().setSortIndicator(col, order)
         self._move_special_roots_to_bottom()
@@ -8855,7 +9030,7 @@ class PDDashboard(QMainWindow):
         _rfc           = None if self.ignore_run_filter else self.run_filter_config
         _notes         = self.global_notes
         _personal_notes = self.personal_notes
-        _note_text_cache = {}
+        _note_text_cache = self._note_text_cache
         visible_run_items = []
         self._visible_run_item_cache = None
 
@@ -8946,13 +9121,18 @@ class PDDashboard(QMainWindow):
             if _do_search:
                 note_id  = f"{rtl} : {run['r_name']}"
                 notes    = _search_notes(note_id)
-                combined = (
-                    f"{run['r_name']} {rtl} {src} {rt_type} "
-                    f"{run.get('owner','')} "
-                    f"{run.get('st_n','')} {run.get('st_u','')} "
-                    f"{run.get('vslp_status','')} "
-                    f"{run['info']['runtime']} {run['info']['start']} "
-                    f"{run['info']['end']} {notes}").lower()
+                base_blob = run.get("_search_blob")
+                if not base_blob:
+                    base_blob = (
+                        "{} {} {} {} {} {} {} {} {} {} {}".format(
+                            run.get("r_name", ""), rtl, src, rt_type,
+                            run.get("owner", ""), run.get("st_n", ""),
+                            run.get("st_u", ""), run.get("vslp_status", ""),
+                            run.get("info", {}).get("runtime", ""),
+                            run.get("info", {}).get("start", ""),
+                            run.get("info", {}).get("end", ""))).lower()
+                    run["_search_blob"] = base_blob
+                combined = (base_blob + " " + notes.lower())
                 # Fast path: plain substring check when no wildcards in query
                 _raw_lc = raw_query
                 if '*' not in _raw_lc:
@@ -9337,6 +9517,7 @@ class PDDashboard(QMainWindow):
             if dlg.exec_():
                 save_personal_note(note_identifier, dlg.get_text())
                 self.personal_notes = load_personal_notes()
+                self._note_text_cache = {}
                 self._refresh_current_note_widgets(note_identifier, item)
 
         elif edit_shared_note_act and res == edit_shared_note_act:
@@ -9591,9 +9772,13 @@ class PDDashboard(QMainWindow):
             self.item_map.pop(item_id, None)
 
     def fit_all_columns(self):
-        for i in range(self.tree.columnCount()):
-            if not self.tree.isColumnHidden(i):
-                self.tree.resizeColumnToContents(i)
+        self.tree.setUpdatesEnabled(False)
+        try:
+            for i in range(self.tree.columnCount()):
+                if not self.tree.isColumnHidden(i):
+                    self.tree.resizeColumnToContents(i)
+        finally:
+            self.tree.setUpdatesEnabled(True)
         self._fit_run_name_column()
 
     def _fit_run_name_column(self):

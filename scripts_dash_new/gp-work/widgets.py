@@ -7,44 +7,51 @@ from PyQt5.QtGui import QColor, QBrush, QPainter, QPen, QFont
 from PyQt5.QtWidgets import QTreeWidgetItem
 
 
+class _GanttCanvas(QWidget):
+    def __init__(self, stages_data, is_dark=False, parent=None):
+        super().__init__(parent)
+        self.stages_data = stages_data or []
+        self.is_dark = bool(is_dark)
+        self.setMinimumHeight(max(200, len(self.stages_data) * 40 + 50))
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self.stages_data:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w = self.width() - 40
+        x_start = 120
+        usable_w = max(1, w - x_start)
+        max_sec = max([d['sec'] for d in self.stages_data if d.get('sec', 0) > 0] + [1])
+        scale = float(usable_w) / float(max_sec)
+        y = 30
+        for data in self.stages_data:
+            painter.setPen(QPen(Qt.white if self.is_dark else Qt.black))
+            painter.drawText(10, y + 15, data.get('name', ''))
+            bar_w = data.get('sec', 0) * scale
+            color = QColor("#4CAF50") if data.get('sec', 0) > 0 else QColor("#9E9E9E")
+            painter.setBrush(QBrush(color))
+            painter.setPen(Qt.NoPen)
+            painter.drawRect(x_start, y, int(bar_w), 20)
+            painter.setPen(QPen(Qt.white if self.is_dark else Qt.black))
+            painter.drawText(x_start + int(bar_w) + 10, y + 15, data.get('time_str', ''))
+            y += 40
+
+
 class GanttChartDialog(QDialog):
     def __init__(self, run_name, stages_data, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Timeline: {run_name}")
         self.resize(800, 400)
         layout = QVBoxLayout(self)
-        self.scene = QWidget()
-        self.scene.setMinimumHeight(max(200, len(stages_data) * 40 + 50))
+        self.scene = _GanttCanvas(stages_data, parent.is_dark_mode if parent else False)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(self.scene)
         layout.addWidget(scroll)
         self.stages_data = stages_data
         self.is_dark = parent.is_dark_mode if parent else False
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self.stages_data:
-            return
-        painter = QPainter(self.scene)
-        painter.setRenderHint(QPainter.Antialiasing)
-        w = self.scene.width() - 40
-        x_start = 120
-        usable_w = w - x_start
-        max_sec = max([d['sec'] for d in self.stages_data if d['sec'] > 0] + [1])
-        scale = usable_w / max_sec
-        y = 30
-        for data in self.stages_data:
-            painter.setPen(QPen(Qt.white if self.is_dark else Qt.black))
-            painter.drawText(10, y + 15, data['name'])
-            bar_w = data['sec'] * scale
-            color = QColor("#4CAF50") if data['sec'] > 0 else QColor("#9E9E9E")
-            painter.setBrush(QBrush(color))
-            painter.setPen(Qt.NoPen)
-            painter.drawRect(x_start, y, int(bar_w), 20)
-            painter.setPen(QPen(Qt.white if self.is_dark else Qt.black))
-            painter.drawText(x_start + int(bar_w) + 10, y + 15, data['time_str'])
-            y += 40
 
 
 class CustomTreeItem(QTreeWidgetItem):
@@ -81,6 +88,9 @@ class CustomTreeItem(QTreeWidgetItem):
             if (self.data(0, Qt.UserRole) == "RTL"
                     and other.data(0, Qt.UserRole) == "RTL"):
                 def rtl_key(item):
+                    cached = item.data(0, Qt.UserRole + 70)
+                    if cached is not None:
+                        return cached
                     text = item.text(0) or ""
                     m = CustomTreeItem._RTL_RE.search(text)
                     if m:

@@ -1035,12 +1035,16 @@ class ScannerWorker(QThread):
     def _scan_single_workspace(self, ws_base, ws_name, tools_to_scan):
         tasks           = []
         releases_found  = {}
+        if self._cancel_requested():
+            return tasks, releases_found
         ws_path         = os.path.join(ws_base, ws_name)
         if not os.path.isdir(ws_path):
             return tasks, releases_found
 
         current_rtl = "Unknown"
         for sf in glob.glob(os.path.join(ws_path, "*.p4_sync")):
+            if self._cancel_requested():
+                return tasks, releases_found
             try:
                 with open(sf, 'r', encoding='utf-8', errors='ignore') as f:
                     lbls = re.findall(r'/([^/]+_syn\d*)\.config', f.read())
@@ -1053,52 +1057,61 @@ class ScannerWorker(QThread):
                 pass
 
         for ent_path in glob.glob(os.path.join(ws_path, "IMPLEMENTATION", "*", "SOC", "*")):
+            if self._cancel_requested():
+                return tasks, releases_found
             ent_name = os.path.basename(ent_path)
 
             fc_path = os.path.join(ent_path, "fc")
-            fc_names = []
-            if os.path.isdir(fc_path):
-                try:
-                    fc_names = os.listdir(fc_path)
-                except Exception:
-                    fc_names = []
+            fc_entries = []
+            try:
+                for entry in os.scandir(fc_path):
+                    if self._cancel_requested():
+                        return tasks, releases_found
+                    try:
+                        if entry.name.startswith('.') or not entry.is_dir():
+                            continue
+                        fc_entries.append((entry.name, entry.path))
+                    except Exception:
+                        pass
+            except Exception:
+                fc_entries = []
 
             if ws_base == _BASE_WS_FE():
-                for name in fc_names:
-                    if not name.endswith("-FE") or name.startswith('.'):
+                for name, rd in fc_entries:
+                    if self._cancel_requested():
+                        return tasks, releases_found
+                    if not name.endswith("-FE"):
                         continue
                     if _ignored_by_pattern(name, _IGNORE_FE_RUN_PATTERNS()):
                         continue
-                    rd = os.path.join(fc_path, name)
-                    if os.path.isdir(rd):
-                        tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
+                    tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "FE", None))
 
             if "fc" in tools_to_scan:
-                for name in fc_names:
-                    if not name.endswith("-BE") or name.startswith('.'):
+                for name, rd in fc_entries:
+                    if self._cancel_requested():
+                        return tasks, releases_found
+                    if not name.endswith("-BE"):
                         continue
                     if _ignored_by_pattern(name, _IGNORE_BE_RUN_PATTERNS()):
                         continue
-                    rd = os.path.join(fc_path, name)
-                    if os.path.isdir(rd):
-                        tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                    tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
 
             if "innovus" in tools_to_scan:
-                # Catch all innovus run dirs -- not just EVT* named ones.
-                # TOP runs may have different naming.
                 inv_path = os.path.join(ent_path, "innovus")
                 try:
-                    inv_names = os.listdir(inv_path) if os.path.isdir(inv_path) else []
+                    for entry in os.scandir(inv_path):
+                        if self._cancel_requested():
+                            return tasks, releases_found
+                        try:
+                            if entry.name.startswith('.') or not entry.is_dir():
+                                continue
+                            if _ignored_by_pattern(entry.name, _IGNORE_BE_RUN_PATTERNS()):
+                                continue
+                            tasks.append((ent_name, entry.path, ws_path, current_rtl, "WS", "BE", None))
+                        except Exception:
+                            pass
                 except Exception:
-                    inv_names = []
-                for name in inv_names:
-                    if name.startswith('.'):
-                        continue
-                    if _ignored_by_pattern(name, _IGNORE_BE_RUN_PATTERNS()):
-                        continue
-                    rd = os.path.join(inv_path, name)
-                    if os.path.isdir(rd):
-                        tasks.append((ent_name, rd, ws_path, current_rtl, "WS", "BE", None))
+                    pass
 
         return tasks, releases_found
 
@@ -1151,42 +1164,76 @@ class ScannerWorker(QThread):
         # --- Outfeed discovery ---
         self.status_update.emit("Discovering OUTFEED directories...")
         if os.path.exists(_BASE_OUTFEED()):
-            for ent_name in os.listdir(_BASE_OUTFEED()):
+            try:
+                outfeed_entries = list(os.scandir(_BASE_OUTFEED()))
+            except Exception:
+                outfeed_entries = []
+            for ent in outfeed_entries:
                 if self._cancel_requested():
                     self.finished.emit(ws_data, out_data, {}, scan_stats)
                     return
-                ent_path = os.path.join(_BASE_OUTFEED(), ent_name)
-                if not os.path.isdir(ent_path):
+                try:
+                    if not ent.is_dir():
+                        continue
+                except Exception:
                     continue
+                ent_name = ent.name
+                ent_path = ent.path
 
                 # Expected outfeed structure:
                 # outfeed/{BLOCK}/{EVT_LABEL}/fc/{run}/{run}-FE
                 # outfeed/{BLOCK}/{EVT_LABEL}/fc/{run}-BE
                 # outfeed/{BLOCK}/{EVT_LABEL}/innovus/{run}[-BE]
-                evt_dirs_a = glob.glob(os.path.join(ent_path, "EVT*"))
+                try:
+                    evt_entries = [e for e in os.scandir(ent_path)
+                                   if e.name.startswith("EVT") and e.is_dir()]
+                except Exception:
+                    evt_entries = []
 
-                if evt_dirs_a:
-                    for evt_dir in evt_dirs_a:
-                        phys_evt = os.path.basename(evt_dir)
-                        blk_name = ent_name
-                        for rd in glob.glob(os.path.join(evt_dir, "fc", "*", "*-FE")):
-                            if _ignored_by_pattern(os.path.basename(rd),
-                                                   _IGNORE_FE_RUN_PATTERNS()):
+                for evt_entry in evt_entries:
+                    if self._cancel_requested():
+                        self.finished.emit(ws_data, out_data, {}, scan_stats)
+                        return
+                    evt_dir = evt_entry.path
+                    phys_evt = evt_entry.name
+                    blk_name = ent_name
+
+                    fc_dir = os.path.join(evt_dir, "fc")
+                    try:
+                        fc_entries = [e for e in os.scandir(fc_dir) if e.is_dir()]
+                    except Exception:
+                        fc_entries = []
+                    for fc_entry in fc_entries:
+                        if self._cancel_requested():
+                            self.finished.emit(ws_data, out_data, {}, scan_stats)
+                            return
+                        name = fc_entry.name
+                        if name.endswith("-BE"):
+                            if "fc" in tools_to_scan and not _ignored_by_pattern(name, _IGNORE_BE_RUN_PATTERNS()):
+                                tasks.append((blk_name, fc_entry.path, fc_entry.path, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                            continue
+                        try:
+                            child_entries = [e for e in os.scandir(fc_entry.path) if e.is_dir()]
+                        except Exception:
+                            child_entries = []
+                        for child in child_entries:
+                            if child.name.endswith("-FE"):
+                                if not _ignored_by_pattern(child.name, _IGNORE_FE_RUN_PATTERNS()):
+                                    tasks.append((blk_name, child.path, child.path, "UNKNOWN", "OUTFEED", "FE", phys_evt))
+
+                    if "innovus" in tools_to_scan:
+                        inv_dir = os.path.join(evt_dir, "innovus")
+                        try:
+                            inv_entries = [e for e in os.scandir(inv_dir) if e.is_dir()]
+                        except Exception:
+                            inv_entries = []
+                        for inv_entry in inv_entries:
+                            if self._cancel_requested():
+                                self.finished.emit(ws_data, out_data, {}, scan_stats)
+                                return
+                            if _ignored_by_pattern(inv_entry.name, _IGNORE_BE_RUN_PATTERNS()):
                                 continue
-                            tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "FE", phys_evt))
-                        if "fc" in tools_to_scan:
-                            for rd in glob.glob(os.path.join(evt_dir, "fc", "*-BE")):
-                                if _ignored_by_pattern(os.path.basename(rd),
-                                                       _IGNORE_BE_RUN_PATTERNS()):
-                                    continue
-                                tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
-                        if "innovus" in tools_to_scan:
-                            for rd in glob.glob(os.path.join(evt_dir, "innovus", "*")):
-                                if os.path.isdir(rd):
-                                    if _ignored_by_pattern(os.path.basename(rd),
-                                                           _IGNORE_BE_RUN_PATTERNS()):
-                                        continue
-                                    tasks.append((blk_name, rd, rd, "UNKNOWN", "OUTFEED", "BE", phys_evt))
+                            tasks.append((blk_name, inv_entry.path, inv_entry.path, "UNKNOWN", "OUTFEED", "BE", phys_evt))
 
         # --- Dedupe discovered tasks by normalized real path before processing ---
         seen_task_paths = set()
@@ -1336,12 +1383,18 @@ class ScannerWorker(QThread):
         if _allowed_blocks and b_name not in _allowed_blocks:
             return None
 
+        if self._cancel_requested():
+            return None
         evt_base     = get_dynamic_evt_path(rtl, b_name)
+        if self._cancel_requested():
+            return None
         owner        = get_owner(rd) if _SCAN_OWNER_ON_START() else "Unknown"
 
         fm_n     = os.path.join(evt_base, "fm",   clean_run, "r2n",   "reports", f"{b_name}_r2n.failpoint.rpt")
         fm_u     = os.path.join(evt_base, "fm",   clean_run, "r2upf", "reports", f"{b_name}_r2upf.failpoint.rpt")
         vslp_rpt = os.path.join(evt_base, "vslp", clean_run, "pre",   "reports", "report_lp.rpt")
+        if self._cancel_requested():
+            return None
         if run_type == "FE":
             info = parse_runtime_rpt(os.path.join(rd, "reports/runtime.V2.rpt"))
         else:
@@ -1370,18 +1423,25 @@ class ScannerWorker(QThread):
                     except:
                         pass
 
+        if self._cancel_requested():
+            return None
         stages = []
         if run_type == "BE":
             is_innovus_run = "/innovus/" in rd.replace("\\", "/")
             if source == "WS" and is_innovus_run:
-                search_glob = os.path.join(rd, "reports", "*")
+                search_dir = os.path.join(rd, "reports")
             elif source == "WS":
-                search_glob = os.path.join(rd, "outputs", "*")
+                search_dir = os.path.join(rd, "outputs")
             else:
-                search_glob = os.path.join(rd, "*")
-            for s_dir in glob.glob(search_glob):
-                if not os.path.isdir(s_dir):
-                    continue
+                search_dir = rd
+            try:
+                stage_entries = [e for e in os.scandir(search_dir) if e.is_dir()]
+            except Exception:
+                stage_entries = []
+            for entry in stage_entries:
+                if self._cancel_requested():
+                    return None
+                s_dir = entry.path
                 step_name = os.path.basename(s_dir)
                 if step_name in ["logs", "pass", "fail", "outputs"]:
                     continue
@@ -1631,7 +1691,8 @@ class QuickStatusRefreshWorker(QThread):
             except Exception as e:
                 row["_error"] = str(e)
             out.append(row)
-            self.progress.emit(idx, total)
+            if idx == total or idx % 10 == 0:
+                self.progress.emit(idx, total)
         if self._cancelled or self.isInterruptionRequested():
             self.finished.emit([])
             return
@@ -1711,7 +1772,7 @@ class MetricBatchWorker(QThread):
         if not _METRICS_AVAILABLE:
             self.finished.emit(out)
             return
-        for task in self.tasks:
+        for idx, task in enumerate(self.tasks, 1):
             if self._cancelled or self.isInterruptionRequested():
                 break
             row = dict(task)
@@ -1741,7 +1802,8 @@ class MetricBatchWorker(QThread):
             except Exception as e:
                 row["metrics"] = {"_error": str(e)}
             out.append(row)
-            self.progress.emit(len(out), len(self.tasks))
+            if idx == len(self.tasks) or idx % 10 == 0:
+                self.progress.emit(len(out), len(self.tasks))
         if self._cancelled or self.isInterruptionRequested():
             self.finished.emit([])
             return
