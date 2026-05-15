@@ -603,14 +603,14 @@ def resolve_pnr_stage_status(stage, be_run):
     is_innovus = bool(stage.get("_is_innovus"))
 
     if source == "OUTFEED":
-        return "COMPLETED", step_name, pass_path
+        return "COMPLETED", "COMPLETED", pass_path
 
     marker = (_parse_innovus_stage_marker(log_path, step_name)
               if is_innovus else _parse_fc_stage_marker(log_path, step_name))
     active_stage = marker or step_name
     pass_exists = bool(pass_path and cached_exists(pass_path))
     if pass_exists:
-        return "COMPLETED", active_stage, pass_path
+        return "COMPLETED", "COMPLETED", pass_path
     if marker and cached_exists(log_path):
         return "RUNNING", marker, pass_path
     return "NOT STARTED", active_stage, pass_path
@@ -1720,6 +1720,56 @@ class StageDetailWorker(QThread):
             st.get("_stage_index", 9999),
             st.get("name", "")))
         self.finished.emit(self.be_path, self.run_name, enriched)
+
+
+class BranchStatusWorker(QThread):
+    finished = pyqtSignal(str, str, list)   # (be_path, run_name, status_stages)
+
+    def __init__(self, be_run):
+        super().__init__()
+        self.be_run = dict(be_run or {})
+        self.be_path = self.be_run.get("path", "")
+        self.run_name = self.be_run.get("r_name", "")
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def run(self):
+        stages = []
+        for s in self.be_run.get("stages", []):
+            if self._cancelled or self.isInterruptionRequested():
+                self.finished.emit(self.be_path, self.run_name, [])
+                return
+            s2 = dict(s)
+            rpt_file = s2.get("rpt", "")
+            for cand in s2.get("_rpt_cands", [rpt_file]):
+                if self._cancelled or self.isInterruptionRequested():
+                    self.finished.emit(self.be_path, self.run_name, [])
+                    return
+                if cand and cached_exists(cand):
+                    rpt_file = cand
+                    break
+            if rpt_file:
+                s2["info"] = parse_pnr_runtime_rpt(rpt_file)
+            stage_status, active_stage, pass_path = resolve_pnr_stage_status(
+                s2, self.be_run)
+            s2["stage_status"] = stage_status
+            s2["active_stage"] = active_stage
+            s2["pass_path"] = pass_path
+            s2["_branch_status_loaded"] = True
+            stages.append(s2)
+
+        stages.sort(key=lambda st: (
+            0 if _parse_stage_start_sort_value(st.get("info", {})) else 1,
+            _parse_stage_start_sort_value(st.get("info", {})) or (9999, 12, 31, 23, 59),
+            st.get("_stage_index", 9999),
+            st.get("name", "")))
+        self.finished.emit(self.be_path, self.run_name, stages)
 
 
 class QuickStatusRefreshWorker(QThread):

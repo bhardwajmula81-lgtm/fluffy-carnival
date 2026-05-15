@@ -3689,6 +3689,173 @@ class BEStageSummaryDialog(QDialog):
             QMessageBox.warning(self, "Error", str(e))
 
 
+class BranchStatusDialog(QDialog):
+    def __init__(self, dashboard, be_item):
+        QDialog.__init__(self, dashboard)
+        self.dashboard = dashboard
+        self.be_item = be_item
+        self._be_path = ""
+        self.setWindowTitle("Branch Status")
+        self.resize(1050, 560)
+        self.setModal(False)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint |
+                            Qt.WindowMinimizeButtonHint)
+        try:
+            dashboard._prepare_utility_dialog(self)
+        except Exception:
+            pass
+
+        layout = QVBoxLayout(self)
+        self.header = QLabel("")
+        layout.addWidget(self.header)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.flow = QWidget()
+        self.flow_l = QHBoxLayout(self.flow)
+        self.flow_l.setContentsMargins(10, 10, 10, 10)
+        self.flow_l.setSpacing(10)
+        self.scroll.setWidget(self.flow)
+        layout.addWidget(self.scroll, 1)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(
+            ["Stage", "Status", "Active Stage", "Start", "End", "Runtime", "Log"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.cellDoubleClicked.connect(self._on_table_double_click)
+        layout.addWidget(self.table, 1)
+
+        buttons = QHBoxLayout()
+        self.timeline_btn = QPushButton("Timeline Overview")
+        self.timeline_btn.clicked.connect(self._open_timeline)
+        self.summary_btn = QPushButton("Generate Summary")
+        self.summary_btn.clicked.connect(self._open_summary)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.timeline_btn)
+        buttons.addWidget(self.summary_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(close_btn)
+        layout.addLayout(buttons)
+
+        self.refresh_from_item(be_item)
+
+    def _item_be_run(self):
+        if not self.be_item:
+            return {}
+        return (self.be_item.data(0, Qt.UserRole + 10) or
+                self.be_item.data(0, Qt.UserRole + 11) or {})
+
+    def _clear_flow(self):
+        while self.flow_l.count():
+            it = self.flow_l.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+
+    def _card_style(self, status, is_action=False):
+        dark = bool(getattr(self.dashboard, "is_dark_mode", False))
+        if is_action:
+            bg, fg, bd = "#1565c0", "#ffffff", "#0d47a1"
+        elif status == "COMPLETED":
+            bg, fg, bd = "#e8f5e9", "#1b5e20", "#43a047"
+        elif status == "RUNNING":
+            bg, fg, bd = "#fff3e0", "#e65100", "#fb8c00"
+        else:
+            bg, fg, bd = "#eeeeee", "#424242", "#9e9e9e"
+        if dark:
+            if status == "COMPLETED":
+                bg, fg, bd = "#1b3a25", "#a5d6a7", "#66bb6a"
+            elif status == "RUNNING":
+                bg, fg, bd = "#4a2d12", "#ffcc80", "#fb8c00"
+            elif not is_action:
+                bg, fg, bd = "#30343a", "#dfe1e5", "#666c75"
+        return ("QPushButton {{ text-align: left; padding: 8px; "
+                "border: 1px solid {}; border-radius: 6px; "
+                "background: {}; color: {}; }}").format(bd, bg, fg)
+
+    def refresh_from_item(self, be_item=None):
+        if be_item is not None:
+            self.be_item = be_item
+        be_run = self._item_be_run()
+        if not be_run:
+            return
+        self._be_path = be_run.get("path", "")
+        fe_item = self.dashboard._parent_fe_item_for_be(self.be_item)
+        title = "Branch Status: " + (self.be_item.text(0) if self.be_item else "")
+        self.setWindowTitle(title)
+        self.header.setText("<b>Branch:</b> {}{}".format(
+            (fe_item.text(0) + " -> ") if fe_item else "",
+            self.be_item.text(0) if self.be_item else ""))
+
+        self._clear_flow()
+        if fe_item:
+            fe_btn = QPushButton("FE\n{}\n{}".format(fe_item.text(0), fe_item.text(3)))
+            fe_btn.setMinimumWidth(210)
+            fe_btn.setMinimumHeight(92)
+            fe_btn.setStyleSheet(self._card_style(fe_item.text(3)))
+            fe_btn.clicked.connect(
+                lambda _=False, it=fe_item: self.dashboard._launch_metric_worker(it))
+            self.flow_l.addWidget(fe_btn)
+            self.flow_l.addWidget(QLabel("->"))
+
+        stages = list(be_run.get("stages", []))
+        stages.sort(key=lambda st: st.get("_stage_order", st.get("_stage_index", 9999)))
+        self.table.setRowCount(len(stages))
+        for idx, st in enumerate(stages):
+            name = st.get("name", "-")
+            status = st.get("stage_status", "CHECKING")
+            active = st.get("active_stage", name)
+            info = st.get("info", {}) or {}
+            runtime = info.get("runtime", "-")
+            btn = QPushButton("{}\nStatus: {}\nStage: {}\nRuntime: {}".format(
+                name, status, active, runtime))
+            btn.setMinimumWidth(190)
+            btn.setMinimumHeight(92)
+            btn.setStyleSheet(self._card_style(status))
+            btn.setToolTip("Click to open QoR Summary for {}".format(name))
+            btn.clicked.connect(
+                lambda _=False, sn=name: self.dashboard._open_branch_stage_qor(
+                    self.be_item, sn))
+            self.flow_l.addWidget(btn)
+            if idx != len(stages) - 1:
+                self.flow_l.addWidget(QLabel("->"))
+
+            vals = [name, status, active,
+                    self.dashboard._fmt_ts(info.get("start", "-")),
+                    self.dashboard._fmt_ts(info.get("end", "-")),
+                    runtime, st.get("log", "-")]
+            for c, val in enumerate(vals):
+                self.table.setItem(idx, c, QTableWidgetItem(str(val)))
+
+        if stages:
+            self.flow_l.addWidget(QLabel("->"))
+        action = QPushButton("Generate Summary\nBE Stage Summary Table")
+        action.setMinimumWidth(210)
+        action.setMinimumHeight(92)
+        action.setStyleSheet(self._card_style("COMPLETED", True))
+        action.clicked.connect(self._open_summary)
+        self.flow_l.addWidget(action)
+        self.flow_l.addStretch(1)
+        self.table.resizeColumnsToContents()
+
+    def _on_table_double_click(self, row, _col):
+        item = self.table.item(row, 0)
+        if item is not None:
+            self.dashboard._open_branch_stage_qor(self.be_item, item.text())
+
+    def _open_summary(self):
+        if self.be_item is not None:
+            self.dashboard.show_be_stage_summary_table(self.be_item)
+
+    def _open_timeline(self):
+        if self.be_item is not None:
+            self.dashboard.show_timeline_overview(self.be_item)
+
+
 class PDDashboard(QMainWindow):
 
     class WorkerRegistry(object):
@@ -8725,6 +8892,109 @@ class PDDashboard(QMainWindow):
         except RuntimeError:
             pass
 
+    def _ensure_stage_rows_visible(self, be_item, be_run):
+        if be_item is None or not be_run:
+            return
+        try:
+            has_stage = False
+            has_placeholder = False
+            for i in range(be_item.childCount()):
+                ch = be_item.child(i)
+                nt = ch.data(0, Qt.UserRole)
+                if nt == "STAGE":
+                    has_stage = True
+                elif nt == "__PLACEHOLDER__":
+                    has_placeholder = True
+            if has_stage and not has_placeholder:
+                return
+            parent_checked = be_item.checkState(0) == Qt.Checked
+            kept = []
+            while be_item.childCount():
+                ch = be_item.takeChild(0)
+                if ch.data(0, Qt.UserRole) != "__PLACEHOLDER__":
+                    kept.append(ch)
+            for ch in kept:
+                if ch.data(0, Qt.UserRole) != "STAGE":
+                    be_item.addChild(ch)
+            ign_root = self._ensure_ign_root(self.tree.invisibleRootItem())
+            self._add_stages(be_item, be_run, ign_root)
+            self._reorder_stage_children_by_runtime()
+            if parent_checked:
+                self.tree.blockSignals(True)
+                for i in range(be_item.childCount()):
+                    ch = be_item.child(i)
+                    if ch.data(0, Qt.UserRole) == "STAGE":
+                        ch.setCheckState(0, Qt.Checked)
+                self.tree.blockSignals(False)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _start_branch_status_worker(self, be_item, be_run):
+        if not be_run or be_run.get("_branch_status_loading"):
+            return
+        try:
+            from workers import BranchStatusWorker
+            be_run["_branch_status_loading"] = True
+            w = BranchStatusWorker(be_run)
+            w.finished.connect(self._on_branch_status_loaded)
+            self._workers.start("branch_status", w,
+                                attr_name="_branch_status_worker")
+        except Exception as e:
+            be_run["_branch_status_loading"] = False
+            self.status_bar.showMessage(
+                "Branch status lookup failed: {}".format(e), 5000)
+
+    def _refresh_open_branch_status_dialog(self, be_path, be_item):
+        dlg = getattr(self, "_branch_status_dialog", None)
+        try:
+            if dlg is not None and dlg.isVisible() and getattr(dlg, "_be_path", "") == be_path:
+                dlg.refresh_from_item(be_item)
+        except RuntimeError:
+            self._branch_status_dialog = None
+        except Exception:
+            pass
+
+    def _on_branch_status_loaded(self, be_path, run_name, enriched_stages):
+        try:
+            be_item = self._signoff_items_by_path.get(be_path)
+            if be_item is None:
+                return
+            be_run = (be_item.data(0, Qt.UserRole + 10) or
+                      be_item.data(0, Qt.UserRole + 11))
+            if not be_run or be_run.get("path") != be_path:
+                return
+            be_run["_branch_status_loading"] = False
+            if run_name and be_run.get("r_name") != run_name and be_item.text(0) != run_name:
+                return
+            if not enriched_stages:
+                return
+            current_by_name = {}
+            for st in be_run.get("stages", []):
+                current_by_name[st.get("name", "")] = dict(st)
+            merged = []
+            for st in enriched_stages:
+                base = current_by_name.get(st.get("name", ""), {})
+                if base:
+                    keep_loaded = base.get("_lazy") is False
+                    base.update(st)
+                    if keep_loaded:
+                        base["_lazy"] = False
+                    merged.append(base)
+                else:
+                    merged.append(st)
+            be_run["stages"] = merged
+            be_run["_branch_status_loaded"] = True
+            for idx, st in enumerate(be_run["stages"]):
+                st["_stage_order"] = idx
+            self._refresh_stage_children_from_run(be_item, be_run)
+            self._refresh_open_branch_status_dialog(be_path, be_item)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
     def on_item_expanded(self, item):
         def _start_stage_detail_worker(be_run):
             if not be_run or be_run.get("_stage_detail_loading"):
@@ -8786,9 +9056,7 @@ class PDDashboard(QMainWindow):
                 for idx, st in enumerate(be_run["stages"]):
                     st["_stage_order"] = idx
                 self._refresh_stage_children_from_run(be_item, be_run)
-                if getattr(self, "_pending_branch_status_be_path", "") == be_path:
-                    self._pending_branch_status_be_path = ""
-                    QTimer.singleShot(0, lambda item=be_item: self.show_branch_status(item))
+                self._refresh_open_branch_status_dialog(be_path, be_item)
         except RuntimeError:
             pass
         except Exception:
@@ -11756,130 +12024,41 @@ class PDDashboard(QMainWindow):
         be_item = item
         if be_item and be_item.data(0, Qt.UserRole) == "STAGE":
             be_item = be_item.parent()
-        be_run = be_item.data(0, Qt.UserRole + 10) if be_item else None
+        be_run = ((be_item.data(0, Qt.UserRole + 10) or
+                   be_item.data(0, Qt.UserRole + 11)) if be_item else None)
         if not be_run or be_run.get("run_type") != "BE":
             QMessageBox.information(
                 self, "Branch Status", "Right-click a BE run row to open branch status.")
             return
 
-        needs_load = any(s.get("_lazy") for s in be_run.get("stages", []))
-        has_placeholder = (be_item.childCount() == 1
-                           and be_item.child(0).data(0, Qt.UserRole) == "__PLACEHOLDER__")
-        if needs_load or has_placeholder:
-            self._pending_branch_status_be_path = be_run.get("path", "")
-            be_item.setExpanded(True)
-            self.on_item_expanded(be_item)
-            self.status_bar.showMessage("Loading branch stage status...", 3000)
-            return
+        self._ensure_stage_rows_visible(be_item, be_run)
+        need_status = (not be_run.get("_branch_status_loaded") or
+                       any((s.get("stage_status") or "CHECKING") == "CHECKING"
+                           for s in be_run.get("stages", [])))
+        if need_status:
+            self._start_branch_status_worker(be_item, be_run)
+            self.status_bar.showMessage("Loading branch status in background...", 3000)
 
-        dlg = QDialog(self)
-        self._prepare_utility_dialog(dlg)
-        dlg.setWindowTitle("Branch Status: " + be_item.text(0))
-        dlg.resize(1050, 560)
-        layout = QVBoxLayout(dlg)
+        old = getattr(self, "_branch_status_dialog", None)
+        try:
+            if old is not None and old.isVisible():
+                old.close()
+        except Exception:
+            pass
+        dlg = BranchStatusDialog(self, be_item)
+        self._branch_status_dialog = dlg
+        try:
+            dlg.finished.connect(lambda _=0, d=dlg: self._clear_branch_status_dialog(d))
+        except Exception:
+            pass
+        dlg.show()
 
-        fe_item = self._parent_fe_item_for_be(be_item)
-        header = QLabel("<b>Branch:</b> {}{}".format(
-            (fe_item.text(0) + " -> ") if fe_item else "",
-            be_item.text(0)))
-        layout.addWidget(header)
-
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        flow = QWidget()
-        flow_l = QHBoxLayout(flow)
-        flow_l.setContentsMargins(10, 10, 10, 10)
-        flow_l.setSpacing(10)
-
-        def _card_style(status, is_action=False):
-            if is_action:
-                bg, fg, bd = "#1565c0", "#ffffff", "#0d47a1"
-            elif status == "COMPLETED":
-                bg, fg, bd = "#e8f5e9", "#1b5e20", "#43a047"
-            elif status == "RUNNING":
-                bg, fg, bd = "#fff3e0", "#e65100", "#fb8c00"
-            else:
-                bg, fg, bd = "#eeeeee", "#424242", "#9e9e9e"
-            if self.is_dark_mode:
-                if status == "COMPLETED":
-                    bg, fg, bd = "#1b3a25", "#a5d6a7", "#66bb6a"
-                elif status == "RUNNING":
-                    bg, fg, bd = "#4a2d12", "#ffcc80", "#fb8c00"
-                elif not is_action:
-                    bg, fg, bd = "#30343a", "#dfe1e5", "#666c75"
-            return ("QPushButton {{ text-align: left; padding: 8px; "
-                    "border: 1px solid {}; border-radius: 6px; "
-                    "background: {}; color: {}; }}").format(bd, bg, fg)
-
-        if fe_item:
-            fe_btn = QPushButton("FE\n{}\n{}".format(fe_item.text(0), fe_item.text(3)))
-            fe_btn.setMinimumWidth(210)
-            fe_btn.setStyleSheet(_card_style(fe_item.text(3)))
-            fe_btn.clicked.connect(lambda _=False, it=fe_item: self._launch_metric_worker(it))
-            flow_l.addWidget(fe_btn)
-            flow_l.addWidget(QLabel("->"))
-
-        stages = list(be_run.get("stages", []))
-        stages.sort(key=lambda st: st.get("_stage_order", st.get("_stage_index", 9999)))
-        for idx, st in enumerate(stages):
-            status = st.get("stage_status", "-")
-            name = st.get("name", "-")
-            active = st.get("active_stage", name)
-            runtime = (st.get("info", {}) or {}).get("runtime", "-")
-            btn = QPushButton("{}\nStatus: {}\nStage: {}\nRuntime: {}".format(
-                name, status, active, runtime))
-            btn.setMinimumWidth(190)
-            btn.setMinimumHeight(92)
-            btn.setStyleSheet(_card_style(status))
-            btn.setToolTip("Click to open QoR Summary for {}".format(name))
-            btn.clicked.connect(
-                lambda _=False, sn=name: self._open_branch_stage_qor(be_item, sn))
-            flow_l.addWidget(btn)
-            if idx != len(stages) - 1:
-                flow_l.addWidget(QLabel("->"))
-
-        if stages:
-            flow_l.addWidget(QLabel("->"))
-        summary_btn = QPushButton("Generate Summary\nBE Stage Summary Table")
-        summary_btn.setMinimumWidth(210)
-        summary_btn.setMinimumHeight(92)
-        summary_btn.setStyleSheet(_card_style("COMPLETED", True))
-        summary_btn.clicked.connect(lambda _=False, it=be_item: self.show_be_stage_summary_table(it))
-        flow_l.addWidget(summary_btn)
-        flow_l.addStretch(1)
-        scroll.setWidget(flow)
-        layout.addWidget(scroll, 1)
-
-        table = QTableWidget()
-        table.setColumnCount(7)
-        table.setHorizontalHeaderLabels(
-            ["Stage", "Status", "Active Stage", "Start", "End", "Runtime", "Log"])
-        table.setRowCount(len(stages))
-        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        for r, st in enumerate(stages):
-            info = st.get("info", {}) or {}
-            vals = [st.get("name", "-"), st.get("stage_status", "-"),
-                    st.get("active_stage", st.get("name", "-")),
-                    self._fmt_ts(info.get("start", "-")),
-                    self._fmt_ts(info.get("end", "-")),
-                    info.get("runtime", "-"), st.get("log", "-")]
-            for c, val in enumerate(vals):
-                table.setItem(r, c, QTableWidgetItem(str(val)))
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        table.resizeColumnsToContents()
-        layout.addWidget(table, 1)
-
-        buttons = QHBoxLayout()
-        timeline_btn = QPushButton("Timeline Overview")
-        timeline_btn.clicked.connect(lambda _=False, it=be_item: self.show_timeline_overview(it))
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        buttons.addWidget(timeline_btn)
-        buttons.addStretch(1)
-        buttons.addWidget(close_btn)
-        layout.addLayout(buttons)
-        dlg.exec_()
+    def _clear_branch_status_dialog(self, dlg):
+        try:
+            if getattr(self, "_branch_status_dialog", None) is dlg:
+                self._branch_status_dialog = None
+        except Exception:
+            pass
 
     def _metric_task_from_item(self, item):
         if not item:
