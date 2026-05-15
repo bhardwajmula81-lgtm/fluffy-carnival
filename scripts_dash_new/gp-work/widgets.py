@@ -85,6 +85,12 @@ class CustomTreeItem(QTreeWidgetItem):
         # RTL release grouping rows should keep numeric release order even
         # when run rows are sorted by date/modified/name.
         try:
+            if (self.data(0, Qt.UserRole) == "STAGE"
+                    and other.data(0, Qt.UserRole) == "STAGE"):
+                k1 = self.data(0, Qt.UserRole + 80)
+                k2 = other.data(0, Qt.UserRole + 80)
+                if k1 is not None or k2 is not None:
+                    return (k1 if k1 is not None else 999999) < (k2 if k2 is not None else 999999)
             if (self.data(0, Qt.UserRole) == "RTL"
                     and other.data(0, Qt.UserRole) == "RTL"):
                 def rtl_key(item):

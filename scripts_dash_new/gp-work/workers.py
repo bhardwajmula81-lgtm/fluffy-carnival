@@ -544,6 +544,77 @@ def parse_pnr_runtime_rpt(file_path):
         pass
     return d
 
+def _parse_stage_start_sort_value(info):
+    txt = str((info or {}).get("start", "") or "")
+    m = re.search(
+        r"([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{1,2}):(\d{2})",
+        txt)
+    if not m:
+        return None
+    months = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5,
+              "Jun": 6, "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10,
+              "Nov": 11, "Dec": 12}
+    return (int(m.group(3)), months.get(m.group(1), 12),
+            int(m.group(2)), int(m.group(4)), int(m.group(5)))
+
+def _parse_fc_stage_marker(log_path, fallback_stage):
+    marker = ""
+    if not log_path or not cached_exists(log_path):
+        return marker
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                m = re.search(r"TimeStamp\s*:\s*(\S+)", line)
+                if not m:
+                    continue
+                val = m.group(1).strip()
+                if val and val not in ("TOTAL", "TOTAL_START"):
+                    marker = val
+    except Exception:
+        marker = ""
+    return marker
+
+def _parse_innovus_stage_marker(log_path, fallback_stage):
+    marker = ""
+    if not log_path or not cached_exists(log_path):
+        return marker
+    pat = re.compile(
+        r"^\s*(?:@file\s+\d+\s*:\s*)?sec_StartTimer\s+([A-Za-z0-9_./-]+)\b")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                m = pat.search(stripped)
+                if m:
+                    marker = m.group(1).strip()
+    except Exception:
+        marker = ""
+    return marker
+
+def resolve_pnr_stage_status(stage, be_run):
+    stage = dict(stage or {})
+    be_run = be_run or {}
+    source = be_run.get("source", "WS")
+    step_name = stage.get("name", "")
+    log_path = stage.get("log", "")
+    pass_path = stage.get("pass_path", "")
+    is_innovus = bool(stage.get("_is_innovus"))
+
+    if source == "OUTFEED":
+        return "COMPLETED", step_name, pass_path
+
+    marker = (_parse_innovus_stage_marker(log_path, step_name)
+              if is_innovus else _parse_fc_stage_marker(log_path, step_name))
+    active_stage = marker or step_name
+    pass_exists = bool(pass_path and cached_exists(pass_path))
+    if pass_exists:
+        return "COMPLETED", active_stage, pass_path
+    if marker and cached_exists(log_path):
+        return "RUNNING", marker, pass_path
+    return "NOT STARTED", active_stage, pass_path
+
 def get_fm_info(report_path):
     if not report_path or not cached_exists(report_path):
         return "N/A"
@@ -1487,6 +1558,12 @@ class ScannerWorker(QThread):
                     "rpt":           rpt_cands[0],   # primary (used as fallback)
                     "_rpt_cands":    rpt_cands,       # resolved lazily in StageDetailWorker
                     "log":           log,
+                    "pass_path":     (os.path.join(rd, "pass", f"{step_name}.pass")
+                                      if source == "WS" else ""),
+                    "stage_status":  ("COMPLETED" if source == "OUTFEED" else "CHECKING"),
+                    "active_stage":  step_name,
+                    "_stage_index":  len(stages),
+                    "_is_innovus":   bool(is_innovus_run),
                     # All deferred - filled by StageDetailWorker on expand
                     "info":          {"start": "-", "end": "-",
                                       "runtime": "-", "last_stage": "-"},
@@ -1585,6 +1662,11 @@ class StageDetailWorker(QThread):
                     rpt_file = cand
                     break
             s2["info"] = parse_pnr_runtime_rpt(rpt_file)
+            stage_status, active_stage, pass_path = resolve_pnr_stage_status(
+                s2, self.be_run)
+            s2["stage_status"] = stage_status
+            s2["active_stage"] = active_stage
+            s2["pass_path"] = pass_path
 
             fm_base = s.get("_fm_base", "")
             step = s.get("_fm_step", s["name"])
@@ -1632,6 +1714,11 @@ class StageDetailWorker(QThread):
             s2["vslp_status"] = get_vslp_info(vslp_path)
             s2["_lazy"] = False
             enriched.append(s2)
+        enriched.sort(key=lambda st: (
+            0 if _parse_stage_start_sort_value(st.get("info", {})) else 1,
+            _parse_stage_start_sort_value(st.get("info", {})) or (9999, 12, 31, 23, 59),
+            st.get("_stage_index", 9999),
+            st.get("name", "")))
         self.finished.emit(self.be_path, self.run_name, enriched)
 
 
