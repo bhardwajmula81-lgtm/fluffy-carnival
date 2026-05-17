@@ -1747,12 +1747,16 @@ class BranchStatusWorker(QThread):
                 return
             s2 = dict(s)
             rpt_file = s2.get("rpt", "")
-            for cand in s2.get("_rpt_cands", [rpt_file]):
+            rpt_candidates = list(s2.get("_rpt_cands", [rpt_file]) or [])
+            s2["_runtime_candidates"] = rpt_candidates
+            s2["_runtime_rpt_path"] = ""
+            for cand in rpt_candidates:
                 if self._cancelled or self.isInterruptionRequested():
                     self.finished.emit(self.be_path, self.run_name, [])
                     return
                 if cand and cached_exists(cand):
                     rpt_file = cand
+                    s2["_runtime_rpt_path"] = cand
                     break
             if rpt_file:
                 s2["info"] = parse_pnr_runtime_rpt(rpt_file)

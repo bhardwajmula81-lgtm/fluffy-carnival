@@ -23,6 +23,7 @@ import gzip
 import tarfile
 import html
 import io
+import hashlib
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -3689,6 +3690,338 @@ class BEStageSummaryDialog(QDialog):
             QMessageBox.warning(self, "Error", str(e))
 
 
+class StatusPackageDialog(QDialog):
+    FE_HEADERS = list(BlockSummaryDialog.HEADERS)
+    BE_HEADERS = list(BEStageSummaryDialog.HEADERS)
+
+    def __init__(self, title, pairs, fe_tasks, be_tasks, is_dark, parent=None):
+        QDialog.__init__(self, parent)
+        self.setWindowTitle(title)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint |
+                            Qt.WindowMinimizeButtonHint)
+        self.setSizeGripEnabled(True)
+        self.resize(1500, 760)
+        self.pairs = list(pairs or [])
+        self.fe_tasks = list(fe_tasks or [])
+        self.be_tasks = list(be_tasks or [])
+        self.is_dark = is_dark
+        self._worker = None
+        self._cancelled = False
+
+        layout = QVBoxLayout(self)
+        hdr = QLabel("<b>Block Status Package</b>")
+        hdr.setAlignment(Qt.AlignCenter)
+        layout.addWidget(hdr)
+        self.status_lbl = QLabel(
+            "{} FE/BE pair(s). Click Generate Metrics.".format(len(self.pairs)))
+        self.status_lbl.setStyleSheet("color: #1976d2;")
+        layout.addWidget(self.status_lbl)
+
+        pair_tbl = QTableWidget(0, 4)
+        pair_tbl.setHorizontalHeaderLabels(["Block", "FE Run", "BE Run", "Source"])
+        pair_tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        pair_tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        pair_tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        pair_tbl.setMaximumHeight(150)
+        for pair in self.pairs:
+            r = pair_tbl.rowCount()
+            pair_tbl.insertRow(r)
+            vals = [pair.get("block", "-"), pair.get("fe_name", "-"),
+                    pair.get("be_name", "-"), pair.get("source", "-")]
+            for c, val in enumerate(vals):
+                pair_tbl.setItem(r, c, QTableWidgetItem(str(val)))
+        pair_tbl.resizeColumnsToContents()
+        layout.addWidget(pair_tbl)
+
+        self.tabs = QTabWidget()
+        self.fe_tbl = self._make_table(self.FE_HEADERS)
+        self.be_tbl = self._make_table(self.BE_HEADERS)
+        self.tabs.addTab(self.fe_tbl, "FE Summary")
+        self.tabs.addTab(self.be_tbl, "BE Stage Summary")
+        layout.addWidget(self.tabs, 1)
+
+        row = QHBoxLayout()
+        self.gen_btn = QPushButton("Generate Metrics")
+        self.gen_btn.clicked.connect(self._start_loading)
+        self.prog = QProgressBar()
+        self.prog.setVisible(False)
+        fe_csv = QPushButton("Export FE CSV")
+        fe_csv.clicked.connect(lambda: self._export_csv(self.fe_tbl, "fe_status_summary.csv"))
+        be_csv = QPushButton("Export BE CSV")
+        be_csv.clicked.connect(lambda: self._export_csv(self.be_tbl, "be_status_summary.csv"))
+        mail_btn = QPushButton("Send HTML Mail")
+        mail_btn.clicked.connect(self._send_mail)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        row.addWidget(self.gen_btn)
+        row.addWidget(self.prog, 1)
+        row.addWidget(fe_csv)
+        row.addWidget(be_csv)
+        row.addWidget(mail_btn)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+    def _make_table(self, headers):
+        tbl = QTableWidget(0, len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tbl.setAlternatingRowColors(True)
+        tbl.setSortingEnabled(True)
+        tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        hh = tbl.horizontalHeader()
+        hh.setSectionsMovable(True)
+        for c in range(len(headers)):
+            hh.setSectionResizeMode(c, QHeaderView.Interactive)
+            tbl.setColumnWidth(c, 125)
+        parent = self.parent()
+        if parent and hasattr(parent, "_make_table_user_adjustable"):
+            parent._make_table_user_adjustable(tbl)
+        return tbl
+
+    def _start_loading(self):
+        tasks = list(self.fe_tasks) + list(self.be_tasks)
+        if not tasks:
+            return
+        self._cancelled = False
+        self.gen_btn.setEnabled(False)
+        self.fe_tbl.setRowCount(0)
+        self.be_tbl.setRowCount(0)
+        self.prog.setRange(0, len(tasks))
+        self.prog.setValue(0)
+        self.prog.setVisible(True)
+        self.status_lbl.setText("Extracting status package metrics...")
+        try:
+            from workers import MetricBatchWorker
+            self._worker = MetricBatchWorker(tasks)
+            self._worker.progress.connect(self._on_progress)
+            self._worker.finished.connect(self._on_done)
+            self._worker.finished.connect(lambda *_: setattr(self, "_worker", None))
+            parent = self.parent()
+            if parent is not None and hasattr(parent, "_workers"):
+                parent._workers.start("summary", self._worker)
+            else:
+                self._worker.start()
+        except Exception as e:
+            self.gen_btn.setEnabled(True)
+            self.prog.setVisible(False)
+            QMessageBox.warning(self, "Status Package", str(e))
+
+    def _on_progress(self, done, total):
+        if self._cancelled:
+            return
+        self.prog.setRange(0, total)
+        self.prog.setValue(done)
+        self.status_lbl.setText(
+            "Extracting status package metrics... {} / {}".format(done, total))
+
+    def _on_done(self, rows):
+        if self._cancelled:
+            return
+        self.fe_tbl.setSortingEnabled(False)
+        self.be_tbl.setSortingEnabled(False)
+        self.fe_tbl.setRowCount(0)
+        self.be_tbl.setRowCount(0)
+        for row in rows:
+            if row.get("run_type") == "FE":
+                self._add_fe_row(row)
+            else:
+                self._add_be_row(row)
+        self.fe_tbl.setSortingEnabled(True)
+        self.be_tbl.setSortingEnabled(True)
+        self.fe_tbl.resizeColumnsToContents()
+        self.be_tbl.resizeColumnsToContents()
+        self.prog.setValue(len(rows))
+        self.prog.setVisible(False)
+        self.gen_btn.setEnabled(True)
+        self.status_lbl.setText(
+            "Done. FE rows: {}, BE rows: {}.".format(
+                self.fe_tbl.rowCount(), self.be_tbl.rowCount()))
+
+    def _v(self, metrics, area, *keys):
+        for src in (area, metrics):
+            for key in keys:
+                val = src.get(key)
+                if val and str(val).strip() not in ("", "-", "N/A"):
+                    return str(val)
+        return "-"
+
+    def _add_values(self, tbl, values):
+        r = tbl.rowCount()
+        tbl.insertRow(r)
+        for c, val in enumerate(values):
+            item = QTableWidgetItem(str(val) if val not in (None, "") else "-")
+            item.setTextAlignment(Qt.AlignCenter)
+            if c in (0, 1, 2):
+                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+            tbl.setItem(r, c, item)
+
+    def _add_fe_row(self, row):
+        metrics = row.get("metrics", {}) or {}
+        area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
+        vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
+        mbit = metrics.get("mbit", area.get("mbit", "-"))
+        cgc = metrics.get("cgc", "-")
+        std_area = self._v(metrics, area, "std_cell_area", "combinational_area")
+        gc = self._v(metrics, area, "gate_count")
+        if gc == "-":
+            try:
+                factor = getattr(self.parent(), "gate_count_unit_area", 0.2419) or 0.2419
+                gc = str(int(float(std_area) / factor))
+            except Exception:
+                gc = "-"
+        values = [
+            row.get("block", "-"),
+            row.get("run_name", row.get("name", "-")),
+            mbit,
+            cgc,
+            self._v(metrics, area, "instance_count", "total_count"),
+            std_area,
+            gc,
+            vth.get("vt_area", vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-"))),
+            metrics.get("setup_r2r", metrics.get("r2r_setup", "-")),
+            metrics.get("hold_r2r", metrics.get("r2r_hold", "-")),
+            metrics.get("logic_depth", "-"),
+            metrics.get("runtime", row.get("runtime", "-")),
+        ]
+        self._add_values(self.fe_tbl, values)
+
+    def _metric_value(self, metrics, key):
+        metrics = metrics or {}
+        area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
+        vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
+        cong = metrics.get("congestion", {}) if isinstance(metrics.get("congestion", {}), dict) else {}
+        if key == "std_count_area":
+            return metrics.get("std_cell_count_area", "-")
+        if key == "gc":
+            val = metrics.get("gate_count", "-")
+            if val != "-":
+                return val
+            try:
+                factor = getattr(self.parent(), "gate_count_unit_area", 0.2419) or 0.2419
+                return str(int(float(area.get("std_cell_area", "-")) / factor))
+            except Exception:
+                return "-"
+        if key == "std_util":
+            util = metrics.get("util", {}) if isinstance(metrics.get("util", {}), dict) else {}
+            return util.get("std_util_str", metrics.get("std_util_str", "-"))
+        if key == "vt_inst":
+            return vth.get("stage_vt_inst", vth.get("vt_inst", "-"))
+        if key == "vt_area":
+            return vth.get("stage_vt_area", vth.get("vt_area", "-"))
+        if key == "cong":
+            return cong.get("cong_both", metrics.get("congestion", "-"))
+        return metrics.get(key, "-")
+
+    def _add_be_row(self, row):
+        metrics = row.get("metrics", {}) or {}
+        values = [
+            row.get("block", "-"),
+            row.get("be_name", row.get("name", "-")),
+            row.get("stage_name", "-"),
+            self._metric_value(metrics, "setup_r2r"),
+            self._metric_value(metrics, "setup_total"),
+            self._metric_value(metrics, "hold_total") if self._metric_value(metrics, "hold_total") != "-" else self._metric_value(metrics, "hold_all"),
+            self._metric_value(metrics, "cong"),
+            self._metric_value(metrics, "std_count_area"),
+            self._metric_value(metrics, "gc"),
+            self._metric_value(metrics, "std_util"),
+            self._metric_value(metrics, "total_util"),
+            self._metric_value(metrics, "vt_inst"),
+            self._metric_value(metrics, "vt_area"),
+            self._metric_value(metrics, "skew_latency"),
+            self._metric_value(metrics, "clock_repeater_count_area"),
+            self._metric_value(metrics, "runtime")
+            if self._metric_value(metrics, "runtime") not in ("", "-", "N/A")
+            else row.get("runtime", "-"),
+        ]
+        self._add_values(self.be_tbl, values)
+
+    def _table_html(self, tbl, title):
+        headers = [tbl.horizontalHeaderItem(c).text()
+                   for c in range(tbl.columnCount())]
+        out = [
+            "<h3>{}</h3>".format(html.escape(title)),
+            "<table border='1' cellpadding='4' cellspacing='0' "
+            "style='border-collapse:collapse;font-family:Arial,monospace;font-size:12px;'>",
+            "<tr>" + "".join(
+                "<th style='background:#1976d2;color:white;'>{}</th>".format(
+                    html.escape(h)) for h in headers) + "</tr>",
+        ]
+        for r in range(tbl.rowCount()):
+            out.append("<tr>" + "".join(
+                "<td>{}</td>".format(html.escape(
+                    tbl.item(r, c).text() if tbl.item(r, c) else ""))
+                for c in range(tbl.columnCount())) + "</tr>")
+        out.append("</table>")
+        return "\n".join(out)
+
+    def _send_mail(self):
+        if self.fe_tbl.rowCount() == 0 and self.be_tbl.rowCount() == 0:
+            QMessageBox.information(self, "Mail", "Generate metrics first.")
+            return
+        body = (self._table_html(self.fe_tbl, "FE Summary") + "<br>" +
+                self._table_html(self.be_tbl, "BE Stage Summary"))
+        parent = self.parent()
+        if parent and hasattr(parent, "_open_mail_compose_dialog"):
+            parent._open_mail_compose_dialog(
+                subject="Flow Pulse Block Status Package",
+                body=body,
+                html_body=body)
+        else:
+            QMessageBox.information(self, "Mail Body", body[:3000])
+
+    def _export_csv(self, tbl, default_name):
+        if tbl.rowCount() == 0:
+            QMessageBox.information(self, "Export", "Generate metrics first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export", default_name, "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow([tbl.horizontalHeaderItem(c).text()
+                            for c in range(tbl.columnCount())])
+                for r in range(tbl.rowCount()):
+                    w.writerow([tbl.item(r, c).text() if tbl.item(r, c) else ""
+                                for c in range(tbl.columnCount())])
+            QMessageBox.information(self, "Export", "Saved: " + path)
+        except Exception as e:
+            QMessageBox.warning(self, "Export", str(e))
+
+    def closeEvent(self, event):
+        if self._stop_worker():
+            event.accept()
+        else:
+            event.ignore()
+
+    def accept(self):
+        if self._stop_worker():
+            QDialog.accept(self)
+
+    def reject(self):
+        if self._stop_worker():
+            QDialog.reject(self)
+
+    def _stop_worker(self):
+        self._cancelled = True
+        w = getattr(self, "_worker", None)
+        try:
+            if w and w.isRunning():
+                if hasattr(w, "cancel"):
+                    w.cancel()
+                w.wait(1000)
+                if w.isRunning():
+                    self.status_lbl.setText(
+                        "Stopping metric extraction... please close again in a moment.")
+                    return False
+        except Exception:
+            return True
+        return True
+
+
 class BranchStatusDialog(QDialog):
     def __init__(self, dashboard, be_item):
         QDialog.__init__(self, dashboard)
@@ -3829,7 +4162,15 @@ class BranchStatusDialog(QDialog):
                     self.dashboard._fmt_ts(info.get("end", "-")),
                     runtime, st.get("log", "-")]
             for c, val in enumerate(vals):
-                self.table.setItem(idx, c, QTableWidgetItem(str(val)))
+                item = QTableWidgetItem(str(val))
+                if c == 5 and str(runtime).strip() in ("", "-", "N/A"):
+                    cands = st.get("_runtime_candidates", []) or []
+                    if cands:
+                        item.setToolTip(
+                            "Runtime not found. Tried:\n" + "\n".join(cands))
+                elif c == 6 and st.get("log"):
+                    item.setToolTip(str(st.get("log")))
+                self.table.setItem(idx, c, item)
 
         if stages:
             self.flow_l.addWidget(QLabel("->"))
@@ -4872,6 +5213,135 @@ class PDDashboard(QMainWindow):
                 "path": original_path, "kind": kind, "reason": str(e)})
             return False
 
+    def _archive_store_dir(self):
+        path = os.path.join(self._snapshot_dir(), "archive_store")
+        try:
+            if not os.path.exists(path):
+                os.makedirs(path)
+        except Exception:
+            pass
+        return path
+
+    def _archive_store_manifest_file(self):
+        return os.path.join(self._archive_store_dir(), "manifest.json")
+
+    def _archive_store_snapshot_file(self):
+        path = os.path.join(self._archive_store_dir(), "snapshots")
+        try:
+            if not os.path.exists(path):
+                os.makedirs(path)
+        except Exception:
+            pass
+        return os.path.join(path, "latest_snapshot.json.gz")
+
+    def _archive_file_sha1(self, path):
+        h = hashlib.sha1()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _archive_bytes_sha1(self, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8", "ignore")
+        return hashlib.sha1(data or b"").hexdigest()
+
+    def _archive_store_rel(self, kind, label, src_path, digest):
+        base = os.path.basename(src_path or "file")
+        rel = os.path.join("objects", kind, _safe_path_token(label)[:80],
+                           "{}.{}".format(base, digest[:12]))
+        return rel.replace(os.sep, "/")
+
+    def _load_archive_store_manifest(self):
+        fp = self._archive_store_manifest_file()
+        try:
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {
+            "schema": "flow_pulse_archive_store_v1",
+            "project": PROJECT_PREFIX,
+            "created_by": getpass.getuser(),
+            "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "updated_at": "",
+            "summary": {},
+            "limits": {"report_max_bytes": 5 * 1024 * 1024,
+                       "image_max_bytes": 10 * 1024 * 1024},
+            "files": {},
+            "skipped": [],
+        }
+
+    def _save_archive_store_manifest(self, manifest):
+        manifest["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _atomic_write_json(self._archive_store_manifest_file(), manifest,
+                           indent=2, sort_keys=True)
+
+    def _archive_store_add_bytes(self, manifest, original_path, data, kind, label):
+        try:
+            if isinstance(data, str):
+                data = data.encode("utf-8", "ignore")
+            digest = self._archive_bytes_sha1(data)
+            rel = self._archive_store_rel(kind, label, original_path, digest)
+            out = os.path.join(self._archive_store_dir(), rel.replace("/", os.sep))
+            old = manifest.get("files", {}).get(original_path) or {}
+            if old.get("sha1") == digest and old.get("store") and os.path.exists(out):
+                return False
+            parent = os.path.dirname(out)
+            if not os.path.exists(parent):
+                os.makedirs(parent)
+            if not os.path.exists(out):
+                with open(out, "wb") as f:
+                    f.write(data or b"")
+            manifest["files"][original_path] = {
+                "store": rel, "kind": kind, "size": len(data or b""),
+                "sha1": digest, "source_mtime": 0}
+            return True
+        except Exception as e:
+            manifest.setdefault("skipped", []).append({
+                "path": original_path, "kind": kind, "reason": str(e)})
+            return False
+
+    def _archive_store_add_file(self, manifest, src_path, kind, label, max_size):
+        try:
+            if not src_path or not os.path.isfile(src_path):
+                return False
+            size = os.path.getsize(src_path)
+            mtime = os.path.getmtime(src_path)
+            if size > max_size:
+                manifest.setdefault("skipped", []).append({
+                    "path": src_path, "kind": kind, "reason": "oversize",
+                    "size": size, "limit": max_size})
+                return False
+            old = manifest.get("files", {}).get(src_path) or {}
+            if (old.get("size") == size and int(old.get("source_mtime", 0)) == int(mtime)
+                    and old.get("store")
+                    and os.path.exists(os.path.join(
+                        self._archive_store_dir(),
+                        str(old.get("store")).replace("/", os.sep)))):
+                return False
+            digest = self._archive_file_sha1(src_path)
+            rel = self._archive_store_rel(kind, label, src_path, digest)
+            out = os.path.join(self._archive_store_dir(), rel.replace("/", os.sep))
+            parent = os.path.dirname(out)
+            if not os.path.exists(parent):
+                os.makedirs(parent)
+            if not os.path.exists(out):
+                shutil.copy2(src_path, out)
+            manifest["files"][src_path] = {
+                "store": rel, "kind": kind, "size": size,
+                "sha1": digest, "source_mtime": int(mtime)}
+            return True
+        except Exception as e:
+            manifest.setdefault("skipped", []).append({
+                "path": src_path, "kind": kind, "reason": str(e)})
+            return False
+
     def _archive_find_matches(self, directory, patterns):
         out = []
         if not directory or not os.path.isdir(directory):
@@ -5006,6 +5476,59 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
 
+    def _update_archive_store(self, include_images=False):
+        payload = self._snapshot_payload({
+            "archive_store": True,
+            "include_images": bool(include_images)})
+        snap_fp = self._archive_store_snapshot_file()
+        _atomic_write_gzip_json(snap_fp, payload, indent=2, sort_keys=True)
+        manifest = self._load_archive_store_manifest()
+        manifest["schema"] = "flow_pulse_archive_store_v1"
+        manifest["project"] = PROJECT_PREFIX
+        manifest["created_by"] = getpass.getuser()
+        manifest["summary"] = payload.get("summary", {})
+        manifest["include_images"] = bool(include_images)
+        manifest.setdefault("files", {})
+        manifest["skipped"] = []
+        limits = manifest.setdefault(
+            "limits",
+            {"report_max_bytes": 5 * 1024 * 1024,
+             "image_max_bytes": 10 * 1024 * 1024})
+        report_limit = int(limits.get("report_max_bytes", 5 * 1024 * 1024))
+        image_limit = int(limits.get("image_max_bytes", 10 * 1024 * 1024))
+        runs = ((self.ws_data or {}).get("all_runs", []) +
+                (self.out_data or {}).get("all_runs", []))
+        added = 0
+        seen = set()
+        for run in runs:
+            for src, kind, label in self._archive_report_candidates_for_run(run):
+                key = os.path.abspath(src)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if kind == "log_snippet":
+                    if self._archive_store_add_bytes(
+                            manifest, src, self._archive_log_snippet(src),
+                            "reports", label):
+                        added += 1
+                else:
+                    if self._archive_store_add_file(
+                            manifest, src, "reports", label, report_limit):
+                        added += 1
+            if include_images:
+                for src, kind, label in self._archive_image_candidates_for_run(run):
+                    key = os.path.abspath(src)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if self._archive_store_add_file(
+                            manifest, src, "images", label, image_limit):
+                        added += 1
+        manifest["last_added_count"] = added
+        manifest["snapshot"] = "snapshots/latest_snapshot.json.gz"
+        self._save_archive_store_manifest(manifest)
+        return self._archive_store_dir(), manifest, added
+
     def create_archive_snapshot(self):
         if not (self.ws_data or self.out_data):
             QMessageBox.information(
@@ -5016,7 +5539,7 @@ class PDDashboard(QMainWindow):
         dlg.setWindowTitle("Create Archive Snapshot")
         lay = QVBoxLayout(dlg)
         lay.addWidget(QLabel(
-            "Archive snapshot stores the current dashboard snapshot plus selected source reports."))
+            "Archive store updates the current dashboard snapshot and adds only new or changed reports."))
         report_cb = QCheckBox("Include report files")
         report_cb.setChecked(True)
         report_cb.setEnabled(False)
@@ -5031,15 +5554,67 @@ class PDDashboard(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
         try:
-            fp, manifest = self._write_archive_snapshot(include_images=image_cb.isChecked())
+            fp, manifest, added = self._update_archive_store(
+                include_images=image_cb.isChecked())
             QMessageBox.information(
                 self, "Archive Snapshot",
-                "Archive saved:\n{}\n\nFiles: {}\nSkipped: {}".format(
-                    fp, len(manifest.get("files", {})), len(manifest.get("skipped", []))))
+                "Archive store updated:\n{}\n\nNew/changed files: {}\nTotal files: {}\nSkipped: {}".format(
+                    fp, added, len(manifest.get("files", {})),
+                    len(manifest.get("skipped", []))))
         except Exception as e:
             QMessageBox.warning(
                 self, "Archive Snapshot",
                 "Could not create archive snapshot:\n" + str(e))
+
+    def export_archive_store_tar(self):
+        manifest = self._load_archive_store_manifest()
+        snap_fp = self._archive_store_snapshot_file()
+        if not os.path.exists(snap_fp):
+            QMessageBox.information(
+                self, "Archive Snapshot",
+                "No archive store exists yet. Create Archive Snapshot first.")
+            return
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out = os.path.join(self._snapshot_dir(),
+                           "archive_store_export_{}.tar.gz".format(stamp))
+        latest = self._archive_latest_file()
+        tmp = out + ".tmp.{}.{}".format(os.getpid(), int(time.time() * 1000000))
+        try:
+            export_manifest = self._json_safe(manifest)
+            for _src, rec in (export_manifest.get("files", {}) or {}).items():
+                if isinstance(rec, dict) and rec.get("store"):
+                    rec["archive"] = rec.get("store")
+            with tarfile.open(tmp, "w:gz") as tar:
+                tar.add(snap_fp, arcname="snapshot.json.gz")
+                man_bytes = json.dumps(
+                    export_manifest, indent=2, sort_keys=True).encode("utf-8")
+                info = tarfile.TarInfo("manifest.json")
+                info.size = len(man_bytes)
+                info.mtime = time.time()
+                tar.addfile(info, io.BytesIO(man_bytes))
+                root = self._archive_store_dir()
+                for _src, rec in (manifest.get("files", {}) or {}).items():
+                    if not isinstance(rec, dict) or not rec.get("store"):
+                        continue
+                    rel = rec.get("store")
+                    fp = os.path.join(root, str(rel).replace("/", os.sep))
+                    if os.path.exists(fp):
+                        tar.add(fp, arcname=str(rel).replace(os.sep, "/"))
+            os.replace(tmp, out)
+            try:
+                shutil.copy2(out, latest)
+            except Exception:
+                pass
+            QMessageBox.information(
+                self, "Archive Snapshot",
+                "Archive tar exported:\n" + out)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            QMessageBox.warning(self, "Archive Snapshot", str(e))
 
     def _write_archive_snapshot(self, include_images=False):
         snap_dir = self._snapshot_dir()
@@ -5116,6 +5691,10 @@ class PDDashboard(QMainWindow):
         return None
 
     def load_latest_archive_snapshot_view(self):
+        store_snap = self._archive_store_snapshot_file()
+        if os.path.exists(store_snap):
+            self._load_archive_store_snapshot_view()
+            return
         fp = self._archive_latest_file()
         if not os.path.exists(fp):
             QMessageBox.information(
@@ -5123,6 +5702,25 @@ class PDDashboard(QMainWindow):
                 "No latest archive snapshot found.\n\nExpected:\n" + fp)
             return
         self._load_archive_snapshot_view_from_path(fp)
+
+    def _load_archive_store_snapshot_view(self):
+        try:
+            snap_fp = self._archive_store_snapshot_file()
+            with gzip.open(snap_fp, "rt", encoding="utf-8") as f:
+                payload = json.load(f)
+            manifest = self._load_archive_store_manifest()
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Archive Snapshot",
+                "Could not load archive store snapshot:\n" + str(e))
+            return
+        self._archive_tar_path = ""
+        self._archive_file_map = {}
+        self._archive_store_file_map = manifest.get("files", {}) if isinstance(manifest, dict) else {}
+        self._archive_store_root = self._archive_store_dir()
+        self._load_snapshot_payload_view(payload)
+        self.sb_scan_time.setText(
+            "     Loaded archive store: " + str(payload.get("created_at", "-")) + "   ")
 
     def load_archive_snapshot_file_view(self):
         fp, _ = QFileDialog.getOpenFileName(
@@ -5147,6 +5745,7 @@ class PDDashboard(QMainWindow):
             return
         self._archive_tar_path = fp
         self._archive_file_map = manifest.get("files", {}) if isinstance(manifest, dict) else {}
+        self._archive_store_file_map = {}
         self._load_snapshot_payload_view(payload)
         self.sb_scan_time.setText("     Loaded archive: " + str(payload.get("created_at", "-")) + "   ")
 
@@ -5155,6 +5754,14 @@ class PDDashboard(QMainWindow):
             return original_path
         if os.path.exists(original_path):
             return original_path
+        store_root = getattr(self, "_archive_store_root", "") or self._archive_store_dir()
+        store_map = getattr(self, "_archive_store_file_map", {}) or {}
+        store_rec = store_map.get(original_path) or store_map.get(os.path.abspath(original_path))
+        if isinstance(store_rec, dict) and store_rec.get("store"):
+            store_path = os.path.join(
+                store_root, str(store_rec.get("store")).replace("/", os.sep))
+            if os.path.exists(store_path):
+                return store_path
         archive = getattr(self, "_archive_tar_path", "")
         file_map = getattr(self, "_archive_file_map", {}) or {}
         rec = file_map.get(original_path) or file_map.get(os.path.abspath(original_path))
@@ -6019,6 +6626,10 @@ class PDDashboard(QMainWindow):
                                self.show_selected_timeline_overview)
         summary_menu.addAction("Analytics / Charts", self.show_analytics)
 
+        reports_menu = self.actions_menu.addMenu("Reports")
+        reports_menu.addAction("Generate Block Status Package",
+                               self.show_block_status_package)
+
         filt_menu = self.actions_menu.addMenu("Config / Filters")
         filt_menu.addAction("Load Run Filter Config...", self.load_filter_config)
         self.ignore_run_filter_act = filt_menu.addAction("Ignore Run Filter")
@@ -6044,6 +6655,7 @@ class PDDashboard(QMainWindow):
         snapshot_menu.addAction("Export Last Snapshot...", self.export_latest_snapshot)
         snapshot_menu.addSeparator()
         snapshot_menu.addAction("Create Archive Snapshot...", self.create_archive_snapshot)
+        snapshot_menu.addAction("Export Archive Tar...", self.export_archive_store_tar)
         snapshot_menu.addAction("Load Last Archive View", self.load_latest_archive_snapshot_view)
         snapshot_menu.addAction("Load Archive File...", self.load_archive_snapshot_file_view)
 
@@ -8871,6 +9483,7 @@ class PDDashboard(QMainWindow):
     def _refresh_stage_children_from_run(self, be_item, be_run):
         checked = {}
         try:
+            self.tree.setUpdatesEnabled(False)
             for i in range(be_item.childCount()):
                 ch = be_item.child(i)
                 if ch.data(0, Qt.UserRole) == "STAGE":
@@ -8884,18 +9497,24 @@ class PDDashboard(QMainWindow):
                 be_item.addChild(ch)
             ign_root = self._ensure_ign_root(self.tree.invisibleRootItem())
             self._add_stages(be_item, be_run, ign_root)
-            self._reorder_stage_children_by_runtime()
+            self._reorder_stage_children_for_item(be_item)
             for i in range(be_item.childCount()):
                 ch = be_item.child(i)
                 if ch.data(0, Qt.UserRole) == "STAGE" and ch.text(0) in checked:
                     ch.setCheckState(0, checked.get(ch.text(0), Qt.Unchecked))
         except RuntimeError:
             pass
+        finally:
+            try:
+                self.tree.setUpdatesEnabled(True)
+            except Exception:
+                pass
 
     def _ensure_stage_rows_visible(self, be_item, be_run):
         if be_item is None or not be_run:
             return
         try:
+            self.tree.setUpdatesEnabled(False)
             has_stage = False
             has_placeholder = False
             for i in range(be_item.childCount()):
@@ -8918,7 +9537,7 @@ class PDDashboard(QMainWindow):
                     be_item.addChild(ch)
             ign_root = self._ensure_ign_root(self.tree.invisibleRootItem())
             self._add_stages(be_item, be_run, ign_root)
-            self._reorder_stage_children_by_runtime()
+            self._reorder_stage_children_for_item(be_item)
             if parent_checked:
                 self.tree.blockSignals(True)
                 for i in range(be_item.childCount()):
@@ -8930,6 +9549,11 @@ class PDDashboard(QMainWindow):
             pass
         except Exception:
             pass
+        finally:
+            try:
+                self.tree.setUpdatesEnabled(True)
+            except Exception:
+                pass
 
     def _start_branch_status_worker(self, be_item, be_run):
         if not be_run or be_run.get("_branch_status_loading"):
@@ -9016,23 +9640,34 @@ class PDDashboard(QMainWindow):
                     ign_root = self._ensure_ign_root(
                         self.tree.invisibleRootItem())
                     parent_checked = item.checkState(0) == Qt.Checked
-                    item.removeChild(ph)
-                    self._add_stages(item, be_run, ign_root)
-                    self._reorder_stage_children_by_runtime()
-                    # Propagate parent check state to newly created stages
-                    if parent_checked:
-                        self.tree.blockSignals(True)
-                        for i in range(item.childCount()):
-                            ch = item.child(i)
-                            if ch.data(0, Qt.UserRole) == "STAGE":
-                                ch.setCheckState(0, Qt.Checked)
-                        self.tree.blockSignals(False)
-                    # Load stage timing/FM/VSLP in background if deferred
-                    _start_stage_detail_worker(be_run)
+                    try:
+                        self.tree.setUpdatesEnabled(False)
+                        item.removeChild(ph)
+                        self._add_stages(item, be_run, ign_root)
+                        self._reorder_stage_children_for_item(item)
+                        # Propagate parent check state to newly created stages
+                        if parent_checked:
+                            self.tree.blockSignals(True)
+                            for i in range(item.childCount()):
+                                ch = item.child(i)
+                                if ch.data(0, Qt.UserRole) == "STAGE":
+                                    ch.setCheckState(0, Qt.Checked)
+                            self.tree.blockSignals(False)
+                    finally:
+                        try:
+                            self.tree.setUpdatesEnabled(True)
+                        except Exception:
+                            pass
+                    # Keep expand light: resolve only status/runtime here.
+                    if (not be_run.get("_branch_status_loaded")
+                            and not be_run.get("_branch_status_loading")):
+                        self._start_branch_status_worker(item, be_run)
                     return
         be_run = item.data(0, Qt.UserRole + 11)
         if be_run:
-            _start_stage_detail_worker(be_run)
+            if (not be_run.get("_branch_status_loaded")
+                    and not be_run.get("_branch_status_loading")):
+                self._start_branch_status_worker(item, be_run)
 
     def _on_stage_details_loaded(self, be_path, run_name, enriched_stages):
         """Called by StageDetailWorker using stable identifiers only."""
@@ -9200,20 +9835,43 @@ class PDDashboard(QMainWindow):
             pass
 
     def _reorder_stage_children_by_runtime(self):
+        def _sort_one(parent):
+            if not parent or not parent.data(0, Qt.UserRole + 11):
+                return
+            if parent.childCount() <= 1:
+                return
+            children = [parent.takeChild(0) for _ in range(parent.childCount())]
+            children.sort(key=lambda it: (
+                0 if it.data(0, Qt.UserRole) == "STAGE" else 1,
+                it.data(0, Qt.UserRole + 80)
+                if it.data(0, Qt.UserRole + 80) is not None else 999999,
+                it.text(0)))
+            for child in children:
+                parent.addChild(child)
+
         def _walk(parent):
-            if parent.data(0, Qt.UserRole + 11) and parent.childCount() > 1:
-                children = [parent.takeChild(0) for _ in range(parent.childCount())]
-                children.sort(key=lambda it: (
-                    0 if it.data(0, Qt.UserRole) == "STAGE" else 1,
-                    it.data(0, Qt.UserRole + 80)
-                    if it.data(0, Qt.UserRole + 80) is not None else 999999,
-                    it.text(0)))
-                for child in children:
-                    parent.addChild(child)
+            _sort_one(parent)
             for i in range(parent.childCount()):
                 _walk(parent.child(i))
         try:
             _walk(self.tree.invisibleRootItem())
+        except Exception:
+            pass
+
+    def _reorder_stage_children_for_item(self, be_item):
+        try:
+            if not be_item or not be_item.data(0, Qt.UserRole + 11):
+                return
+            if be_item.childCount() <= 1:
+                return
+            children = [be_item.takeChild(0) for _ in range(be_item.childCount())]
+            children.sort(key=lambda it: (
+                0 if it.data(0, Qt.UserRole) == "STAGE" else 1,
+                it.data(0, Qt.UserRole + 80)
+                if it.data(0, Qt.UserRole + 80) is not None else 999999,
+                it.text(0)))
+            for child in children:
+                be_item.addChild(child)
         except Exception:
             pass
 
@@ -10160,6 +10818,95 @@ class PDDashboard(QMainWindow):
                 or (self.use_custom_colors
                     and self.custom_bg_color < "#888888"))
         dlg = BlockSummaryDialog(rtl_label, run_list, dark, self)
+        dlg.exec_()
+
+    def _checked_fe_items_for_status_package(self):
+        items = []
+        def collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                run = child.data(0, Qt.UserRole + 10) or {}
+                if (run.get("run_type") == "FE"
+                        and child.checkState(0) == Qt.Checked
+                        and child.text(15)
+                        and child.text(15) != "N/A"):
+                    items.append(child)
+                collect(child)
+        collect(self.tree.invisibleRootItem())
+        return items
+
+    def _checked_be_children_for_fe(self, fe_item):
+        out = []
+        def collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                run = child.data(0, Qt.UserRole + 10) or {}
+                if run.get("run_type") == "BE" and child.checkState(0) == Qt.Checked:
+                    out.append(child)
+                if child.data(0, Qt.UserRole) != "STAGE":
+                    collect(child)
+        collect(fe_item)
+        return out
+
+    def show_block_status_package(self):
+        fe_items = self._checked_fe_items_for_status_package()
+        if not fe_items:
+            QMessageBox.information(
+                self, "Block Status Package",
+                "Check FE runs first. Under each checked FE, check exactly one BE child run.")
+            return
+        errors = []
+        pairs = []
+        fe_tasks = []
+        be_tasks = []
+        seen_fe = set()
+        for fe_item in fe_items:
+            be_items = self._checked_be_children_for_fe(fe_item)
+            if len(be_items) != 1:
+                errors.append("{}: expected exactly one checked BE child, found {}".format(
+                    fe_item.text(0), len(be_items)))
+                continue
+            be_item = be_items[0]
+            fe_run = fe_item.data(0, Qt.UserRole + 10) or {}
+            be_run = be_item.data(0, Qt.UserRole + 10) or {}
+            block = fe_run.get("block") or fe_item.data(0, Qt.UserRole + 2) or "UNKNOWN"
+            fe_key = fe_item.text(15)
+            if fe_key not in seen_fe:
+                seen_fe.add(fe_key)
+                fe_tasks.append({
+                    "block": block,
+                    "path": fe_item.text(15),
+                    "run_name": fe_item.text(0),
+                    "name": fe_item.text(0),
+                    "runtime": fe_item.text(12) or "-",
+                    "source": fe_run.get("source", fe_item.text(2) or "WS"),
+                    "run_type": "FE",
+                })
+            tasks = self._stage_tasks_from_be_item(be_item)
+            if not tasks:
+                errors.append("{}: no PNR stages found under selected BE run {}".format(
+                    fe_item.text(0), be_item.text(0)))
+                continue
+            be_tasks.extend(tasks)
+            pairs.append({
+                "block": block,
+                "fe_name": fe_item.text(0),
+                "be_name": be_item.text(0),
+                "source": be_run.get("source", be_item.text(2) or "WS"),
+            })
+        if errors:
+            QMessageBox.warning(
+                self, "Block Status Package",
+                "Fix the selection first:\n\n" + "\n".join(errors[:20]))
+            return
+        if not pairs or not fe_tasks or not be_tasks:
+            QMessageBox.information(
+                self, "Block Status Package",
+                "No valid FE/BE pairs found.")
+            return
+        dlg = StatusPackageDialog(
+            "Block Status Package", pairs, fe_tasks, be_tasks,
+            self.is_dark_mode, self)
         dlg.exec_()
 
     def export_csv(self):
