@@ -2926,9 +2926,15 @@ class BlockSummaryDialog(QDialog):
             self._active_worker = w
             owner = self.parent()
             if owner is not None and hasattr(owner, "_workers"):
-                owner._workers.start("summary", w)
+                owner._workers.start("fe_summary", w)
             else:
-                w.start()
+                self._active_worker = None
+                self.gen_btn.setEnabled(True)
+                self.prog.setVisible(False)
+                QMessageBox.warning(
+                    self, "FE Block Summary",
+                    "FE Block Summary must be opened from the dashboard so its worker can be tracked safely.")
+                return
         except Exception as e:
             self.status_lbl.setText("Metric extraction failed: " + str(e))
             self.prog.setVisible(False)
@@ -3018,7 +3024,7 @@ class BlockSummaryDialog(QDialog):
             if w and w.isRunning():
                 if hasattr(w, "cancel"):
                     w.cancel()
-                w.wait(1000)
+                w.wait(3000)
                 if w.isRunning():
                     self.status_lbl.setText(
                         "Stopping metric extraction... please close again in a moment.")
@@ -3369,7 +3375,7 @@ class BlockSummaryDialog(QDialog):
                     if self.tbl.horizontalHeaderItem(c) else ""
                     for c in range(self.tbl.columnCount())]
                 w.writerow(hdrs)
-                for r in range(self.tbl.rowCount()):
+                for r in _table_visible_rows(self.tbl):
                     row = [
                         self.tbl.item(r, c).text()
                         if self.tbl.item(r, c) else ""
@@ -3378,6 +3384,87 @@ class BlockSummaryDialog(QDialog):
             QMessageBox.information(self, "Export", "Saved:\n" + path)
         except Exception as e:
             QMessageBox.warning(self, "Export Error", str(e))
+
+
+def _table_visible_rows(tbl):
+    return [r for r in range(tbl.rowCount()) if not tbl.isRowHidden(r)]
+
+
+def _table_text(tbl, row, col):
+    item = tbl.item(row, col)
+    return item.text() if item else ""
+
+
+def _clear_table_spans(tbl):
+    try:
+        for r in range(tbl.rowCount()):
+            for c in range(tbl.columnCount()):
+                tbl.setSpan(r, c, 1, 1)
+    except Exception:
+        pass
+
+
+def _rowspan_groups(tbl, merge_cols):
+    rows = _table_visible_rows(tbl)
+    spans = {}
+    skip = set()
+    for col in merge_cols or []:
+        i = 0
+        while i < len(rows):
+            start = rows[i]
+            key = tuple(_table_text(tbl, start, c) for c in range(col + 1))
+            j = i + 1
+            while j < len(rows):
+                row = rows[j]
+                row_key = tuple(_table_text(tbl, row, c) for c in range(col + 1))
+                if row_key != key:
+                    break
+                j += 1
+            span = j - i
+            if span > 1 and key and key[-1] not in ("", "-"):
+                spans[(start, col)] = span
+                for k in range(i + 1, j):
+                    skip.add((rows[k], col))
+            i = j
+    return spans, skip
+
+
+def _apply_common_table_spans(tbl, merge_cols=(0, 1)):
+    _clear_table_spans(tbl)
+    spans, _skip = _rowspan_groups(tbl, merge_cols)
+    try:
+        for (row, col), span in spans.items():
+            tbl.setSpan(row, col, span, 1)
+    except Exception:
+        pass
+
+
+def _table_to_html(tbl, title=None, merge_cols=None):
+    headers = [tbl.horizontalHeaderItem(c).text()
+               for c in range(tbl.columnCount())]
+    spans, skip = _rowspan_groups(tbl, merge_cols or [])
+    out = []
+    if title:
+        out.append("<h3>{}</h3>".format(html.escape(str(title))))
+    out.extend([
+        "<table border='1' cellpadding='4' cellspacing='0' "
+        "style='border-collapse:collapse;font-family:Arial,monospace;font-size:12px;'>",
+        "<tr>" + "".join(
+            "<th style='background:#1976d2;color:white;'>{}</th>".format(
+                html.escape(h)) for h in headers) + "</tr>",
+    ])
+    for r in _table_visible_rows(tbl):
+        cells = []
+        for c in range(tbl.columnCount()):
+            if (r, c) in skip:
+                continue
+            val = html.escape(_table_text(tbl, r, c))
+            span = spans.get((r, c), 1)
+            rs = " rowspan='{}'".format(span) if span > 1 else ""
+            cells.append("<td{} style='vertical-align:middle;'>{}</td>".format(rs, val))
+        out.append("<tr>" + "".join(cells) + "</tr>")
+    out.append("</table>")
+    return "\n".join(out)
 
 
 class BEStageSummaryDialog(QDialog):
@@ -3398,6 +3485,7 @@ class BEStageSummaryDialog(QDialog):
             self.windowFlags()
             | Qt.WindowMaximizeButtonHint
             | Qt.WindowMinimizeButtonHint)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setSizeGripEnabled(True)
         self.resize(1500, 650)
         self._tasks = list(tasks or [])
@@ -3445,6 +3533,12 @@ class BEStageSummaryDialog(QDialog):
         self.prog.setValue(0)
         self.prog.setVisible(False)
         btn_row.addWidget(self.prog, 1)
+        hide_btn = QPushButton("Hide Selected Row(s)")
+        hide_btn.clicked.connect(self._hide_selected_rows)
+        btn_row.addWidget(hide_btn)
+        show_btn = QPushButton("Show Hidden Rows")
+        show_btn.clicked.connect(self._show_hidden_rows)
+        btn_row.addWidget(show_btn)
         export_btn = QPushButton("Export CSV")
         export_btn.clicked.connect(self._export_csv)
         btn_row.addWidget(export_btn)
@@ -3515,11 +3609,9 @@ class BEStageSummaryDialog(QDialog):
             if hasattr(self._worker, "progress"):
                 self._worker.progress.connect(self._on_batch_progress)
             self._worker.finished.connect(self._on_metrics_done)
-            self._worker.finished.connect(
-                lambda *_: setattr(self, "_worker", None))
             owner = self.parent()
             if owner is not None and hasattr(owner, "_workers"):
-                owner._workers.start("summary", self._worker)
+                owner._workers.start("be_summary", self._worker)
             else:
                 self._worker = None
                 self.gen_btn.setEnabled(True)
@@ -3542,6 +3634,7 @@ class BEStageSummaryDialog(QDialog):
 
     def _on_metrics_done(self, rows):
         if self._cancelled:
+            self._worker = None
             return
         self.tbl.setSortingEnabled(False)
         self.tbl.setRowCount(0)
@@ -3551,11 +3644,13 @@ class BEStageSummaryDialog(QDialog):
         self.tbl.setHorizontalHeaderLabels(headers)
         for row in rows:
             self._add_row(row, row.get("metrics", {}))
-        self.tbl.setSortingEnabled(True)
+        self.tbl.setSortingEnabled(False)
+        _apply_common_table_spans(self.tbl, (0, 1))
         self.prog.setValue(len(rows))
         self.prog.setVisible(False)
         self.gen_btn.setEnabled(True)
         self.status_lbl.setText("Done. {} row(s) loaded.".format(self.tbl.rowCount()))
+        self._worker = None
 
     def closeEvent(self, event):
         if self._stop_active_worker():
@@ -3578,14 +3673,31 @@ class BEStageSummaryDialog(QDialog):
             if w and w.isRunning():
                 if hasattr(w, "cancel"):
                     w.cancel()
-                w.wait(1000)
+                w.wait(3000)
                 if w.isRunning():
                     self.status_lbl.setText(
                         "Stopping metric extraction... please close again in a moment.")
                     return False
         except Exception:
             return True
+        if w and not w.isRunning():
+            self._worker = None
         return True
+
+    def _hide_selected_rows(self):
+        rows = sorted(set(i.row() for i in self.tbl.selectionModel().selectedRows()))
+        if not rows:
+            return
+        _clear_table_spans(self.tbl)
+        for r in rows:
+            self.tbl.setRowHidden(r, True)
+        _apply_common_table_spans(self.tbl, (0, 1))
+
+    def _show_hidden_rows(self):
+        _clear_table_spans(self.tbl)
+        for r in range(self.tbl.rowCount()):
+            self.tbl.setRowHidden(r, False)
+        _apply_common_table_spans(self.tbl, (0, 1))
 
     def _add_row(self, task, metrics):
         values = [
@@ -3627,22 +3739,7 @@ class BEStageSummaryDialog(QDialog):
             self.tbl.setItem(r, c, item)
 
     def _html_table(self):
-        nc = self.tbl.columnCount()
-        headers = [self.tbl.horizontalHeaderItem(c).text() for c in range(nc)]
-        html_lines = [
-            "<table border='1' cellpadding='4' cellspacing='0' "
-            "style='border-collapse:collapse;font-family:Arial,monospace;font-size:12px;'>",
-            "<tr>" + "".join(
-                "<th style='background:#1976d2;color:white;'>{}</th>".format(
-                    html.escape(h)) for h in headers) + "</tr>"
-        ]
-        for r in range(self.tbl.rowCount()):
-            html_lines.append("<tr>" + "".join(
-                "<td>{}</td>".format(html.escape(
-                    self.tbl.item(r, c).text() if self.tbl.item(r, c) else ""))
-                for c in range(nc)) + "</tr>")
-        html_lines.append("</table>")
-        return "\n".join(html_lines)
+        return _table_to_html(self.tbl, merge_cols=(0, 1))
 
     # -- Mail -------------------------------------------------------------
 
@@ -3699,6 +3796,7 @@ class StatusPackageDialog(QDialog):
         self.setWindowTitle(title)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMaximizeButtonHint |
                             Qt.WindowMinimizeButtonHint)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
         self.setSizeGripEnabled(True)
         self.resize(1500, 760)
         self.pairs = list(pairs or [])
@@ -3749,6 +3847,10 @@ class StatusPackageDialog(QDialog):
         fe_csv.clicked.connect(lambda: self._export_csv(self.fe_tbl, "fe_status_summary.csv"))
         be_csv = QPushButton("Export BE CSV")
         be_csv.clicked.connect(lambda: self._export_csv(self.be_tbl, "be_status_summary.csv"))
+        hide_btn = QPushButton("Hide Selected Row(s)")
+        hide_btn.clicked.connect(self._hide_selected_rows)
+        show_btn = QPushButton("Show Hidden Rows")
+        show_btn.clicked.connect(self._show_hidden_rows)
         mail_btn = QPushButton("Send HTML Mail")
         mail_btn.clicked.connect(self._send_mail)
         close_btn = QPushButton("Close")
@@ -3757,6 +3859,8 @@ class StatusPackageDialog(QDialog):
         row.addWidget(self.prog, 1)
         row.addWidget(fe_csv)
         row.addWidget(be_csv)
+        row.addWidget(hide_btn)
+        row.addWidget(show_btn)
         row.addWidget(mail_btn)
         row.addWidget(close_btn)
         layout.addLayout(row)
@@ -3796,12 +3900,17 @@ class StatusPackageDialog(QDialog):
             self._worker = MetricBatchWorker(tasks)
             self._worker.progress.connect(self._on_progress)
             self._worker.finished.connect(self._on_done)
-            self._worker.finished.connect(lambda *_: setattr(self, "_worker", None))
             parent = self.parent()
             if parent is not None and hasattr(parent, "_workers"):
-                parent._workers.start("summary", self._worker)
+                parent._workers.start("status_package", self._worker)
             else:
-                self._worker.start()
+                self._worker = None
+                self.gen_btn.setEnabled(True)
+                self.prog.setVisible(False)
+                QMessageBox.warning(
+                    self, "Status Package",
+                    "Status package must be opened from the dashboard so its worker can be tracked safely.")
+                return
         except Exception as e:
             self.gen_btn.setEnabled(True)
             self.prog.setVisible(False)
@@ -3817,6 +3926,7 @@ class StatusPackageDialog(QDialog):
 
     def _on_done(self, rows):
         if self._cancelled:
+            self._worker = None
             return
         self.fe_tbl.setSortingEnabled(False)
         self.be_tbl.setSortingEnabled(False)
@@ -3828,7 +3938,8 @@ class StatusPackageDialog(QDialog):
             else:
                 self._add_be_row(row)
         self.fe_tbl.setSortingEnabled(True)
-        self.be_tbl.setSortingEnabled(True)
+        self.be_tbl.setSortingEnabled(False)
+        _apply_common_table_spans(self.be_tbl, (0, 1))
         self.fe_tbl.resizeColumnsToContents()
         self.be_tbl.resizeColumnsToContents()
         self.prog.setValue(len(rows))
@@ -3837,6 +3948,7 @@ class StatusPackageDialog(QDialog):
         self.status_lbl.setText(
             "Done. FE rows: {}, BE rows: {}.".format(
                 self.fe_tbl.rowCount(), self.be_tbl.rowCount()))
+        self._worker = None
 
     def _v(self, metrics, area, *keys):
         for src in (area, metrics):
@@ -3937,24 +4049,33 @@ class StatusPackageDialog(QDialog):
         ]
         self._add_values(self.be_tbl, values)
 
-    def _table_html(self, tbl, title):
-        headers = [tbl.horizontalHeaderItem(c).text()
-                   for c in range(tbl.columnCount())]
-        out = [
-            "<h3>{}</h3>".format(html.escape(title)),
-            "<table border='1' cellpadding='4' cellspacing='0' "
-            "style='border-collapse:collapse;font-family:Arial,monospace;font-size:12px;'>",
-            "<tr>" + "".join(
-                "<th style='background:#1976d2;color:white;'>{}</th>".format(
-                    html.escape(h)) for h in headers) + "</tr>",
-        ]
+    def _current_summary_table(self):
+        return self.fe_tbl if self.tabs.currentWidget() is self.fe_tbl else self.be_tbl
+
+    def _hide_selected_rows(self):
+        tbl = self._current_summary_table()
+        rows = sorted(set(i.row() for i in tbl.selectionModel().selectedRows()))
+        if not rows:
+            return
+        if tbl is self.be_tbl:
+            _clear_table_spans(tbl)
+        for r in rows:
+            tbl.setRowHidden(r, True)
+        if tbl is self.be_tbl:
+            _apply_common_table_spans(tbl, (0, 1))
+
+    def _show_hidden_rows(self):
+        tbl = self._current_summary_table()
+        if tbl is self.be_tbl:
+            _clear_table_spans(tbl)
         for r in range(tbl.rowCount()):
-            out.append("<tr>" + "".join(
-                "<td>{}</td>".format(html.escape(
-                    tbl.item(r, c).text() if tbl.item(r, c) else ""))
-                for c in range(tbl.columnCount())) + "</tr>")
-        out.append("</table>")
-        return "\n".join(out)
+            tbl.setRowHidden(r, False)
+        if tbl is self.be_tbl:
+            _apply_common_table_spans(tbl, (0, 1))
+
+    def _table_html(self, tbl, title):
+        merge_cols = (0, 1) if tbl is self.be_tbl else None
+        return _table_to_html(tbl, title=title, merge_cols=merge_cols)
 
     def _send_mail(self):
         if self.fe_tbl.rowCount() == 0 and self.be_tbl.rowCount() == 0:
@@ -3984,7 +4105,7 @@ class StatusPackageDialog(QDialog):
                 w = csv.writer(f)
                 w.writerow([tbl.horizontalHeaderItem(c).text()
                             for c in range(tbl.columnCount())])
-                for r in range(tbl.rowCount()):
+                for r in _table_visible_rows(tbl):
                     w.writerow([tbl.item(r, c).text() if tbl.item(r, c) else ""
                                 for c in range(tbl.columnCount())])
             QMessageBox.information(self, "Export", "Saved: " + path)
@@ -4012,13 +4133,15 @@ class StatusPackageDialog(QDialog):
             if w and w.isRunning():
                 if hasattr(w, "cancel"):
                     w.cancel()
-                w.wait(1000)
+                w.wait(3000)
                 if w.isRunning():
                     self.status_lbl.setText(
                         "Stopping metric extraction... please close again in a moment.")
                     return False
         except Exception:
             return True
+        if w and not w.isRunning():
+            self._worker = None
         return True
 
 
@@ -4264,10 +4387,25 @@ class PDDashboard(QMainWindow):
             return worker
 
         def _finished(self, group, worker, attr_name=None, list_name=None):
+            # Many workers use a custom finished signal emitted from run().
+            # Keep the strong reference until Qt says the native thread stopped.
+            if self._is_running(worker):
+                try:
+                    QTimer.singleShot(
+                        100,
+                        lambda w=worker, g=group, a=attr_name, l=list_name:
+                        self._finished(g, w, a, l))
+                except Exception:
+                    pass
+                return
             try:
                 arr = self.groups.get(group, [])
                 if worker in arr:
                     arr.remove(worker)
+                for _g in list(self.groups.keys()):
+                    arr2 = self.groups.get(_g, [])
+                    if worker in arr2:
+                        arr2.remove(worker)
             except Exception:
                 pass
             if attr_name:
@@ -4294,15 +4432,20 @@ class PDDashboard(QMainWindow):
             if not worker:
                 return True
             if not self._is_running(worker):
+                self._finished("manual", worker)
                 return True
             self._cancel(worker)
             try:
                 worker.wait(timeout_ms)
             except RuntimeError:
+                self._finished("manual", worker)
                 return True
             except Exception:
                 pass
-            return not self._is_running(worker)
+            stopped = not self._is_running(worker)
+            if stopped:
+                self._finished("manual", worker)
+            return stopped
 
         def stop_attr(self, attr_name, timeout_ms=3000):
             worker = getattr(self.owner, attr_name, None)
@@ -4357,6 +4500,7 @@ class PDDashboard(QMainWindow):
         self.global_notes = load_all_notes()
         self.personal_notes = load_personal_notes()
         self.user_pins    = load_user_pins()
+        self.status_package_blocks = set()
         self._fp_ver_cache = {}
         self._cong_img_cache = {}
         self._cong_image_cache = {}
@@ -9556,8 +9700,16 @@ class PDDashboard(QMainWindow):
                 pass
 
     def _start_branch_status_worker(self, be_item, be_run):
-        if not be_run or be_run.get("_branch_status_loading"):
+        if not be_run:
             return
+        if be_run.get("_branch_status_loading"):
+            w = getattr(self, "_branch_status_worker", None)
+            try:
+                if w is not None and w.isRunning():
+                    return
+            except Exception:
+                pass
+            be_run["_branch_status_loading"] = False
         try:
             from workers import BranchStatusWorker
             be_run["_branch_status_loading"] = True
@@ -9573,8 +9725,13 @@ class PDDashboard(QMainWindow):
     def _refresh_open_branch_status_dialog(self, be_path, be_item):
         dlg = getattr(self, "_branch_status_dialog", None)
         try:
-            if dlg is not None and dlg.isVisible() and getattr(dlg, "_be_path", "") == be_path:
-                dlg.refresh_from_item(be_item)
+            if dlg is not None and dlg.isVisible():
+                try:
+                    same = os.path.normpath(getattr(dlg, "_be_path", "") or "") == os.path.normpath(be_path or "")
+                except Exception:
+                    same = getattr(dlg, "_be_path", "") == be_path
+                if same:
+                    dlg.refresh_from_item(be_item)
         except RuntimeError:
             self._branch_status_dialog = None
         except Exception:
@@ -9584,15 +9741,24 @@ class PDDashboard(QMainWindow):
         try:
             be_item = self._signoff_items_by_path.get(be_path)
             if be_item is None:
+                be_item = self._find_item_by_path(be_path, run_name)
+            if be_item is None:
                 return
             be_run = (be_item.data(0, Qt.UserRole + 10) or
                       be_item.data(0, Qt.UserRole + 11))
-            if not be_run or be_run.get("path") != be_path:
+            cur_path = be_run.get("path") if be_run else ""
+            try:
+                same_path = os.path.normpath(cur_path or "") == os.path.normpath(be_path or "")
+            except Exception:
+                same_path = (cur_path == be_path)
+            if not be_run or not same_path:
                 return
             be_run["_branch_status_loading"] = False
             if run_name and be_run.get("r_name") != run_name and be_item.text(0) != run_name:
+                self._refresh_open_branch_status_dialog(be_path, be_item)
                 return
             if not enriched_stages:
+                self._refresh_open_branch_status_dialog(be_path, be_item)
                 return
             current_by_name = {}
             for st in be_run.get("stages", []):
@@ -10297,9 +10463,30 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def on_context_menu(self, pos):
         item = self.tree.itemAt(pos)
-        if not item or not item.parent():
+        if not item:
             return
         self.tree.setCurrentItem(item)
+        if item.data(0, Qt.UserRole) == "BLOCK":
+            m = QMenu()
+            block_name = item.text(0)
+            if block_name in self.status_package_blocks:
+                mark_act = m.addAction("Unmark Block for Status Package")
+            else:
+                mark_act = m.addAction("Mark Block for Status Package")
+            res = m.exec_(self.tree.viewport().mapToGlobal(pos))
+            if res == mark_act:
+                if block_name in self.status_package_blocks:
+                    self.status_package_blocks.remove(block_name)
+                    item.setIcon(0, QIcon())
+                else:
+                    self.status_package_blocks.add(block_name)
+                    item.setIcon(0, self._create_dot_icon("#1565c0", "#0d47a1"))
+                self.status_bar.showMessage(
+                    "Status package marked blocks: {}".format(
+                        len(self.status_package_blocks)), 3000)
+            return
+        if not item.parent():
+            return
         m = QMenu()
 
         run_path  = item.text(15)
@@ -10826,10 +11013,13 @@ class PDDashboard(QMainWindow):
             for i in range(node.childCount()):
                 child = node.child(i)
                 run = child.data(0, Qt.UserRole + 10) or {}
+                block = run.get("block") or child.data(0, Qt.UserRole + 2) or ""
                 if (run.get("run_type") == "FE"
                         and child.checkState(0) == Qt.Checked
                         and child.text(15)
-                        and child.text(15) != "N/A"):
+                        and child.text(15) != "N/A"
+                        and (not self.status_package_blocks
+                             or block in self.status_package_blocks)):
                     items.append(child)
                 collect(child)
         collect(self.tree.invisibleRootItem())
@@ -10853,7 +11043,7 @@ class PDDashboard(QMainWindow):
         if not fe_items:
             QMessageBox.information(
                 self, "Block Status Package",
-                "Check FE runs first. Under each checked FE, check exactly one BE child run.")
+                "Check FE runs first. Under each checked FE, check exactly one BE child run. If blocks are marked, only marked blocks are used.")
             return
         errors = []
         pairs = []

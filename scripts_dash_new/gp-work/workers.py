@@ -559,7 +559,7 @@ def _parse_stage_start_sort_value(info):
 
 def _parse_fc_stage_marker(log_path, fallback_stage):
     marker = ""
-    if not log_path or not cached_exists(log_path):
+    if not log_path or not os.path.exists(log_path):
         return marker
     try:
         with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -576,7 +576,7 @@ def _parse_fc_stage_marker(log_path, fallback_stage):
 
 def _parse_innovus_stage_marker(log_path, fallback_stage):
     marker = ""
-    if not log_path or not cached_exists(log_path):
+    if not log_path or not os.path.exists(log_path):
         return marker
     pat = re.compile(
         r"^\s*(?:@file\s+\d+\s*:\s*)?sec_StartTimer\s+([A-Za-z0-9_./-]+)\b")
@@ -593,6 +593,52 @@ def _parse_innovus_stage_marker(log_path, fallback_stage):
         marker = ""
     return marker
 
+
+def _unique_existing_order(values):
+    out = []
+    seen = set()
+    for val in values or []:
+        if not val:
+            continue
+        key = os.path.normpath(val)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(val)
+    return out
+
+
+def _stage_runtime_candidates(run_path, stage):
+    stage = stage or {}
+    step = stage.get("name", "")
+    stage_path = stage.get("stage_path", "")
+    vals = []
+    vals.extend(stage.get("_rpt_cands", []) or [])
+    if stage.get("rpt"):
+        vals.append(stage.get("rpt"))
+    if run_path and step:
+        vals.append(os.path.join(run_path, "reports", step, "%s.runtime.rpt" % step))
+        vals.append(os.path.join(run_path, "reports", "%s.runtime.rpt" % step))
+        vals.append(os.path.join(run_path, step, "reports", step, "%s.runtime.rpt" % step))
+        vals.append(os.path.join(run_path, step, "reports", "%s.runtime.rpt" % step))
+        vals.append(os.path.join(run_path, step, "%s.runtime.rpt" % step))
+    if stage_path and step:
+        vals.append(os.path.join(stage_path, "reports", step, "%s.runtime.rpt" % step))
+        vals.append(os.path.join(stage_path, "reports", "%s.runtime.rpt" % step))
+        vals.append(os.path.join(stage_path, "%s.runtime.rpt" % step))
+    return _unique_existing_order(vals)
+
+
+def _stage_pass_candidates(run_path, stage):
+    stage = stage or {}
+    step = stage.get("name", "")
+    vals = []
+    if stage.get("pass_path"):
+        vals.append(stage.get("pass_path"))
+    if run_path and step:
+        vals.append(os.path.join(run_path, "pass", "%s.pass" % step))
+    return _unique_existing_order(vals)
+
 def resolve_pnr_stage_status(stage, be_run):
     stage = dict(stage or {})
     be_run = be_run or {}
@@ -605,13 +651,17 @@ def resolve_pnr_stage_status(stage, be_run):
     if source == "OUTFEED":
         return "COMPLETED", "COMPLETED", pass_path
 
+    pass_candidates = list(stage.get("_pass_candidates", []) or [])
+    if pass_path:
+        pass_candidates.insert(0, pass_path)
+    for cand in _unique_existing_order(pass_candidates):
+        if os.path.exists(cand):
+            return "COMPLETED", "COMPLETED", cand
+
     marker = (_parse_innovus_stage_marker(log_path, step_name)
               if is_innovus else _parse_fc_stage_marker(log_path, step_name))
     active_stage = marker or step_name
-    pass_exists = bool(pass_path and cached_exists(pass_path))
-    if pass_exists:
-        return "COMPLETED", "COMPLETED", pass_path
-    if marker and cached_exists(log_path):
+    if marker and log_path and os.path.exists(log_path):
         return "RUNNING", marker, pass_path
     return "NOT STARTED", active_stage, pass_path
 
@@ -1741,38 +1791,48 @@ class BranchStatusWorker(QThread):
 
     def run(self):
         stages = []
-        for s in self.be_run.get("stages", []):
-            if self._cancelled or self.isInterruptionRequested():
-                self.finished.emit(self.be_path, self.run_name, [])
-                return
-            s2 = dict(s)
-            rpt_file = s2.get("rpt", "")
-            rpt_candidates = list(s2.get("_rpt_cands", [rpt_file]) or [])
-            s2["_runtime_candidates"] = rpt_candidates
-            s2["_runtime_rpt_path"] = ""
-            for cand in rpt_candidates:
+        try:
+            for s in self.be_run.get("stages", []):
                 if self._cancelled or self.isInterruptionRequested():
                     self.finished.emit(self.be_path, self.run_name, [])
                     return
-                if cand and cached_exists(cand):
-                    rpt_file = cand
-                    s2["_runtime_rpt_path"] = cand
-                    break
-            if rpt_file:
-                s2["info"] = parse_pnr_runtime_rpt(rpt_file)
-            stage_status, active_stage, pass_path = resolve_pnr_stage_status(
-                s2, self.be_run)
-            s2["stage_status"] = stage_status
-            s2["active_stage"] = active_stage
-            s2["pass_path"] = pass_path
-            s2["_branch_status_loaded"] = True
-            stages.append(s2)
-
-        stages.sort(key=lambda st: (
-            0 if _parse_stage_start_sort_value(st.get("info", {})) else 1,
-            _parse_stage_start_sort_value(st.get("info", {})) or (9999, 12, 31, 23, 59),
-            st.get("_stage_index", 9999),
-            st.get("name", "")))
+                s2 = dict(s)
+                rpt_candidates = _stage_runtime_candidates(self.be_path, s2)
+                s2["_runtime_candidates"] = rpt_candidates
+                s2["_runtime_rpt_path"] = ""
+                rpt_file = ""
+                for cand in rpt_candidates:
+                    if self._cancelled or self.isInterruptionRequested():
+                        self.finished.emit(self.be_path, self.run_name, [])
+                        return
+                    if cand and os.path.exists(cand):
+                        rpt_file = cand
+                        s2["_runtime_rpt_path"] = cand
+                        break
+                if rpt_file:
+                    s2["info"] = parse_pnr_runtime_rpt(rpt_file)
+                else:
+                    s2["info"] = s2.get("info", {"start": "-", "end": "-", "runtime": "-", "last_stage": "-"})
+                pass_candidates = _stage_pass_candidates(self.be_path, s2)
+                s2["_pass_candidates"] = pass_candidates
+                if pass_candidates and not s2.get("pass_path"):
+                    s2["pass_path"] = pass_candidates[0]
+                stage_status, active_stage, pass_path = resolve_pnr_stage_status(
+                    s2, self.be_run)
+                s2["stage_status"] = stage_status
+                s2["active_stage"] = active_stage
+                s2["pass_path"] = pass_path
+                s2["_branch_status_loaded"] = True
+                stages.append(s2)
+            stages.sort(key=lambda st: (
+                0 if _parse_stage_start_sort_value(st.get("info", {})) else 1,
+                _parse_stage_start_sort_value(st.get("info", {})) or (9999, 12, 31, 23, 59),
+                st.get("_stage_index", 9999),
+                st.get("name", "")))
+        except Exception:
+            # Emit whatever was resolved so far; the UI can keep existing rows
+            # for unresolved stages instead of staying stuck at CHECKING forever.
+            pass
         self.finished.emit(self.be_path, self.run_name, stages)
 
 
@@ -2019,6 +2079,23 @@ class QoRWorker(QThread):
             # If not absolute, make it relative to script_dir
             if html_path and not os.path.isabs(html_path):
                 html_path = os.path.join(script_dir, html_path)
+            if not html_path or not os.path.exists(html_path):
+                candidates = [
+                    os.path.join(script_dir, "qor_report.html"),
+                    os.path.join(script_dir, "qor_metrices", "qor_report.html"),
+                ]
+                try:
+                    candidates.extend(glob.glob(os.path.join(
+                        script_dir, "qor_metrices", "**", "qor_report.html"),
+                        recursive=True))
+                    candidates.extend(glob.glob(os.path.join(
+                        script_dir, "qor_metrices", "**", "*.html"),
+                        recursive=True))
+                except Exception:
+                    pass
+                hits = [p for p in candidates if p and os.path.exists(p)]
+                if hits:
+                    html_path = max(hits, key=os.path.getmtime)
             self.finished.emit(html_path if (html_path and os.path.exists(html_path)) else "")
         except Exception as e:
             self.finished.emit("")
