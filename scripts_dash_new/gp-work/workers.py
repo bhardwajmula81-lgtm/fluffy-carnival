@@ -504,13 +504,11 @@ def parse_runtime_rpt(file_path):
         pass
     return d
 
-def parse_pnr_runtime_rpt(file_path):
+def _parse_pnr_runtime_rpt_body(file_path):
     d = {"start": "-", "end": "-",
          "runtime": "-", "last_stage": "-"}
-    if not file_path or not cached_exists(file_path):
-        return d
-    months = ["Jan","Feb","Mar","Apr","May","Jun",
-              "Jul","Aug","Sep","Oct","Nov","Dec"]
+    months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     try:
         first_ts = last_ts = final_time_str = None
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
@@ -528,21 +526,34 @@ def parse_pnr_runtime_rpt(file_path):
                         first_ts = ts
                     t = tm[1] if len(tm) > 1 else tm[0]
                     d2, h2, mn, sc = map(int, t)
-                    final_time_str = (f"{d2*24+h2:02}h:"
-                                      f"{mn:02}m:{sc:02}s")
+                    final_time_str = ("%02dh:%02dm:%02ds" %
+                                      (d2 * 24 + h2, mn, sc))
         if first_ts:
             y, mo, dy, H, M = first_ts.groups()
-            d["start"] = (f"{months[int(mo)-1]} {int(dy):02d}, "
-                           f"{y} - {H}:{M}")
+            d["start"] = ("%s %02d, %s - %s:%s" %
+                           (months[int(mo) - 1], int(dy), y, H, M))
         if last_ts:
             y, mo, dy, H, M = last_ts.groups()
-            d["end"] = (f"{months[int(mo)-1]} {int(dy):02d}, "
-                         f"{y} - {H}:{M}")
+            d["end"] = ("%s %02d, %s - %s:%s" %
+                         (months[int(mo) - 1], int(dy), y, H, M))
         if final_time_str:
             d["runtime"] = final_time_str
     except Exception:
         pass
     return d
+
+
+def parse_pnr_runtime_rpt(file_path):
+    if not file_path or not cached_exists(file_path):
+        return {"start": "-", "end": "-", "runtime": "-", "last_stage": "-"}
+    return _parse_pnr_runtime_rpt_body(file_path)
+
+
+def parse_pnr_runtime_rpt_uncached(file_path):
+    """Branch Status uses fresh filesystem checks to avoid stale cache reads."""
+    if not file_path or not os.path.exists(file_path):
+        return {"start": "-", "end": "-", "runtime": "-", "last_stage": "-"}
+    return _parse_pnr_runtime_rpt_body(file_path)
 
 def _parse_stage_start_sort_value(info):
     txt = str((info or {}).get("start", "") or "")
@@ -1711,7 +1722,7 @@ class StageDetailWorker(QThread):
                 if cached_exists(cand):
                     rpt_file = cand
                     break
-            s2["info"] = parse_pnr_runtime_rpt(rpt_file)
+            s2["info"] = parse_pnr_runtime_rpt_uncached(rpt_file)
             stage_status, active_stage, pass_path = resolve_pnr_stage_status(
                 s2, self.be_run)
             s2["stage_status"] = stage_status
@@ -1810,7 +1821,7 @@ class BranchStatusWorker(QThread):
                         s2["_runtime_rpt_path"] = cand
                         break
                 if rpt_file:
-                    s2["info"] = parse_pnr_runtime_rpt(rpt_file)
+                    s2["info"] = parse_pnr_runtime_rpt_uncached(rpt_file)
                 else:
                     s2["info"] = s2.get("info", {"start": "-", "end": "-", "runtime": "-", "last_stage": "-"})
                 pass_candidates = _stage_pass_candidates(self.be_path, s2)

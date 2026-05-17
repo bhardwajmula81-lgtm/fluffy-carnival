@@ -4259,12 +4259,29 @@ class BranchStatusDialog(QDialog):
             self.flow_l.addWidget(QLabel("->"))
 
         stages = list(be_run.get("stages", []))
+        try:
+            cache_key = os.path.normpath(self._be_path or "")
+        except Exception:
+            cache_key = self._be_path or ""
+        cached_stages = list(getattr(self.dashboard, "_branch_status_cache", {}).get(cache_key, []) or [])
+        unresolved = False
+        for st in stages:
+            s_txt = str(st.get("stage_status", "") or "").upper()
+            if s_txt in ("", "-", "PENDING", "CHECKING"):
+                unresolved = True
+                break
+        if cached_stages and (not stages or unresolved):
+            stages = cached_stages
         stages.sort(key=lambda st: st.get("_stage_order", st.get("_stage_index", 9999)))
         self.table.setRowCount(len(stages))
         for idx, st in enumerate(stages):
             name = st.get("name", "-")
-            status = st.get("stage_status", "CHECKING")
-            active = st.get("active_stage", name)
+            status = str(st.get("stage_status", "CHECKING") or "CHECKING").upper()
+            if status in ("", "-", "PENDING"):
+                status = "CHECKING"
+            active = st.get("active_stage", name) or name
+            if status == "COMPLETED":
+                active = "COMPLETED"
             info = st.get("info", {}) or {}
             runtime = info.get("runtime", "-")
             btn = QPushButton("{}\nStatus: {}\nStage: {}\nRuntime: {}".format(
@@ -4500,7 +4517,10 @@ class PDDashboard(QMainWindow):
         self.global_notes = load_all_notes()
         self.personal_notes = load_personal_notes()
         self.user_pins    = load_user_pins()
-        self.status_package_blocks = set()
+        saved_status_blocks = prefs.get('STATUS_PACKAGE', 'marked_blocks', fallback='')
+        self.status_package_blocks = set(
+            b.strip() for b in saved_status_blocks.split(',') if b.strip())
+        self._branch_status_cache = {}
         self._fp_ver_cache = {}
         self._cong_img_cache = {}
         self._cong_image_cache = {}
@@ -9555,6 +9575,9 @@ class PDDashboard(QMainWindow):
         p.setText(0, text)
         p.setData(0, Qt.UserRole, node_type)
         p.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        if node_type == "BLOCK" and text in getattr(self, "status_package_blocks", set()):
+            p.setIcon(0, self._create_dot_icon("#1565c0", "#0d47a1"))
+            p.setToolTip(0, "%s (marked for Status Package)" % text)
         if node_type == "MILESTONE":
             p.setForeground(0, self._colors["milestone"])
             f = p.font(0); f.setBold(True); p.setFont(0, f)
@@ -9699,6 +9722,51 @@ class PDDashboard(QMainWindow):
             except Exception:
                 pass
 
+    def _save_status_package_blocks(self):
+        try:
+            if not prefs.has_section('STATUS_PACKAGE'):
+                prefs.add_section('STATUS_PACKAGE')
+            prefs.set('STATUS_PACKAGE', 'marked_blocks',
+                      ','.join(sorted(self.status_package_blocks)))
+            _write_config_atomic(prefs, USER_PREFS_FILE)
+        except Exception:
+            pass
+
+    def _stage_dicts_from_child_rows(self, be_item, be_run):
+        out = []
+        if be_item is None or be_run is None:
+            return out
+        run_path = be_run.get("path", "") or be_item.text(15)
+        is_innovus = "innovus" in (run_path or "").lower()
+        source = be_run.get("source", be_item.text(2) or "WS")
+        for i in range(be_item.childCount()):
+            ch = be_item.child(i)
+            if ch.data(0, Qt.UserRole) != "STAGE":
+                continue
+            name = ch.text(0)
+            if not name:
+                continue
+            info = {"start": ch.data(0, Qt.UserRole + 40) or ch.text(13) or "-",
+                    "end": ch.data(0, Qt.UserRole + 41) or ch.text(14) or "-",
+                    "runtime": ch.text(12) or "-",
+                    "last_stage": ch.text(4) or "-"}
+            stage_path = ch.text(15) or ""
+            log_path = ch.text(16) or ""
+            if (not log_path) or log_path == "N/A":
+                log_path = os.path.join(run_path, "logs", "%s.log" % name)
+            out.append({"name": name,
+                        "info": info,
+                        "stage_path": stage_path,
+                        "log": log_path,
+                        "stage_status": ch.text(3) or "CHECKING",
+                        "active_stage": ch.text(4) or name,
+                        "pass_path": os.path.join(run_path, "pass", "%s.pass" % name),
+                        "_stage_index": i,
+                        "_stage_order": i,
+                        "_is_innovus": is_innovus,
+                        "source": source})
+        return out
+
     def _start_branch_status_worker(self, be_item, be_run):
         if not be_run:
             return
@@ -9711,6 +9779,10 @@ class PDDashboard(QMainWindow):
                 pass
             be_run["_branch_status_loading"] = False
         try:
+            if not be_run.get("stages"):
+                fallback_stages = self._stage_dicts_from_child_rows(be_item, be_run)
+                if fallback_stages:
+                    be_run["stages"] = fallback_stages
             from workers import BranchStatusWorker
             be_run["_branch_status_loading"] = True
             w = BranchStatusWorker(be_run)
@@ -9739,19 +9811,37 @@ class PDDashboard(QMainWindow):
 
     def _on_branch_status_loaded(self, be_path, run_name, enriched_stages):
         try:
+            try:
+                cache_key = os.path.normpath(be_path or "")
+            except Exception:
+                cache_key = be_path or ""
+            self._branch_status_cache[cache_key] = list(enriched_stages or [])
+
             be_item = self._signoff_items_by_path.get(be_path)
+            if be_item is None:
+                for pth, item in list(self._signoff_items_by_path.items()):
+                    try:
+                        if os.path.normpath(pth or "") == cache_key:
+                            be_item = item
+                            break
+                    except Exception:
+                        if pth == be_path:
+                            be_item = item
+                            break
             if be_item is None:
                 be_item = self._find_item_by_path(be_path, run_name)
             if be_item is None:
+                self._refresh_open_branch_status_dialog(be_path, None)
                 return
             be_run = (be_item.data(0, Qt.UserRole + 10) or
                       be_item.data(0, Qt.UserRole + 11))
             cur_path = be_run.get("path") if be_run else ""
             try:
-                same_path = os.path.normpath(cur_path or "") == os.path.normpath(be_path or "")
+                same_path = os.path.normpath(cur_path or "") == cache_key
             except Exception:
                 same_path = (cur_path == be_path)
             if not be_run or not same_path:
+                self._refresh_open_branch_status_dialog(be_path, be_item)
                 return
             be_run["_branch_status_loading"] = False
             if run_name and be_run.get("r_name") != run_name and be_item.text(0) != run_name:
@@ -10478,9 +10568,12 @@ class PDDashboard(QMainWindow):
                 if block_name in self.status_package_blocks:
                     self.status_package_blocks.remove(block_name)
                     item.setIcon(0, QIcon())
+                    item.setToolTip(0, block_name)
                 else:
                     self.status_package_blocks.add(block_name)
                     item.setIcon(0, self._create_dot_icon("#1565c0", "#0d47a1"))
+                    item.setToolTip(0, "%s (marked for Status Package)" % block_name)
+                self._save_status_package_blocks()
                 self.status_bar.showMessage(
                     "Status package marked blocks: {}".format(
                         len(self.status_package_blocks)), 3000)
@@ -11097,6 +11190,9 @@ class PDDashboard(QMainWindow):
         dlg = StatusPackageDialog(
             "Block Status Package", pairs, fe_tasks, be_tasks,
             self.is_dark_mode, self)
+        if self.status_package_blocks:
+            marked = ", ".join(sorted(self.status_package_blocks))
+            dlg.status_lbl.setText(dlg.status_lbl.text() + "  Marked blocks: " + marked)
         dlg.exec_()
 
     def export_csv(self):
