@@ -3536,6 +3536,9 @@ class BEStageSummaryDialog(QDialog):
         hide_btn = QPushButton("Hide Selected Row(s)")
         hide_btn.clicked.connect(self._hide_selected_rows)
         btn_row.addWidget(hide_btn)
+        empty_btn = QPushButton("Hide Empty Metric Rows")
+        empty_btn.clicked.connect(self._hide_empty_metric_rows)
+        btn_row.addWidget(empty_btn)
         show_btn = QPushButton("Show Hidden Rows")
         show_btn.clicked.connect(self._show_hidden_rows)
         btn_row.addWidget(show_btn)
@@ -3691,6 +3694,19 @@ class BEStageSummaryDialog(QDialog):
         _clear_table_spans(self.tbl)
         for r in rows:
             self.tbl.setRowHidden(r, True)
+        _apply_common_table_spans(self.tbl, (0, 1))
+
+    def _hide_empty_metric_rows(self):
+        _clear_table_spans(self.tbl)
+        for r in range(self.tbl.rowCount()):
+            vals = [_table_text(self.tbl, r, c).strip() for c in range(3, self.tbl.columnCount())]
+            empty = True
+            for val in vals:
+                if val and val not in ("-", "N/A", "NA", "0/0/0"):
+                    empty = False
+                    break
+            if empty:
+                self.tbl.setRowHidden(r, True)
         _apply_common_table_spans(self.tbl, (0, 1))
 
     def _show_hidden_rows(self):
@@ -3851,6 +3867,8 @@ class StatusPackageDialog(QDialog):
         hide_btn.clicked.connect(self._hide_selected_rows)
         show_btn = QPushButton("Show Hidden Rows")
         show_btn.clicked.connect(self._show_hidden_rows)
+        empty_btn = QPushButton("Hide Empty Metric Rows")
+        empty_btn.clicked.connect(self._hide_empty_metric_rows)
         mail_btn = QPushButton("Send HTML Mail")
         mail_btn.clicked.connect(self._send_mail)
         close_btn = QPushButton("Close")
@@ -3860,6 +3878,7 @@ class StatusPackageDialog(QDialog):
         row.addWidget(fe_csv)
         row.addWidget(be_csv)
         row.addWidget(hide_btn)
+        row.addWidget(empty_btn)
         row.addWidget(show_btn)
         row.addWidget(mail_btn)
         row.addWidget(close_btn)
@@ -4061,6 +4080,24 @@ class StatusPackageDialog(QDialog):
             _clear_table_spans(tbl)
         for r in rows:
             tbl.setRowHidden(r, True)
+        if tbl is self.be_tbl:
+            _apply_common_table_spans(tbl, (0, 1))
+
+    def _hide_empty_metric_rows(self):
+        tbl = self._current_summary_table()
+        if tbl is self.be_tbl:
+            _clear_table_spans(tbl)
+        start_col = 3 if tbl is self.be_tbl else 2
+        for r in range(tbl.rowCount()):
+            vals = [_table_text(tbl, r, c).strip()
+                    for c in range(start_col, tbl.columnCount())]
+            empty = True
+            for val in vals:
+                if val and val not in ("-", "N/A", "NA", "0/0/0"):
+                    empty = False
+                    break
+            if empty:
+                tbl.setRowHidden(r, True)
         if tbl is self.be_tbl:
             _apply_common_table_spans(tbl, (0, 1))
 
@@ -4337,6 +4374,154 @@ class BranchStatusDialog(QDialog):
             self.dashboard.show_timeline_overview(self.be_item)
 
 
+class ArchiveStoreWorker(QThread):
+    finished = pyqtSignal(str, int, int, int, str)
+
+    def __init__(self, dashboard, include_images=False):
+        super().__init__()
+        self.dashboard = dashboard
+        self.include_images = bool(include_images)
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def run(self):
+        try:
+            if self._cancelled or self.isInterruptionRequested():
+                self.finished.emit("", 0, 0, 0, "cancelled")
+                return
+            fp, manifest, added = self.dashboard._update_archive_store(
+                include_images=self.include_images)
+            total = len(manifest.get("files", {})) if isinstance(manifest, dict) else 0
+            skipped = len(manifest.get("skipped", [])) if isinstance(manifest, dict) else 0
+            self.finished.emit(fp, int(added), int(total), int(skipped), "")
+        except Exception as e:
+            self.finished.emit("", 0, 0, 0, str(e))
+
+
+class LatestOutfeedStatusWorker(QThread):
+    finished = pyqtSignal(list, list, str)
+
+    def __init__(self, dashboard):
+        super().__init__(dashboard)
+        self.dashboard = dashboard
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        self.requestInterruption()
+
+    def run(self):
+        try:
+            fe_rows, be_rows = self.dashboard._latest_outfeed_rows(
+                lambda: self._cancelled or self.isInterruptionRequested())
+            if self._cancelled or self.isInterruptionRequested():
+                return
+            self.finished.emit(fe_rows, be_rows, "")
+        except Exception as e:
+            self.finished.emit([], [], str(e))
+
+
+class LatestOutfeedStatusDialog(QDialog):
+    def __init__(self, fe_rows, be_rows, is_dark, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Latest OUTFEED Status")
+        self.resize(1300, 650)
+        self.fe_rows = list(fe_rows or [])
+        self.be_rows = list(be_rows or [])
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "<b>Latest complete OUTFEED runs by block</b>"))
+        tabs = QTabWidget()
+        self.fe_tbl = self._make_table(
+            ["Block", "RTL", "FE Run", "Runtime", "End", "Path", "Missing"])
+        self.be_tbl = self._make_table(
+            ["Block", "RTL", "BE Run", "Stages", "End", "Path", "Missing"])
+        tabs.addTab(self.fe_tbl, "FE")
+        tabs.addTab(self.be_tbl, "BE")
+        layout.addWidget(tabs, 1)
+        self._fill_table(self.fe_tbl, self.fe_rows)
+        self._fill_table(self.be_tbl, self.be_rows)
+        row = QHBoxLayout()
+        export_btn = QPushButton("Export CSV")
+        export_btn.clicked.connect(self._export_csv)
+        mail_btn = QPushButton("Send HTML Mail")
+        mail_btn.clicked.connect(self._send_mail)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        row.addStretch()
+        row.addWidget(export_btn)
+        row.addWidget(mail_btn)
+        row.addWidget(close_btn)
+        layout.addLayout(row)
+
+    def _make_table(self, headers):
+        tbl = QTableWidget(0, len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.setAlternatingRowColors(True)
+        tbl.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectRows)
+        tbl.horizontalHeader().setSectionsMovable(True)
+        for c in range(len(headers)):
+            tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
+            tbl.setColumnWidth(c, 150)
+        tbl.setColumnWidth(2, 340)
+        tbl.setColumnWidth(5, 420)
+        return tbl
+
+    def _fill_table(self, tbl, rows):
+        tbl.setRowCount(0)
+        for row in rows:
+            r = tbl.rowCount()
+            tbl.insertRow(r)
+            vals = row.get("values", [])
+            missing = row.get("missing", [])
+            for c, val in enumerate(vals):
+                it = QTableWidgetItem(str(val if val is not None else "-"))
+                if c == tbl.columnCount() - 1 and missing:
+                    it.setToolTip("\n".join(missing))
+                tbl.setItem(r, c, it)
+
+    def _table_to_csv_rows(self, tbl):
+        rows = [[tbl.horizontalHeaderItem(c).text() for c in range(tbl.columnCount())]]
+        for r in range(tbl.rowCount()):
+            rows.append([_table_text(tbl, r, c) for c in range(tbl.columnCount())])
+        return rows
+
+    def _export_csv(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Latest OUTFEED Status", "latest_outfeed_status.csv",
+            "CSV Files (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["FE"])
+                w.writerows(self._table_to_csv_rows(self.fe_tbl))
+                w.writerow([])
+                w.writerow(["BE"])
+                w.writerows(self._table_to_csv_rows(self.be_tbl))
+            QMessageBox.information(self, "Export", "Exported:\n" + path)
+        except Exception as e:
+            QMessageBox.warning(self, "Export", str(e))
+
+    def _send_mail(self):
+        parent = self.parent()
+        body = (_table_to_html(self.fe_tbl, title="Latest OUTFEED FE") +
+                "<br>" +
+                _table_to_html(self.be_tbl, title="Latest OUTFEED BE"))
+        if parent and hasattr(parent, "_open_mail_compose_dialog"):
+            parent._open_mail_compose_dialog(
+                subject="Flow Pulse Latest OUTFEED Status",
+                body=body, html_body=body)
+
+
 class PDDashboard(QMainWindow):
 
     class WorkerRegistry(object):
@@ -4517,9 +4702,7 @@ class PDDashboard(QMainWindow):
         self.global_notes = load_all_notes()
         self.personal_notes = load_personal_notes()
         self.user_pins    = load_user_pins()
-        saved_status_blocks = prefs.get('STATUS_PACKAGE', 'marked_blocks', fallback='')
-        self.status_package_blocks = set(
-            b.strip() for b in saved_status_blocks.split(',') if b.strip())
+        self.status_package_marks = self._load_status_package_marks()
         self._branch_status_cache = {}
         self._fp_ver_cache = {}
         self._cong_img_cache = {}
@@ -4549,6 +4732,10 @@ class PDDashboard(QMainWindow):
         self._owner_lookup_worker = None
         self._owner_items_by_path = {}
         self._stage_metric_last_key = None
+        self._stage_index_worker = None
+        self._archive_worker = None
+        self._disk_cache = self._load_disk_cache()
+        self._disk_dialog = None
 
         # -- theme/display ------------------------------------------------
         self.is_dark_mode          = False
@@ -4605,6 +4792,8 @@ class PDDashboard(QMainWindow):
         self.run_filter_config      = None
         self.current_config_path    = None
         self.ignore_run_filter      = False
+        self.prefer_complete_outfeed_duplicate = prefs.get(
+            'UI', 'prefer_complete_outfeed_duplicate', fallback='false').lower() == 'true'
         self.active_col_filters     = {}
         self._tree_builder          = None
         self._archive_tar_path      = ""
@@ -5717,18 +5906,32 @@ class PDDashboard(QMainWindow):
         lay.addWidget(btns)
         if dlg.exec_() != QDialog.Accepted:
             return
-        try:
-            fp, manifest, added = self._update_archive_store(
-                include_images=image_cb.isChecked())
-            QMessageBox.information(
-                self, "Archive Snapshot",
-                "Archive store updated:\n{}\n\nNew/changed files: {}\nTotal files: {}\nSkipped: {}".format(
-                    fp, added, len(manifest.get("files", {})),
-                    len(manifest.get("skipped", []))))
-        except Exception as e:
-            QMessageBox.warning(
-                self, "Archive Snapshot",
-                "Could not create archive snapshot:\n" + str(e))
+        busy = QDialog(self)
+        busy.setWindowTitle("Archive Snapshot")
+        bl = QVBoxLayout(busy)
+        lbl = QLabel("Updating archive store in background...")
+        bl.addWidget(lbl)
+        cancel_btn = QPushButton("Cancel")
+        bl.addWidget(cancel_btn)
+        worker = ArchiveStoreWorker(self, include_images=image_cb.isChecked())
+        def _done(fp, added, total, skipped, err):
+            try:
+                busy.accept()
+            except Exception:
+                pass
+            if err:
+                QMessageBox.warning(
+                    self, "Archive Snapshot",
+                    "Could not create archive snapshot:\n" + err)
+            else:
+                QMessageBox.information(
+                    self, "Archive Snapshot",
+                    "Archive store updated:\n{}\n\nNew/changed files: {}\nTotal files: {}\nSkipped: {}".format(
+                        fp, added, total, skipped))
+        cancel_btn.clicked.connect(worker.cancel)
+        worker.finished.connect(_done)
+        self._workers.start("archive", worker, attr_name="_archive_worker")
+        busy.exec_()
 
     def export_archive_store_tar(self):
         manifest = self._load_archive_store_manifest()
@@ -6793,6 +6996,8 @@ class PDDashboard(QMainWindow):
         reports_menu = self.actions_menu.addMenu("Reports")
         reports_menu.addAction("Generate Block Status Package",
                                self.show_block_status_package)
+        reports_menu.addAction("Latest OUTFEED Status",
+                               self.show_latest_outfeed_status)
 
         filt_menu = self.actions_menu.addMenu("Config / Filters")
         filt_menu.addAction("Load Run Filter Config...", self.load_filter_config)
@@ -7604,7 +7809,8 @@ class PDDashboard(QMainWindow):
             self.sb_selected.setText(f"     Selected: {len(self._checked_paths)}")
             if self._last_scan_time:
                 self.sb_scan_time.setText(
-                    f"     Last scan: {self._last_scan_time}   ")
+                    f"     Last scan: {self._last_scan_time}   "
+                    f"Marked: {len(getattr(self, 'status_package_marks', set()))}   ")
             def _restyle_be(btn, label, color):
                 btn.setText(label)
                 btn.setStyleSheet(
@@ -7641,7 +7847,8 @@ class PDDashboard(QMainWindow):
         self.sb_selected.setText(f"     Selected: {len(self._checked_paths)}")
         if self._last_scan_time:
             self.sb_scan_time.setText(
-                f"     Last scan: {self._last_scan_time}   ")
+                f"     Last scan: {self._last_scan_time}   "
+                f"Marked: {len(getattr(self, 'status_package_marks', set()))}   ")
 
         # Health strip badges
         def _restyle(btn, label, color):
@@ -8930,6 +9137,8 @@ class PDDashboard(QMainWindow):
                 self._record_run_history(r)
         self._save_run_history()
         self._save_lightweight_snapshot_async(stats)
+        self.start_bg_disk_scan(force=False)
+        self.start_stage_index_worker()
 
         self._rebuild_filter_dropdowns()
         self._restore_filter_state()
@@ -9139,6 +9348,210 @@ class PDDashboard(QMainWindow):
                 pass
 
     # ------------------------------------------------------------------
+    # OUTFEED COMPLETENESS / DUPLICATE VIEW / LATEST STATUS
+    # ------------------------------------------------------------------
+    def _cfg_patterns(self, section, key, fallback):
+        try:
+            raw = _proj_cfg.get(section, key, fallback=fallback)
+        except Exception:
+            raw = fallback
+        return [x.strip() for x in re.split(r'[,\s]+', raw or '') if x.strip()]
+
+    def _dir_matches_any(self, directory, patterns):
+        if not directory or not os.path.isdir(directory):
+            return False
+        try:
+            names = os.listdir(directory)
+        except Exception:
+            return False
+        for pat in patterns:
+            for name in names:
+                if fnmatch.fnmatch(name, pat):
+                    return True
+        return False
+
+    def _missing_patterns(self, directory, patterns):
+        missing = []
+        if not directory or not os.path.isdir(directory):
+            return ["missing directory: {}".format(directory or "-")]
+        try:
+            names = os.listdir(directory)
+        except Exception as e:
+            return ["cannot list {}: {}".format(directory, e)]
+        for pat in patterns:
+            ok = False
+            for name in names:
+                if fnmatch.fnmatch(name, pat):
+                    ok = True
+                    break
+            if not ok:
+                missing.append(pat)
+        return missing
+
+    def _outfeed_fe_missing_reports(self, run):
+        path = (run or {}).get("path") or ""
+        rpt_dir = os.path.join(path, "reports")
+        log_dir = os.path.join(path, "logs")
+        patterns = self._cfg_patterns(
+            'OUTFEED_COMPLETENESS', 'FE_REQUIRED_REPORTS',
+            'runtime.V2.rpt area.*.rpt utilization.*.rpt '
+            'cell_usage.summary.*.rpt congestion.*.rpt qor.*.rpt')
+        missing = ["reports/" + x for x in self._missing_patterns(rpt_dir, patterns)]
+        log_patterns = self._cfg_patterns(
+            'OUTFEED_COMPLETENESS', 'FE_REQUIRED_LOGS', 'compile_opt.log')
+        if log_patterns:
+            missing.extend(["logs/" + x for x in self._missing_patterns(log_dir, log_patterns)])
+        return missing
+
+    def _outfeed_stage_report_dir(self, be_path, stage_name):
+        # OUTFEED FC layout: {run-BE}/{stage}/reports/{stage}
+        # Some innovus/outfeed layouts keep reports directly under {stage}/reports.
+        candidates = [
+            os.path.join(be_path, stage_name, "reports", stage_name),
+            os.path.join(be_path, stage_name, "reports"),
+            os.path.join(be_path, "reports", stage_name),
+        ]
+        for c in candidates:
+            if os.path.isdir(c):
+                return c
+        return candidates[0]
+
+    def _outfeed_be_missing_reports(self, run):
+        path = (run or {}).get("path") or ""
+        stages = (run or {}).get("stages") or []
+        patterns = self._cfg_patterns(
+            'OUTFEED_COMPLETENESS', 'BE_REQUIRED_REPORTS',
+            '*.runtime.rpt *.qor_sum.rpt *.grc.rpt *.sec_get_area.rpt')
+        missing = []
+        if not stages:
+            return ["no stages discovered"]
+        for st in stages:
+            name = st.get("name", "")
+            rpt_dir = self._outfeed_stage_report_dir(path, name)
+            for pat in self._missing_patterns(rpt_dir, patterns):
+                missing.append("{}/{}".format(name, pat))
+        return missing
+
+    def _is_complete_outfeed_fe(self, run):
+        return (run or {}).get("source") == "OUTFEED" and not self._outfeed_fe_missing_reports(run)
+
+    def _is_complete_outfeed_be(self, run):
+        return (run or {}).get("source") == "OUTFEED" and not self._outfeed_be_missing_reports(run)
+
+    def _normal_fe_base(self, run_name):
+        base = str(run_name or "")
+        if base.endswith("-FE"):
+            base = base[:-3]
+        return base
+
+    def _fe_duplicate_identity(self, run):
+        return (
+            (run or {}).get("block", ""),
+            (run or {}).get("rtl", ""),
+            self._normal_fe_base((run or {}).get("r_name", "")))
+
+    def _run_date_key(self, run):
+        info = (run or {}).get("info", {}) or {}
+        text = info.get("end") or info.get("start") or ""
+        for fmt in ("%a %b %d, %Y - %H:%M", "%Y-%m-%d %H:%M:%S",
+                    "%Y-%m-%d %H:%M", "%m/%d %H:%M"):
+            try:
+                return datetime.datetime.strptime(str(text).strip(), fmt)
+            except Exception:
+                pass
+        try:
+            p = (run or {}).get("path")
+            if p and os.path.exists(p):
+                return datetime.datetime.fromtimestamp(os.path.getmtime(p))
+        except Exception:
+            pass
+        return datetime.datetime.min
+
+    def _runs_for_tree(self):
+        ws_runs = list((self.ws_data or {}).get("all_runs", []) or [])
+        out_runs = list((self.out_data or {}).get("all_runs", []) or [])
+        if not getattr(self, "prefer_complete_outfeed_duplicate", False):
+            return ws_runs + out_runs
+
+        out_complete = {}
+        for run in out_runs:
+            if run.get("run_type") == "FE" and self._is_complete_outfeed_fe(run):
+                out_complete[self._fe_duplicate_identity(run)] = run
+
+        filtered_ws = []
+        for run in ws_runs:
+            if run.get("run_type") == "FE":
+                if self._fe_duplicate_identity(run) in out_complete:
+                    continue
+            filtered_ws.append(run)
+        return filtered_ws + out_runs
+
+    def _latest_outfeed_rows(self, cancel_cb=None):
+        cancel_cb = cancel_cb or (lambda: False)
+        out_runs = list((self.out_data or {}).get("all_runs", []) or [])
+        by_block_fe = {}
+        by_block_be = {}
+        for run in out_runs:
+            if cancel_cb():
+                return [], []
+            if run.get("source") != "OUTFEED":
+                continue
+            block = run.get("block", "")
+            if run.get("run_type") == "FE":
+                missing = self._outfeed_fe_missing_reports(run)
+                if missing:
+                    continue
+                prev = by_block_fe.get(block)
+                if prev is None or self._run_date_key(run) > self._run_date_key(prev):
+                    by_block_fe[block] = run
+            elif run.get("run_type") == "BE":
+                missing = self._outfeed_be_missing_reports(run)
+                if missing:
+                    continue
+                prev = by_block_be.get(block)
+                if prev is None or self._run_date_key(run) > self._run_date_key(prev):
+                    by_block_be[block] = run
+
+        fe_rows = []
+        be_rows = []
+        for block in sorted(by_block_fe):
+            run = by_block_fe[block]
+            info = run.get("info", {}) or {}
+            fe_rows.append({"values": [
+                block, run.get("rtl", ""), run.get("r_name", ""),
+                info.get("runtime", "-"), info.get("end", "-"),
+                run.get("path", ""), ""]})
+        for block in sorted(by_block_be):
+            run = by_block_be[block]
+            stages = [st.get("name", "") for st in (run.get("stages") or [])]
+            info = run.get("info", {}) or {}
+            be_rows.append({"values": [
+                block, run.get("rtl", ""), run.get("r_name", ""),
+                ", ".join([s for s in stages if s]) or "-",
+                info.get("end", "-"), run.get("path", ""), ""]})
+        return fe_rows, be_rows
+
+    def show_latest_outfeed_status(self):
+        if self._worker_is_running(getattr(self, "_latest_outfeed_worker", None)):
+            QMessageBox.information(
+                self, "Latest OUTFEED Status",
+                "Latest OUTFEED status scan is already running.")
+            return
+        self.status_bar.showMessage("Scanning latest complete OUTFEED runs...", 3000)
+        worker = LatestOutfeedStatusWorker(self)
+        worker.finished.connect(self._on_latest_outfeed_status_done)
+        self._workers.start(
+            "latest_outfeed", worker, attr_name="_latest_outfeed_worker")
+
+    def _on_latest_outfeed_status_done(self, fe_rows, be_rows, err):
+        if err:
+            QMessageBox.warning(self, "Latest OUTFEED Status", err)
+            return
+        dlg = LatestOutfeedStatusDialog(
+            fe_rows, be_rows, self.is_dark_mode, self)
+        dlg.exec_()
+
+    # ------------------------------------------------------------------
     # BUILD TREE
     # ------------------------------------------------------------------
     def _build_tree(self):
@@ -9186,9 +9599,7 @@ class PDDashboard(QMainWindow):
         self.tree.setSortingEnabled(False)
         self.tree.clear()
 
-        runs_to_process = []
-        runs_to_process.extend(self.ws_data.get("all_runs", []))
-        runs_to_process.extend(self.out_data.get("all_runs", []))
+        runs_to_process = self._runs_for_tree()
 
         # Resolve BE RTL from matching FE run
         fe_info = {}
@@ -9561,6 +9972,7 @@ class PDDashboard(QMainWindow):
         if pin_type and pin_type in self.icons:
             child.setIcon(0, self.icons[pin_type])
             child.setData(0, Qt.UserRole + 5, pin_type)
+        self._set_status_package_mark_icon(child, run)
 
         return child
 
@@ -9575,9 +9987,6 @@ class PDDashboard(QMainWindow):
         p.setText(0, text)
         p.setData(0, Qt.UserRole, node_type)
         p.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        if node_type == "BLOCK" and text in getattr(self, "status_package_blocks", set()):
-            p.setIcon(0, self._create_dot_icon("#1565c0", "#0d47a1"))
-            p.setToolTip(0, "%s (marked for Status Package)" % text)
         if node_type == "MILESTONE":
             p.setForeground(0, self._colors["milestone"])
             f = p.font(0); f.setBold(True); p.setFont(0, f)
@@ -9722,15 +10131,72 @@ class PDDashboard(QMainWindow):
             except Exception:
                 pass
 
-    def _save_status_package_blocks(self):
+    def _load_status_package_marks(self):
+        raw = prefs.get('STATUS_PACKAGE', 'marked_runs_json', fallback='')
+        marks = set()
+        if raw:
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    marks.update(str(x) for x in data if x)
+            except Exception:
+                marks.update(x.strip() for x in raw.split('\n') if x.strip())
+        return marks
+
+    def _save_status_package_marks(self):
         try:
             if not prefs.has_section('STATUS_PACKAGE'):
                 prefs.add_section('STATUS_PACKAGE')
-            prefs.set('STATUS_PACKAGE', 'marked_blocks',
-                      ','.join(sorted(self.status_package_blocks)))
+            prefs.set('STATUS_PACKAGE', 'marked_runs_json',
+                      json.dumps(sorted(getattr(self, "status_package_marks", set()))))
+            prefs.set('STATUS_PACKAGE', 'marked_blocks', '')
             _write_config_atomic(prefs, USER_PREFS_FILE)
         except Exception:
             pass
+
+    def _status_package_run_id(self, run=None, item=None):
+        run = run or {}
+        source = run.get("source", item.text(2) if item else "WS")
+        block = run.get("block", item.data(0, Qt.UserRole + 2) if item else "")
+        rtl = run.get("rtl", item.text(1) if item else "")
+        run_type = run.get("run_type", "")
+        if not run_type and item:
+            run_type = (item.data(0, Qt.UserRole + 10) or {}).get("run_type", "")
+        base = run.get("r_name", item.text(0) if item else "")
+        base = str(base or "").replace("-FE", "").replace("-BE", "")
+        path = run.get("path", item.text(15) if item else "")
+        try:
+            path = os.path.normpath(path)
+        except Exception:
+            path = str(path or "")
+        return "|".join([str(source or ""), str(block or ""), str(rtl or ""),
+                         str(run_type or ""), str(base or ""), str(path or "")])
+
+    def _is_status_package_marked(self, run=None, item=None):
+        rid = self._status_package_run_id(run, item)
+        return bool(rid and rid in getattr(self, "status_package_marks", set()))
+
+    def _set_status_package_mark_icon(self, item, run=None):
+        try:
+            if self._is_status_package_marked(run, item):
+                item.setIcon(2, self._create_dot_icon("#1565c0", "#0d47a1"))
+                item.setToolTip(2, (item.text(2) or "") + " [marked for Status Package]")
+            else:
+                item.setIcon(2, QIcon())
+                item.setToolTip(2, item.text(2) or "")
+        except Exception:
+            pass
+
+    def _update_status_package_icons_for_path(self, path):
+        try:
+            items = list(self._items_by_path.get(path, []) or [])
+        except Exception:
+            items = []
+        for it in items:
+            try:
+                self._set_status_package_mark_icon(it, it.data(0, Qt.UserRole + 10) or {})
+            except RuntimeError:
+                pass
 
     def _stage_dicts_from_child_rows(self, be_item, be_run):
         out = []
@@ -10308,6 +10774,7 @@ class PDDashboard(QMainWindow):
             if run is None:
                 return False
             src = run["source"]
+            rt_type = run["run_type"]
             if _src_ws  and src != "WS":      return False
             if _src_out and src != "OUTFEED": return False
             path = run["path"]
@@ -10325,17 +10792,29 @@ class PDDashboard(QMainWindow):
                     if matched_rtls:
                         allowed = []
                         for cfg_rtl in matched_rtls:
-                            allowed.extend(src_cfg.get(cfg_rtl, {}).get(rb, []) or [])
+                            allowed.extend(self._filter_allowed_names(
+                                src, cfg_rtl, rb, rt_type))
                         if not allowed:
                             return False
                         base_name = run["r_name"].replace("-FE", "").replace("-BE", "")
-                        if base_name not in allowed and run["r_name"] not in allowed:
+                        parent_tokens = [
+                            x for x in allowed
+                            if str(x).startswith("__PARENT_FOR_BE_FILTER__:")
+                        ]
+                        parent_ok = False
+                        if parent_tokens and rt_type == "FE":
+                            parent_ok = any(
+                                self._be_name_matches_fe(
+                                    str(tok).split(":", 1)[1], base_name)
+                                for tok in parent_tokens)
+                        if (not parent_ok
+                                and base_name not in allowed
+                                and run["r_name"] not in allowed):
                             return False
             rtl = run["rtl"]
             if not _sel_rtl_all:
                 if rtl != sel_rtl and not rtl.startswith(_sel_rtl_sfx):
                     return False
-            rt_type = run["run_type"]
             if _fe_only and rt_type != "FE": return False
             if _be_only and rt_type != "BE": return False
             if _completed_only and not (
@@ -10557,26 +11036,6 @@ class PDDashboard(QMainWindow):
             return
         self.tree.setCurrentItem(item)
         if item.data(0, Qt.UserRole) == "BLOCK":
-            m = QMenu()
-            block_name = item.text(0)
-            if block_name in self.status_package_blocks:
-                mark_act = m.addAction("Unmark Block for Status Package")
-            else:
-                mark_act = m.addAction("Mark Block for Status Package")
-            res = m.exec_(self.tree.viewport().mapToGlobal(pos))
-            if res == mark_act:
-                if block_name in self.status_package_blocks:
-                    self.status_package_blocks.remove(block_name)
-                    item.setIcon(0, QIcon())
-                    item.setToolTip(0, block_name)
-                else:
-                    self.status_package_blocks.add(block_name)
-                    item.setIcon(0, self._create_dot_icon("#1565c0", "#0d47a1"))
-                    item.setToolTip(0, "%s (marked for Status Package)" % block_name)
-                self._save_status_package_blocks()
-                self.status_bar.showMessage(
-                    "Status package marked blocks: {}".format(
-                        len(self.status_package_blocks)), 3000)
             return
         if not item.parent():
             return
@@ -10591,6 +11050,7 @@ class PDDashboard(QMainWindow):
         is_rtl    = item.data(0, Qt.UserRole) == "RTL"
         run_data_for_menu = item.data(0, Qt.UserRole + 10) or {}
         is_be_run = bool(run_data_for_menu.get("run_type") == "BE")
+        is_run_row = bool(run_data_for_menu.get("run_type") in ("FE", "BE"))
 
         target_item = item if not is_stage else item.parent()
         b_name      = target_item.data(0, Qt.UserRole + 2)
@@ -10652,6 +11112,14 @@ class PDDashboard(QMainWindow):
             else:
                 add_config_act = m.addAction(
                     "Create New Filter Config & Add Run")
+            m.addSeparator()
+
+        status_mark_act = None
+        if is_run_row:
+            if self._is_status_package_marked(run_data_for_menu, item):
+                status_mark_act = m.addAction("Unmark Run for Status Package")
+            else:
+                status_mark_act = m.addAction("Mark Run for Status Package")
             m.addSeparator()
 
         restore_all_act = None
@@ -10770,6 +11238,20 @@ class PDDashboard(QMainWindow):
                             self._set_pin_icon_for_item(item, self.user_pins.get(p_target))
                     except RuntimeError:
                         pass
+        elif status_mark_act and res == status_mark_act:
+            rid = self._status_package_run_id(run_data_for_menu, item)
+            if rid in self.status_package_marks:
+                self.status_package_marks.remove(rid)
+            else:
+                self.status_package_marks.add(rid)
+            self._save_status_package_marks()
+            self._set_status_package_mark_icon(item, run_data_for_menu)
+            self._update_status_package_icons_for_path(item.text(15))
+            self._update_status_bar()
+            self.status_bar.showMessage(
+                "Status package marked runs: {}".format(
+                    len(self.status_package_marks)), 3000)
+            return
         elif res in sort_actions:
             self._set_tree_sort_mode(sort_actions[res])
             return
@@ -10805,7 +11287,8 @@ class PDDashboard(QMainWindow):
                     return
                 self.current_config_path = path
             added = self._add_run_to_filter_config(
-                run_source, r_rtl, b_name, base_run)
+                run_source, r_rtl, b_name, base_run,
+                run_data_for_menu.get("run_type", "FE"))
             self._save_current_config()
             self.sb_config.setText(
                 f"Config: {os.path.basename(self.current_config_path)}")
@@ -11106,17 +11589,48 @@ class PDDashboard(QMainWindow):
             for i in range(node.childCount()):
                 child = node.child(i)
                 run = child.data(0, Qt.UserRole + 10) or {}
-                block = run.get("block") or child.data(0, Qt.UserRole + 2) or ""
                 if (run.get("run_type") == "FE"
                         and child.checkState(0) == Qt.Checked
                         and child.text(15)
-                        and child.text(15) != "N/A"
-                        and (not self.status_package_blocks
-                             or block in self.status_package_blocks)):
+                        and child.text(15) != "N/A"):
                     items.append(child)
                 collect(child)
         collect(self.tree.invisibleRootItem())
         return items
+
+    def _marked_run_items_for_status_package(self):
+        items = []
+        marks = getattr(self, "status_package_marks", set())
+        if not marks:
+            return items
+        def collect(node):
+            for i in range(node.childCount()):
+                child = node.child(i)
+                run = child.data(0, Qt.UserRole + 10) or {}
+                if (run.get("run_type") in ("FE", "BE")
+                        and self._status_package_run_id(run, child) in marks):
+                    items.append(child)
+                collect(child)
+        collect(self.tree.invisibleRootItem())
+        return items
+
+    def _status_package_fe_items(self):
+        marks = getattr(self, "status_package_marks", set())
+        if not marks:
+            return self._checked_fe_items_for_status_package()
+        out = []
+        seen = set()
+        for item in self._marked_run_items_for_status_package():
+            run = item.data(0, Qt.UserRole + 10) or {}
+            fe_item = item if run.get("run_type") == "FE" else self._parent_fe_item_for_be(item)
+            if fe_item is None:
+                continue
+            key = fe_item.text(15)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(fe_item)
+        return out
 
     def _checked_be_children_for_fe(self, fe_item):
         out = []
@@ -11132,11 +11646,12 @@ class PDDashboard(QMainWindow):
         return out
 
     def show_block_status_package(self):
-        fe_items = self._checked_fe_items_for_status_package()
+        marked_mode = bool(getattr(self, "status_package_marks", set()))
+        fe_items = self._status_package_fe_items()
         if not fe_items:
             QMessageBox.information(
                 self, "Block Status Package",
-                "Check FE runs first. Under each checked FE, check exactly one BE child run. If blocks are marked, only marked blocks are used.")
+                "Check FE runs first, or mark FE/BE runs for Status Package.")
             return
         errors = []
         pairs = []
@@ -11145,6 +11660,24 @@ class PDDashboard(QMainWindow):
         seen_fe = set()
         for fe_item in fe_items:
             be_items = self._checked_be_children_for_fe(fe_item)
+            if marked_mode:
+                marked_be = []
+                for be in self._checked_be_children_for_fe(fe_item):
+                    if self._is_status_package_marked(be.data(0, Qt.UserRole + 10) or {}, be):
+                        marked_be.append(be)
+                def _collect_marked_be(node):
+                    for i in range(node.childCount()):
+                        ch = node.child(i)
+                        run = ch.data(0, Qt.UserRole + 10) or {}
+                        if (run.get("run_type") == "BE"
+                                and self._is_status_package_marked(run, ch)
+                                and ch not in marked_be):
+                            marked_be.append(ch)
+                        if ch.data(0, Qt.UserRole) != "STAGE":
+                            _collect_marked_be(ch)
+                _collect_marked_be(fe_item)
+                if marked_be:
+                    be_items = marked_be
             if len(be_items) != 1:
                 errors.append("{}: expected exactly one checked BE child, found {}".format(
                     fe_item.text(0), len(be_items)))
@@ -11190,9 +11723,10 @@ class PDDashboard(QMainWindow):
         dlg = StatusPackageDialog(
             "Block Status Package", pairs, fe_tasks, be_tasks,
             self.is_dark_mode, self)
-        if self.status_package_blocks:
-            marked = ", ".join(sorted(self.status_package_blocks))
-            dlg.status_lbl.setText(dlg.status_lbl.text() + "  Marked blocks: " + marked)
+        if marked_mode:
+            dlg.status_lbl.setText(
+                dlg.status_lbl.text() + "  Marked runs: {}".format(
+                    len(self.status_package_marks)))
         dlg.exec_()
 
     def export_csv(self):
@@ -11242,14 +11776,46 @@ class PDDashboard(QMainWindow):
     def _run_in_filter_config(self, run):
         if not self.run_filter_config or not run:
             return False
-        src = run.get("source", "")
-        rtl = run.get("rtl", "")
-        blk = run.get("block", "")
-        allowed = self.run_filter_config.get(src, {}).get(rtl, {}).get(blk)
+        allowed = self._filter_allowed_names(
+            run.get("source", ""), run.get("rtl", ""),
+            run.get("block", ""), run.get("run_type", "FE"))
         if not allowed:
             return False
         base = run.get("r_name", "").replace("-FE", "").replace("-BE", "")
-        return run.get("r_name", "") in allowed or base in allowed
+        return (any(str(x).startswith("__PARENT_FOR_BE_FILTER__:")
+                    for x in allowed)
+                or run.get("r_name", "") in allowed
+                or base in allowed)
+
+    def _filter_allowed_names(self, source, rtl, block, role):
+        cfg = self.run_filter_config or {}
+        val = cfg.get(source, {}).get(rtl, {}).get(block)
+        if not val:
+            return []
+        if isinstance(val, dict):
+            role = str(role or "FE").upper()
+            if role == "FE":
+                out = list(val.get("FE", []) or [])
+                if val.get("BE"):
+                    out.extend("__PARENT_FOR_BE_FILTER__:" + str(x)
+                               for x in (val.get("BE", []) or []))
+                return out
+            return list(val.get(role, []) or [])
+        return list(val or [])
+
+    def _be_name_matches_fe(self, be_name, fe_base):
+        be_name = str(be_name or "")
+        fe_base = str(fe_base or "")
+        if not be_name or not fe_base:
+            return False
+        if fe_base in be_name:
+            return True
+        stripped = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', be_name)
+        idx = stripped.find('_')
+        be_fe = stripped[:idx] if idx >= 0 else stripped
+        if be_fe.endswith("-BE"):
+            be_fe = be_fe[:-3]
+        return be_fe == fe_base
 
     def _ensure_filter_config_path(self):
         if self.current_config_path:
@@ -11294,19 +11860,21 @@ class PDDashboard(QMainWindow):
         for item in items:
             run = item.data(0, Qt.UserRole + 10) or {}
             base_run = item.data(0, Qt.UserRole + 4) or item.text(0)
-            before = list(self.run_filter_config.get(
-                run.get("source", ""), {}).get(
-                item.text(1), {}).get(
-                run.get("block", item.data(0, Qt.UserRole + 2) or ""), [])) if self.run_filter_config else []
+            role = run.get("run_type", "FE")
+            before = list(self._filter_allowed_names(
+                run.get("source", ""), item.text(1),
+                run.get("block", item.data(0, Qt.UserRole + 2) or ""),
+                role)) if self.run_filter_config else []
             self._add_run_to_filter_config(
                 run.get("source", item.text(2)),
                 item.text(1),
                 run.get("block", item.data(0, Qt.UserRole + 2) or ""),
-                base_run)
-            after = self.run_filter_config.get(
-                run.get("source", item.text(2)), {}).get(
-                item.text(1), {}).get(
-                run.get("block", item.data(0, Qt.UserRole + 2) or ""), [])
+                base_run,
+                role)
+            after = self._filter_allowed_names(
+                run.get("source", item.text(2)), item.text(1),
+                run.get("block", item.data(0, Qt.UserRole + 2) or ""),
+                role)
             if len(after) > len(before):
                 added_count += 1
         self._save_current_config()
@@ -11346,19 +11914,31 @@ class PDDashboard(QMainWindow):
                     if '=' in line and '|' in line.split('=', 1)[0]:
                         key, runs_str = line.split('=', 1)
                         parts = [p.strip() for p in key.split('|')]
+                        has_role_key = (len(parts) == 4)
                     else:
                         parts = [p.strip() for p in line.split(':', 3)]
                         runs_str = parts[3] if len(parts) == 4 else ""
-                    if len(parts) != 3 and len(parts) != 4:
+                        if len(parts) == 4:
+                            parts = parts[:3]
+                        has_role_key = False
+                    if len(parts) not in (3, 4):
                         continue
-                    if len(parts) == 4:
-                        source, rtl, block = parts[:3]
+                    if has_role_key and len(parts) == 4:
+                        source, rtl, block, role = parts[:4]
                     else:
                         source, rtl, block = parts
+                        role = "FE"
                     run_list = [r.strip() for r in runs_str.split(',')
                                 if r.strip()]
-                    current = cfg.setdefault(source, {}).setdefault(
-                        rtl, {}).setdefault(block, [])
+                    slot = cfg.setdefault(source, {}).setdefault(
+                        rtl, {}).setdefault(block, {"FE": [], "BE": []})
+                    if not isinstance(slot, dict):
+                        slot = {"FE": list(slot or []), "BE": []}
+                        cfg.setdefault(source, {}).setdefault(rtl, {})[block] = slot
+                    role = str(role or "FE").upper()
+                    if role not in ("FE", "BE"):
+                        role = "FE"
+                    current = slot.setdefault(role, [])
                     for run_name in run_list:
                         if run_name not in current:
                             current.append(run_name)
@@ -11389,29 +11969,38 @@ class PDDashboard(QMainWindow):
         if not path:
             return
         sample = (
-            "# Format: SOURCE|RTL_RELEASE|BLOCK = run1,run2,...\n"
+            "# Format: SOURCE|RTL_RELEASE|BLOCK|FE = fe_run1,fe_run2,...\n"
+            "# Format: SOURCE|RTL_RELEASE|BLOCK|BE = be_run1,be_run2,...\n"
             "# Old source:rtl:block:run1,run2 format is still accepted.\n"
             "# Example:\n"
-            "WS|S5K2P5SP_EVT0_ML4_DEV00_syn1|BLK_CMU = run1,run2\n"
-            "OUTFEED|S5K2P5SP_EVT0_ML4_DEV00|BLK_CPU = run1\n")
+            "WS|S5K2P5SP_EVT0_ML4_DEV00_syn1|BLK_CMU|FE = run1,run2\n"
+            "WS|S5K2P5SP_EVT0_ML4_DEV00_syn1|BLK_CMU|BE = be_run1\n"
+            "OUTFEED|S5K2P5SP_EVT0_ML4_DEV00|BLK_CPU|FE = run1\n")
         with open(path, 'w') as f:
             f.write(sample)
         QMessageBox.information(self, "Sample Config", f"Saved to:\n{path}")
 
-    def _add_run_to_filter_config(self, source, rtl, block, run_name):
+    def _add_run_to_filter_config(self, source, rtl, block, run_name, role="FE"):
         if self.run_filter_config is None:
             self.run_filter_config = {}
         source = str(source or "WS").strip()
         rtl = str(rtl or "").strip()
         block = str(block or "").strip()
         run_name = str(run_name or "").strip()
+        role = str(role or "FE").upper()
+        if role not in ("FE", "BE"):
+            role = "FE"
         if not source or not rtl or not block or not run_name:
             return "-"
-        runs = self.run_filter_config.setdefault(source, {}).setdefault(
-            rtl, {}).setdefault(block, [])
+        slot = self.run_filter_config.setdefault(source, {}).setdefault(
+            rtl, {}).setdefault(block, {"FE": [], "BE": []})
+        if not isinstance(slot, dict):
+            slot = {"FE": list(slot or []), "BE": []}
+            self.run_filter_config[source][rtl][block] = slot
+        runs = slot.setdefault(role, [])
         if run_name not in runs:
             runs.append(run_name)
-        return "{}|{}|{} = {}".format(source, rtl, block, run_name)
+        return "{}|{}|{}|{} = {}".format(source, rtl, block, role, run_name)
 
     def _save_current_config(self):
         if not self.current_config_path or not self.run_filter_config:
@@ -11422,8 +12011,15 @@ class PDDashboard(QMainWindow):
             for src, rtl_dict in self.run_filter_config.items():
                 for rtl, blk_dict in rtl_dict.items():
                     for blk, runs in blk_dict.items():
-                        f.write("{}|{}|{} = {}\n".format(
-                            src, rtl, blk, ",".join(runs)))
+                        if isinstance(runs, dict):
+                            for role in ("FE", "BE"):
+                                vals = runs.get(role, []) or []
+                                if vals:
+                                    f.write("{}|{}|{}|{} = {}\n".format(
+                                        src, rtl, blk, role, ",".join(vals)))
+                        else:
+                            f.write("{}|{}|{}|FE = {}\n".format(
+                                src, rtl, blk, ",".join(runs)))
 
     # ------------------------------------------------------------------
     # SETTINGS DIALOG
@@ -11502,6 +12098,14 @@ class PDDashboard(QMainWindow):
         hide_blk_cb = QCheckBox("Hide Block grouping level in tree")
         hide_blk_cb.setChecked(self.hide_block_nodes)
         gen_l.addRow("", hide_blk_cb)
+
+        prefer_outfeed_cb = QCheckBox("Prefer complete OUTFEED duplicate FE over WS")
+        prefer_outfeed_cb.setChecked(
+            getattr(self, "prefer_complete_outfeed_duplicate", False))
+        prefer_outfeed_cb.setToolTip(
+            "When an OUTFEED FE run is complete, show it instead of the matching WS FE row, "
+            "while keeping WS and OUTFEED BE children visible.")
+        gen_l.addRow("", prefer_outfeed_cb)
 
         closure_cb = QCheckBox("Enable Closure Scorecard (colors run names by sign-off status)")
         closure_cb.setChecked(getattr(self, '_closure_enabled', False))
@@ -11763,6 +12367,12 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'hide_block_nodes',
                   'true' if self.hide_block_nodes else 'false')
         _need_rebuild = _need_rebuild or (old_hide_blk != self.hide_block_nodes)
+        old_prefer_outfeed = getattr(self, "prefer_complete_outfeed_duplicate", False)
+        self.prefer_complete_outfeed_duplicate = prefer_outfeed_cb.isChecked()
+        prefs.set('UI', 'prefer_complete_outfeed_duplicate',
+                  'true' if self.prefer_complete_outfeed_duplicate else 'false')
+        _need_rebuild = _need_rebuild or (
+            old_prefer_outfeed != self.prefer_complete_outfeed_duplicate)
         self._closure_enabled = closure_cb.isChecked()
         self._status_regression_enabled = status_reg_cb.isChecked()
         self._qor_regression_enabled = qor_reg_cb.isChecked()
@@ -11850,15 +12460,183 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # DISK USAGE
     # ------------------------------------------------------------------
+    def _user_project_dir(self):
+        path = os.path.join(NOTES_DIR, _safe_path_token(PROJECT_PREFIX), _safe_user_name())
+        try:
+            if not os.path.exists(path):
+                os.makedirs(path)
+        except Exception:
+            pass
+        return path
+
+    def start_stage_index_worker(self):
+        runs = []
+        for run in ((self.ws_data or {}).get("all_runs", []) +
+                    (self.out_data or {}).get("all_runs", [])):
+            if run.get("run_type") == "BE" and run.get("stages"):
+                runs.append(run)
+        if not runs:
+            return
+        try:
+            from workers import StageIndexWorker
+            worker = StageIndexWorker(runs)
+            worker.finished.connect(self._on_stage_index_loaded)
+            self._workers.start("stage_index", worker, attr_name="_stage_index_worker")
+        except Exception as e:
+            self.status_bar.showMessage(
+                "Stage index lookup failed: {}".format(e), 5000)
+
+    def _merge_stage_index_into_run(self, be_run, enriched):
+        if not be_run or enriched is None:
+            return
+        cur = {}
+        for st in be_run.get("stages", []) or []:
+            cur[st.get("name", "")] = dict(st)
+        merged = []
+        for st in enriched:
+            base = cur.get(st.get("name", ""), {})
+            if base:
+                base.update(st)
+                merged.append(base)
+            else:
+                merged.append(st)
+        if merged:
+            be_run["stages"] = merged
+            for idx, st in enumerate(be_run["stages"]):
+                st["_stage_order"] = idx
+
+    def _update_stage_children_in_place(self, be_item, be_run):
+        stages = {}
+        for st in (be_run.get("stages", []) or []):
+            stages[st.get("name", "")] = st
+        try:
+            for i in range(be_item.childCount()):
+                ch = be_item.child(i)
+                if ch.data(0, Qt.UserRole) != "STAGE":
+                    continue
+                st = stages.get(ch.text(0))
+                if not st:
+                    continue
+                status = st.get("stage_status", ch.text(3) or "-")
+                active = st.get("active_stage", ch.text(4) or st.get("name", "-"))
+                info = st.get("info", {}) or {}
+                ch.setIcon(3, self._status_icon_for_text(status))
+                ch.setText(3, status)
+                ch.setText(4, active)
+                ch.setText(12, info.get("runtime", ch.text(12) or ""))
+                self._set_item_time_data(
+                    ch, info.get("start", ch.data(0, Qt.UserRole + 40) or ""),
+                    info.get("end", ch.data(0, Qt.UserRole + 41) or ""))
+                ch.setText(13, self._fmt_ts(info.get("start", ch.text(13))))
+                ch.setText(14, self._fmt_ts(info.get("end", ch.text(14))))
+                if st.get("log"):
+                    ch.setText(16, st.get("log"))
+                self._apply_status_color(ch, 3, status)
+        except RuntimeError:
+            pass
+
+    def _on_stage_index_loaded(self, index_data):
+        if not isinstance(index_data, dict):
+            return
+        for run in ((self.ws_data or {}).get("all_runs", []) +
+                    (self.out_data or {}).get("all_runs", [])):
+            if run.get("run_type") != "BE":
+                continue
+            try:
+                key = os.path.normpath(run.get("path", "") or "")
+            except Exception:
+                key = run.get("path", "") or ""
+            enriched = index_data.get(key)
+            if enriched is None:
+                continue
+            self._merge_stage_index_into_run(run, enriched)
+            self._branch_status_cache[key] = list(run.get("stages", []) or [])
+            item = self._signoff_items_by_path.get(run.get("path", ""))
+            if item is not None:
+                try:
+                    if item.isExpanded():
+                        self._update_stage_children_in_place(item, run)
+                except RuntimeError:
+                    pass
+        self.status_bar.showMessage("PNR stage status index updated.", 3000)
+
+    def _disk_cache_file(self):
+        return os.path.join(
+            self._user_project_dir(),
+            "disk_usage_cache_{}.json".format(_safe_user_name()))
+
+    def _load_disk_cache(self):
+        fp = self._disk_cache_file()
+        try:
+            with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data.get("entries", data)
+        except Exception:
+            pass
+        return {}
+
+    def _save_disk_cache(self):
+        try:
+            payload = {
+                "schema": "flow_pulse_disk_cache_v1",
+                "project": PROJECT_PREFIX,
+                "user": _safe_user_name(),
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "entries": getattr(self, "_disk_cache", {}) or {},
+            }
+            _atomic_write_json(self._disk_cache_file(), payload, indent=2, sort_keys=True)
+        except Exception:
+            pass
+
+    def _current_disk_run_targets(self):
+        runs = []
+        seen = set()
+        for run in ((self.ws_data or {}).get("all_runs", []) +
+                    (self.out_data or {}).get("all_runs", [])):
+            path = os.path.normpath(str(run.get("path", "") or ""))
+            if not path or path == "N/A" or path in seen:
+                continue
+            seen.add(path)
+            runs.append(run)
+        return runs
+
+    def _disk_data_from_cache(self):
+        data = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
+        for path, rec in (getattr(self, "_disk_cache", {}) or {}).items():
+            try:
+                if not rec.get("exists", True):
+                    continue
+                size = float(rec.get("size_gb", 0.0) or 0.0)
+                if size <= 0.01:
+                    continue
+                cat = rec.get("category") or ("OUTFEED" if rec.get("source") == "OUTFEED"
+                                               else ("WS (BE)" if rec.get("run_type") == "BE" else "WS (FE)"))
+                owner = rec.get("owner") or "Unknown"
+                if cat not in data:
+                    data[cat] = {}
+                if owner not in data[cat]:
+                    data[cat][owner] = {"total": 0, "dirs": []}
+                data[cat][owner]["total"] += size
+                data[cat][owner]["dirs"].append((rec.get("path") or path, size))
+            except Exception:
+                pass
+        for cat in data:
+            for owner in data[cat]:
+                data[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
+        return data
+
     def open_disk_usage(self):
         data = getattr(self, "_disk_data", None)
         if not data:
-            QMessageBox.information(
-                self, "Disk Space",
-                "Disk scan not yet complete. Please wait a moment and try again.")
-            return
+            data = self._disk_data_from_cache()
+            self._disk_data = data
+            if not any(data.get(k) for k in data):
+                self.start_bg_disk_scan(force=False)
         dlg = DiskUsageDialog(data, self.is_dark_mode, self)
+        self._disk_dialog = dlg
         dlg.exec_()
+        self._disk_dialog = None
 
     def start_bg_disk_scan(self, force=False):
         if (not force and hasattr(self, '_disk_scan_worker')
@@ -11870,7 +12648,10 @@ class PDDashboard(QMainWindow):
         if hasattr(self, 'disk_btn'):
             self.disk_btn.setEnabled(False)
             self.disk_btn.setText("Scanning Disk...")
-        worker = DiskScannerWorker()
+        worker = DiskScannerWorker(
+            self._current_disk_run_targets(),
+            getattr(self, "_disk_cache", {}),
+            force=force)
         # DiskScannerWorker uses finished_scan signal
         sig = getattr(worker, "finished_scan", None)
         if sig is None:
@@ -11880,11 +12661,24 @@ class PDDashboard(QMainWindow):
                             attr_name="_disk_scan_worker")
 
     def _on_bg_disk_scan_finished(self, data):
+        if isinstance(data, dict) and "__cache__" in data:
+            self._disk_cache = data.pop("__cache__", {}) or {}
+            data.pop("__pending_count__", None)
+            self._save_disk_cache()
         self._disk_data = data
         # Re-enable disk button
         if hasattr(self, 'disk_btn'):
             self.disk_btn.setEnabled(True)
             self.disk_btn.setText("Disk Space")
+        dlg = getattr(self, "_disk_dialog", None)
+        try:
+            if dlg is not None and dlg.isVisible():
+                dlg.disk_data = data
+                dlg.update_view()
+                dlg.recalc_btn.setEnabled(True)
+                dlg.recalc_btn.setText("Recalculate Disk Usage")
+        except RuntimeError:
+            self._disk_dialog = None
 
     # ------------------------------------------------------------------
     # QoR

@@ -957,9 +957,12 @@ class SingleSizeWorker(QThread):
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
 
-    def __init__(self):
+    def __init__(self, run_targets=None, disk_cache=None, force=False):
         super().__init__()
         self._is_cancelled = False
+        self.run_targets = list(run_targets or [])
+        self.disk_cache = dict(disk_cache or {})
+        self.force = bool(force)
 
     def cancel(self):
         self._is_cancelled = True
@@ -990,7 +993,103 @@ class DiskScannerWorker(QThread):
             pass
         return results
 
+    def _category_for_run(self, run):
+        src = run.get("source", "WS")
+        rtype = run.get("run_type", "")
+        if src == "OUTFEED":
+            return "OUTFEED"
+        if rtype == "BE":
+            return "WS (BE)"
+        return "WS (FE)"
+
+    def _build_data_from_cache(self, cache):
+        results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
+        for _path, rec in (cache or {}).items():
+            try:
+                if not rec.get("exists", True):
+                    continue
+                gb_sz = float(rec.get("size_gb", 0.0) or 0.0)
+                if gb_sz <= 0.01:
+                    continue
+                cat = rec.get("category") or "WS (FE)"
+                owner = rec.get("owner") or "Unknown"
+                full_path = rec.get("path") or _path
+                if cat not in results:
+                    results[cat] = {}
+                if owner not in results[cat]:
+                    results[cat][owner] = {"total": 0, "dirs": []}
+                results[cat][owner]["total"] += gb_sz
+                results[cat][owner]["dirs"].append((full_path, gb_sz))
+            except Exception:
+                continue
+        for cat in results:
+            for owner in results[cat]:
+                results[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
+        return results
+
+    def _run_incremental_cache_scan(self):
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cache = {}
+        current = {}
+        for run in self.run_targets:
+            if self._is_cancelled or self.isInterruptionRequested():
+                return None
+            path = os.path.normpath(str(run.get("path", "") or ""))
+            if not path or path == "N/A":
+                continue
+            current[path] = run
+        for path, rec in self.disk_cache.items():
+            npath = os.path.normpath(str(path or ""))
+            if npath in current:
+                cache[npath] = dict(rec or {})
+                cache[npath]["exists"] = True
+        pending = []
+        for path, run in current.items():
+            rec = cache.get(path)
+            if self.force or not rec:
+                pending.append(path)
+            else:
+                rec["path"] = path
+                rec["source"] = run.get("source", "")
+                rec["run_type"] = run.get("run_type", "")
+                rec["block"] = run.get("block", "")
+                rec["rtl"] = run.get("rtl", "")
+                rec["run_name"] = run.get("r_name", "")
+                rec["category"] = self._category_for_run(run)
+        for i in range(0, len(pending), 25):
+            if self._is_cancelled or self.isInterruptionRequested():
+                return None
+            chunk = pending[i:i + 25]
+            for owner, sz_kb, full_path in self._get_batch_dir_info(chunk):
+                if self._is_cancelled or self.isInterruptionRequested():
+                    return None
+                path = os.path.normpath(full_path)
+                run = current.get(path, {})
+                cache[path] = {
+                    "path": path,
+                    "size_gb": sz_kb / float(1024 ** 2),
+                    "owner": owner or run.get("owner", "Unknown"),
+                    "source": run.get("source", ""),
+                    "run_type": run.get("run_type", ""),
+                    "block": run.get("block", ""),
+                    "rtl": run.get("rtl", ""),
+                    "run_name": run.get("r_name", ""),
+                    "category": self._category_for_run(run),
+                    "exists": True,
+                    "updated_at": now,
+                }
+        data = self._build_data_from_cache(cache)
+        data["__cache__"] = cache
+        data["__pending_count__"] = len(pending)
+        return data
+
     def run(self):
+        if self.run_targets:
+            data = self._run_incremental_cache_scan()
+            if data is not None and not self._is_cancelled and not self.isInterruptionRequested():
+                self.finished_scan.emit(data)
+            return
+
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
         if self._is_cancelled or self.isInterruptionRequested():
             self.finished_scan.emit(results)
@@ -1845,6 +1944,82 @@ class BranchStatusWorker(QThread):
             # for unresolved stages instead of staying stuck at CHECKING forever.
             pass
         self.finished.emit(self.be_path, self.run_name, stages)
+
+
+class StageIndexWorker(QThread):
+    finished = pyqtSignal(dict)   # path -> enriched stage list
+    progress = pyqtSignal(int, int)
+
+    def __init__(self, runs):
+        super().__init__()
+        self.runs = list(runs or [])
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def _index_run(self, be_run):
+        be_run = dict(be_run or {})
+        be_path = be_run.get("path", "")
+        stages = []
+        for s in be_run.get("stages", []) or []:
+            if self._cancelled or self.isInterruptionRequested():
+                return []
+            s2 = dict(s)
+            rpt_candidates = _stage_runtime_candidates(be_path, s2)
+            s2["_runtime_candidates"] = rpt_candidates
+            s2["_runtime_rpt_path"] = ""
+            info = s2.get("info", {}) or {}
+            for cand in rpt_candidates:
+                if self._cancelled or self.isInterruptionRequested():
+                    return []
+                if cand and os.path.exists(cand):
+                    s2["_runtime_rpt_path"] = cand
+                    info = parse_pnr_runtime_rpt_uncached(cand)
+                    break
+            if not info:
+                info = {"start": "-", "end": "-", "runtime": "-", "last_stage": "-"}
+            s2["info"] = info
+            pass_candidates = _stage_pass_candidates(be_path, s2)
+            s2["_pass_candidates"] = pass_candidates
+            if pass_candidates and not s2.get("pass_path"):
+                s2["pass_path"] = pass_candidates[0]
+            status, active_stage, pass_path = resolve_pnr_stage_status(s2, be_run)
+            s2["stage_status"] = status
+            s2["active_stage"] = active_stage
+            s2["pass_path"] = pass_path
+            s2["_stage_index_loaded"] = True
+            stages.append(s2)
+        stages.sort(key=lambda st: (
+            0 if _parse_stage_start_sort_value(st.get("info", {})) else 1,
+            _parse_stage_start_sort_value(st.get("info", {})) or (9999, 12, 31, 23, 59),
+            st.get("_stage_index", 9999),
+            st.get("name", "")))
+        for idx, st in enumerate(stages):
+            st["_stage_order"] = idx
+        return stages
+
+    def run(self):
+        out = {}
+        total = len(self.runs)
+        for idx, run in enumerate(self.runs):
+            if self._cancelled or self.isInterruptionRequested():
+                self.finished.emit(out)
+                return
+            try:
+                if run.get("run_type") == "BE" and run.get("stages"):
+                    path = os.path.normpath(run.get("path", "") or "")
+                    if path:
+                        out[path] = self._index_run(run)
+            except Exception:
+                pass
+            if idx % 10 == 0 or idx + 1 == total:
+                self.progress.emit(idx + 1, total)
+        self.finished.emit(out)
 
 
 class QuickStatusRefreshWorker(QThread):
