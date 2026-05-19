@@ -4436,12 +4436,17 @@ class LatestOutfeedStatusDialog(QDialog):
         self.be_rows = list(be_rows or [])
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "<b>Latest complete OUTFEED runs by block</b>"))
+            "<b>Latest OUTFEED status by block with QoR metrics</b>"))
         tabs = QTabWidget()
-        self.fe_tbl = self._make_table(
-            ["Block", "RTL", "FE Run", "Runtime", "End", "Path", "Missing"])
-        self.be_tbl = self._make_table(
-            ["Block", "RTL", "BE Run", "Stages", "End", "Path", "Missing"])
+        self.fe_tbl = self._make_table([
+            "Block", "RTL", "FE Run", "Runtime", "End",
+            "R2R Setup W/T/N", "R2R Hold W/T/N",
+            "Std Cell Count/Area", "Gate Count", "Congestion", "Path", "Missing"])
+        self.be_tbl = self._make_table([
+            "Block", "RTL", "BE Run", "Stage",
+            "R2R Setup W/T/N", "Total Setup W/T/N", "Hold W/T/N",
+            "Cong/Shorts", "Std Cell Count/Area", "Gate Count",
+            "Runtime", "End", "Missing", "Path"])
         tabs.addTab(self.fe_tbl, "FE")
         tabs.addTab(self.be_tbl, "BE")
         layout.addWidget(tabs, 1)
@@ -4470,8 +4475,13 @@ class LatestOutfeedStatusDialog(QDialog):
         for c in range(len(headers)):
             tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
             tbl.setColumnWidth(c, 150)
-        tbl.setColumnWidth(2, 340)
-        tbl.setColumnWidth(5, 420)
+        if len(headers) > 2:
+            tbl.setColumnWidth(2, 340)
+        for idx, header in enumerate(headers):
+            if header == "Path":
+                tbl.setColumnWidth(idx, 420)
+            elif header == "Missing":
+                tbl.setColumnWidth(idx, 240)
         return tbl
 
     def _fill_table(self, tbl, rows):
@@ -4481,11 +4491,15 @@ class LatestOutfeedStatusDialog(QDialog):
             tbl.insertRow(r)
             vals = row.get("values", [])
             missing = row.get("missing", [])
+            tip = "\n".join(missing) if missing else ""
             for c, val in enumerate(vals):
                 it = QTableWidgetItem(str(val if val is not None else "-"))
-                if c == tbl.columnCount() - 1 and missing:
-                    it.setToolTip("\n".join(missing))
+                if tip:
+                    it.setToolTip(tip)
                 tbl.setItem(r, c, it)
+        tbl.resizeColumnsToContents()
+        for c in range(tbl.columnCount()):
+            tbl.setColumnWidth(c, min(max(tbl.columnWidth(c), 90), 420))
 
     def _table_to_csv_rows(self, tbl):
         rows = [[tbl.horizontalHeaderItem(c).text() for c in range(tbl.columnCount())]]
@@ -9417,20 +9431,381 @@ class PDDashboard(QMainWindow):
         return candidates[0]
 
     def _outfeed_be_missing_reports(self, run):
-        path = (run or {}).get("path") or ""
-        stages = (run or {}).get("stages") or []
-        patterns = self._cfg_patterns(
-            'OUTFEED_COMPLETENESS', 'BE_REQUIRED_REPORTS',
-            '*.runtime.rpt *.qor_sum.rpt *.grc.rpt *.sec_get_area.rpt')
         missing = []
+        stages = (run or {}).get("stages") or []
         if not stages:
             return ["no stages discovered"]
         for st in stages:
-            name = st.get("name", "")
-            rpt_dir = self._outfeed_stage_report_dir(path, name)
-            for pat in self._missing_patterns(rpt_dir, patterns):
-                missing.append("{}/{}".format(name, pat))
+            missing.extend(self._latest_outfeed_stage_missing_reports(run, st))
         return missing
+
+    def _latest_outfeed_scan_runs(self, cancel_cb=None):
+        cancel_cb = cancel_cb or (lambda: False)
+        runs = []
+        base = globals().get("BASE_OUTFEED_DIR", "")
+        if not base or not os.path.isdir(base):
+            return runs
+
+        def _ignored(name, patterns):
+            for pat in re.split(r"[,\s]+", patterns or ""):
+                pat = pat.strip()
+                if pat and fnmatch.fnmatch(name, pat):
+                    return True
+            return False
+
+        ignore_fe = globals().get("IGNORE_FE_RUN_PATTERNS", "")
+        ignore_be = globals().get("IGNORE_BE_RUN_PATTERNS", "")
+        project = globals().get("PROJECT_PREFIX", "")
+        try:
+            block_entries = list(os.scandir(base))
+        except Exception:
+            return runs
+        for block_ent in block_entries:
+            if cancel_cb():
+                return runs
+            try:
+                if not block_ent.is_dir():
+                    continue
+            except Exception:
+                continue
+            block = block_ent.name
+            try:
+                evt_entries = list(os.scandir(block_ent.path))
+            except Exception:
+                continue
+            for evt_ent in evt_entries:
+                if cancel_cb():
+                    return runs
+                try:
+                    if not evt_ent.is_dir() or not evt_ent.name.startswith("EVT"):
+                        continue
+                except Exception:
+                    continue
+                evt = evt_ent.name
+                rtl = normalize_rtl(evt) if "normalize_rtl" in globals() else ((project + "_" + evt) if project else evt)
+                fc_dir = os.path.join(evt_ent.path, "fc")
+                if os.path.isdir(fc_dir):
+                    try:
+                        fc_entries = list(os.scandir(fc_dir))
+                    except Exception:
+                        fc_entries = []
+                    for ent in fc_entries:
+                        if cancel_cb():
+                            return runs
+                        try:
+                            if not ent.is_dir():
+                                continue
+                        except Exception:
+                            continue
+                        name = ent.name
+                        if name.endswith("-BE"):
+                            if _ignored(name, ignore_be):
+                                continue
+                            stages = self._latest_outfeed_stage_list(ent.path, "fc", cancel_cb)
+                            info = self._latest_outfeed_be_info(ent.path, stages)
+                            runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "BE",
+                                         "block": block, "rtl": rtl, "r_name": name,
+                                         "path": ent.path, "stages": stages,
+                                         "info": info, "start": info.get("start", "-"),
+                                         "end": info.get("end", "-"), "runtime": info.get("runtime", "-")})
+                        elif name.endswith("-FE"):
+                            if _ignored(name, ignore_fe):
+                                continue
+                            info = self._latest_outfeed_fe_info(ent.path)
+                            runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "FE",
+                                         "block": block, "rtl": rtl, "r_name": name,
+                                         "path": ent.path, "info": info,
+                                         "start": info.get("start", "-"), "end": info.get("end", "-"),
+                                         "runtime": info.get("runtime", "-")})
+                        else:
+                            try:
+                                child_entries = list(os.scandir(ent.path))
+                            except Exception:
+                                child_entries = []
+                            for child in child_entries:
+                                if cancel_cb():
+                                    return runs
+                                try:
+                                    if not child.is_dir():
+                                        continue
+                                except Exception:
+                                    continue
+                                cname = child.name
+                                if cname.endswith("-FE") and not _ignored(cname, ignore_fe):
+                                    info = self._latest_outfeed_fe_info(child.path)
+                                    runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "FE",
+                                                 "block": block, "rtl": rtl, "r_name": cname,
+                                                 "path": child.path, "info": info,
+                                                 "start": info.get("start", "-"), "end": info.get("end", "-"),
+                                                 "runtime": info.get("runtime", "-")})
+                inv_dir = os.path.join(evt_ent.path, "innovus")
+                if os.path.isdir(inv_dir):
+                    try:
+                        inv_entries = list(os.scandir(inv_dir))
+                    except Exception:
+                        inv_entries = []
+                    for ent in inv_entries:
+                        if cancel_cb():
+                            return runs
+                        try:
+                            if not ent.is_dir():
+                                continue
+                        except Exception:
+                            continue
+                        name = ent.name
+                        if _ignored(name, ignore_be):
+                            continue
+                        stages = self._latest_outfeed_stage_list(ent.path, "innovus", cancel_cb)
+                        info = self._latest_outfeed_be_info(ent.path, stages)
+                        runs.append({"source": "OUTFEED", "tool": "innovus", "run_type": "BE",
+                                     "block": block, "rtl": rtl, "r_name": name,
+                                     "path": ent.path, "stages": stages, "info": info,
+                                     "start": info.get("start", "-"), "end": info.get("end", "-"),
+                                     "runtime": info.get("runtime", "-")})
+        return self._dedupe_latest_outfeed_runs(runs)
+
+    def _dedupe_latest_outfeed_runs(self, runs):
+        out = []
+        seen = set()
+        for run in runs:
+            path = run.get("path", "")
+            key = os.path.realpath(path) if path else run.get("r_name", "")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(run)
+        return out
+
+    def _latest_outfeed_fe_info(self, path):
+        rpt = os.path.join(path or "", "reports", "runtime.V2.rpt")
+        try:
+            return parse_runtime_rpt(rpt)
+        except Exception:
+            return {"start": "-", "end": "-", "runtime": "-"}
+
+    def _latest_outfeed_be_info(self, path, stages):
+        timed = []
+        for st in stages or []:
+            info = st.get("info") or {}
+            dt = self._latest_datetime_value(info.get("end") or info.get("start"))
+            if dt:
+                timed.append((dt, info))
+        if timed:
+            timed.sort(key=lambda x: x[0])
+            first = stages[0].get("info", {}) if stages else {}
+            last = timed[-1][1]
+            return {"start": first.get("start", "-"), "end": last.get("end", "-"), "runtime": last.get("runtime", "-")}
+        try:
+            mt = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+            return {"start": "-", "end": mt.strftime("%b %d, %Y - %H:%M"), "runtime": "-"}
+        except Exception:
+            return {"start": "-", "end": "-", "runtime": "-"}
+
+    def _latest_datetime_value(self, text):
+        text = str(text or "").strip()
+        if not text or text == "-":
+            return None
+        for fmt in ("%a %b %d, %Y - %H:%M", "%b %d, %Y - %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.datetime.strptime(text, fmt)
+            except Exception:
+                pass
+        return None
+
+    def _latest_outfeed_stage_list(self, be_path, tool, cancel_cb=None):
+        cancel_cb = cancel_cb or (lambda: False)
+        skip = set(["reports", "logs", "pass", "fail", "outputs", "screenshot", "screenshots"])
+        stages = []
+        try:
+            entries = list(os.scandir(be_path))
+        except Exception:
+            entries = []
+        idx = 0
+        for ent in entries:
+            if cancel_cb():
+                return stages
+            try:
+                if not ent.is_dir():
+                    continue
+            except Exception:
+                continue
+            name = ent.name
+            if name.startswith(".") or name in skip:
+                continue
+            st = {"name": name, "stage_path": ent.path, "_stage_index": idx, "tool": tool}
+            idx += 1
+            st["_rpt_cands"] = self._latest_stage_runtime_candidates(be_path, st)
+            st["info"] = self._latest_parse_stage_runtime(st["_rpt_cands"])
+            st["runtime_rpt"] = st.get("info", {}).get("path", "")
+            stages.append(st)
+        stages.sort(key=lambda st: self._latest_stage_sort_key(st))
+        return stages
+
+    def _latest_stage_runtime_candidates(self, be_path, st):
+        name = st.get("name", "")
+        stage_path = st.get("stage_path") or os.path.join(be_path, name)
+        return [
+            os.path.join(stage_path, "reports", name, name + ".runtime.rpt"),
+            os.path.join(stage_path, "reports", name + ".runtime.rpt"),
+            os.path.join(be_path, "reports", name, name + ".runtime.rpt"),
+            os.path.join(be_path, name, "reports", name, name + ".runtime.rpt"),
+            os.path.join(be_path, name, "reports", name + ".runtime.rpt"),
+        ]
+
+    def _latest_parse_stage_runtime(self, cands):
+        for cand in cands or []:
+            if cand and os.path.exists(cand):
+                try:
+                    info = parse_pnr_runtime_rpt_uncached(cand)
+                except Exception:
+                    info = {"start": "-", "end": "-", "runtime": "-"}
+                info["path"] = cand
+                return info
+        return {"start": "-", "end": "-", "runtime": "-", "path": ""}
+
+    def _latest_stage_sort_key(self, st):
+        info = st.get("info") or {}
+        dt = self._latest_datetime_value(info.get("start") or info.get("end"))
+        if dt:
+            return (0, dt, st.get("_stage_index", 9999), st.get("name", ""))
+        return (1, datetime.datetime.max, st.get("_stage_index", 9999), st.get("name", ""))
+
+    def _latest_stage_report_dirs(self, be_path, st):
+        name = st.get("name", "")
+        stage_path = st.get("stage_path") or os.path.join(be_path, name)
+        dirs = [
+            os.path.join(stage_path, "reports", name),
+            os.path.join(stage_path, "reports"),
+            os.path.join(be_path, "reports", name),
+        ]
+        out = []
+        seen = set()
+        for d in dirs:
+            if d and d not in seen:
+                seen.add(d)
+                out.append(d)
+        return out
+
+    def _latest_dirs_have_match(self, dirs, patterns):
+        for d in dirs or []:
+            try:
+                names = os.listdir(d)
+            except Exception:
+                continue
+            for pat in patterns:
+                for name in names:
+                    if fnmatch.fnmatch(name, pat):
+                        return True
+        return False
+
+    def _latest_outfeed_stage_missing_reports(self, run, st):
+        be_path = (run or {}).get("path", "")
+        name = st.get("name", "")
+        missing = []
+        if not any(os.path.exists(c) for c in self._latest_stage_runtime_candidates(be_path, st)):
+            missing.append("{}/runtime".format(name))
+        dirs = self._latest_stage_report_dirs(be_path, st)
+        is_innovus = ((run or {}).get("tool") == "innovus") or ("/innovus/" in (be_path or "").replace("\\", "/"))
+        if is_innovus:
+            required = [
+                ("setup", [name + "_p*.summary.gz", name + "_p*.summary", "*_p*.summary.gz"]),
+                ("hold", [name + ".qor.snap.rpt", "*.qor.snap.rpt"]),
+                ("congestion", [name + ".grc.rpt", "*.grc.rpt"]),
+                ("area/util", [name + ".sec_get_area.rpt", "*.sec_get_area.rpt"]),
+            ]
+        else:
+            required = [
+                ("setup/hold", [name + ".qor_sum.rpt", "*.qor_sum.rpt"]),
+                ("congestion", [name + ".grc.rpt", "*.grc.rpt"]),
+                ("area/util", [name + ".sec_get_area.rpt", "*.sec_get_area.rpt"]),
+            ]
+        for label, pats in required:
+            if not self._latest_dirs_have_match(dirs, pats):
+                missing.append("{}/{}".format(name, label))
+        return missing
+
+    def _latest_outfeed_run_date_key(self, run):
+        dt = self._latest_datetime_value(run.get("end") or run.get("start"))
+        if dt:
+            return dt
+        info = run.get("info", {}) or {}
+        dt = self._latest_datetime_value(info.get("end") or info.get("start"))
+        if dt:
+            return dt
+        try:
+            return datetime.datetime.fromtimestamp(os.path.getmtime(run.get("path", "")))
+        except Exception:
+            return datetime.datetime.min
+
+    def _latest_gate_count_from_metrics(self, metrics):
+        try:
+            area = (metrics.get("area") or {}).get("std_cell_area")
+            if area in (None, "", "-"):
+                sca = metrics.get("std_cell_count_area", "")
+                if "/" in str(sca):
+                    area = str(sca).split("/", 1)[1]
+            area = float(str(area).replace(",", ""))
+            unit = float(getattr(self, "gate_count_unit_area", 0.2419) or 0.2419)
+            if unit <= 0:
+                unit = 0.2419
+            return str(int(round(area / unit)))
+        except Exception:
+            return "-"
+
+    def _latest_fe_qor_row(self, run, missing, cancel_cb):
+        try:
+            from metric_extract import extract_fe_metrics
+            metrics = extract_fe_metrics(run.get("path", ""), source="OUTFEED", block=run.get("block", ""), cancel_check=cancel_cb)
+        except Exception:
+            metrics = {}
+        area = metrics.get("area") or {}
+        inst = area.get("instance_count") or "-"
+        std_area = area.get("std_cell_area") or "-"
+        std_ca = "{}/{}".format(inst, std_area) if (inst != "-" or std_area != "-") else "-"
+        cong = (metrics.get("congestion") or {}).get("cong_both") or "-"
+        runtime = run.get("runtime", "-") or metrics.get("runtime", "-")
+        return {"values": [
+            run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
+            runtime, run.get("end", "-"), metrics.get("r2r_setup", "-"),
+            metrics.get("r2r_hold", "-"), std_ca,
+            self._latest_gate_count_from_metrics(metrics), cong,
+            run.get("path", ""), "; ".join(missing) if missing else ""],
+            "missing": missing}
+
+    def _latest_be_qor_rows(self, run, missing_map, cancel_cb):
+        rows = []
+        try:
+            from metric_extract import extract_pnr_stage_metrics
+        except Exception:
+            extract_pnr_stage_metrics = None
+        for st in run.get("stages") or []:
+            if cancel_cb():
+                return rows
+            name = st.get("name", "")
+            if extract_pnr_stage_metrics:
+                try:
+                    metrics = extract_pnr_stage_metrics(
+                        run.get("path", ""), name, source="OUTFEED",
+                        block=run.get("block", ""), stage_path=st.get("stage_path"),
+                        cancel_check=cancel_cb)
+                except Exception:
+                    metrics = {}
+            else:
+                metrics = {}
+            info = st.get("info") or {}
+            runtime = metrics.get("runtime") if metrics.get("runtime") not in (None, "", "-") else info.get("runtime", "-")
+            end = info.get("end", "-")
+            cong = (metrics.get("congestion") or {}).get("cong_both") or "-"
+            hold = metrics.get("hold_r2r") or metrics.get("r2r_hold") or metrics.get("hold_all") or "-"
+            missing = missing_map.get(name, [])
+            rows.append({"values": [
+                run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""), name,
+                metrics.get("r2r_setup", "-"), metrics.get("setup_total", "-"), hold,
+                cong, metrics.get("std_cell_count_area", "-"),
+                self._latest_gate_count_from_metrics(metrics), runtime, end,
+                "; ".join(missing) if missing else "", st.get("stage_path", run.get("path", ""))],
+                "missing": missing})
+        return rows
 
     def _is_complete_outfeed_fe(self, run):
         return (run or {}).get("source") == "OUTFEED" and not self._outfeed_fe_missing_reports(run)
@@ -9488,47 +9863,65 @@ class PDDashboard(QMainWindow):
 
     def _latest_outfeed_rows(self, cancel_cb=None):
         cancel_cb = cancel_cb or (lambda: False)
-        out_runs = list((self.out_data or {}).get("all_runs", []) or [])
+        out_runs = self._latest_outfeed_scan_runs(cancel_cb)
         by_block_fe = {}
         by_block_be = {}
         for run in out_runs:
             if cancel_cb():
                 return [], []
-            if run.get("source") != "OUTFEED":
-                continue
             block = run.get("block", "")
+            if not block:
+                continue
             if run.get("run_type") == "FE":
                 missing = self._outfeed_fe_missing_reports(run)
-                if missing:
-                    continue
-                prev = by_block_fe.get(block)
-                if prev is None or self._run_date_key(run) > self._run_date_key(prev):
-                    by_block_fe[block] = run
+                item = (run, missing)
+                cur = by_block_fe.get(block)
+                complete = not missing
+                if cur is None:
+                    by_block_fe[block] = item
+                else:
+                    cur_complete = not cur[1]
+                    if ((complete and not cur_complete) or
+                            (complete == cur_complete and
+                             self._latest_outfeed_run_date_key(run) > self._latest_outfeed_run_date_key(cur[0]))):
+                        by_block_fe[block] = item
             elif run.get("run_type") == "BE":
-                missing = self._outfeed_be_missing_reports(run)
-                if missing:
-                    continue
-                prev = by_block_be.get(block)
-                if prev is None or self._run_date_key(run) > self._run_date_key(prev):
-                    by_block_be[block] = run
+                miss_map = {}
+                all_missing = []
+                for st in run.get("stages") or []:
+                    sm = self._latest_outfeed_stage_missing_reports(run, st)
+                    miss_map[st.get("name", "")] = sm
+                    all_missing.extend(sm)
+                if not run.get("stages"):
+                    all_missing = ["no stages discovered"]
+                item = (run, all_missing, miss_map)
+                cur = by_block_be.get(block)
+                complete = not all_missing
+                if cur is None:
+                    by_block_be[block] = item
+                else:
+                    cur_complete = not cur[1]
+                    if ((complete and not cur_complete) or
+                            (complete == cur_complete and
+                             self._latest_outfeed_run_date_key(run) > self._latest_outfeed_run_date_key(cur[0]))):
+                        by_block_be[block] = item
 
         fe_rows = []
-        be_rows = []
         for block in sorted(by_block_fe):
-            run = by_block_fe[block]
-            info = run.get("info", {}) or {}
-            fe_rows.append({"values": [
-                block, run.get("rtl", ""), run.get("r_name", ""),
-                info.get("runtime", "-"), info.get("end", "-"),
-                run.get("path", ""), ""]})
+            run, missing = by_block_fe[block]
+            fe_rows.append(self._latest_fe_qor_row(run, missing, cancel_cb))
+        be_rows = []
         for block in sorted(by_block_be):
-            run = by_block_be[block]
-            stages = [st.get("name", "") for st in (run.get("stages") or [])]
-            info = run.get("info", {}) or {}
-            be_rows.append({"values": [
-                block, run.get("rtl", ""), run.get("r_name", ""),
-                ", ".join([s for s in stages if s]) or "-",
-                info.get("end", "-"), run.get("path", ""), ""]})
+            run, all_missing, miss_map = by_block_be[block]
+            stage_rows = self._latest_be_qor_rows(run, miss_map, cancel_cb)
+            if stage_rows:
+                be_rows.extend(stage_rows)
+            else:
+                be_rows.append({"values": [
+                    block, run.get("rtl", ""), run.get("r_name", ""), "-",
+                    "-", "-", "-", "-", "-", "-", "-", run.get("end", "-"),
+                    "; ".join(all_missing) if all_missing else "", run.get("path", "")],
+                    "missing": all_missing})
         return fe_rows, be_rows
 
     def show_latest_outfeed_status(self):
@@ -9537,7 +9930,7 @@ class PDDashboard(QMainWindow):
                 self, "Latest OUTFEED Status",
                 "Latest OUTFEED status scan is already running.")
             return
-        self.status_bar.showMessage("Scanning latest complete OUTFEED runs...", 3000)
+        self.status_bar.showMessage("Scanning latest OUTFEED FE/BE status and QoR...", 3000)
         worker = LatestOutfeedStatusWorker(self)
         worker.finished.connect(self._on_latest_outfeed_status_done)
         self._workers.start(
@@ -10940,7 +11333,14 @@ class PDDashboard(QMainWindow):
                         # BE child run under FE item: hide when FE-only
                         child_run = ch.data(0, _UR10)
                         child_rt  = child_run.get("run_type") if child_run else None
-                        hide_child = not passes or (_fe_only and child_rt == "BE")
+                        child_passes = passes
+                        if child_run and child_rt == "BE" and _rfc is not None:
+                            be_allowed = self._filter_allowed_names(
+                                child_run.get("source", ""), child_run.get("rtl", ""),
+                                child_run.get("block", ""), "BE")
+                            if be_allowed:
+                                child_passes = _passes(child_run)
+                        hide_child = not child_passes or (_fe_only and child_rt == "BE")
                         if _pinned_only:
                             child_path = child_run.get("path") if child_run else ch.text(15)
                             hide_child = not (
@@ -11286,14 +11686,23 @@ class PDDashboard(QMainWindow):
                 if not path:
                     return
                 self.current_config_path = path
+            role = run_data_for_menu.get("run_type", "FE")
+            parent_fe = ""
+            if str(role or "FE").upper() == "BE":
+                parent_fe = (self._parent_fe_base_for_filter_item(target_item)
+                             or self._fe_base_from_be_run_name(base_run))
             added = self._add_run_to_filter_config(
-                run_source, r_rtl, b_name, base_run,
-                run_data_for_menu.get("run_type", "FE"))
+                run_source, r_rtl, b_name, base_run, role,
+                parent_fe_name=parent_fe)
             self._save_current_config()
+            self.ignore_run_filter = False
+            if hasattr(self, "ignore_run_filter_act"):
+                self.ignore_run_filter_act.setChecked(False)
             self.sb_config.setText(
                 f"Config: {os.path.basename(self.current_config_path)}")
             self.status_bar.showMessage(
                 "Added to active filter config: " + added, 5000)
+            self.refresh_view()
 
         elif res == ignore_checked_act:
             paths_to_ignore = [p for p in self._checked_paths
@@ -11817,6 +12226,24 @@ class PDDashboard(QMainWindow):
             be_fe = be_fe[:-3]
         return be_fe == fe_base
 
+    def _fe_base_from_be_run_name(self, be_name):
+        be_name = str(be_name or "")
+        if not be_name:
+            return ""
+        stripped = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', be_name)
+        if stripped.endswith("-BE"):
+            stripped = stripped[:-3]
+        idx = stripped.find('_')
+        return stripped[:idx] if idx >= 0 else stripped
+
+    def _parent_fe_base_for_filter_item(self, item):
+        parent = item.parent() if item else None
+        while parent:
+            run = parent.data(0, Qt.UserRole + 10) or {}
+            if run.get("run_type") == "FE":
+                return parent.data(0, Qt.UserRole + 4) or parent.text(0)
+            parent = parent.parent()
+        return ""
     def _ensure_filter_config_path(self):
         if self.current_config_path:
             return True
@@ -11865,12 +12292,17 @@ class PDDashboard(QMainWindow):
                 run.get("source", ""), item.text(1),
                 run.get("block", item.data(0, Qt.UserRole + 2) or ""),
                 role)) if self.run_filter_config else []
+            parent_fe = ""
+            if str(role or "FE").upper() == "BE":
+                parent_fe = (self._parent_fe_base_for_filter_item(item)
+                             or self._fe_base_from_be_run_name(base_run))
             self._add_run_to_filter_config(
                 run.get("source", item.text(2)),
                 item.text(1),
                 run.get("block", item.data(0, Qt.UserRole + 2) or ""),
                 base_run,
-                role)
+                role,
+                parent_fe_name=parent_fe)
             after = self._filter_allowed_names(
                 run.get("source", item.text(2)), item.text(1),
                 run.get("block", item.data(0, Qt.UserRole + 2) or ""),
@@ -11980,7 +12412,7 @@ class PDDashboard(QMainWindow):
             f.write(sample)
         QMessageBox.information(self, "Sample Config", f"Saved to:\n{path}")
 
-    def _add_run_to_filter_config(self, source, rtl, block, run_name, role="FE"):
+    def _add_run_to_filter_config(self, source, rtl, block, run_name, role="FE", parent_fe_name=""):
         if self.run_filter_config is None:
             self.run_filter_config = {}
         source = str(source or "WS").strip()
@@ -11988,6 +12420,7 @@ class PDDashboard(QMainWindow):
         block = str(block or "").strip()
         run_name = str(run_name or "").strip()
         role = str(role or "FE").upper()
+        parent_fe_name = str(parent_fe_name or "").strip()
         if role not in ("FE", "BE"):
             role = "FE"
         if not source or not rtl or not block or not run_name:
@@ -12000,6 +12433,12 @@ class PDDashboard(QMainWindow):
         runs = slot.setdefault(role, [])
         if run_name not in runs:
             runs.append(run_name)
+        if role == "BE":
+            fe_name = parent_fe_name or self._fe_base_from_be_run_name(run_name)
+            if fe_name:
+                fe_runs = slot.setdefault("FE", [])
+                if fe_name not in fe_runs:
+                    fe_runs.append(fe_name)
         return "{}|{}|{}|{} = {}".format(source, rtl, block, role, run_name)
 
     def _save_current_config(self):
