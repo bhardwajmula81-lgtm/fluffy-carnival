@@ -416,6 +416,16 @@ if os.path.exists(USER_PREFS_FILE):
     prefs.read(USER_PREFS_FILE)
 
 
+def _ensure_pref_section(section):
+    try:
+        if not prefs.has_section(section):
+            prefs.add_section(section)
+    except Exception:
+        pass
+
+
+
+
 def _ensure_notes_dir():
     if not os.path.exists(NOTES_DIR):
         try:
@@ -3397,9 +3407,8 @@ def _table_text(tbl, row, col):
 
 def _clear_table_spans(tbl):
     try:
-        for r in range(tbl.rowCount()):
-            for c in range(tbl.columnCount()):
-                tbl.setSpan(r, c, 1, 1)
+        if hasattr(tbl, "clearSpans"):
+            tbl.clearSpans()
     except Exception:
         pass
 
@@ -3434,7 +3443,8 @@ def _apply_common_table_spans(tbl, merge_cols=(0, 1)):
     spans, _skip = _rowspan_groups(tbl, merge_cols)
     try:
         for (row, col), span in spans.items():
-            tbl.setSpan(row, col, span, 1)
+            if span > 1:
+                tbl.setSpan(row, col, span, 1)
     except Exception:
         pass
 
@@ -3728,8 +3738,8 @@ class BEStageSummaryDialog(QDialog):
             self._metric_value(metrics, "gc"),
             self._metric_value(metrics, "std_util"),
             self._metric_value(metrics, "total_util"),
-            self._metric_value(metrics, "vt_inst"),
-            self._metric_value(metrics, "vt_area"),
+            self._metric_value(metrics, "vth_inst"),
+            self._metric_value(metrics, "vth_area"),
             self._metric_value(metrics, "skew_latency"),
             self._metric_value(metrics, "clock_repeater_count_area"),
             (self._metric_value(metrics, "runtime")
@@ -4058,8 +4068,8 @@ class StatusPackageDialog(QDialog):
             self._metric_value(metrics, "gc"),
             self._metric_value(metrics, "std_util"),
             self._metric_value(metrics, "total_util"),
-            self._metric_value(metrics, "vt_inst"),
-            self._metric_value(metrics, "vt_area"),
+            self._metric_value(metrics, "vth_inst"),
+            self._metric_value(metrics, "vth_area"),
             self._metric_value(metrics, "skew_latency"),
             self._metric_value(metrics, "clock_repeater_count_area"),
             self._metric_value(metrics, "runtime")
@@ -4405,7 +4415,7 @@ class ArchiveStoreWorker(QThread):
 
 
 class LatestOutfeedStatusWorker(QThread):
-    finished = pyqtSignal(list, list, str)
+    finished = pyqtSignal(list, list, list, str)
 
     def __init__(self, dashboard):
         super().__init__(dashboard)
@@ -4418,38 +4428,50 @@ class LatestOutfeedStatusWorker(QThread):
 
     def run(self):
         try:
-            fe_rows, be_rows = self.dashboard._latest_outfeed_rows(
+            alias_rows, fe_rows, be_rows = self.dashboard._latest_outfeed_rows(
                 lambda: self._cancelled or self.isInterruptionRequested())
             if self._cancelled or self.isInterruptionRequested():
                 return
-            self.finished.emit(fe_rows, be_rows, "")
+            self.finished.emit(alias_rows, fe_rows, be_rows, "")
         except Exception as e:
-            self.finished.emit([], [], str(e))
+            self.finished.emit([], [], [], str(e))
 
 
 class LatestOutfeedStatusDialog(QDialog):
-    def __init__(self, fe_rows, be_rows, is_dark, parent=None):
+    def __init__(self, alias_rows, fe_rows, be_rows, is_dark, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Latest OUTFEED Status")
-        self.resize(1300, 650)
+        self.resize(1500, 750)
+        self.alias_rows = list(alias_rows or [])
         self.fe_rows = list(fe_rows or [])
         self.be_rows = list(be_rows or [])
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "<b>Latest OUTFEED status by block with QoR metrics</b>"))
+            "<b>Latest OUTFEED block package</b><br>"
+            "<small>Aliases map run1/run2 to the selected FE run, BE run, and latest BE stage.</small>"))
+
+        self.alias_tbl = self._make_table([
+            "Alias", "Block", "FE Run", "BE Run", "Latest BE Stage",
+            "FE Path", "BE Path"])
+        self.alias_tbl.setMaximumHeight(170)
+        layout.addWidget(self.alias_tbl)
+
         tabs = QTabWidget()
         self.fe_tbl = self._make_table([
-            "Block", "RTL", "FE Run", "Runtime", "End",
+            "Alias", "Block", "RTL", "FE Run", "Runtime", "End",
             "R2R Setup W/T/N", "R2R Hold W/T/N",
-            "Std Cell Count/Area", "Gate Count", "Congestion", "Path", "Missing"])
+            "Std Cell Count/Area", "Gate Count", "Congestion",
+            "VT Area%", "Logic Depth", "Missing", "Path"])
         self.be_tbl = self._make_table([
-            "Block", "RTL", "BE Run", "Stage",
-            "R2R Setup W/T/N", "Total Setup W/T/N", "Hold W/T/N",
-            "Cong/Shorts", "Std Cell Count/Area", "Gate Count",
-            "Runtime", "End", "Missing", "Path"])
-        tabs.addTab(self.fe_tbl, "FE")
-        tabs.addTab(self.be_tbl, "BE")
+            "Alias", "Block", "RTL", "BE Run", "Latest Stage", "Status",
+            "Runtime", "End", "R2R Setup W/T/N", "Total Setup W/T/N",
+            "Hold W/T/N", "Cong/Shorts", "Std Cell Count/Area", "GC",
+            "Std Cell/Std Only Util", "Total Util", "VT Inst%", "VT Area%",
+            "Skew/Latency", "Clock Repeater Count/Area", "Missing", "Path"])
+        tabs.addTab(self.fe_tbl, "FE QoR")
+        tabs.addTab(self.be_tbl, "Latest BE Stage QoR")
         layout.addWidget(tabs, 1)
+        self._fill_table(self.alias_tbl, self.alias_rows)
         self._fill_table(self.fe_tbl, self.fe_rows)
         self._fill_table(self.be_tbl, self.be_rows)
         row = QHBoxLayout()
@@ -4475,13 +4497,13 @@ class LatestOutfeedStatusDialog(QDialog):
         for c in range(len(headers)):
             tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.Interactive)
             tbl.setColumnWidth(c, 150)
-        if len(headers) > 2:
-            tbl.setColumnWidth(2, 340)
         for idx, header in enumerate(headers):
-            if header == "Path":
+            if header in ("FE Run", "BE Run"):
+                tbl.setColumnWidth(idx, 330)
+            elif header == "Path" or header.endswith("Path"):
                 tbl.setColumnWidth(idx, 420)
             elif header == "Missing":
-                tbl.setColumnWidth(idx, 240)
+                tbl.setColumnWidth(idx, 260)
         return tbl
 
     def _fill_table(self, tbl, rows):
@@ -4499,7 +4521,7 @@ class LatestOutfeedStatusDialog(QDialog):
                 tbl.setItem(r, c, it)
         tbl.resizeColumnsToContents()
         for c in range(tbl.columnCount()):
-            tbl.setColumnWidth(c, min(max(tbl.columnWidth(c), 90), 420))
+            tbl.setColumnWidth(c, min(max(tbl.columnWidth(c), 90), 460))
 
     def _table_to_csv_rows(self, tbl):
         rows = [[tbl.horizontalHeaderItem(c).text() for c in range(tbl.columnCount())]]
@@ -4516,6 +4538,9 @@ class LatestOutfeedStatusDialog(QDialog):
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
+                w.writerow(["Aliases"])
+                w.writerows(self._table_to_csv_rows(self.alias_tbl))
+                w.writerow([])
                 w.writerow(["FE"])
                 w.writerows(self._table_to_csv_rows(self.fe_tbl))
                 w.writerow([])
@@ -4527,9 +4552,11 @@ class LatestOutfeedStatusDialog(QDialog):
 
     def _send_mail(self):
         parent = self.parent()
-        body = (_table_to_html(self.fe_tbl, title="Latest OUTFEED FE") +
+        body = (_table_to_html(self.alias_tbl, title="Run Aliases") +
                 "<br>" +
-                _table_to_html(self.be_tbl, title="Latest OUTFEED BE"))
+                _table_to_html(self.fe_tbl, title="Latest OUTFEED FE QoR") +
+                "<br>" +
+                _table_to_html(self.be_tbl, title="Latest OUTFEED Latest BE Stage QoR"))
         if parent and hasattr(parent, "_open_mail_compose_dialog"):
             parent._open_mail_compose_dialog(
                 subject="Flow Pulse Latest OUTFEED Status",
@@ -5021,8 +5048,7 @@ class PDDashboard(QMainWindow):
             self._stop_worker_attr(attr_name, 3000)
 
     def _save_ui_preferences_for_close(self):
-        if not prefs.has_section('UI'):
-            prefs.add_section('UI')
+        _ensure_pref_section('UI')
         prefs.set('UI', 'main_splitter', ','.join(
             map(str, self.main_splitter.sizes())))
         prefs.set('UI', 'last_source',  self.src_combo.currentText())
@@ -5032,6 +5058,8 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'last_sort', getattr(
             self, "_tree_sort_mode", "Start Date Old->New"))
         prefs.set('UI', 'last_search',  self.search.text())
+        if hasattr(self, 'search_mode_combo'):
+            prefs.set('UI', 'search_mode', self.search_mode_combo.currentText())
         prefs.set('UI', 'last_auto',    self.auto_combo.currentText())
         prefs.set('UI', 'search_history', '|||'.join(self._search_history[:15]))
         col_widths = ','.join(
@@ -6943,6 +6971,15 @@ class PDDashboard(QMainWindow):
             self._show_search_history)
         top_layout.addWidget(self.search)
 
+        self.search_mode_combo = QComboBox()
+        self.search_mode_combo.addItems(["Filter", "Highlight"])
+        self.search_mode_combo.setFixedWidth(92)
+        self.search_mode_combo.setToolTip(
+            "Filter hides non-matches. Highlight keeps rows visible and marks matches.")
+        self.search_mode_combo.currentIndexChanged.connect(
+            lambda: self.search_timer.start(80))
+        top_layout.addWidget(self.search_mode_combo)
+
         # Search result count label
         self.search_count_lbl = QLabel("")
         self.search_count_lbl.setFixedWidth(70)
@@ -7545,8 +7582,7 @@ class PDDashboard(QMainWindow):
             if idx >= 0:
                 self.rel_combo.setCurrentIndex(idx)
             self.rel_combo.blockSignals(False)
-        if not prefs.has_section('UI'):
-            prefs.add_section('UI')
+        _ensure_pref_section('UI')
         for key, val in (
                 ('last_source', 'ALL'),
                 ('last_rtl', '[ SHOW ALL ]'),
@@ -7554,6 +7590,7 @@ class PDDashboard(QMainWindow):
                 ('last_mode', 'Standard'),
                 ('last_sort', 'Start Date Old->New'),
                 ('last_search', ''),
+                ('search_mode', 'Filter'),
                 ('last_auto', 'Off'),
                 ('hide_block_nodes', 'false'),
                 ('show_relative_time', 'false'),
@@ -7743,27 +7780,60 @@ class PDDashboard(QMainWindow):
                                      {0, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14})
         self._preset_full     = _get('full',     set(range(15)) | {22})
 
+    def _current_visible_preset(self):
+        if not hasattr(self, '_preset_compact'):
+            self._load_preset_sets()
+        name = "Standard"
+        try:
+            if hasattr(self, 'mode_combo'):
+                name = self.mode_combo.currentText()
+        except Exception:
+            pass
+        if name == "Compact":
+            return self._preset_compact
+        if name == "Full":
+            return self._preset_full
+        return self._preset_standard
+
+    def _apply_column_visibility(self):
+        if not hasattr(self, "tree"):
+            return
+        visible = set(self._current_visible_preset())
+        always_hidden = {15, 16, 17, 18, 19, 20, 21, 23}
+        try:
+            sel_rtl = self.rel_combo.currentText()
+        except Exception:
+            sel_rtl = "[ SHOW ALL ]"
+        try:
+            src_mode = self.src_combo.currentText()
+        except Exception:
+            src_mode = "ALL"
+        hidden = set(always_hidden)
+        if sel_rtl != "[ SHOW ALL ]":
+            hidden.add(1)
+        if src_mode == "WS":
+            hidden.add(2)
+        elif src_mode == "OUTFEED":
+            hidden.update([2, 3, 4])
+        for i in range(self.tree.columnCount()):
+            self.tree.setColumnHidden(i, (i not in visible) or (i in hidden))
+
     def _set_col_preset(self, preset, persist=True):
         if not hasattr(self, '_preset_compact'):
             self._load_preset_sets()
-        always_hidden = {15, 16, 17, 18, 19, 20, 21, 23}
-        if preset == 1:   visible = self._preset_compact
-        elif preset == 2: visible = self._preset_standard
-        else:             visible = self._preset_full
-        for i in range(self.tree.columnCount()):
-            self.tree.setColumnHidden(i, i not in visible or i in always_hidden)
         name_map = {1: "Compact", 2: "Standard", 3: "Full"}
+        mode_name = name_map.get(preset, "Standard")
         if hasattr(self, 'mode_combo'):
             self.mode_combo.blockSignals(True)
-            idx = self.mode_combo.findText(name_map.get(preset, "Standard"))
+            idx = self.mode_combo.findText(mode_name)
             if idx >= 0:
                 self.mode_combo.setCurrentIndex(idx)
             self.mode_combo.blockSignals(False)
+        self._apply_column_visibility()
         if persist:
             try:
-                if not prefs.has_section('UI'):
-                    prefs.add_section('UI')
-                prefs.set('UI', 'last_mode', name_map.get(preset, "Standard"))
+                _ensure_pref_section('UI')
+                prefs.set('UI', 'last_mode', mode_name)
                 _write_config_atomic(prefs, USER_PREFS_FILE)
             except Exception:
                 pass
@@ -7993,8 +8063,7 @@ class PDDashboard(QMainWindow):
         self.enable_fe_hover_metrics = bool(checked)
         if hasattr(self, "fe_hover_metrics_act"):
             self.fe_hover_metrics_act.setChecked(self.enable_fe_hover_metrics)
-        if not prefs.has_section('UI'):
-            prefs.add_section('UI')
+        _ensure_pref_section('UI')
         prefs.set('UI', 'enable_fe_hover_metrics',
                   'true' if self.enable_fe_hover_metrics else 'false')
         try:
@@ -8021,7 +8090,7 @@ class PDDashboard(QMainWindow):
             inst = self._metric_value(metrics, "instance_count")
         vt_area = vth.get("lvt_rvt_hvt_area", "-")
         if vt_area in ("", "-", "N/A"):
-            vt_area = self._metric_value(metrics, "vt_area")
+            vt_area = self._metric_value(metrics, "vth_area")
         lines = [
             "WNS: " + str(self._metric_value(metrics, "wns")),
             "Gate Count: " + str(gc),
@@ -9222,6 +9291,7 @@ class PDDashboard(QMainWindow):
                 'UI', 'last_sort', fallback='Start Date Old->New')
             mode = prefs.get('UI', 'last_mode', fallback='Standard')
             srch = prefs.get('UI', 'last_search', fallback='')
+            search_mode = prefs.get('UI', 'search_mode', fallback='Filter')
             auto = prefs.get('UI', 'last_auto',   fallback='Off')
             idx = self.src_combo.findText(src)
             if idx >= 0:
@@ -9241,6 +9311,12 @@ class PDDashboard(QMainWindow):
                 self.search.blockSignals(True)
                 self.search.setText(srch)
                 self.search.blockSignals(False)
+            if hasattr(self, 'search_mode_combo'):
+                idx = self.search_mode_combo.findText(search_mode)
+                if idx >= 0:
+                    self.search_mode_combo.blockSignals(True)
+                    self.search_mode_combo.setCurrentIndex(idx)
+                    self.search_mode_combo.blockSignals(False)
             self._tree_sort_mode = sort_mode
             if hasattr(self, "mode_combo"):
                 idx = self.mode_combo.findText(mode)
@@ -9261,19 +9337,7 @@ class PDDashboard(QMainWindow):
     # SOURCE CHANGE
     # ------------------------------------------------------------------
     def on_source_changed(self):
-        src_mode = self.src_combo.currentText()
-        if src_mode == "WS":
-            self.tree.setColumnHidden(2, True)
-            self.tree.setColumnHidden(3, False)
-            self.tree.setColumnHidden(4, False)
-        elif src_mode == "OUTFEED":
-            self.tree.setColumnHidden(2, True)
-            self.tree.setColumnHidden(3, True)
-            self.tree.setColumnHidden(4, True)
-        else:
-            self.tree.setColumnHidden(2, False)
-            self.tree.setColumnHidden(3, False)
-            self.tree.setColumnHidden(4, False)
+        self._apply_column_visibility()
         self._rebuild_filter_dropdowns()
         self.refresh_view()
 
@@ -9632,7 +9696,8 @@ class PDDashboard(QMainWindow):
             name = ent.name
             if name.startswith(".") or name in skip:
                 continue
-            st = {"name": name, "stage_path": ent.path, "_stage_index": idx, "tool": tool}
+            st = {"name": name, "stage_path": ent.path, "_stage_index": idx, "tool": tool,
+                  "stage_status": "COMPLETED", "active_stage": "COMPLETED"}
             idx += 1
             st["_rpt_cands"] = self._latest_stage_runtime_candidates(be_path, st)
             st["info"] = self._latest_parse_stage_runtime(st["_rpt_cands"])
@@ -9752,7 +9817,7 @@ class PDDashboard(QMainWindow):
         except Exception:
             return "-"
 
-    def _latest_fe_qor_row(self, run, missing, cancel_cb):
+    def _latest_fe_qor_row(self, alias, run, missing, cancel_cb):
         try:
             from metric_extract import extract_fe_metrics
             metrics = extract_fe_metrics(run.get("path", ""), source="OUTFEED", block=run.get("block", ""), cancel_check=cancel_cb)
@@ -9764,48 +9829,55 @@ class PDDashboard(QMainWindow):
         std_ca = "{}/{}".format(inst, std_area) if (inst != "-" or std_area != "-") else "-"
         cong = (metrics.get("congestion") or {}).get("cong_both") or "-"
         runtime = run.get("runtime", "-") or metrics.get("runtime", "-")
+        vt_area = self._metric_value(metrics, "vth_area") if hasattr(self, "_metric_value") else "-"
+        logic_depth = metrics.get("logic_depth", "-")
         return {"values": [
-            run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
+            alias, run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
             runtime, run.get("end", "-"), metrics.get("r2r_setup", "-"),
             metrics.get("r2r_hold", "-"), std_ca,
-            self._latest_gate_count_from_metrics(metrics), cong,
-            run.get("path", ""), "; ".join(missing) if missing else ""],
+            self._latest_gate_count_from_metrics(metrics), cong, vt_area,
+            logic_depth, "; ".join(missing) if missing else "", run.get("path", "")],
             "missing": missing}
 
-    def _latest_be_qor_rows(self, run, missing_map, cancel_cb):
-        rows = []
+    def _latest_be_qor_row(self, alias, run, missing_map, cancel_cb):
         try:
             from metric_extract import extract_pnr_stage_metrics
         except Exception:
             extract_pnr_stage_metrics = None
-        for st in run.get("stages") or []:
-            if cancel_cb():
-                return rows
-            name = st.get("name", "")
-            if extract_pnr_stage_metrics:
-                try:
-                    metrics = extract_pnr_stage_metrics(
-                        run.get("path", ""), name, source="OUTFEED",
-                        block=run.get("block", ""), stage_path=st.get("stage_path"),
-                        cancel_check=cancel_cb)
-                except Exception:
-                    metrics = {}
-            else:
+        st = self._latest_stage_for_status(run)
+        if not st:
+            return None
+        name = st.get("name", "")
+        if extract_pnr_stage_metrics:
+            try:
+                metrics = extract_pnr_stage_metrics(
+                    run.get("path", ""), name, source="OUTFEED",
+                    block=run.get("block", ""), stage_path=st.get("stage_path"),
+                    cancel_check=cancel_cb)
+            except Exception:
                 metrics = {}
-            info = st.get("info") or {}
-            runtime = metrics.get("runtime") if metrics.get("runtime") not in (None, "", "-") else info.get("runtime", "-")
-            end = info.get("end", "-")
-            cong = (metrics.get("congestion") or {}).get("cong_both") or "-"
-            hold = metrics.get("hold_r2r") or metrics.get("r2r_hold") or metrics.get("hold_all") or "-"
-            missing = missing_map.get(name, [])
-            rows.append({"values": [
-                run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""), name,
-                metrics.get("r2r_setup", "-"), metrics.get("setup_total", "-"), hold,
-                cong, metrics.get("std_cell_count_area", "-"),
-                self._latest_gate_count_from_metrics(metrics), runtime, end,
-                "; ".join(missing) if missing else "", st.get("stage_path", run.get("path", ""))],
-                "missing": missing})
-        return rows
+        else:
+            metrics = {}
+        info = st.get("info") or {}
+        runtime = metrics.get("runtime") if metrics.get("runtime") not in (None, "", "-") else info.get("runtime", "-")
+        end = info.get("end", "-")
+        cong = (metrics.get("congestion") or {}).get("cong_both") or "-"
+        hold = metrics.get("hold_r2r") or metrics.get("r2r_hold") or metrics.get("hold_all") or "-"
+        missing = missing_map.get(name, [])
+        vt_inst = self._metric_value(metrics, "vth_inst") if hasattr(self, "_metric_value") else "-"
+        vt_area = self._metric_value(metrics, "vth_area") if hasattr(self, "_metric_value") else "-"
+        return {"values": [
+            alias, run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
+            name, st.get("stage_status", "COMPLETED"), runtime, end,
+            metrics.get("r2r_setup", "-"), metrics.get("setup_total", "-"), hold,
+            cong, metrics.get("std_cell_count_area", "-"),
+            self._latest_gate_count_from_metrics(metrics),
+            metrics.get("std_cell_only_util", "-"), metrics.get("total_util", "-"),
+            vt_inst, vt_area, metrics.get("skew_latency", "-"),
+            metrics.get("clock_repeater_count_area", "-"),
+            "; ".join(missing) if missing else "",
+            st.get("stage_path", run.get("path", ""))],
+            "missing": missing}
 
     def _is_complete_outfeed_fe(self, run):
         return (run or {}).get("source") == "OUTFEED" and not self._outfeed_fe_missing_reports(run)
@@ -9848,18 +9920,64 @@ class PDDashboard(QMainWindow):
         if not getattr(self, "prefer_complete_outfeed_duplicate", False):
             return ws_runs + out_runs
 
-        out_complete = {}
+        selected_outfeed = {}
         for run in out_runs:
-            if run.get("run_type") == "FE" and self._is_complete_outfeed_fe(run):
-                out_complete[self._fe_duplicate_identity(run)] = run
+            try:
+                run.pop("_replaces_ws_fe", None)
+            except Exception:
+                pass
+            if run.get("run_type") != "FE":
+                continue
+            if not self._is_complete_outfeed_fe(run):
+                continue
+            ident = self._fe_duplicate_identity(run)
+            cur = selected_outfeed.get(ident)
+            if cur is None or self._run_date_key(run) >= self._run_date_key(cur):
+                selected_outfeed[ident] = run
 
         filtered_ws = []
+        replaced_idents = set()
         for run in ws_runs:
             if run.get("run_type") == "FE":
-                if self._fe_duplicate_identity(run) in out_complete:
+                ident = self._fe_duplicate_identity(run)
+                if ident in selected_outfeed:
+                    replaced_idents.add(ident)
                     continue
             filtered_ws.append(run)
-        return filtered_ws + out_runs
+
+        filtered_out = []
+        emitted_selected = set()
+        for run in out_runs:
+            if run.get("run_type") == "FE":
+                ident = self._fe_duplicate_identity(run)
+                if ident in selected_outfeed:
+                    if run is not selected_outfeed[ident]:
+                        continue
+                    emitted_selected.add(ident)
+                    if ident in replaced_idents:
+                        run["_replaces_ws_fe"] = True
+            filtered_out.append(run)
+        return filtered_ws + filtered_out
+
+    def _latest_stage_for_status(self, run):
+        best = None
+        best_key = None
+        for st in (run or {}).get("stages", []) or []:
+            info = st.get("info") or {}
+            end_dt = self._latest_datetime_value(info.get("end"))
+            start_dt = self._latest_datetime_value(info.get("start"))
+            try:
+                mtime = datetime.datetime.fromtimestamp(os.path.getmtime(st.get("stage_path", "")))
+            except Exception:
+                mtime = datetime.datetime.min
+            key = (
+                2 if end_dt else (1 if start_dt else 0),
+                end_dt or start_dt or mtime,
+                st.get("_stage_index", 9999))
+            if best is None or key > best_key:
+                best = st
+                best_key = key
+        return best
 
     def _latest_outfeed_rows(self, cancel_cb=None):
         cancel_cb = cancel_cb or (lambda: False)
@@ -9868,7 +9986,7 @@ class PDDashboard(QMainWindow):
         by_block_be = {}
         for run in out_runs:
             if cancel_cb():
-                return [], []
+                return [], [], []
             block = run.get("block", "")
             if not block:
                 continue
@@ -9906,23 +10024,40 @@ class PDDashboard(QMainWindow):
                              self._latest_outfeed_run_date_key(run) > self._latest_outfeed_run_date_key(cur[0]))):
                         by_block_be[block] = item
 
+        alias_rows = []
         fe_rows = []
-        for block in sorted(by_block_fe):
-            run, missing = by_block_fe[block]
-            fe_rows.append(self._latest_fe_qor_row(run, missing, cancel_cb))
         be_rows = []
-        for block in sorted(by_block_be):
-            run, all_missing, miss_map = by_block_be[block]
-            stage_rows = self._latest_be_qor_rows(run, miss_map, cancel_cb)
-            if stage_rows:
-                be_rows.extend(stage_rows)
-            else:
-                be_rows.append({"values": [
-                    block, run.get("rtl", ""), run.get("r_name", ""), "-",
-                    "-", "-", "-", "-", "-", "-", "-", run.get("end", "-"),
-                    "; ".join(all_missing) if all_missing else "", run.get("path", "")],
-                    "missing": all_missing})
-        return fe_rows, be_rows
+        blocks = sorted(set(list(by_block_fe.keys()) + list(by_block_be.keys())))
+        for idx, block in enumerate(blocks, 1):
+            alias = "run{}".format(idx)
+            fe_item = by_block_fe.get(block)
+            be_item = by_block_be.get(block)
+            fe_run = fe_item[0] if fe_item else None
+            be_run = be_item[0] if be_item else None
+            latest_stage = self._latest_stage_for_status(be_run) if be_run else None
+            alias_rows.append({"values": [
+                alias, block,
+                fe_run.get("r_name", "-") if fe_run else "-",
+                be_run.get("r_name", "-") if be_run else "-",
+                latest_stage.get("name", "-") if latest_stage else "-",
+                fe_run.get("path", "-") if fe_run else "-",
+                be_run.get("path", "-") if be_run else "-"],
+                "missing": []})
+            if fe_item:
+                fe_rows.append(self._latest_fe_qor_row(alias, fe_item[0], fe_item[1], cancel_cb))
+            if be_item:
+                row = self._latest_be_qor_row(alias, be_item[0], be_item[2], cancel_cb)
+                if row:
+                    be_rows.append(row)
+                else:
+                    all_missing = be_item[1]
+                    be_rows.append({"values": [
+                        alias, block, be_item[0].get("rtl", ""), be_item[0].get("r_name", ""), "-",
+                        "-", "-", be_item[0].get("end", "-"), "-", "-", "-", "-", "-", "-", "-",
+                        "-", "-", "-", "-", "-", "; ".join(all_missing) if all_missing else "",
+                        be_item[0].get("path", "")],
+                        "missing": all_missing})
+        return alias_rows, fe_rows, be_rows
 
     def show_latest_outfeed_status(self):
         if self._worker_is_running(getattr(self, "_latest_outfeed_worker", None)):
@@ -9936,12 +10071,12 @@ class PDDashboard(QMainWindow):
         self._workers.start(
             "latest_outfeed", worker, attr_name="_latest_outfeed_worker")
 
-    def _on_latest_outfeed_status_done(self, fe_rows, be_rows, err):
+    def _on_latest_outfeed_status_done(self, alias_rows, fe_rows, be_rows, err):
         if err:
             QMessageBox.warning(self, "Latest OUTFEED Status", err)
             return
         dlg = LatestOutfeedStatusDialog(
-            fe_rows, be_rows, self.is_dark_mode, self)
+            alias_rows, fe_rows, be_rows, self.is_dark_mode, self)
         dlg.exec_()
 
     # ------------------------------------------------------------------
@@ -10244,12 +10379,14 @@ class PDDashboard(QMainWindow):
         child.setToolTip(5, display_owner)
         child.setText(15, run["path"])
         run["_search_blob"] = (
-            "{} {} {} {} {} {} {} {} {} {} {}".format(
-                run.get("r_name", ""), run.get("rtl", ""), run.get("source", ""),
-                run.get("run_type", ""), run.get("owner", ""),
+            "{} {} {} {} {} {} {} {} {} {} {} {} {} {}".format(
+                run.get("r_name", ""), run.get("block", ""), run.get("rtl", ""),
+                run.get("source", ""), run.get("run_type", ""),
+                run.get("owner", ""), run.get("user", ""),
                 run.get("st_n", ""), run.get("st_u", ""),
-                run.get("vslp_status", ""), run.get("info", {}).get("runtime", ""),
-                run.get("info", {}).get("start", ""), run.get("info", {}).get("end", ""))).lower()
+                run.get("vslp_status", ""), run.get("path", ""),
+                run.get("log_path", ""), run.get("info", {}).get("runtime", ""),
+                run.get("info", {}).get("end", ""))).lower()
         self._register_item_path(child, run["path"])
         child.setText(22, "")
         child.setData(0, Qt.UserRole + 2, run["block"])
@@ -10331,6 +10468,9 @@ class PDDashboard(QMainWindow):
         child.setData(0, Qt.UserRole, "STAGE"
                       if run["run_type"] == "STAGE" else None)
 
+        if run.get("_replaces_ws_fe"):
+            tooltip_text += "\n[Complete OUTFEED FE shown instead of matching WS FE]"
+            child.setText(23, "OUTFEED>WS")
         if self._run_in_filter_config(run):
             child.setText(23, "CONFIG")
             child.setForeground(0, QColor("#1565c0" if not self.is_dark_mode else "#90caf9"))
@@ -11074,6 +11214,70 @@ class PDDashboard(QMainWindow):
         else:
             self.refresh_view()
 
+    def _iter_run_dicts(self):
+        for src_data in ((self.ws_data or {}), (self.out_data or {})):
+            for run in src_data.get("all_runs", []) or []:
+                yield run
+
+    def _set_item_search_highlight(self, item, active):
+        try:
+            if active:
+                color = QColor("#fff3a0" if not self.is_dark_mode else "#394b59")
+                brush = QBrush(color)
+            else:
+                brush = QBrush()
+            for c in range(min(self.tree.columnCount(), 15)):
+                item.setBackground(c, brush)
+        except Exception:
+            pass
+
+    def _search_matches_run(self, run, query, notes=""):
+        q = str(query or "").strip().lower()
+        if not q:
+            return False
+        info = (run or {}).get("info", {}) or {}
+        fields = {
+            "run": (run or {}).get("r_name", ""),
+            "name": (run or {}).get("r_name", ""),
+            "rtl": (run or {}).get("rtl", ""),
+            "block": (run or {}).get("block", ""),
+            "source": (run or {}).get("source", ""),
+            "type": (run or {}).get("run_type", ""),
+            "status": "{} {}".format((run or {}).get("fe_status", ""), (run or {}).get("st_n", "")),
+            "stage": "{} {}".format((run or {}).get("st_u", ""), (run or {}).get("vslp_status", "")),
+            "user": "{} {}".format((run or {}).get("owner", ""), (run or {}).get("user", "")),
+            "owner": "{} {}".format((run or {}).get("owner", ""), (run or {}).get("user", "")),
+            "path": (run or {}).get("path", ""),
+            "log": (run or {}).get("log_path", ""),
+            "runtime": info.get("runtime", ""),
+            "start": info.get("start", ""),
+            "end": info.get("end", ""),
+            "note": notes or "",
+        }
+        for st in (run or {}).get("stages", []) or []:
+            fields["stage"] += " {} {} {} {} {}".format(
+                st.get("name", ""), st.get("stage_status", ""),
+                st.get("active_stage", ""), st.get("log_path", ""),
+                st.get("stage_path", ""))
+            fields["log"] += " " + str(st.get("log_path", ""))
+            fields["path"] += " " + str(st.get("stage_path", ""))
+        m = re.match(r"^(rtl|block|user|owner|source|stage|log|status|path|run|name|type|runtime|start|end|note):(.+)$", q)
+        if m:
+            key = m.group(1)
+            val = m.group(2).strip()
+            return val in str(fields.get(key, "")).lower()
+        base_blob = (run or {}).get("_search_blob")
+        if not base_blob:
+            base_blob = " ".join(str(v) for v in fields.values()).lower()
+            try:
+                run["_search_blob"] = base_blob
+            except Exception:
+                pass
+        combined = (base_blob + " " + str(notes or "").lower())
+        if "*" in q:
+            return fnmatch.fnmatch(combined, "*" + q + "*")
+        return q in combined
+
     def refresh_view(self):
         src_mode = self.src_combo.currentText()
         sel_rtl  = self.rel_combo.currentText()
@@ -11089,19 +11293,7 @@ class PDDashboard(QMainWindow):
             for i in range(self.blk_list.count())
             if self.blk_list.item(i).checkState() == Qt.Checked)
 
-        self.tree.setColumnHidden(1, sel_rtl != "[ SHOW ALL ]")
-        if src_mode == "WS":
-            self.tree.setColumnHidden(2, True)
-            self.tree.setColumnHidden(3, False)
-            self.tree.setColumnHidden(4, False)
-        elif src_mode == "OUTFEED":
-            self.tree.setColumnHidden(2, True)
-            self.tree.setColumnHidden(3, True)
-            self.tree.setColumnHidden(4, True)
-        else:
-            self.tree.setColumnHidden(2, False)
-            self.tree.setColumnHidden(3, False)
-            self.tree.setColumnHidden(4, False)
+        self._apply_column_visibility()
 
         self.tree.blockSignals(True)
         self.tree.setUpdatesEnabled(False)
@@ -11114,6 +11306,11 @@ class PDDashboard(QMainWindow):
         _sel_rtl_all = (sel_rtl == "[ SHOW ALL ]")
         _sel_rtl_sfx = sel_rtl + "_"
         _do_search   = (search_pattern != "*")
+        _highlight_mode = False
+        try:
+            _highlight_mode = self.search_mode_combo.currentText() == "Highlight"
+        except Exception:
+            _highlight_mode = False
         _fe_only       = (preset == "FE Only")
         _be_only       = (preset == "BE Only")
         _completed_only = (preset == "Completed Only")
@@ -11228,39 +11425,14 @@ class PDDashboard(QMainWindow):
                 if not (rt.endswith("ago")
                         and ("h ago" in rt or "m ago" in rt)):
                     return False
+            run["_search_hit"] = False
             if _do_search:
-                note_id  = f"{rtl} : {run['r_name']}"
+                note_id  = "{} : {}".format(rtl, run["r_name"])
                 notes    = _search_notes(note_id)
-                base_blob = run.get("_search_blob")
-                if not base_blob:
-                    base_blob = (
-                        "{} {} {} {} {} {} {} {} {} {} {}".format(
-                            run.get("r_name", ""), rtl, src, rt_type,
-                            run.get("owner", ""), run.get("st_n", ""),
-                            run.get("st_u", ""), run.get("vslp_status", ""),
-                            run.get("info", {}).get("runtime", ""),
-                            run.get("info", {}).get("start", ""),
-                            run.get("info", {}).get("end", ""))).lower()
-                    run["_search_blob"] = base_blob
-                combined = (base_blob + " " + notes.lower())
-                # Fast path: plain substring check when no wildcards in query
-                _raw_lc = raw_query
-                if '*' not in _raw_lc:
-                    _hit = _raw_lc in combined
-                else:
-                    _hit = fnmatch.fnmatch(combined, search_pattern)
-                if not _hit:
-                    if rt_type == "BE":
-                        def _stage_hit(s):
-                            sc = (f"{s['name']} {s['st_n']} {s['st_u']} "
-                                  f"{s['vslp_status']} "
-                                  f"{s['info']['runtime']}").lower()
-                            return (_raw_lc in sc if '*' not in _raw_lc
-                                    else fnmatch.fnmatch(sc, search_pattern))
-                        if not any(_stage_hit(s) for s in run.get("stages",[])):
-                            return False
-                    else:
-                        return False
+                _hit = self._search_matches_run(run, raw_query, notes)
+                run["_search_hit"] = bool(_hit)
+                if (not _hit) and (not _highlight_mode):
+                    return False
             return True
 
         _UR   = Qt.UserRole
@@ -11312,6 +11484,7 @@ class PDDashboard(QMainWindow):
                     passes = True
                 rt_type_run = run.get("run_type") if run else None
                 item.setHidden(not passes)
+                self._set_item_search_highlight(item, bool(_do_search and run and run.get("_search_hit")))
                 if passes and run:
                     visible_runs.append(run)
                     if run.get("run_type") == "FE":
@@ -11329,6 +11502,7 @@ class PDDashboard(QMainWindow):
                             stage_pinned = bool(ch.text(15) and ch.text(15) in _pins)
                             hide_stage = not (parent_pinned or stage_pinned)
                         ch.setHidden(hide_stage)
+                        self._set_item_search_highlight(ch, False)
                     else:
                         # BE child run under FE item: hide when FE-only
                         child_run = ch.data(0, _UR10)
@@ -11341,6 +11515,15 @@ class PDDashboard(QMainWindow):
                             if be_allowed:
                                 child_passes = _passes(child_run)
                         hide_child = not child_passes or (_fe_only and child_rt == "BE")
+                        if _highlight_mode and _do_search:
+                            try:
+                                if child_run:
+                                    cnid = "{} : {}".format(child_run.get("rtl", ""), child_run.get("r_name", ""))
+                                    cnotes = _search_notes(cnid)
+                                    child_run["_search_hit"] = self._search_matches_run(child_run, raw_query, cnotes)
+                                self._set_item_search_highlight(ch, bool(child_run and child_run.get("_search_hit")))
+                            except Exception:
+                                pass
                         if _pinned_only:
                             child_path = child_run.get("path") if child_run else ch.text(15)
                             hide_child = not (
@@ -11362,9 +11545,14 @@ class PDDashboard(QMainWindow):
         self.tree.setUpdatesEnabled(True)
         # FEAT 6: Show search result count when search is active
         if raw_query:
-            fe_visible = sum(1 for r in visible_runs
-                             if r.get("run_type") == "FE")
-            self.search_count_lbl.setText(f"{fe_visible} found")
+            if _highlight_mode:
+                fe_visible = sum(1 for r in self._iter_run_dicts()
+                                 if r.get("_search_hit"))
+                self.search_count_lbl.setText("{} match".format(fe_visible))
+            else:
+                fe_visible = sum(1 for r in visible_runs
+                                 if r.get("run_type") == "FE")
+                self.search_count_lbl.setText("{} found".format(fe_visible))
             self.search_count_lbl.setVisible(True)
         else:
             self.search_count_lbl.setVisible(False)
@@ -12464,6 +12652,9 @@ class PDDashboard(QMainWindow):
     # SETTINGS DIALOG
     # ------------------------------------------------------------------
     def open_settings(self):
+        _ensure_pref_section('UI')
+        _ensure_pref_section('PRESETS')
+        _ensure_pref_section('QOR')
         col_names   = [
             "Run Name", "RTL Release", "Source", "Status", "Stage", "User",
             "Size", "FM-NONUPF", "FM-UPF", "VSLP", "Static IR", "Dynamic IR",
@@ -12849,8 +13040,7 @@ class PDDashboard(QMainWindow):
         standard_set = set(new_presets[1].keys()) | {0}
         full_set     = set(new_presets[2].keys()) | {0}
 
-        if not prefs.has_section('PRESETS'):
-            prefs.add_section('PRESETS')
+        _ensure_pref_section('PRESETS')
         prefs.set('PRESETS', 'compact',
                   ','.join(str(i) for i in sorted(compact_set)))
         prefs.set('PRESETS', 'standard',
@@ -12865,8 +13055,7 @@ class PDDashboard(QMainWindow):
 
         # Save QoR script path
         qor_path_val = qor_script_edit.text().strip()
-        if not prefs.has_section('QOR'):
-            prefs.add_section('QOR')
+        _ensure_pref_section('QOR')
         prefs.set('QOR', 'script_path', qor_path_val)
         if qor_path_val:
             # Inject into module globals so try/except in run_qor finds it
