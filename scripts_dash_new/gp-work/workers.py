@@ -2224,13 +2224,14 @@ class QoRWorker(QThread):
 
     def run(self):
         try:
-            # summary.py outputs to qor_metrices/summary_<date>.html
-            # Run from the script's directory so relative paths work
+            # New summary.py writes report_qor.html in the launch PWD.
             script_dir = os.path.dirname(os.path.abspath(self.script_path))
+            launch_cwd = os.getcwd()
+            start_time = time.time() - 2.0
             cmd = [self.python_bin, self.script_path] + self.run_dirs
             self._proc = subprocess.Popen(
                 cmd,
-                cwd=script_dir,
+                cwd=launch_cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE
             )
@@ -2264,10 +2265,17 @@ class QoRWorker(QThread):
                     break
             # If not absolute, make it relative to script_dir
             if html_path and not os.path.isabs(html_path):
-                html_path = os.path.join(script_dir, html_path)
+                html_path = os.path.join(launch_cwd, html_path)
+            try:
+                if html_path and os.path.exists(html_path) and os.path.getmtime(html_path) < start_time:
+                    html_path = ""
+            except Exception:
+                html_path = ""
             if not html_path or not os.path.exists(html_path):
                 candidates = [
+                    os.path.join(launch_cwd, "report_qor.html"),
                     os.path.join(script_dir, "qor_report.html"),
+                    os.path.join(script_dir, "report_qor.html"),
                     os.path.join(script_dir, "qor_metrices", "qor_report.html"),
                 ]
                 try:
@@ -2279,7 +2287,13 @@ class QoRWorker(QThread):
                         recursive=True))
                 except Exception:
                     pass
-                hits = [p for p in candidates if p and os.path.exists(p)]
+                hits = []
+                for p in candidates:
+                    try:
+                        if p and os.path.exists(p) and os.path.getmtime(p) >= start_time:
+                            hits.append(p)
+                    except Exception:
+                        pass
                 if hits:
                     html_path = max(hits, key=os.path.getmtime)
             self.finished.emit(html_path if (html_path and os.path.exists(html_path)) else "")

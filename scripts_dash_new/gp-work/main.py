@@ -894,11 +894,16 @@ class AdvancedMailDialog(QDialog):
                 f"{len(self.attachments)} file(s): {names}")
 
     def _attach_qor(self):
-        # Find latest QoR HTML in qor_metrices/
+        # New summary.py writes report_qor.html in the launch PWD.
         import glob as _glob
-        hits = _glob.glob(
-            os.path.join(os.getcwd(), "qor_metrices", "**", "*.html"),
-            recursive=True)
+        direct = os.path.join(os.getcwd(), "report_qor.html")
+        hits = []
+        if os.path.exists(direct):
+            hits = [direct]
+        else:
+            hits.extend(_glob.glob(
+                os.path.join(os.getcwd(), "qor_metrices", "**", "*.html"),
+                recursive=True))
         if hits:
             latest = sorted(hits, key=os.path.getmtime)[-1]
             if latest not in self.attachments:
@@ -907,7 +912,7 @@ class AdvancedMailDialog(QDialog):
         else:
             QMessageBox.warning(
                 self, "Not Found",
-                "No QoR HTML found in qor_metrices/.")
+                "No report_qor.html or QoR HTML found.")
 
     def _browse_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -4461,13 +4466,13 @@ class LatestOutfeedStatusDialog(QDialog):
             "Alias", "Block", "RTL", "FE Run", "Runtime", "End",
             "R2R Setup W/T/N", "R2R Hold W/T/N",
             "Std Cell Count/Area", "Gate Count", "Congestion",
-            "VT Area%", "Logic Depth", "Missing", "Path"])
+            "VT Area%", "Logic Depth", "Path"])
         self.be_tbl = self._make_table([
             "Alias", "Block", "RTL", "BE Run", "Latest Stage", "Status",
             "Runtime", "End", "R2R Setup W/T/N", "Total Setup W/T/N",
             "Hold W/T/N", "Cong/Shorts", "Std Cell Count/Area", "GC",
             "Std Cell/Std Only Util", "Total Util", "VT Inst%", "VT Area%",
-            "Skew/Latency", "Clock Repeater Count/Area", "Missing", "Path"])
+            "Skew/Latency", "Clock Repeater Count/Area", "Path"])
         tabs.addTab(self.fe_tbl, "FE QoR")
         tabs.addTab(self.be_tbl, "Latest BE Stage QoR")
         layout.addWidget(tabs, 1)
@@ -4479,11 +4484,16 @@ class LatestOutfeedStatusDialog(QDialog):
         export_btn.clicked.connect(self._export_csv)
         mail_btn = QPushButton("Send HTML Mail")
         mail_btn.clicked.connect(self._send_mail)
+        max_btn = QPushButton("Maximize")
+        max_btn.clicked.connect(lambda: parent._toggle_dialog_maximize(self, max_btn)
+                                if parent and hasattr(parent, "_toggle_dialog_maximize")
+                                else self.showMaximized())
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         row.addStretch()
         row.addWidget(export_btn)
         row.addWidget(mail_btn)
+        row.addWidget(max_btn)
         row.addWidget(close_btn)
         layout.addLayout(row)
 
@@ -4504,6 +4514,9 @@ class LatestOutfeedStatusDialog(QDialog):
                 tbl.setColumnWidth(idx, 420)
             elif header == "Missing":
                 tbl.setColumnWidth(idx, 260)
+        parent = self.parent()
+        if parent and hasattr(parent, "_install_table_column_menu"):
+            parent._install_table_column_menu(tbl)
         return tbl
 
     def _fill_table(self, tbl, rows):
@@ -6936,8 +6949,9 @@ class PDDashboard(QMainWindow):
 
         top_layout.addWidget(self._label("Source:"))
         self.src_combo = QComboBox()
-        self.src_combo.addItems(["ALL", "WS", "OUTFEED"])
-        self.src_combo.setFixedWidth(100)
+        self.src_combo.addItems(["ALL", "ALL-merged", "WS", "OUTFEED"])
+        self.src_combo.setFixedWidth(125)
+        self._last_source_mode = self.src_combo.currentText()
         self.src_combo.currentIndexChanged.connect(self.on_source_changed)
         top_layout.addWidget(self.src_combo)
 
@@ -9337,9 +9351,15 @@ class PDDashboard(QMainWindow):
     # SOURCE CHANGE
     # ------------------------------------------------------------------
     def on_source_changed(self):
+        new_src = self.src_combo.currentText()
+        old_src = getattr(self, "_last_source_mode", "")
+        self._last_source_mode = new_src
         self._apply_column_visibility()
         self._rebuild_filter_dropdowns()
-        self.refresh_view()
+        if "ALL-merged" in (new_src, old_src) and self.ws_data is not None:
+            QTimer.singleShot(0, self._build_tree)
+        else:
+            self.refresh_view()
 
     # ------------------------------------------------------------------
     # AUTO REFRESH
@@ -9836,7 +9856,7 @@ class PDDashboard(QMainWindow):
             runtime, run.get("end", "-"), metrics.get("r2r_setup", "-"),
             metrics.get("r2r_hold", "-"), std_ca,
             self._latest_gate_count_from_metrics(metrics), cong, vt_area,
-            logic_depth, "; ".join(missing) if missing else "", run.get("path", "")],
+            logic_depth, run.get("path", "")],
             "missing": missing}
 
     def _latest_be_qor_row(self, alias, run, missing_map, cancel_cb):
@@ -9875,7 +9895,6 @@ class PDDashboard(QMainWindow):
             metrics.get("std_cell_only_util", "-"), metrics.get("total_util", "-"),
             vt_inst, vt_area, metrics.get("skew_latency", "-"),
             metrics.get("clock_repeater_count_area", "-"),
-            "; ".join(missing) if missing else "",
             st.get("stage_path", run.get("path", ""))],
             "missing": missing}
 
@@ -9897,6 +9916,140 @@ class PDDashboard(QMainWindow):
             (run or {}).get("rtl", ""),
             self._normal_fe_base((run or {}).get("r_name", "")))
 
+    def _run_tool_for_merge(self, run):
+        path = str((run or {}).get("path", "")).replace("\\", "/").lower()
+        if "/innovus/" in path:
+            return "innovus"
+        return "fc"
+
+    def _clone_run_for_merge(self, run):
+        out = dict(run or {})
+        out["stages"] = [dict(st or {}) for st in ((run or {}).get("stages", []) or [])]
+        for key in ("_merged_sources", "_merged_paths", "_replaces_ws_fe"):
+            try:
+                out.pop(key, None)
+            except Exception:
+                pass
+        return out
+
+    def _be_base_for_merge(self, run):
+        name = str((run or {}).get("r_name", ""))
+        stripped = re.sub(r'^EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?_', '', name)
+        if stripped.endswith("-BE"):
+            stripped = stripped[:-3]
+        fe_base = self._fe_base_from_be_run_name(name)
+        if fe_base and stripped.startswith(fe_base + "_"):
+            stripped = stripped[len(fe_base) + 1:]
+        return stripped or name.replace("-BE", "")
+
+    def _be_duplicate_identity(self, run, fe_rtl_map=None):
+        fe_base = self._fe_base_from_be_run_name((run or {}).get("r_name", ""))
+        rtl = (run or {}).get("rtl", "")
+        if fe_rtl_map is not None:
+            rtl = fe_rtl_map.get(((run or {}).get("block", ""), fe_base), rtl)
+        return (
+            (run or {}).get("block", ""),
+            rtl or "",
+            fe_base,
+            self._run_tool_for_merge(run),
+            self._be_base_for_merge(run))
+
+    def _stage_duplicate_identity(self, stage):
+        return str((stage or {}).get("name", "")).strip().lower()
+
+    def _merge_stage_lists_for_tree(self, primary_run, duplicate_runs):
+        merged = []
+        seen = set()
+
+        def _add_from(run, preferred):
+            src = (run or {}).get("source", "")
+            for st in ((run or {}).get("stages", []) or []):
+                key = self._stage_duplicate_identity(st)
+                if not key:
+                    continue
+                if key in seen:
+                    continue
+                cp = dict(st or {})
+                cp["_merged_stage_source"] = src
+                cp["_merged_stage_preferred"] = bool(preferred)
+                merged.append(cp)
+                seen.add(key)
+
+        _add_from(primary_run, True)
+        for run in duplicate_runs or []:
+            _add_from(run, False)
+        merged.sort(key=lambda st: self._latest_stage_sort_key(st))
+        for idx, st in enumerate(merged):
+            st["_stage_order"] = idx
+        return merged
+
+    def _merged_runs_for_tree(self, ws_runs, out_runs):
+        fe_rtl_map = {}
+        for run in list(ws_runs or []) + list(out_runs or []):
+            if (run or {}).get("run_type") == "FE":
+                fe_rtl_map[((run or {}).get("block", ""),
+                            self._normal_fe_base((run or {}).get("r_name", "")))] = (run or {}).get("rtl", "")
+
+        fe_groups = {}
+        be_groups = {}
+        passthrough = []
+        for run in list(ws_runs or []) + list(out_runs or []):
+            if not run:
+                continue
+            rt = run.get("run_type")
+            if rt == "FE":
+                ident = self._fe_duplicate_identity(run)
+                fe_groups.setdefault(ident, []).append(run)
+            elif rt == "BE":
+                ident = self._be_duplicate_identity(run, fe_rtl_map)
+                be_groups.setdefault(ident, []).append(run)
+            else:
+                passthrough.append(run)
+
+        def _pick_preferred(runs):
+            out = [r for r in runs if r.get("source") == "OUTFEED"]
+            pool = out if out else list(runs)
+            best = None
+            for r in pool:
+                if best is None or self._run_date_key(r) >= self._run_date_key(best):
+                    best = r
+            return best
+
+        merged = []
+        for ident, group in fe_groups.items():
+            preferred = _pick_preferred(group)
+            if not preferred:
+                continue
+            out = self._clone_run_for_merge(preferred)
+            paths = [g.get("path", "") for g in group if g.get("path")]
+            sources = sorted(set(g.get("source", "") for g in group if g.get("source")))
+            if len(group) > 1:
+                out["_merged_sources"] = sources
+                out["_merged_paths"] = paths
+                if preferred.get("source") == "OUTFEED":
+                    out["_replaces_ws_fe"] = True
+            merged.append(out)
+
+        for ident, group in be_groups.items():
+            preferred = _pick_preferred(group)
+            if not preferred:
+                continue
+            out = self._clone_run_for_merge(preferred)
+            duplicates = [g for g in group if g is not preferred]
+            if preferred.get("rtl", "") in ("", "UNKNOWN") and fe_rtl_map:
+                out["rtl"] = ident[1] or out.get("rtl", "")
+            out["stages"] = self._merge_stage_lists_for_tree(preferred, duplicates)
+            paths = [g.get("path", "") for g in group if g.get("path")]
+            sources = sorted(set(g.get("source", "") for g in group if g.get("source")))
+            if len(group) > 1:
+                out["_merged_sources"] = sources
+                out["_merged_paths"] = paths
+                if preferred.get("source") == "OUTFEED":
+                    out["_replaces_ws_fe"] = True
+            merged.append(out)
+        merged.extend(passthrough)
+        return merged
+
     def _run_date_key(self, run):
         info = (run or {}).get("info", {}) or {}
         text = info.get("end") or info.get("start") or ""
@@ -9917,6 +10070,12 @@ class PDDashboard(QMainWindow):
     def _runs_for_tree(self):
         ws_runs = list((self.ws_data or {}).get("all_runs", []) or [])
         out_runs = list((self.out_data or {}).get("all_runs", []) or [])
+        try:
+            src_mode = self.src_combo.currentText()
+        except Exception:
+            src_mode = "ALL"
+        if src_mode == "ALL-merged":
+            return self._merged_runs_for_tree(ws_runs, out_runs)
         if not getattr(self, "prefer_complete_outfeed_duplicate", False):
             return ws_runs + out_runs
 
@@ -10054,8 +10213,7 @@ class PDDashboard(QMainWindow):
                     be_rows.append({"values": [
                         alias, block, be_item[0].get("rtl", ""), be_item[0].get("r_name", ""), "-",
                         "-", "-", be_item[0].get("end", "-"), "-", "-", "-", "-", "-", "-", "-",
-                        "-", "-", "-", "-", "-", "; ".join(all_missing) if all_missing else "",
-                        be_item[0].get("path", "")],
+                        "-", "-", "-", "-", "-", be_item[0].get("path", "")],
                         "missing": all_missing})
         return alias_rows, fe_rows, be_rows
 
@@ -10077,6 +10235,7 @@ class PDDashboard(QMainWindow):
             return
         dlg = LatestOutfeedStatusDialog(
             alias_rows, fe_rows, be_rows, self.is_dark_mode, self)
+        self._prepare_utility_dialog(dlg)
         dlg.exec_()
 
     # ------------------------------------------------------------------
@@ -10469,8 +10628,13 @@ class PDDashboard(QMainWindow):
                       if run["run_type"] == "STAGE" else None)
 
         if run.get("_replaces_ws_fe"):
-            tooltip_text += "\n[Complete OUTFEED FE shown instead of matching WS FE]"
+            tooltip_text += "\n[OUTFEED shown instead of matching WS entry]"
             child.setText(23, "OUTFEED>WS")
+        if run.get("_merged_sources") or run.get("_merged_paths"):
+            srcs = ", ".join(run.get("_merged_sources", []) or [])
+            tooltip_text += "\nMerged sources: " + (srcs or "-")
+            for mp in (run.get("_merged_paths", []) or []):
+                tooltip_text += "\n  " + str(mp)
         if self._run_in_filter_config(run):
             child.setText(23, "CONFIG")
             child.setForeground(0, QColor("#1565c0" if not self.is_dark_mode else "#90caf9"))
@@ -11233,6 +11397,10 @@ class PDDashboard(QMainWindow):
 
     def _search_matches_run(self, run, query, notes=""):
         q = str(query or "").strip().lower()
+        try:
+            run["_search_stage_hits"] = set()
+        except Exception:
+            pass
         if not q:
             return False
         info = (run or {}).get("info", {}) or {}
@@ -11245,8 +11413,8 @@ class PDDashboard(QMainWindow):
             "type": (run or {}).get("run_type", ""),
             "status": "{} {}".format((run or {}).get("fe_status", ""), (run or {}).get("st_n", "")),
             "stage": "{} {}".format((run or {}).get("st_u", ""), (run or {}).get("vslp_status", "")),
-            "user": "{} {}".format((run or {}).get("owner", ""), (run or {}).get("user", "")),
-            "owner": "{} {}".format((run or {}).get("owner", ""), (run or {}).get("user", "")),
+            "user": "{} {} {}".format((run or {}).get("owner", ""), (run or {}).get("user", ""), (run or {}).get("path", "")),
+            "owner": "{} {} {}".format((run or {}).get("owner", ""), (run or {}).get("user", ""), (run or {}).get("path", "")),
             "path": (run or {}).get("path", ""),
             "log": (run or {}).get("log_path", ""),
             "runtime": info.get("runtime", ""),
@@ -11254,18 +11422,57 @@ class PDDashboard(QMainWindow):
             "end": info.get("end", ""),
             "note": notes or "",
         }
+        stage_blobs = []
         for st in (run or {}).get("stages", []) or []:
-            fields["stage"] += " {} {} {} {} {}".format(
+            st_blob = "{} {} {} {} {}".format(
                 st.get("name", ""), st.get("stage_status", ""),
                 st.get("active_stage", ""), st.get("log_path", ""),
                 st.get("stage_path", ""))
+            fields["stage"] += " " + st_blob
             fields["log"] += " " + str(st.get("log_path", ""))
             fields["path"] += " " + str(st.get("stage_path", ""))
+            stage_blobs.append((st.get("name", ""), st_blob.lower(),
+                                str(st.get("log_path", "")).lower(),
+                                str(st.get("stage_path", "")).lower(),
+                                str(st.get("stage_status", "")).lower(),
+                                str(st.get("active_stage", "")).lower()))
+
+        def _match_text(text, needle):
+            text = str(text or "").lower()
+            if "*" in needle:
+                return fnmatch.fnmatch(text, "*" + needle + "*")
+            return needle in text
+
+        def _record_stage_hits(key=None, val=None):
+            hits = set()
+            needle = val if val is not None else q
+            for name, blob, log_text, path_text, status_text, active_text in stage_blobs:
+                if key == "stage":
+                    text = blob
+                elif key == "log":
+                    text = log_text
+                elif key == "path":
+                    text = path_text
+                elif key == "status":
+                    text = status_text + " " + active_text
+                elif key in ("run", "name", "rtl", "block", "source", "user", "owner", "type", "runtime", "start", "end", "note"):
+                    text = ""
+                else:
+                    text = blob + " " + log_text + " " + path_text + " " + status_text + " " + active_text
+                if text and _match_text(text, needle):
+                    hits.add(name)
+            try:
+                run["_search_stage_hits"] = hits
+            except Exception:
+                pass
+            return bool(hits)
+
         m = re.match(r"^(rtl|block|user|owner|source|stage|log|status|path|run|name|type|runtime|start|end|note):(.+)$", q)
         if m:
             key = m.group(1)
             val = m.group(2).strip()
-            return val in str(fields.get(key, "")).lower()
+            stage_hit = _record_stage_hits(key, val)
+            return (val in str(fields.get(key, "")).lower()) or stage_hit
         base_blob = (run or {}).get("_search_blob")
         if not base_blob:
             base_blob = " ".join(str(v) for v in fields.values()).lower()
@@ -11274,9 +11481,10 @@ class PDDashboard(QMainWindow):
             except Exception:
                 pass
         combined = (base_blob + " " + str(notes or "").lower())
+        stage_hit = _record_stage_hits(None, q)
         if "*" in q:
-            return fnmatch.fnmatch(combined, "*" + q + "*")
-        return q in combined
+            return fnmatch.fnmatch(combined, "*" + q + "*") or stage_hit
+        return q in combined or stage_hit
 
     def refresh_view(self):
         src_mode = self.src_combo.currentText()
@@ -11480,6 +11688,18 @@ class PDDashboard(QMainWindow):
             else:
                 run         = item.data(0, _UR10)
                 passes      = _passes(run)
+                own_passes  = passes
+                child_search_passes = {}
+                if (not passes and _do_search and run
+                        and run.get("run_type") == "FE" and not _fe_only):
+                    for ci in range(item.childCount()):
+                        citem = item.child(ci)
+                        crun = citem.data(0, _UR10)
+                        if crun and crun.get("run_type") == "BE":
+                            cp = _passes(crun)
+                            child_search_passes[id(citem)] = cp
+                            if cp:
+                                passes = True
                 if _pinned_only and not passes and id(item) in _pinned_desc_items:
                     passes = True
                 rt_type_run = run.get("run_type") if run else None
@@ -11489,6 +11709,10 @@ class PDDashboard(QMainWindow):
                     visible_runs.append(run)
                     if run.get("run_type") == "FE":
                         visible_run_items.append(item)
+                if (_do_search and run and run.get("run_type") == "BE"
+                        and run.get("_search_stage_hits") and not item.isHidden()):
+                    self._ensure_stage_rows_visible(item, run)
+                    item.setExpanded(True)
                 for i in range(item.childCount()):
                     ch = item.child(i)
                     if ch.data(0, _UR) == "__PLACEHOLDER__":
@@ -11497,17 +11721,34 @@ class PDDashboard(QMainWindow):
                         # When BE-only: hide synthesis stages of FE parent
                         hide_stage = not passes or (
                             _be_only and rt_type_run == "FE")
+                        stage_hits = set()
+                        try:
+                            stage_hits = set(run.get("_search_stage_hits") or [])
+                        except Exception:
+                            stage_hits = set()
+                        if _do_search and stage_hits and rt_type_run == "BE":
+                            matched_stage = ch.text(0) in stage_hits
+                            if _highlight_mode:
+                                hide_stage = not passes
+                            else:
+                                hide_stage = not matched_stage
+                            self._set_item_search_highlight(ch, matched_stage)
+                            if matched_stage:
+                                item.setExpanded(True)
                         if _pinned_only:
                             parent_pinned = bool(run and run.get("path") in _pins)
                             stage_pinned = bool(ch.text(15) and ch.text(15) in _pins)
                             hide_stage = not (parent_pinned or stage_pinned)
                         ch.setHidden(hide_stage)
-                        self._set_item_search_highlight(ch, False)
+                        if not (_do_search and stage_hits and rt_type_run == "BE"):
+                            self._set_item_search_highlight(ch, False)
                     else:
                         # BE child run under FE item: hide when FE-only
                         child_run = ch.data(0, _UR10)
                         child_rt  = child_run.get("run_type") if child_run else None
                         child_passes = passes
+                        if _do_search and not own_passes and id(ch) in child_search_passes:
+                            child_passes = child_search_passes.get(id(ch), False)
                         if child_run and child_rt == "BE" and _rfc is not None:
                             be_allowed = self._filter_allowed_names(
                                 child_run.get("source", ""), child_run.get("rtl", ""),
@@ -11530,6 +11771,21 @@ class PDDashboard(QMainWindow):
                                 (child_path and child_path in _pins)
                                 or id(ch) in _pinned_desc_items)
                         ch.setHidden(hide_child)
+                        if (_do_search and child_run
+                                and child_run.get("_search_stage_hits")
+                                and not hide_child):
+                            self._ensure_stage_rows_visible(ch, child_run)
+                            hits = set(child_run.get("_search_stage_hits") or [])
+                            for si in range(ch.childCount()):
+                                st_item = ch.child(si)
+                                if st_item.data(0, _UR) != "STAGE":
+                                    continue
+                                matched_stage = st_item.text(0) in hits
+                                if not _highlight_mode:
+                                    st_item.setHidden(not matched_stage)
+                                self._set_item_search_highlight(st_item, matched_stage)
+                            item.setExpanded(True)
+                            ch.setExpanded(True)
                 return passes
 
         root = self.tree.invisibleRootItem()
@@ -13315,7 +13571,32 @@ class PDDashboard(QMainWindow):
         """Run summary.py on checked runs then open HTML in Firefox."""
         # Collect checked run paths -- normalize trailing slash
         sel = []
-        for item in self._iter_checked_items():
+        checked_items = list(self._iter_checked_items())
+        stage_items = [it for it in checked_items
+                       if it.data(0, Qt.UserRole) == "STAGE"]
+        if len(stage_items) == 1 and len(checked_items) == 1:
+            item = stage_items[0]
+            parent_item = item.parent()
+            be_run_path = parent_item.text(15) if parent_item else item.text(15)
+            stage_name = item.text(0)
+            script = self._resolve_qor_script()
+            if not script:
+                return
+            if be_run_path and not be_run_path.endswith("/"):
+                be_run_path += "/"
+            if not self._stop_worker_attr("_qor_worker"):
+                QMessageBox.information(
+                    self, "QoR Compare",
+                    "Previous QoR compare is still running. Please try again in a moment.")
+                return
+            worker = QoRWorker(script, [be_run_path, "-stage", stage_name],
+                               _PYTHON_BIN)
+            worker.finished.connect(self._on_qor_done)
+            self._workers.start("qor", worker, attr_name="_qor_worker")
+            return
+        for item in checked_items:
+            if item.data(0, Qt.UserRole) == "STAGE":
+                continue
             path = item.text(15)
             if not path or path == "N/A":
                 continue
@@ -13325,10 +13606,10 @@ class PDDashboard(QMainWindow):
                 path += "/"
             sel.append(path)
 
-        if len(sel) < 2:
+        if len(sel) < 1:
             QMessageBox.information(
                 self, "QoR Compare",
-                "Please check at least 2 runs first.\n"
+                "Please check at least 1 run or 1 PNR stage first.\n"
                 "(Check boxes in the Run Name column)")
             return
 
@@ -13351,19 +13632,10 @@ class PDDashboard(QMainWindow):
         if html_path and os.path.exists(html_path):
             subprocess.Popen([FIREFOX_PATH, html_path])
         else:
-            # Also try finding latest in qor_metrices/
-            import glob as _glob
-            hits = _glob.glob(
-                os.path.join(os.getcwd(), "qor_metrices", "**", "*.html"),
-                recursive=True)
-            if hits:
-                latest = sorted(hits, key=os.path.getmtime)[-1]
-                subprocess.Popen([FIREFOX_PATH, latest])
-            else:
-                QMessageBox.warning(
-                    self, "QoR Compare",
-                    "QoR script ran but no HTML output found.\n"
-                    "Check terminal output for errors.")
+            QMessageBox.warning(
+                self, "QoR Compare",
+                "QoR script ran but no report_qor.html output was found.\n"
+                "Check terminal output for errors.")
 
     def _run_single_stage_qor(self, item, b_name, r_rtl, base_run):
         """Run QoR for a single PNR stage.
@@ -14602,6 +14874,36 @@ class PDDashboard(QMainWindow):
             hh.setSectionsMovable(bool(movable))
             hh.setStretchLastSection(False)
             tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            self._install_table_column_menu(tbl)
+        except Exception:
+            pass
+
+    def _install_table_column_menu(self, tbl):
+        try:
+            header = tbl.horizontalHeader()
+            header.setContextMenuPolicy(Qt.CustomContextMenu)
+            def _show_menu(pos, table=tbl, hh=header):
+                menu = QMenu(table)
+                for col in range(table.columnCount()):
+                    item = table.horizontalHeaderItem(col)
+                    label = item.text() if item else "Column {}".format(col + 1)
+                    act = menu.addAction(label)
+                    act.setCheckable(True)
+                    act.setChecked(not table.isColumnHidden(col))
+                    act.triggered.connect(
+                        lambda checked, c=col, t=table: t.setColumnHidden(c, not checked))
+                if table.columnCount():
+                    menu.addSeparator()
+                show_all = menu.addAction("Show All Columns")
+                show_all.triggered.connect(
+                    lambda _=False, t=table: [t.setColumnHidden(c, False)
+                                              for c in range(t.columnCount())])
+                menu.exec_(hh.mapToGlobal(pos))
+            try:
+                header.customContextMenuRequested.disconnect()
+            except Exception:
+                pass
+            header.customContextMenuRequested.connect(_show_menu)
         except Exception:
             pass
 
