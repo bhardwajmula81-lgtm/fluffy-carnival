@@ -4783,6 +4783,8 @@ class PDDashboard(QMainWindow):
         self._hover_metric_timer.timeout.connect(self._run_pending_hover_metric_lookup)
         self._pending_hover_metric = None
         self._note_text_cache = {}
+        self._search_match_items = []
+        self._search_match_index = -1
         self._owner_lookup_worker = None
         self._owner_items_by_path = {}
         self._stage_metric_last_key = None
@@ -4797,6 +4799,8 @@ class PDDashboard(QMainWindow):
         self.custom_bg_color       = "#2b2d30"
         self.custom_fg_color       = "#dfe1e5"
         self.custom_sel_color      = "#2f65ca"
+        self.search_highlight_color = prefs.get(
+            'UI', 'search_highlight_color', fallback='#fff200')
         self.row_spacing           = 2
         self.show_relative_time    = prefs.get(
             'UI', 'show_relative_time', fallback='false').lower() == 'true'
@@ -5073,6 +5077,8 @@ class PDDashboard(QMainWindow):
         prefs.set('UI', 'last_search',  self.search.text())
         if hasattr(self, 'search_mode_combo'):
             prefs.set('UI', 'search_mode', self.search_mode_combo.currentText())
+        prefs.set('UI', 'search_highlight_color',
+                  getattr(self, "search_highlight_color", "#fff200"))
         prefs.set('UI', 'last_auto',    self.auto_combo.currentText())
         prefs.set('UI', 'search_history', '|||'.join(self._search_history[:15]))
         col_widths = ','.join(
@@ -7002,6 +7008,18 @@ class PDDashboard(QMainWindow):
         self.search_count_lbl.setVisible(False)
         top_layout.addWidget(self.search_count_lbl)
 
+        self.search_prev_btn = QPushButton("N")
+        self.search_prev_btn.setFixedWidth(28)
+        self.search_prev_btn.setToolTip("Previous search match (N)")
+        self.search_prev_btn.clicked.connect(lambda: self._jump_search_match(-1))
+        top_layout.addWidget(self.search_prev_btn)
+
+        self.search_next_btn = QPushButton("M")
+        self.search_next_btn.setFixedWidth(28)
+        self.search_next_btn.setToolTip("Next search match (M)")
+        self.search_next_btn.clicked.connect(lambda: self._jump_search_match(1))
+        top_layout.addWidget(self.search_next_btn)
+
         top_layout.addStretch(1)
 
         self.refresh_btn = QPushButton("Refresh")
@@ -7566,6 +7584,7 @@ class PDDashboard(QMainWindow):
         self.custom_bg_color = "#2b2d30"
         self.custom_fg_color = "#dfe1e5"
         self.custom_sel_color = "#2f65ca"
+        self.search_highlight_color = "#fff200"
         self.row_spacing = 2
         self.gate_count_unit_area = 0.2419
         self._closure_enabled = False
@@ -7605,6 +7624,7 @@ class PDDashboard(QMainWindow):
                 ('last_sort', 'Start Date Old->New'),
                 ('last_search', ''),
                 ('search_mode', 'Filter'),
+                ('search_highlight_color', '#fff200'),
                 ('last_auto', 'Off'),
                 ('hide_block_nodes', 'false'),
                 ('show_relative_time', 'false'),
@@ -7661,13 +7681,30 @@ class PDDashboard(QMainWindow):
         QShortcut(QKeySequence("Ctrl+?"), self,      self.open_settings)
         QShortcut(QKeySequence("L"),      self,      self._shortcut_open_log)
         QShortcut(QKeySequence("D"),      self,      self._toggle_dark_mode)
+        QShortcut(QKeySequence("M"),      self,      self._shortcut_search_next)
         QShortcut(QKeySequence("1"),      self,      lambda: self._set_col_preset(1))
         QShortcut(QKeySequence("2"),      self,      lambda: self._set_col_preset(2))
         QShortcut(QKeySequence("3"),      self,      lambda: self._set_col_preset(3))
         # FEAT 7: Keyboard navigation between visible run items
-        QShortcut(QKeySequence("N"),      self,      self._nav_next_run)
+        QShortcut(QKeySequence("N"),      self,      self._shortcut_search_prev_or_nav)
         QShortcut(QKeySequence("P"),      self,      self._nav_prev_run)
         QShortcut(QKeySequence("F"),      self,      self._nav_next_failed)
+
+    def _search_text_active(self):
+        try:
+            return bool(self.search.text().strip())
+        except Exception:
+            return False
+
+    def _shortcut_search_next(self):
+        if self._search_text_active():
+            self._jump_search_match(1)
+
+    def _shortcut_search_prev_or_nav(self):
+        if self._search_text_active():
+            self._jump_search_match(-1)
+        else:
+            self._nav_next_run()
 
     def _get_visible_run_items(self):
         """Collect all visible FE run items in tree order."""
@@ -7698,6 +7735,47 @@ class PDDashboard(QMainWindow):
         """Select item, scroll to it, update inspector."""
         self.tree.setCurrentItem(item)
         self.tree.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+
+    def _jump_search_match(self, direction):
+        """Navigate among current search matches without changing filters."""
+        if not self._search_text_active():
+            return
+        items = []
+        for it in list(getattr(self, "_search_match_items", []) or []):
+            try:
+                if it is not None and not it.isHidden():
+                    items.append(it)
+            except RuntimeError:
+                pass
+        if not items:
+            self.refresh_view()
+            for it in list(getattr(self, "_search_match_items", []) or []):
+                try:
+                    if it is not None and not it.isHidden():
+                        items.append(it)
+                except RuntimeError:
+                    pass
+        if not items:
+            self.status_bar.showMessage("No search matches", 2000)
+            return
+        curr = self.tree.currentItem()
+        try:
+            idx = items.index(curr)
+        except ValueError:
+            idx = getattr(self, "_search_match_index", -1)
+        if direction >= 0:
+            idx = (idx + 1) % len(items)
+        else:
+            idx = (idx - 1) % len(items)
+        self._search_match_index = idx
+        target = items[idx]
+        parent = target.parent()
+        while parent is not None:
+            parent.setExpanded(True)
+            parent = parent.parent()
+        self._nav_to_item(target)
+        self.status_bar.showMessage(
+            "Search match {}/{}".format(idx + 1, len(items)), 2000)
 
     def _nav_next_run(self):
         """N key: navigate to next visible FE run."""
@@ -9261,10 +9339,10 @@ class PDDashboard(QMainWindow):
     def _rebuild_filter_dropdowns(self):
         src_mode = self.src_combo.currentText()
         releases, blocks = set(), set()
-        if src_mode in ["WS", "ALL"] and self.ws_data:
+        if src_mode in ["WS", "ALL", "ALL-merged"] and self.ws_data:
             releases.update(self.ws_data.get("releases", {}).keys())
             blocks.update(self.ws_data.get("blocks", set()))
-        if src_mode in ["OUTFEED", "ALL"] and self.out_data:
+        if src_mode in ["OUTFEED", "ALL", "ALL-merged"] and self.out_data:
             releases.update(self.out_data.get("releases", {}).keys())
             blocks.update(self.out_data.get("blocks", set()))
 
@@ -9916,6 +9994,35 @@ class PDDashboard(QMainWindow):
             (run or {}).get("rtl", ""),
             self._normal_fe_base((run or {}).get("r_name", "")))
 
+    def _meaningful_rtl_for_merge(self, rtl):
+        text = str(rtl or "").strip()
+        return text and text.upper() not in ("UNKNOWN", "N/A", "-", "NONE")
+
+    def _rtl_from_run_for_merge(self, run):
+        rtl = (run or {}).get("rtl", "")
+        if self._meaningful_rtl_for_merge(rtl):
+            return rtl
+        blob = "{} {}".format((run or {}).get("path", ""), (run or {}).get("r_name", ""))
+        m = re.search(r'([A-Za-z0-9]+_EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?)', blob)
+        if m:
+            return m.group(1)
+        m = re.search(r'(EVT\d+_ML\d+_DEV\d+(?:_syn\d+)?)', blob)
+        if m:
+            return "{}_{}".format(PROJECT_PREFIX, m.group(1))
+        return rtl
+
+    def _best_rtl_for_merge_group(self, group):
+        for run in group or []:
+            rtl = self._rtl_from_run_for_merge(run)
+            if self._meaningful_rtl_for_merge(rtl):
+                return rtl
+        return ""
+
+    def _fe_merge_identity(self, run):
+        return (
+            (run or {}).get("block", ""),
+            self._normal_fe_base((run or {}).get("r_name", "")))
+
     def _run_tool_for_merge(self, run):
         path = str((run or {}).get("path", "")).replace("\\", "/").lower()
         if "/innovus/" in path:
@@ -9954,6 +10061,14 @@ class PDDashboard(QMainWindow):
             self._run_tool_for_merge(run),
             self._be_base_for_merge(run))
 
+    def _be_merge_identity(self, run):
+        fe_base = self._fe_base_from_be_run_name((run or {}).get("r_name", ""))
+        return (
+            (run or {}).get("block", ""),
+            fe_base,
+            self._run_tool_for_merge(run),
+            self._be_base_for_merge(run))
+
     def _stage_duplicate_identity(self, stage):
         return str((stage or {}).get("name", "")).strip().lower()
 
@@ -9987,8 +10102,10 @@ class PDDashboard(QMainWindow):
         fe_rtl_map = {}
         for run in list(ws_runs or []) + list(out_runs or []):
             if (run or {}).get("run_type") == "FE":
-                fe_rtl_map[((run or {}).get("block", ""),
-                            self._normal_fe_base((run or {}).get("r_name", "")))] = (run or {}).get("rtl", "")
+                key = self._fe_merge_identity(run)
+                rtl = self._rtl_from_run_for_merge(run)
+                if self._meaningful_rtl_for_merge(rtl) and key not in fe_rtl_map:
+                    fe_rtl_map[key] = rtl
 
         fe_groups = {}
         be_groups = {}
@@ -9998,10 +10115,10 @@ class PDDashboard(QMainWindow):
                 continue
             rt = run.get("run_type")
             if rt == "FE":
-                ident = self._fe_duplicate_identity(run)
+                ident = self._fe_merge_identity(run)
                 fe_groups.setdefault(ident, []).append(run)
             elif rt == "BE":
-                ident = self._be_duplicate_identity(run, fe_rtl_map)
+                ident = self._be_merge_identity(run)
                 be_groups.setdefault(ident, []).append(run)
             else:
                 passthrough.append(run)
@@ -10021,6 +10138,10 @@ class PDDashboard(QMainWindow):
             if not preferred:
                 continue
             out = self._clone_run_for_merge(preferred)
+            best_rtl = self._best_rtl_for_merge_group(group)
+            if self._meaningful_rtl_for_merge(best_rtl):
+                out["rtl"] = best_rtl
+                fe_rtl_map[ident] = best_rtl
             paths = [g.get("path", "") for g in group if g.get("path")]
             sources = sorted(set(g.get("source", "") for g in group if g.get("source")))
             if len(group) > 1:
@@ -10036,8 +10157,10 @@ class PDDashboard(QMainWindow):
                 continue
             out = self._clone_run_for_merge(preferred)
             duplicates = [g for g in group if g is not preferred]
-            if preferred.get("rtl", "") in ("", "UNKNOWN") and fe_rtl_map:
-                out["rtl"] = ident[1] or out.get("rtl", "")
+            fe_key = (ident[0], ident[1])
+            best_rtl = fe_rtl_map.get(fe_key) or self._best_rtl_for_merge_group(group)
+            if self._meaningful_rtl_for_merge(best_rtl):
+                out["rtl"] = best_rtl
             out["stages"] = self._merge_stage_lists_for_tree(preferred, duplicates)
             paths = [g.get("path", "") for g in group if g.get("path")]
             sources = sorted(set(g.get("source", "") for g in group if g.get("source")))
@@ -11386,7 +11509,9 @@ class PDDashboard(QMainWindow):
     def _set_item_search_highlight(self, item, active):
         try:
             if active:
-                color = QColor("#fff3a0" if not self.is_dark_mode else "#394b59")
+                color = QColor(getattr(self, "search_highlight_color", "#fff200"))
+                if not color.isValid():
+                    color = QColor("#fff200")
                 brush = QBrush(color)
             else:
                 brush = QBrush()
@@ -11535,6 +11660,8 @@ class PDDashboard(QMainWindow):
         _note_text_cache = self._note_text_cache
         visible_run_items = []
         self._visible_run_item_cache = None
+        self._search_match_items = []
+        self._search_match_index = -1
 
         def _search_notes(note_id):
             if note_id in _note_text_cache:
@@ -11792,23 +11919,55 @@ class PDDashboard(QMainWindow):
         for i in range(root.childCount()):
             _update_visibility(root.child(i))
 
-        self._visible_run_item_cache = list(visible_run_items)
         if self.active_col_filters:
             self.apply_tree_filters()
             self._visible_run_item_cache = None
+
+        def _collect_search_matches():
+            matches = []
+            seen = set()
+            def _add(it):
+                try:
+                    key = id(it)
+                    if key not in seen and not it.isHidden():
+                        seen.add(key)
+                        matches.append(it)
+                except RuntimeError:
+                    pass
+            def _walk(node):
+                for ci in range(node.childCount()):
+                    ch = node.child(ci)
+                    try:
+                        if ch.isHidden():
+                            continue
+                        nt = ch.data(0, _UR)
+                        run = ch.data(0, _UR10)
+                        if _do_search and run and run.get("_search_hit"):
+                            _add(ch)
+                        if _do_search and nt == "STAGE":
+                            parent = ch.parent()
+                            prun = parent.data(0, _UR10) if parent is not None else None
+                            hits = set(str(x).lower() for x in (prun or {}).get("_search_stage_hits", []) or [])
+                            if ch.text(0).lower() in hits:
+                                _add(ch)
+                        _walk(ch)
+                    except RuntimeError:
+                        pass
+            _walk(self.tree.invisibleRootItem())
+            self._search_match_items = matches
+
+        _collect_search_matches()
+        self._visible_run_item_cache = list(visible_run_items)
 
         self.tree.blockSignals(False)
         self.tree.setUpdatesEnabled(True)
         # FEAT 6: Show search result count when search is active
         if raw_query:
-            if _highlight_mode:
-                fe_visible = sum(1 for r in self._iter_run_dicts()
-                                 if r.get("_search_hit"))
-                self.search_count_lbl.setText("{} match".format(fe_visible))
-            else:
-                fe_visible = sum(1 for r in visible_runs
-                                 if r.get("run_type") == "FE")
-                self.search_count_lbl.setText("{} found".format(fe_visible))
+            match_count = len(getattr(self, "_search_match_items", []) or [])
+            label = "{} match".format(match_count)
+            if not _highlight_mode:
+                label = "{} found".format(match_count)
+            self.search_count_lbl.setText(label)
             self.search_count_lbl.setVisible(True)
         else:
             self.search_count_lbl.setVisible(False)
@@ -13054,6 +13213,27 @@ class PDDashboard(QMainWindow):
             row.addWidget(swatch)
             gen_l.addRow("", row)
 
+        _search_color = [getattr(self, "search_highlight_color", "#fff200")]
+        search_swatch = QLabel("  ")
+        search_swatch.setFixedSize(60, 20)
+        search_swatch.setStyleSheet(
+            "background:{};border:1px solid #888;".format(_search_color[0]))
+
+        def _pick_search_color():
+            c = QColorDialog.getColor(QColor(_search_color[0]), dlg)
+            if c.isValid():
+                _search_color[0] = c.name()
+                search_swatch.setStyleSheet(
+                    "background:{};border:1px solid #888;".format(c.name()))
+
+        search_color_btn = QPushButton("Search Match Highlight")
+        search_color_btn.setToolTip("Color used for rows matching the search bar.")
+        search_color_btn.clicked.connect(_pick_search_color)
+        search_color_row = QHBoxLayout()
+        search_color_row.addWidget(search_color_btn)
+        search_color_row.addWidget(search_swatch)
+        gen_l.addRow("Search:", search_color_row)
+
         tabs.addTab(gen_w, "General")
 
         # -- Column Presets tab --
@@ -13237,6 +13417,7 @@ class PDDashboard(QMainWindow):
         self.custom_bg_color    = _colors[0]
         self.custom_fg_color    = _colors[1]
         self.custom_sel_color   = _colors[2]
+        self.search_highlight_color = _search_color[0]
         self.row_spacing        = space_spin.value()
         old_rel_time = self.show_relative_time
         old_ist      = self.convert_to_ist
@@ -13271,6 +13452,8 @@ class PDDashboard(QMainWindow):
         self.gate_count_unit_area = gate_factor_spin.value()
         prefs.set('UI', 'gate_count_unit_area',
                   "{:.6f}".format(self.gate_count_unit_area))
+        prefs.set('UI', 'search_highlight_color',
+                  self.search_highlight_color or "#fff200")
 
         # Save tapeout date
         import datetime
