@@ -4463,16 +4463,17 @@ class LatestOutfeedStatusDialog(QDialog):
 
         tabs = QTabWidget()
         self.fe_tbl = self._make_table([
-            "Alias", "Block", "RTL", "FE Run", "Runtime", "End",
+            "Alias", "Block", "RTL", "FE Run",
             "R2R Setup W/T/N", "R2R Hold W/T/N",
             "Std Cell Count/Area", "Gate Count", "Congestion",
-            "VT Area%", "Logic Depth", "Path"])
+            "VT Area%", "Logic Depth", "Path", "Start", "End", "Runtime"])
         self.be_tbl = self._make_table([
             "Alias", "Block", "RTL", "BE Run", "Latest Stage", "Status",
-            "Runtime", "End", "R2R Setup W/T/N", "Total Setup W/T/N",
-            "Hold W/T/N", "Cong/Shorts", "Std Cell Count/Area", "GC",
+            "R2R Setup W/T/N", "Total Setup W/T/N", "Hold W/T/N",
+            "Cong/Shorts", "Std Cell Count/Area", "GC",
             "Std Cell/Std Only Util", "Total Util", "VT Inst%", "VT Area%",
-            "Skew/Latency", "Clock Repeater Count/Area", "Path"])
+            "Skew/Latency", "Clock Repeater Count/Area", "Path",
+            "Start", "End", "Runtime"])
         tabs.addTab(self.fe_tbl, "FE QoR")
         tabs.addTab(self.be_tbl, "Latest BE Stage QoR")
         layout.addWidget(tabs, 1)
@@ -7008,14 +7009,14 @@ class PDDashboard(QMainWindow):
         self.search_count_lbl.setVisible(False)
         top_layout.addWidget(self.search_count_lbl)
 
-        self.search_prev_btn = QPushButton("N")
-        self.search_prev_btn.setFixedWidth(28)
+        self.search_prev_btn = QPushButton("Prev")
+        self.search_prev_btn.setFixedWidth(46)
         self.search_prev_btn.setToolTip("Previous search match (N)")
         self.search_prev_btn.clicked.connect(lambda: self._jump_search_match(-1))
         top_layout.addWidget(self.search_prev_btn)
 
-        self.search_next_btn = QPushButton("M")
-        self.search_next_btn.setFixedWidth(28)
+        self.search_next_btn = QPushButton("Next")
+        self.search_next_btn.setFixedWidth(46)
         self.search_next_btn.setToolTip("Next search match (M)")
         self.search_next_btn.clicked.connect(lambda: self._jump_search_match(1))
         top_layout.addWidget(self.search_next_btn)
@@ -9927,14 +9928,15 @@ class PDDashboard(QMainWindow):
         std_ca = "{}/{}".format(inst, std_area) if (inst != "-" or std_area != "-") else "-"
         cong = (metrics.get("congestion") or {}).get("cong_both") or "-"
         runtime = run.get("runtime", "-") or metrics.get("runtime", "-")
+        start = run.get("start", "-") or "-"
+        end = run.get("end", "-") or "-"
         vt_area = self._metric_value(metrics, "vth_area") if hasattr(self, "_metric_value") else "-"
         logic_depth = metrics.get("logic_depth", "-")
         return {"values": [
             alias, run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
-            runtime, run.get("end", "-"), metrics.get("r2r_setup", "-"),
-            metrics.get("r2r_hold", "-"), std_ca,
+            metrics.get("r2r_setup", "-"), metrics.get("r2r_hold", "-"), std_ca,
             self._latest_gate_count_from_metrics(metrics), cong, vt_area,
-            logic_depth, run.get("path", "")],
+            logic_depth, run.get("path", ""), start, end, runtime],
             "missing": missing}
 
     def _latest_be_qor_row(self, alias, run, missing_map, cancel_cb):
@@ -9958,6 +9960,7 @@ class PDDashboard(QMainWindow):
             metrics = {}
         info = st.get("info") or {}
         runtime = metrics.get("runtime") if metrics.get("runtime") not in (None, "", "-") else info.get("runtime", "-")
+        start = info.get("start", "-")
         end = info.get("end", "-")
         cong = (metrics.get("congestion") or {}).get("cong_both") or "-"
         hold = metrics.get("hold_r2r") or metrics.get("r2r_hold") or metrics.get("hold_all") or "-"
@@ -9966,14 +9969,14 @@ class PDDashboard(QMainWindow):
         vt_area = self._metric_value(metrics, "vth_area") if hasattr(self, "_metric_value") else "-"
         return {"values": [
             alias, run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
-            name, st.get("stage_status", "COMPLETED"), runtime, end,
+            name, st.get("stage_status", "COMPLETED"),
             metrics.get("r2r_setup", "-"), metrics.get("setup_total", "-"), hold,
             cong, metrics.get("std_cell_count_area", "-"),
             self._latest_gate_count_from_metrics(metrics),
             metrics.get("std_cell_only_util", "-"), metrics.get("total_util", "-"),
             vt_inst, vt_area, metrics.get("skew_latency", "-"),
             metrics.get("clock_repeater_count_area", "-"),
-            st.get("stage_path", run.get("path", ""))],
+            st.get("stage_path", run.get("path", "")), start, end, runtime],
             "missing": missing}
 
     def _is_complete_outfeed_fe(self, run):
@@ -10085,7 +10088,8 @@ class PDDashboard(QMainWindow):
                 if key in seen:
                     continue
                 cp = dict(st or {})
-                cp["_merged_stage_source"] = src
+                cp["_merged_stage_source"] = cp.get("source") or src
+                cp["source"] = cp.get("source") or src
                 cp["_merged_stage_preferred"] = bool(preferred)
                 merged.append(cp)
                 seen.add(key)
@@ -10335,8 +10339,9 @@ class PDDashboard(QMainWindow):
                     all_missing = be_item[1]
                     be_rows.append({"values": [
                         alias, block, be_item[0].get("rtl", ""), be_item[0].get("r_name", ""), "-",
-                        "-", "-", be_item[0].get("end", "-"), "-", "-", "-", "-", "-", "-", "-",
-                        "-", "-", "-", "-", "-", be_item[0].get("path", "")],
+                        "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-", "-",
+                        be_item[0].get("path", ""), be_item[0].get("start", "-"),
+                        be_item[0].get("end", "-"), "-"],
                         "missing": all_missing})
         return alias_rows, fe_rows, be_rows
 
@@ -10830,7 +10835,9 @@ class PDDashboard(QMainWindow):
             s_item.setCheckState(0, Qt.Unchecked)
             s_item.setText(0,  stage.get("name", ""))
             s_item.setText(1, be_item.text(1) if be_item else "")
-            s_item.setText(2, be_item.text(2) if be_item else be_run.get("source", ""))
+            s_item.setText(2, stage.get("_merged_stage_source")
+                           or stage.get("source")
+                           or (be_item.text(2) if be_item else be_run.get("source", "")))
             status = stage.get("stage_status", "-")
             active_stage = stage.get("active_stage", stage.get("name", "-"))
             s_item.setIcon(3, self._status_icon_for_text(status))
@@ -11524,6 +11531,7 @@ class PDDashboard(QMainWindow):
         q = str(query or "").strip().lower()
         try:
             run["_search_stage_hits"] = set()
+            run["_search_direct_hit"] = False
         except Exception:
             pass
         if not q:
@@ -11549,18 +11557,21 @@ class PDDashboard(QMainWindow):
         }
         stage_blobs = []
         for st in (run or {}).get("stages", []) or []:
+            name_text = str(st.get("name", "") or "")
+            active_text = str(st.get("active_stage", "") or "")
             st_blob = "{} {} {} {} {}".format(
-                st.get("name", ""), st.get("stage_status", ""),
-                st.get("active_stage", ""), st.get("log_path", ""),
+                name_text, st.get("stage_status", ""),
+                active_text, st.get("log_path", ""),
                 st.get("stage_path", ""))
             fields["stage"] += " " + st_blob
             fields["log"] += " " + str(st.get("log_path", ""))
             fields["path"] += " " + str(st.get("stage_path", ""))
-            stage_blobs.append((st.get("name", ""), st_blob.lower(),
+            stage_blobs.append((name_text, st_blob.lower(),
+                                (name_text + " " + active_text).lower(),
                                 str(st.get("log_path", "")).lower(),
                                 str(st.get("stage_path", "")).lower(),
                                 str(st.get("stage_status", "")).lower(),
-                                str(st.get("active_stage", "")).lower()))
+                                active_text.lower()))
 
         def _match_text(text, needle):
             text = str(text or "").lower()
@@ -11571,9 +11582,9 @@ class PDDashboard(QMainWindow):
         def _record_stage_hits(key=None, val=None):
             hits = set()
             needle = val if val is not None else q
-            for name, blob, log_text, path_text, status_text, active_text in stage_blobs:
+            for name, blob, stage_name_text, log_text, path_text, status_text, active_text in stage_blobs:
                 if key == "stage":
-                    text = blob
+                    text = stage_name_text
                 elif key == "log":
                     text = log_text
                 elif key == "path":
@@ -11597,19 +11608,33 @@ class PDDashboard(QMainWindow):
             key = m.group(1)
             val = m.group(2).strip()
             stage_hit = _record_stage_hits(key, val)
-            return (val in str(fields.get(key, "")).lower()) or stage_hit
+            direct_hit = False if key == "stage" else _match_text(fields.get(key, ""), val)
+            try:
+                run["_search_direct_hit"] = bool(direct_hit)
+            except Exception:
+                pass
+            return direct_hit or stage_hit
         base_blob = (run or {}).get("_search_blob")
         if not base_blob:
-            base_blob = " ".join(str(v) for v in fields.values()).lower()
+            base_blob = " ".join(str(fields.get(k, "")) for k in (
+                "run", "name", "rtl", "block", "source", "type", "status",
+                "user", "owner", "path", "log", "runtime", "start", "end",
+                "note")).lower()
             try:
                 run["_search_blob"] = base_blob
             except Exception:
                 pass
         combined = (base_blob + " " + str(notes or "").lower())
         stage_hit = _record_stage_hits(None, q)
+        direct_hit = (fnmatch.fnmatch(combined, "*" + q + "*")
+                      if "*" in q else q in combined)
+        try:
+            run["_search_direct_hit"] = bool(direct_hit)
+        except Exception:
+            pass
         if "*" in q:
-            return fnmatch.fnmatch(combined, "*" + q + "*") or stage_hit
-        return q in combined or stage_hit
+            return direct_hit or stage_hit
+        return direct_hit or stage_hit
 
     def refresh_view(self):
         src_mode = self.src_combo.currentText()
@@ -11761,6 +11786,7 @@ class PDDashboard(QMainWindow):
                         and ("h ago" in rt or "m ago" in rt)):
                     return False
             run["_search_hit"] = False
+            run["_search_direct_hit"] = False
             if _do_search:
                 note_id  = "{} : {}".format(rtl, run["r_name"])
                 notes    = _search_notes(note_id)
@@ -11774,6 +11800,21 @@ class PDDashboard(QMainWindow):
         _UR10 = Qt.UserRole + 10
         _GROUP_TYPES = frozenset(
             ("BLOCK","MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT"))
+
+        def _clear_all_search_highlights():
+            def _walk(node):
+                for ci in range(node.childCount()):
+                    ch = node.child(ci)
+                    self._set_item_search_highlight(ch, False)
+                    _walk(ch)
+            try:
+                _walk(self.tree.invisibleRootItem())
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+
+        _clear_all_search_highlights()
 
         if _pinned_only:
             _mark_pinned_desc(self.tree.invisibleRootItem())
@@ -11831,7 +11872,7 @@ class PDDashboard(QMainWindow):
                     passes = True
                 rt_type_run = run.get("run_type") if run else None
                 item.setHidden(not passes)
-                self._set_item_search_highlight(item, bool(_do_search and run and run.get("_search_hit")))
+                self._set_item_search_highlight(item, bool(_do_search and run and run.get("_search_direct_hit")))
                 if passes and run:
                     visible_runs.append(run)
                     if run.get("run_type") == "FE":
@@ -11850,11 +11891,11 @@ class PDDashboard(QMainWindow):
                             _be_only and rt_type_run == "FE")
                         stage_hits = set()
                         try:
-                            stage_hits = set(run.get("_search_stage_hits") or [])
+                            stage_hits = set(str(x).lower() for x in (run.get("_search_stage_hits") or []))
                         except Exception:
                             stage_hits = set()
                         if _do_search and stage_hits and rt_type_run == "BE":
-                            matched_stage = ch.text(0) in stage_hits
+                            matched_stage = ch.text(0).lower() in stage_hits
                             if _highlight_mode:
                                 hide_stage = not passes
                             else:
@@ -11889,7 +11930,7 @@ class PDDashboard(QMainWindow):
                                     cnid = "{} : {}".format(child_run.get("rtl", ""), child_run.get("r_name", ""))
                                     cnotes = _search_notes(cnid)
                                     child_run["_search_hit"] = self._search_matches_run(child_run, raw_query, cnotes)
-                                self._set_item_search_highlight(ch, bool(child_run and child_run.get("_search_hit")))
+                                self._set_item_search_highlight(ch, bool(child_run and child_run.get("_search_direct_hit")))
                             except Exception:
                                 pass
                         if _pinned_only:
@@ -11902,12 +11943,12 @@ class PDDashboard(QMainWindow):
                                 and child_run.get("_search_stage_hits")
                                 and not hide_child):
                             self._ensure_stage_rows_visible(ch, child_run)
-                            hits = set(child_run.get("_search_stage_hits") or [])
+                            hits = set(str(x).lower() for x in (child_run.get("_search_stage_hits") or []))
                             for si in range(ch.childCount()):
                                 st_item = ch.child(si)
                                 if st_item.data(0, _UR) != "STAGE":
                                     continue
-                                matched_stage = st_item.text(0) in hits
+                                matched_stage = st_item.text(0).lower() in hits
                                 if not _highlight_mode:
                                     st_item.setHidden(not matched_stage)
                                 self._set_item_search_highlight(st_item, matched_stage)
@@ -11942,7 +11983,7 @@ class PDDashboard(QMainWindow):
                             continue
                         nt = ch.data(0, _UR)
                         run = ch.data(0, _UR10)
-                        if _do_search and run and run.get("_search_hit"):
+                        if _do_search and run and run.get("_search_direct_hit"):
                             _add(ch)
                         if _do_search and nt == "STAGE":
                             parent = ch.parent()
