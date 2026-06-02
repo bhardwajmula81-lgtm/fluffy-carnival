@@ -8,6 +8,12 @@ import re
 import fnmatch
 import gzip
 
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(context, exc=None):
+        pass
+
 # ===========================================================================
 # PATH HELPERS
 # ===========================================================================
@@ -40,9 +46,12 @@ class _ReportFinder(object):
                 try:
                     if entry.is_file() and not entry.name.endswith(".log"):
                         entries.append((entry.name, entry.path, entry.stat().st_mtime))
-                except Exception:
-                    pass
-        except Exception:
+                except Exception as e:
+                    debug_log("metric_extract: report entry stat failed {}".format(rpt_dir), e)
+        except (FileNotFoundError, NotADirectoryError):
+            entries = []
+        except Exception as e:
+            debug_log("metric_extract: report directory scan failed {}".format(rpt_dir), e)
             entries = []
         self._dir_cache[rpt_dir] = entries
         return entries
@@ -109,8 +118,8 @@ def parse_area(file_path, verified=False):
                 if (result["total_count"] != "-"
                         and result["total_area"] != "-"):
                     break
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log("metric_extract: parse_area failed {}".format(file_path), e)
     return result
 
 
@@ -143,8 +152,8 @@ def parse_utilization(file_path, verified=False):
                 combo = "{}%/{}%".format(s, o)
                 result["std_util_str"] = combo
                 result["std_util"]     = combo
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log("metric_extract: parse_utilization failed {}".format(file_path), e)
     return result
 
 
@@ -205,8 +214,8 @@ def parse_cell_usage(file_path, verified=False):
         result["lvt_rvt_hvt_area"] = "{:.2f}%/{:.2f}%/{:.2f}%".format(lvt_a, rvt_a, hvt_a)
         result["lvt_rvt_inst"] = "{:.2f}%/{:.2f}%".format(lvt_i, rvt_i)
         result["lvt_rvt_area"] = "{:.2f}%/{:.2f}%".format(lvt_a, rvt_a)
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log("metric_extract: parse_cell_usage failed {}".format(file_path), e)
     return result
 
 
@@ -244,8 +253,8 @@ def parse_qor(file_path, verified=False):
 
         result["r2r_setup"] = get_r2r_data("Setup violations")
         result["r2r_hold"]  = get_r2r_data("Hold violations")
-    except Exception:
-        pass
+    except Exception as e:
+        debug_log("metric_extract: parse_qor failed {}".format(file_path), e)
     return result
 
 
@@ -404,7 +413,8 @@ def _read_stage_text(path):
                 return f.read()
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
-    except Exception:
+    except Exception as e:
+        debug_log("metric_extract: read stage text failed {}".format(path), e)
         return ""
 
 

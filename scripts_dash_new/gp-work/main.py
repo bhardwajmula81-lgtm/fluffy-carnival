@@ -25,6 +25,12 @@ import html
 import io
 import hashlib
 
+try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(context, exc=None):
+        pass
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QLineEdit, QTreeWidget, QTreeWidgetItem,
@@ -67,8 +73,8 @@ def _atomic_replace_path(path, writer_func):
     if directory and not os.path.exists(directory):
         try:
             os.makedirs(directory)
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log("main: create atomic write directory failed", e)
     tmp = path + ".tmp.{}.{}".format(os.getpid(), int(time.time() * 1000000))
     lock = _atomic_lock_for(path)
     with lock:
@@ -154,6 +160,8 @@ def _load_project_config():
             'MAIL_UTIL':       '/user/vwpmailsystem/MAIL/send_mail_for_rhel7',
             'USER_INFO_UTIL':  '/usr/local/bin/user_info',
             'PYTHON_BIN':      'python3.6',
+            'QOR_TIMEOUT_SEC': '600',
+            'USER_INFO_TIMEOUT_SEC': '5',
         }
     }
     if os.path.exists(cfg_file):
@@ -170,14 +178,14 @@ def _load_project_config():
         if changed:
             try:
                 _write_config_atomic(cfg, cfg_file)
-            except Exception:
-                pass
+            except Exception as e:
+                debug_log("main: project config update failed", e)
     else:
         cfg.read_dict(defaults)
         try:
             _write_config_atomic(cfg, cfg_file)
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log("main: project config create failed", e)
     return cfg
 
 def _load_mail_config():
@@ -191,8 +199,8 @@ def _load_mail_config():
                        'KNOWN_USERS':       {'users': ''}})
         try:
             _write_config_atomic(mc, mc_file)
-        except Exception:
-            pass
+        except Exception as e:
+            debug_log("main: mail config create failed", e)
     else:
         mc.read(mc_file)
     return mc, mc_file
@@ -205,6 +213,8 @@ FIREFOX_PATH   = _proj_cfg.get('TOOLS', 'FIREFOX_PATH',   fallback='/usr/bin/fir
 USER_INFO_UTIL = _proj_cfg.get('TOOLS', 'USER_INFO_UTIL', fallback='/usr/local/bin/user_info')
 _PYTHON_BIN    = _proj_cfg.get('TOOLS', 'PYTHON_BIN',     fallback='python3.6')
 _SUMMARY_SCRIPT = _proj_cfg.get('TOOLS', 'SUMMARY_SCRIPT', fallback='')
+QOR_TIMEOUT_SEC = _proj_cfg.getint('TOOLS', 'QOR_TIMEOUT_SEC', fallback=600)
+USER_INFO_TIMEOUT_SEC = _proj_cfg.getint('TOOLS', 'USER_INFO_TIMEOUT_SEC', fallback=5)
 
 # Project paths -- defined here so they are available even without config.py
 SCRIPT_DIR       = os.path.dirname(os.path.abspath(__file__))
@@ -277,6 +287,8 @@ _bt.SIGNOFF_BG_WORKERS = SIGNOFF_BG_WORKERS
 _bt.IGNORE_FE_RUN_PATTERNS = IGNORE_FE_RUN_PATTERNS
 _bt.IGNORE_BE_RUN_PATTERNS = IGNORE_BE_RUN_PATTERNS
 _bt.IGNORE_PNR_STAGE_PATTERNS = IGNORE_PNR_STAGE_PATTERNS
+_bt.QOR_TIMEOUT_SEC = QOR_TIMEOUT_SEC
+_bt.USER_INFO_TIMEOUT_SEC = USER_INFO_TIMEOUT_SEC
 
 
 def _get_user_email(username):
@@ -286,7 +298,8 @@ def _get_user_email(username):
     try:
         res = subprocess.check_output(
             [USER_INFO_UTIL, '-a', username],
-            stderr=subprocess.DEVNULL).decode('utf-8', errors='ignore')
+            stderr=subprocess.DEVNULL,
+            timeout=USER_INFO_TIMEOUT_SEC).decode('utf-8', errors='ignore')
         # user_info output is comma-separated; email is field 9 (index 8)
         fields = res.split(',')
         if len(fields) >= 9:
@@ -296,8 +309,10 @@ def _get_user_email(username):
         # fallback: regex scan
         m = re.search(r'[\w\.-]+@[\w\.-]+\.\w+', res)
         if m: return m.group(0)
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired as e:
+        debug_log("main: user_info timeout for {}".format(username), e)
+    except Exception as e:
+        debug_log("main: user_info lookup failed for {}".format(username), e)
     return ""
 
 
@@ -1468,7 +1483,7 @@ class QoRSummaryDialog(QDialog):
         layout.addWidget(close_btn)
 
 
-class QoRWorker(QThread):
+class _LegacyQoRWorker(QThread):
     finished = pyqtSignal(str)
 
     def __init__(self, script_path, run_dirs, python_bin="python3.6"):
@@ -1511,6 +1526,13 @@ class QoRWorker(QThread):
                 else "")
         except Exception:
             self.finished.emit("")
+
+
+try:
+    from workers import QoRWorker
+except Exception as _qor_import_error:
+    debug_log("main: using legacy QoRWorker fallback", _qor_import_error)
+    QoRWorker = _LegacyQoRWorker
 
 
 class FeCongestionLookupWorker(QThread):

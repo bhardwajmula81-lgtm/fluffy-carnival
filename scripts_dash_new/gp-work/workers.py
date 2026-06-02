@@ -15,6 +15,12 @@ import time
 from PyQt5.QtCore import QThread, pyqtSignal
 
 try:
+    from debug_log import debug_log
+except Exception:
+    def debug_log(context, exc=None):
+        pass
+
+try:
     from metric_extract import extract_fe_metrics, extract_pnr_stage_metrics
     _METRICS_AVAILABLE = True
 except ImportError:
@@ -88,7 +94,8 @@ def _save_metric_cache():
     try:
         fp = _metric_cache_file()
         _atomic_write_gzip_json(fp, payload, sort_keys=True)
-    except Exception:
+    except Exception as e:
+        debug_log("workers: save metric cache failed", e)
         with _METRIC_CACHE_LOCK:
             _METRIC_CACHE_DIRTY = True
 
@@ -130,6 +137,7 @@ def _dir_signature(path, patterns=None):
             if mt > max_mtime:
                 max_mtime = mt
     except Exception:
+        debug_log("workers: du size failed for {}".format(path))
         return None
     return [os.path.normpath(path), count, int(max_mtime), total_size]
 
@@ -302,6 +310,12 @@ def _g(name, default=""):
     import builtins
     return getattr(builtins, name,
            globals().get(name, default))
+
+def _QOR_TIMEOUT_SEC():
+    try:
+        return max(1, int(_g("QOR_TIMEOUT_SEC", 600)))
+    except Exception:
+        return 600
 
 def _BASE_WS_FE():   return _g("BASE_WS_FE_DIR")
 def _BASE_WS_BE():   return _g("BASE_WS_BE_DIR")
@@ -1133,8 +1147,8 @@ class DiskScannerWorker(QThread):
                                     results[cat][owner] = {"total": 0, "dirs": []}
                                 results[cat][owner]["total"] += gb_sz
                                 results[cat][owner]["dirs"].append((full_path, gb_sz))
-                except:
-                    pass
+                except Exception as e:
+                    debug_log("DiskScannerWorker: batch directory size failed", e)
 
         for cat in results:
             for owner in results[cat]:
@@ -1372,7 +1386,8 @@ class ScannerWorker(QThread):
                     continue
                 try:
                     ws_names = os.listdir(ws_base)
-                except:
+                except Exception as e:
+                    debug_log("ScannerWorker: list workspace base failed {}".format(ws_base), e)
                     continue
                 for ws_name in ws_names:
                     disc_futures.append(
@@ -1389,15 +1404,16 @@ class ScannerWorker(QThread):
                     for rtl, paths in new_releases.items():
                         for p in paths:
                             self._map_release(ws_data, rtl, p)
-                except:
-                    pass
+                except Exception as e:
+                    debug_log("ScannerWorker: workspace discovery future failed", e)
 
         # --- Outfeed discovery ---
         self.status_update.emit("Discovering OUTFEED directories...")
         if os.path.exists(_BASE_OUTFEED()):
             try:
                 outfeed_entries = list(os.scandir(_BASE_OUTFEED()))
-            except Exception:
+            except Exception as e:
+                debug_log("ScannerWorker: list OUTFEED root failed", e)
                 outfeed_entries = []
             for ent in outfeed_entries:
                 if self._cancel_requested():
@@ -1418,7 +1434,8 @@ class ScannerWorker(QThread):
                 try:
                     evt_entries = [e for e in os.scandir(ent_path)
                                    if e.name.startswith("EVT") and e.is_dir()]
-                except Exception:
+                except Exception as e:
+                    debug_log("ScannerWorker: list OUTFEED EVT dirs failed {}".format(ent_path), e)
                     evt_entries = []
 
                 for evt_entry in evt_entries:
@@ -1432,7 +1449,8 @@ class ScannerWorker(QThread):
                     fc_dir = os.path.join(evt_dir, "fc")
                     try:
                         fc_entries = [e for e in os.scandir(fc_dir) if e.is_dir()]
-                    except Exception:
+                    except Exception as e:
+                        debug_log("ScannerWorker: list OUTFEED fc failed {}".format(fc_dir), e)
                         fc_entries = []
                     for fc_entry in fc_entries:
                         if self._cancel_requested():
@@ -1445,7 +1463,8 @@ class ScannerWorker(QThread):
                             continue
                         try:
                             child_entries = [e for e in os.scandir(fc_entry.path) if e.is_dir()]
-                        except Exception:
+                        except Exception as e:
+                            debug_log("ScannerWorker: list OUTFEED fc group failed {}".format(fc_entry.path), e)
                             child_entries = []
                         for child in child_entries:
                             if child.name.endswith("-FE"):
@@ -1456,7 +1475,8 @@ class ScannerWorker(QThread):
                         inv_dir = os.path.join(evt_dir, "innovus")
                         try:
                             inv_entries = [e for e in os.scandir(inv_dir) if e.is_dir()]
-                        except Exception:
+                        except Exception as e:
+                            debug_log("ScannerWorker: list OUTFEED innovus failed {}".format(inv_dir), e)
                             inv_entries = []
                         for inv_entry in inv_entries:
                             if self._cancel_requested():
@@ -1538,8 +1558,8 @@ class ScannerWorker(QThread):
                             scan_stats["fc"] += 1
                         elif "/innovus/" in result["path"]:
                             scan_stats["innovus"] += 1
-                except:
-                    pass
+                except Exception as e:
+                    debug_log("ScannerWorker: process run future failed", e)
 
                 completed_tasks += 1
                 # Throttle UI updates -- emit every 20 tasks to avoid flooding event loop
@@ -1550,7 +1570,8 @@ class ScannerWorker(QThread):
             if ir_future:
                 try:
                     ir_data = {} if self._cancel_requested() else ir_future.result()
-                except:
+                except Exception as e:
+                    debug_log("ScannerWorker: IR scan future failed", e)
                     ir_data = {}
             else:
                 ir_data = {}
@@ -2135,6 +2156,7 @@ class MetricWorker(QThread):
                 return
             self.finished.emit(m)
         except Exception as e:
+            debug_log("MetricWorker: metric extraction failed", e)
             self.finished.emit({"_error": str(e)})
 
 
@@ -2187,6 +2209,7 @@ class MetricBatchWorker(QThread):
                             and row["metrics"].get("runtime", "-") in ("", "-", "N/A")):
                         row["metrics"]["runtime"] = task.get("runtime")
             except Exception as e:
+                debug_log("MetricBatchWorker: metric extraction failed", e)
                 row["metrics"] = {"_error": str(e)}
             out.append(row)
             if idx == len(self.tasks) or idx % 10 == 0:
@@ -2227,7 +2250,8 @@ class QoRWorker(QThread):
             # New summary.py writes report_qor.html in the launch PWD.
             script_dir = os.path.dirname(os.path.abspath(self.script_path))
             launch_cwd = os.getcwd()
-            start_time = time.time() - 2.0
+            start_time = time.time()
+            timeout_sec = _QOR_TIMEOUT_SEC()
             cmd = [self.python_bin, self.script_path] + self.run_dirs
             self._proc = subprocess.Popen(
                 cmd,
@@ -2236,12 +2260,14 @@ class QoRWorker(QThread):
                 stderr=subprocess.PIPE
             )
             try:
-                stdout, stderr = self._proc.communicate(timeout=300)
-            except subprocess.TimeoutExpired:
+                stdout, stderr = self._proc.communicate(timeout=timeout_sec)
+            except subprocess.TimeoutExpired as e:
+                debug_log("QoRWorker: timeout after {} seconds".format(timeout_sec), e)
                 self.cancel()
                 try:
                     stdout, stderr = self._proc.communicate(timeout=5)
-                except Exception:
+                except Exception as e2:
+                    debug_log("QoRWorker: collect after timeout failed", e2)
                     stdout, stderr = b"", b""
             if self._cancelled or self.isInterruptionRequested():
                 self.finished.emit("")
@@ -2269,7 +2295,8 @@ class QoRWorker(QThread):
             try:
                 if html_path and os.path.exists(html_path) and os.path.getmtime(html_path) < start_time:
                     html_path = ""
-            except Exception:
+            except Exception as e:
+                debug_log("QoRWorker: html mtime validation failed", e)
                 html_path = ""
             if not html_path or not os.path.exists(html_path):
                 candidates = [
@@ -2285,17 +2312,18 @@ class QoRWorker(QThread):
                     candidates.extend(glob.glob(os.path.join(
                         script_dir, "qor_metrices", "**", "*.html"),
                         recursive=True))
-                except Exception:
-                    pass
+                except Exception as e:
+                    debug_log("QoRWorker: fallback html glob failed", e)
                 hits = []
                 for p in candidates:
                     try:
                         if p and os.path.exists(p) and os.path.getmtime(p) >= start_time:
                             hits.append(p)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        debug_log("QoRWorker: fallback candidate check failed {}".format(p), e)
                 if hits:
                     html_path = max(hits, key=os.path.getmtime)
             self.finished.emit(html_path if (html_path and os.path.exists(html_path)) else "")
         except Exception as e:
+            debug_log("QoRWorker: run failed", e)
             self.finished.emit("")
