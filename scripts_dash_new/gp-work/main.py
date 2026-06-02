@@ -5018,6 +5018,14 @@ class PDDashboard(QMainWindow):
                 kept.append(worker)
         return kept
 
+    def _is_live_tree_item(self, item):
+        try:
+            return item is not None and item.treeWidget() is self.tree
+        except RuntimeError:
+            return False
+        except Exception:
+            return False
+
     def _stop_worker_list_now(self, workers, timeout_ms=3000):
         kept = []
         for worker in list(workers or []):
@@ -9171,46 +9179,64 @@ class PDDashboard(QMainWindow):
         changed = False
         for row in rows:
             item = self._quick_refresh_items.get(row.get("path", ""))
-            if item is None:
+            if not self._is_live_tree_item(item):
                 continue
-            run = item.data(0, Qt.UserRole + 10)
-            if not run:
+            try:
+                run = item.data(0, Qt.UserRole + 10)
+                if not run:
+                    continue
+                status = row.get("fe_status", run.get("fe_status", item.text(3)))
+                is_comp = bool(row.get("is_comp", run.get("is_comp", False)))
+                info = row.get("info") or run.get("info", {})
+                old_status = run.get("fe_status")
+                run["fe_status"] = status
+                run["is_comp"] = is_comp
+                run["info"] = info
+                item.setData(0, Qt.UserRole + 10, run)
+                _dot_map = {
+                    "COMPLETED":   "#388e3c", "RUNNING":    "#1976d2",
+                    "NOT STARTED": "#9e9e9e", "INTERRUPTED":"#e65100",
+                    "FAILED":      "#d32f2f", "FATAL ERROR":"#b71c1c",
+                }
+                dc = _dot_map.get(status, "#9e9e9e")
+                item.setIcon(3, self._create_dot_icon(dc, dc))
+                item.setText(3, status)
+                item.setText(4, "COMPLETED" if is_comp else info.get("last_stage", item.text(4)))
+                item.setText(12, info.get("runtime", item.text(12)))
+                start_raw = info.get("start", item.data(0, Qt.UserRole + 40) or "")
+                end_raw = info.get("end", item.data(0, Qt.UserRole + 41) or "")
+                self._set_item_time_data(item, start_raw, end_raw)
+                item.setText(13, self._fmt_ts(start_raw))
+                item.setText(14, self._fmt_ts(end_raw))
+                item.setToolTip(13, start_raw)
+                item.setToolTip(14, end_raw)
+                self._apply_status_color(item, 3, status)
+                if old_status != status:
+                    changed = True
+            except RuntimeError:
                 continue
-            status = row.get("fe_status", run.get("fe_status", item.text(3)))
-            is_comp = bool(row.get("is_comp", run.get("is_comp", False)))
-            info = row.get("info") or run.get("info", {})
-            old_status = run.get("fe_status")
-            run["fe_status"] = status
-            run["is_comp"] = is_comp
-            run["info"] = info
-            item.setData(0, Qt.UserRole + 10, run)
-            _dot_map = {
-                "COMPLETED":   "#388e3c", "RUNNING":    "#1976d2",
-                "NOT STARTED": "#9e9e9e", "INTERRUPTED":"#e65100",
-                "FAILED":      "#d32f2f", "FATAL ERROR":"#b71c1c",
-            }
-            dc = _dot_map.get(status, "#9e9e9e")
-            item.setIcon(3, self._create_dot_icon(dc, dc))
-            item.setText(3, status)
-            item.setText(4, "COMPLETED" if is_comp else info.get("last_stage", item.text(4)))
-            item.setText(12, info.get("runtime", item.text(12)))
-            start_raw = info.get("start", item.data(0, Qt.UserRole + 40) or "")
-            end_raw = info.get("end", item.data(0, Qt.UserRole + 41) or "")
-            self._set_item_time_data(item, start_raw, end_raw)
-            item.setText(13, self._fmt_ts(start_raw))
-            item.setText(14, self._fmt_ts(end_raw))
-            item.setToolTip(13, start_raw)
-            item.setToolTip(14, end_raw)
-            self._apply_status_color(item, 3, status)
-            if old_status != status:
-                changed = True
-        self._running_items = [
-            item for item in getattr(self, "_running_items", [])
-            if item is not None and item.text(3) == "RUNNING"
-        ]
+            except Exception:
+                continue
+        running_items = []
+        for item in list(getattr(self, "_running_items", []) or []):
+            try:
+                if self._is_live_tree_item(item) and item.text(3) == "RUNNING":
+                    running_items.append(item)
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
+        self._running_items = running_items
         for row in rows:
             item = self._quick_refresh_items.get(row.get("path", ""))
-            if item is not None and item.text(3) == "RUNNING" and item not in self._running_items:
+            try:
+                item_is_running = (
+                    self._is_live_tree_item(item) and item.text(3) == "RUNNING")
+            except RuntimeError:
+                item_is_running = False
+            except Exception:
+                item_is_running = False
+            if item_is_running and item not in self._running_items:
                 self._running_items.append(item)
         self._quick_refresh_items = {}
         self.prog_container.setVisible(False)
@@ -9233,6 +9259,11 @@ class PDDashboard(QMainWindow):
             return
         if self._worker_is_running(getattr(self, "_quick_refresh_worker", None)):
             return
+        try:
+            self._live_timer.stop()
+        except Exception:
+            pass
+        self._running_items = []
         clear_path_cache()
         self.size_workers = self._cancel_worker_list_keep_running(
             self.size_workers)
@@ -9465,10 +9496,14 @@ class PDDashboard(QMainWindow):
         running_items = []
         for item in list(getattr(self, "_running_items", []) or []):
             try:
-                if item is not None and not item.isHidden() and item.text(3) == "RUNNING":
+                if (self._is_live_tree_item(item) and
+                        not item.isHidden() and item.text(3) == "RUNNING"):
                     running_items.append(item)
             except RuntimeError:
-                pass
+                continue
+            except Exception:
+                continue
+        self._running_items = running_items
         if not running_items:
             self._running_items = []
             return
@@ -9483,12 +9518,20 @@ class PDDashboard(QMainWindow):
         self._quick_refresh_items = {}
         worker_tasks = []
         for item in running_items:
-            run = item.data(0, Qt.UserRole + 10) or {}
-            path = run.get("path") or item.text(15)
-            if not path or path in ("N/A", "-"):
+            try:
+                if not self._is_live_tree_item(item):
+                    continue
+                run = item.data(0, Qt.UserRole + 10) or {}
+                path = run.get("path") or item.text(15)
+                if not path or path in ("N/A", "-"):
+                    continue
+                source = run.get("source", item.text(2) or "WS")
+            except RuntimeError:
+                continue
+            except Exception:
                 continue
             self._quick_refresh_items[path] = item
-            worker_tasks.append({"path": path, "source": run.get("source", item.text(2) or "WS")})
+            worker_tasks.append({"path": path, "source": source})
         if not worker_tasks:
             return
         worker = worker_cls(worker_tasks)
@@ -9502,13 +9545,21 @@ class PDDashboard(QMainWindow):
             "Jan":1,"Feb":2,"Mar":3,"Apr":4,"May":5,"Jun":6,
             "Jul":7,"Aug":8,"Sep":9,"Oct":10,"Nov":11,"Dec":12}
         now = datetime.datetime.now()
-        running_items = [
-            item for item in getattr(self, "_running_items", [])
-            if item is not None and item.text(3) == "RUNNING"
-        ]
-        for child in running_items:
-            start_str = child.toolTip(13)
+        running_items = []
+        for item in list(getattr(self, "_running_items", []) or []):
             try:
+                if self._is_live_tree_item(item) and item.text(3) == "RUNNING":
+                    running_items.append(item)
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
+        self._running_items = running_items
+        for child in running_items:
+            try:
+                if not self._is_live_tree_item(child):
+                    continue
+                start_str = child.toolTip(13)
                 m = re.search(
                     r'(\w{3})\s+(\d{1,2}),\s+(\d{4})\s+-\s+(\d{2}):(\d{2})',
                     start_str or "")
@@ -10372,6 +10423,10 @@ class PDDashboard(QMainWindow):
     def _build_tree(self):
         """Build the full tree once. Filtering done by setHidden() only."""
         self._closure_pass_token = getattr(self, "_closure_pass_token", 0) + 1
+        try:
+            self._live_timer.stop()
+        except Exception:
+            pass
         self.size_workers = self._cancel_worker_list_keep_running(
             self.size_workers)
         self._stage_workers = self._cancel_worker_list_keep_running(self._stage_workers)
@@ -10564,6 +10619,11 @@ class PDDashboard(QMainWindow):
         self.tree.setUpdatesEnabled(True)
         self.tree.blockSignals(False)
         self._building_tree = False
+        try:
+            if not self._live_timer.isActive():
+                self._live_timer.start()
+        except Exception:
+            pass
 
         # Restore expand state (ignore action / rescan keeps tree looking the same)
         if _saved_expanded:
@@ -10700,7 +10760,7 @@ class PDDashboard(QMainWindow):
             dc = _dot_map.get(status_str, "#9e9e9e")
             child.setIcon(3, self._create_dot_icon(dc, dc))
             child.setText(3, status_str)
-            if status_str == "RUNNING":
+            if status_str == "RUNNING" and self._is_live_tree_item(child):
                 self._running_items.append(child)
             child.setText(4, ("COMPLETED" if run["is_comp"]
                               else run["info"]["last_stage"]))
