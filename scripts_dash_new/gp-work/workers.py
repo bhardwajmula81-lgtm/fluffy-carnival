@@ -1736,6 +1736,10 @@ class ScannerWorker(QThread):
 
                 stages.append({
                     "name":          step_name,
+                    "source":        source,
+                    "_origin_source": source,
+                    "_origin_be_path": rd,
+                    "_origin_stage_path": stage_path,
                     "rpt":           rpt_cands[0],   # primary (used as fallback)
                     "_rpt_cands":    rpt_cands,       # resolved lazily in StageDetailWorker
                     "log":           log,

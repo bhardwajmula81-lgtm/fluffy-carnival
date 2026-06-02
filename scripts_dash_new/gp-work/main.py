@@ -6523,12 +6523,21 @@ class PDDashboard(QMainWindow):
 
         if is_stage:
             stage_name = item.text(0)
-            # run_path for stage is the stage dir -- we need BE run dir
+            stage_data = item.data(0, Qt.UserRole + 81) or {}
+            # run_path for stage is the stage dir -- metrics need the stage's
+            # real BE run dir. In ALL-merged, this may differ from the
+            # displayed merged BE parent.
             parent = item.parent()
-            be_run_path = parent.text(15) if parent else run_path
+            be_run_path = (stage_data.get("_origin_be_path")
+                           or (parent.text(15) if parent else run_path))
             run_type = "BE"
             actual_path = be_run_path
-            stage_path = run_path
+            stage_path = (stage_data.get("_origin_stage_path")
+                          or stage_data.get("stage_path")
+                          or run_path)
+            source = (stage_data.get("_origin_source")
+                      or stage_data.get("source")
+                      or source)
         else:
             stage_name  = None
             run_type    = "FE"
@@ -7039,14 +7048,16 @@ class PDDashboard(QMainWindow):
         self.search_count_lbl.setVisible(False)
         top_layout.addWidget(self.search_count_lbl)
 
-        self.search_prev_btn = QPushButton("Prev")
-        self.search_prev_btn.setFixedWidth(46)
+        self.search_prev_btn = QToolButton()
+        self.search_prev_btn.setText("<")
+        self.search_prev_btn.setFixedSize(28, 24)
         self.search_prev_btn.setToolTip("Previous search match (N)")
         self.search_prev_btn.clicked.connect(lambda: self._jump_search_match(-1))
         top_layout.addWidget(self.search_prev_btn)
 
-        self.search_next_btn = QPushButton("Next")
-        self.search_next_btn.setFixedWidth(46)
+        self.search_next_btn = QToolButton()
+        self.search_next_btn.setText(">")
+        self.search_next_btn.setFixedSize(28, 24)
         self.search_next_btn.setToolTip("Next search match (M)")
         self.search_next_btn.clicked.connect(lambda: self._jump_search_match(1))
         top_layout.addWidget(self.search_next_btn)
@@ -7392,10 +7403,8 @@ class PDDashboard(QMainWindow):
         # Auto-fit Run Name column on expand/collapse (throttled 150ms)
         self._col0_resize_timer.timeout.connect(
             self._fit_run_name_column)
-        self.tree.itemExpanded.connect(
-            lambda _: self._col0_resize_timer.start())
-        self.tree.itemCollapsed.connect(
-            lambda _: self._col0_resize_timer.start())
+        self.tree.itemExpanded.connect(self._schedule_tree_column_fit)
+        self.tree.itemCollapsed.connect(self._schedule_tree_column_fit)
 
         for i in [15, 16, 17, 18, 19, 20, 21, 23]:
             self.tree.setColumnHidden(i, True)
@@ -8361,8 +8370,11 @@ class PDDashboard(QMainWindow):
             self._hide_stage_metric_panel()
             return
         parent = item.parent()
-        be_path = parent.text(15)
-        stage_path = item.text(15)
+        stage_data = item.data(0, Qt.UserRole + 81) or {}
+        be_path = stage_data.get("_origin_be_path") or parent.text(15)
+        stage_path = (stage_data.get("_origin_stage_path")
+                      or stage_data.get("stage_path")
+                      or item.text(15))
         stage_name = item.text(0)
         block = item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or ""
         runtime = item.text(12) or "-"
@@ -8649,9 +8661,12 @@ class PDDashboard(QMainWindow):
         self._fe_cong_request_token += 1
         self.fe_cong_panel.setTitle("PNR Stage Screenshots")
         stage_name = item.text(0)
-        stage_path = item.text(15)
         parent = item.parent()
-        be_path = parent.text(15)
+        stage_data = item.data(0, Qt.UserRole + 81) or {}
+        stage_path = (stage_data.get("_origin_stage_path")
+                      or stage_data.get("stage_path")
+                      or item.text(15))
+        be_path = stage_data.get("_origin_be_path") or parent.text(15)
         block = item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or ""
         dark = (self.is_dark_mode or (self.use_custom_colors and self.custom_bg_color < "#888888"))
         self.fe_fp_ver_lbl.setStyleSheet("font-size: 10px; font-weight: bold; color: {};".format("#90caf9" if dark else "#1565c0"))
@@ -8688,7 +8703,12 @@ class PDDashboard(QMainWindow):
         try:
             sel = self.tree.selectedItems()
             if sel and sel[0].data(0, Qt.UserRole) == "STAGE":
-                key = (sel[0].parent().text(15) or "", sel[0].text(15) or "",
+                sd = sel[0].data(0, Qt.UserRole + 81) or {}
+                key = ((sd.get("_origin_be_path")
+                        or sel[0].parent().text(15) or ""),
+                       (sd.get("_origin_stage_path")
+                        or sd.get("stage_path")
+                        or sel[0].text(15) or ""),
                        stage_name or "", block or "")
         except Exception:
             key = ""
@@ -10161,8 +10181,15 @@ class PDDashboard(QMainWindow):
                 if key in seen:
                     continue
                 cp = dict(st or {})
-                cp["_merged_stage_source"] = cp.get("source") or src
-                cp["source"] = cp.get("source") or src
+                origin_source = (cp.get("_origin_source")
+                                 or cp.get("source") or src)
+                cp["_origin_source"] = origin_source
+                cp["_origin_be_path"] = (cp.get("_origin_be_path")
+                                         or (run or {}).get("path", ""))
+                cp["_origin_stage_path"] = (cp.get("_origin_stage_path")
+                                            or cp.get("stage_path", ""))
+                cp["_merged_stage_source"] = origin_source
+                cp["source"] = origin_source
                 cp["_merged_stage_preferred"] = bool(preferred)
                 merged.append(cp)
                 seen.add(key)
@@ -10909,17 +10936,27 @@ class PDDashboard(QMainWindow):
         stages = list(be_run.get("stages", []))
         stages.sort(key=lambda st: st.get("_stage_order", st.get("_stage_index", 9999)))
         for pos, stage in enumerate(stages):
+            origin_source = (stage.get("_origin_source")
+                             or stage.get("_merged_stage_source")
+                             or stage.get("source")
+                             or (be_item.text(2) if be_item else be_run.get("source", "")))
+            origin_be_path = (stage.get("_origin_be_path")
+                              or be_run.get("path", ""))
+            origin_stage_path = (stage.get("_origin_stage_path")
+                                 or stage.get("stage_path", ""))
             s_item = CustomTreeItem(be_item)
             s_item.setData(0, Qt.UserRole, "STAGE")
             s_item.setData(0, Qt.UserRole + 80, pos)
+            stage["_origin_source"] = origin_source
+            stage["_origin_be_path"] = origin_be_path
+            stage["_origin_stage_path"] = origin_stage_path
+            s_item.setData(0, Qt.UserRole + 81, dict(stage))
             s_item.setFlags(
                 Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
             s_item.setCheckState(0, Qt.Unchecked)
             s_item.setText(0,  stage.get("name", ""))
             s_item.setText(1, be_item.text(1) if be_item else "")
-            s_item.setText(2, stage.get("_merged_stage_source")
-                           or stage.get("source")
-                           or (be_item.text(2) if be_item else be_run.get("source", "")))
+            s_item.setText(2, origin_source)
             status = stage.get("stage_status", "-")
             active_stage = stage.get("active_stage", stage.get("name", "-"))
             s_item.setIcon(3, self._status_icon_for_text(status))
@@ -10943,6 +10980,12 @@ class PDDashboard(QMainWindow):
             self._register_item_path(s_item, stage_path)
             self._set_pin_icon_for_item(s_item, self.user_pins.get(stage_path))
             s_item.setText(16, stage.get("log",        "N/A"))
+            if origin_be_path or origin_stage_path:
+                src_tip = "Stage source: {}\nBE path: {}\nStage path: {}".format(
+                    origin_source or "-", origin_be_path or "-",
+                    origin_stage_path or stage_path or "-")
+                s_item.setToolTip(2, src_tip)
+                s_item.setToolTip(15, src_tip)
             s_item.setText(20, stage.get("sta_rpt_path",  "N/A"))
             ir_log = "N/A"
             if (be_run.get("block") or "") == PROJECT_PREFIX:
@@ -10982,7 +11025,6 @@ class PDDashboard(QMainWindow):
                 be_item.addChild(ch)
             ign_root = self._ensure_ign_root(self.tree.invisibleRootItem())
             self._add_stages(be_item, be_run, ign_root)
-            self._reorder_stage_children_for_item(be_item)
             for i in range(be_item.childCount()):
                 ch = be_item.child(i)
                 if ch.data(0, Qt.UserRole) == "STAGE" and ch.text(0) in checked:
@@ -11022,7 +11064,6 @@ class PDDashboard(QMainWindow):
                     be_item.addChild(ch)
             ign_root = self._ensure_ign_root(self.tree.invisibleRootItem())
             self._add_stages(be_item, be_run, ign_root)
-            self._reorder_stage_children_for_item(be_item)
             if parent_checked:
                 self.tree.blockSignals(True)
                 for i in range(be_item.childCount()):
@@ -11275,7 +11316,6 @@ class PDDashboard(QMainWindow):
                         self.tree.setUpdatesEnabled(False)
                         item.removeChild(ph)
                         self._add_stages(item, be_run, ign_root)
-                        self._reorder_stage_children_for_item(item)
                         # Propagate parent check state to newly created stages
                         if parent_checked:
                             self.tree.blockSignals(True)
@@ -12658,6 +12698,16 @@ class PDDashboard(QMainWindow):
         except RuntimeError:
             self.item_map.pop(item_id, None)
 
+    def _schedule_tree_column_fit(self, item=None):
+        try:
+            if item is not None and item.data(0, Qt.UserRole + 11):
+                return
+        except RuntimeError:
+            return
+        except Exception:
+            pass
+        self._col0_resize_timer.start()
+
     def fit_all_columns(self):
         self.tree.setUpdatesEnabled(False)
         try:
@@ -13721,6 +13771,7 @@ class PDDashboard(QMainWindow):
                 ch.setText(14, self._fmt_ts(info.get("end", ch.text(14))))
                 if st.get("log"):
                     ch.setText(16, st.get("log"))
+                ch.setData(0, Qt.UserRole + 81, dict(st))
                 self._apply_status_color(ch, 3, status)
         except RuntimeError:
             pass
@@ -13883,7 +13934,9 @@ class PDDashboard(QMainWindow):
         if len(stage_items) == 1 and len(checked_items) == 1:
             item = stage_items[0]
             parent_item = item.parent()
-            be_run_path = parent_item.text(15) if parent_item else item.text(15)
+            stage_data = item.data(0, Qt.UserRole + 81) or {}
+            be_run_path = (stage_data.get("_origin_be_path")
+                           or (parent_item.text(15) if parent_item else item.text(15)))
             stage_name = item.text(0)
             script = self._resolve_qor_script()
             if not script:
@@ -13949,7 +14002,9 @@ class PDDashboard(QMainWindow):
         The stage name is the step name e.g. place_opt, route_opt."""
         stage_name  = item.text(0)
         parent_item = item.parent()
-        be_run_path = parent_item.text(15) if parent_item else item.text(15)
+        stage_data = item.data(0, Qt.UserRole + 81) or {}
+        be_run_path = (stage_data.get("_origin_be_path")
+                       or (parent_item.text(15) if parent_item else item.text(15)))
 
         script = self._resolve_qor_script()
         if not script: return
@@ -14947,15 +15002,23 @@ class PDDashboard(QMainWindow):
         if not item or item.data(0, Qt.UserRole) != "STAGE" or not item.parent():
             return None
         parent = item.parent()
+        stage_data = item.data(0, Qt.UserRole + 81) or {}
+        task_path = (stage_data.get("_origin_be_path") or parent.text(15))
+        task_stage_path = (stage_data.get("_origin_stage_path")
+                           or stage_data.get("stage_path")
+                           or item.text(15))
+        task_source = (stage_data.get("_origin_source")
+                       or stage_data.get("source")
+                       or item.text(2) or parent.text(2) or "WS")
         return {
             "name": parent.text(0) + " / " + item.text(0),
             "be_name": parent.text(0),
-            "path": parent.text(15),
+            "path": task_path,
             "run_type": "BE",
             "stage_name": item.text(0),
-            "stage_path": item.text(15),
+            "stage_path": task_stage_path,
             "runtime": item.text(12) or "-",
-            "source": item.text(2) or parent.text(2) or "WS",
+            "source": task_source,
             "block": item.data(0, Qt.UserRole + 2) or parent.data(0, Qt.UserRole + 2) or "",
         }
 
@@ -14983,12 +15046,14 @@ class PDDashboard(QMainWindow):
             tasks.append({
                 "name": item.text(0) + " / " + name,
                 "be_name": item.text(0),
-                "path": be_path,
+                "path": stage.get("_origin_be_path") or be_path,
                 "run_type": "BE",
                 "stage_name": name,
-                "stage_path": stage.get("stage_path", ""),
+                "stage_path": (stage.get("_origin_stage_path")
+                               or stage.get("stage_path", "")),
                 "runtime": info.get("runtime", "-"),
-                "source": source,
+                "source": (stage.get("_origin_source")
+                           or stage.get("source") or source),
                 "block": block,
             })
         return tasks
@@ -15547,8 +15612,12 @@ class PDDashboard(QMainWindow):
         if not item or item.data(0, Qt.UserRole) != "STAGE" or not item.parent():
             return []
         stage = item.text(0)
-        stage_path = item.text(15)
-        be_path = item.parent().text(15)
+        stage_data = item.data(0, Qt.UserRole + 81) or {}
+        stage_path = (stage_data.get("_origin_stage_path")
+                      or stage_data.get("stage_path")
+                      or item.text(15))
+        be_path = (stage_data.get("_origin_be_path")
+                   or item.parent().text(15))
         dirs = [
             os.path.join(be_path, "reports", stage),
             os.path.join(stage_path, "reports"),
