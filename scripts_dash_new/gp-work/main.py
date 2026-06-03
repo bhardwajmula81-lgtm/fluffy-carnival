@@ -1833,6 +1833,29 @@ class StageMetricLookupWorker(QThread):
         r2r = self._trip(wv[1], tv[1], nv[1])
         return (total, r2r)
 
+    def _parse_fc_group_timing(self, text, label):
+        low = text.lower()
+        if label.lower().startswith("setup") and "no setup violations found" in low:
+            return ("0/0/0", "0/0/0")
+        if label.lower().startswith("hold") and "no hold violations found" in low:
+            return ("0/0/0", "0/0/0")
+        sec = self._fc_timing_section(text, label)
+        if not sec:
+            return ("-", "-")
+        for line in sec.splitlines():
+            if "|" not in line:
+                continue
+            cells = self._pipe_cells(line)
+            if len(cells) < 2:
+                continue
+            total_nums = re.findall(r"[-+]?\d+(?:\.\d+)?", cells[0])
+            r2r_nums = re.findall(r"[-+]?\d+(?:\.\d+)?", cells[1])
+            if len(total_nums) >= 3 and len(r2r_nums) >= 3:
+                return (
+                    self._trip(total_nums[0], total_nums[1], total_nums[2]),
+                    self._trip(r2r_nums[0], r2r_nums[1], r2r_nums[2]))
+        return ("-", "-")
+
     def _pipe_cells(self, line):
         return [c.strip() for c in line.strip().strip("|").split("|")]
 
@@ -1953,11 +1976,22 @@ class StageMetricLookupWorker(QThread):
             "report_dir": "-",
         }
         try:
-            qor_sum = self._find_file(["{}.qor_sum.rpt".format(self.stage_name), "*.qor_sum.rpt"])
+            qor_sum = self._find_file([
+                "{}.qor_group_sum.rpt".format(self.stage_name),
+                "*.qor_group_sum.rpt"])
+            use_group_sum = bool(qor_sum)
+            if not qor_sum:
+                qor_sum = self._find_file([
+                    "{}.qor_sum.rpt".format(self.stage_name),
+                    "*.qor_sum.rpt"])
             if qor_sum:
                 text = self._read_text(qor_sum)
-                setup_total, setup_r2r = self._parse_fc_timing(text, "Setup violations")
-                hold_total, hold_r2r = self._parse_fc_timing(text, "Hold violations")
+                if use_group_sum:
+                    setup_total, setup_r2r = self._parse_fc_group_timing(text, "Setup violations")
+                    hold_total, hold_r2r = self._parse_fc_group_timing(text, "Hold violations")
+                else:
+                    setup_total, setup_r2r = self._parse_fc_timing(text, "Setup violations")
+                    hold_total, hold_r2r = self._parse_fc_timing(text, "Hold violations")
                 result["setup_total"] = setup_total
                 result["setup_r2r"] = setup_r2r
                 result["hold_total"] = hold_total
@@ -4781,6 +4815,7 @@ class PDDashboard(QMainWindow):
         self.user_pins    = load_user_pins()
         self.status_package_marks = self._load_status_package_marks()
         self._branch_status_cache = {}
+        self._stage_index_cache = {}
         self._fp_ver_cache = {}
         self._cong_img_cache = {}
         self._cong_image_cache = {}
@@ -5860,6 +5895,7 @@ class PDDashboard(QMainWindow):
             ]
             stage_patterns = [
                 sname + ".runtime.rpt",
+                sname + ".qor_group_sum.rpt",
                 sname + ".qor_sum.rpt",
                 sname + "_p*.summary.gz",
                 sname + ".qor.snap.rpt",
@@ -9972,7 +10008,7 @@ class PDDashboard(QMainWindow):
             ]
         else:
             required = [
-                ("setup/hold", [name + ".qor_sum.rpt", "*.qor_sum.rpt"]),
+                ("setup/hold", [name + ".qor_group_sum.rpt", "*.qor_group_sum.rpt"]),
                 ("congestion", [name + ".grc.rpt", "*.grc.rpt"]),
                 ("area/util", [name + ".sec_get_area.rpt", "*.sec_get_area.rpt"]),
             ]
@@ -10518,7 +10554,11 @@ class PDDashboard(QMainWindow):
         self.tree.setSortingEnabled(False)
         self.tree.clear()
 
+        self._merge_cached_stage_index_into_runs(
+            (self.ws_data or {}).get("all_runs", []) +
+            (self.out_data or {}).get("all_runs", []))
         runs_to_process = self._runs_for_tree()
+        self._merge_cached_stage_index_into_runs(runs_to_process)
 
         # Resolve BE RTL from matching FE run
         fe_info = {}
@@ -10933,6 +10973,7 @@ class PDDashboard(QMainWindow):
         return p
 
     def _add_stages(self, be_item, be_run, ign_root):
+        self._apply_stage_index_cache_to_be_run(be_run)
         stages = list(be_run.get("stages", []))
         stages.sort(key=lambda st: st.get("_stage_order", st.get("_stage_index", 9999)))
         for pos, stage in enumerate(stages):
@@ -11284,26 +11325,45 @@ class PDDashboard(QMainWindow):
             be_run["_branch_status_loaded"] = True
             for idx, st in enumerate(be_run["stages"]):
                 st["_stage_order"] = idx
-            self._refresh_stage_children_from_run(be_item, be_run)
+            if be_item.isExpanded():
+                self._update_stage_children_in_place(be_item, be_run)
             self._refresh_open_branch_status_dialog(be_path, be_item)
         except RuntimeError:
             pass
         except Exception:
             pass
 
-    def on_item_expanded(self, item):
-        def _start_stage_detail_worker(be_run):
-            if not be_run or be_run.get("_stage_detail_loading"):
+    def load_stage_signoff_for_branch(self, item):
+        try:
+            if item is not None and item.data(0, Qt.UserRole) == "STAGE":
+                item = item.parent()
+            if item is None:
                 return
-            if not any(s.get("_lazy") for s in be_run.get("stages", [])):
+            be_run = item.data(0, Qt.UserRole + 11)
+            if not be_run:
+                be_run = item.data(0, Qt.UserRole + 10)
+            if not be_run or be_run.get("run_type") != "BE":
                 return
+            if be_run.get("_stage_detail_loading"):
+                self.status_bar.showMessage(
+                    "FM/VSLP detail lookup is already running for this branch.", 3000)
+                return
+            self._apply_stage_index_cache_to_be_run(be_run)
             from workers import StageDetailWorker
             be_run["_stage_detail_loading"] = True
             w = StageDetailWorker(be_run)
             w.finished.connect(self._on_stage_details_loaded)
-            self._workers.start("stage_detail", w,
-                                list_name="_stage_workers")
+            self._workers.start("stage_detail", w, list_name="_stage_workers")
+            self.status_bar.showMessage(
+                "Loading BE stage FM/VSLP details in background...", 3000)
+        except Exception as e:
+            try:
+                self.status_bar.showMessage(
+                    "FM/VSLP detail lookup failed: {}".format(e), 5000)
+            except Exception:
+                pass
 
+    def on_item_expanded(self, item):
         if item.childCount() == 1:
             ph = item.child(0)
             if ph.data(0, Qt.UserRole) == "__PLACEHOLDER__":
@@ -11329,16 +11389,15 @@ class PDDashboard(QMainWindow):
                             self.tree.setUpdatesEnabled(True)
                         except Exception:
                             pass
-                    # Keep expand light: resolve only status/runtime here.
-                    if (not be_run.get("_branch_status_loaded")
-                            and not be_run.get("_branch_status_loading")):
-                        self._start_branch_status_worker(item, be_run)
+                    if any(not s.get("_stage_index_loaded")
+                           for s in be_run.get("stages", []) or []):
+                        self.status_bar.showMessage(
+                            "PNR stage index is still updating in background.", 2500)
                     return
         be_run = item.data(0, Qt.UserRole + 11)
         if be_run:
-            if (not be_run.get("_branch_status_loaded")
-                    and not be_run.get("_branch_status_loading")):
-                self._start_branch_status_worker(item, be_run)
+            self._apply_stage_index_cache_to_be_run(be_run)
+            self._update_stage_children_in_place(item, be_run)
 
     def _on_stage_details_loaded(self, be_path, run_name, enriched_stages):
         """Called by StageDetailWorker using stable identifiers only."""
@@ -11356,12 +11415,15 @@ class PDDashboard(QMainWindow):
                     be_run["_stage_detail_loading"] = False
                 return
             if be_run:
-                be_run["stages"] = enriched_stages
+                self._merge_stage_index_into_run(be_run, enriched_stages)
                 be_run["_stage_detail_loading"] = False
                 be_run["_stage_detail_loaded"] = True
-                for idx, st in enumerate(be_run["stages"]):
-                    st["_stage_order"] = idx
-                self._refresh_stage_children_from_run(be_item, be_run)
+                try:
+                    self._branch_status_cache[self._norm_stage_key(be_path)] = list(be_run.get("stages", []) or [])
+                except Exception:
+                    pass
+                if be_item.isExpanded():
+                    self._update_stage_children_in_place(be_item, be_run)
                 self._refresh_open_branch_status_dialog(be_path, be_item)
         except RuntimeError:
             pass
@@ -12335,9 +12397,11 @@ class PDDashboard(QMainWindow):
         be_stage_table_act = None
         app_opt_paths_act = None
         branch_status_act = None
+        load_stage_signoff_act = None
         if is_stage or is_be_run:
             if is_be_run:
                 branch_status_act = m.addAction("Open Branch Status")
+                load_stage_signoff_act = m.addAction("Load FM/VSLP for This Branch")
             be_stage_table_act = m.addAction(
                 "Generate BE Stage Summary Table")
             if is_stage:
@@ -12377,6 +12441,10 @@ class PDDashboard(QMainWindow):
 
         if branch_status_act and res == branch_status_act:
             self.show_branch_status(item)
+            return
+
+        if load_stage_signoff_act and res == load_stage_signoff_act:
+            self.load_stage_signoff_for_branch(item)
             return
 
         if app_opt_paths_act and res == app_opt_paths_act:
@@ -13709,6 +13777,24 @@ class PDDashboard(QMainWindow):
             pass
         return path
 
+    def _norm_stage_key(self, path):
+        try:
+            return os.path.normpath(path or "")
+        except Exception:
+            return path or ""
+
+    def _merge_cached_stage_index_into_runs(self, runs):
+        for run in list(runs or []):
+            try:
+                if not run or run.get("run_type") != "BE":
+                    continue
+                key = self._norm_stage_key(run.get("path", ""))
+                cached = self._stage_index_cache.get(key)
+                if cached:
+                    self._merge_stage_index_into_run(run, cached)
+            except Exception:
+                pass
+
     def start_stage_index_worker(self):
         runs = []
         for run in ((self.ws_data or {}).get("all_runs", []) +
@@ -13745,6 +13831,39 @@ class PDDashboard(QMainWindow):
             for idx, st in enumerate(be_run["stages"]):
                 st["_stage_order"] = idx
 
+    def _apply_stage_index_cache_to_be_run(self, be_run):
+        if not be_run:
+            return
+        key = self._norm_stage_key(be_run.get("path", ""))
+        cached = self._stage_index_cache.get(key)
+        if cached:
+            self._merge_stage_index_into_run(be_run, cached)
+        for st in list(be_run.get("stages", []) or []):
+            origin_key = self._norm_stage_key(st.get("_origin_be_path", ""))
+            if not origin_key or origin_key == key:
+                continue
+            cached_origin = self._stage_index_cache.get(origin_key)
+            if not cached_origin:
+                continue
+            by_name = dict((c.get("name", ""), c) for c in cached_origin or [])
+            hit = by_name.get(st.get("name", ""))
+            if hit:
+                st.update(hit)
+
+    def _apply_stage_index_cache_to_visible_items(self):
+        for item in self._iter_tree_items():
+            try:
+                be_run = item.data(0, Qt.UserRole + 11)
+                if not be_run:
+                    continue
+                self._apply_stage_index_cache_to_be_run(be_run)
+                if item.isExpanded():
+                    self._update_stage_children_in_place(item, be_run)
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
+
     def _update_stage_children_in_place(self, be_item, be_run):
         stages = {}
         for st in (be_run.get("stages", []) or []):
@@ -13771,14 +13890,37 @@ class PDDashboard(QMainWindow):
                 ch.setText(14, self._fmt_ts(info.get("end", ch.text(14))))
                 if st.get("log"):
                     ch.setText(16, st.get("log"))
+                if st.get("source") or st.get("_origin_source"):
+                    ch.setText(2, st.get("_origin_source") or st.get("source") or ch.text(2))
+                if st.get("stage_path") or st.get("_origin_stage_path"):
+                    ch.setText(15, st.get("_origin_stage_path") or st.get("stage_path") or ch.text(15))
+                ch.setText(7, "NONUPF - {}".format(st.get("st_n", "")))
+                ch.setText(8, "UPF - {}".format(st.get("st_u", "")))
+                ch.setText(9, st.get("vslp_status", ch.text(9) or ""))
+                if st.get("fm_u_path"):
+                    ch.setText(17, st.get("fm_u_path"))
+                if st.get("fm_n_path"):
+                    ch.setText(18, st.get("fm_n_path"))
+                if st.get("vslp_rpt_path"):
+                    ch.setText(19, st.get("vslp_rpt_path"))
+                if st.get("sta_rpt_path"):
+                    ch.setText(20, st.get("sta_rpt_path"))
                 ch.setData(0, Qt.UserRole + 81, dict(st))
                 self._apply_status_color(ch, 3, status)
+                self._apply_fm_color(ch, 7, ch.text(7))
+                self._apply_fm_color(ch, 8, ch.text(8))
+                self._apply_vslp_color(ch, 9, ch.text(9))
         except RuntimeError:
             pass
 
     def _on_stage_index_loaded(self, index_data):
         if not isinstance(index_data, dict):
             return
+        for key, enriched in index_data.items():
+            try:
+                self._stage_index_cache[self._norm_stage_key(key)] = list(enriched or [])
+            except Exception:
+                pass
         for run in ((self.ws_data or {}).get("all_runs", []) +
                     (self.out_data or {}).get("all_runs", [])):
             if run.get("run_type") != "BE":
@@ -13792,13 +13934,7 @@ class PDDashboard(QMainWindow):
                 continue
             self._merge_stage_index_into_run(run, enriched)
             self._branch_status_cache[key] = list(run.get("stages", []) or [])
-            item = self._signoff_items_by_path.get(run.get("path", ""))
-            if item is not None:
-                try:
-                    if item.isExpanded():
-                        self._update_stage_children_in_place(item, run)
-                except RuntimeError:
-                    pass
+        self._apply_stage_index_cache_to_visible_items()
         self.status_bar.showMessage("PNR stage status index updated.", 3000)
 
     def _disk_cache_file(self):

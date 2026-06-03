@@ -159,7 +159,7 @@ def _metric_signature(run_path, run_type, source, stage_name=None,
                       stage_path=None):
     patterns = [
         "*.rpt", "*.rpt.gz", "*.summary", "*.summary.gz",
-        "*.qor_sum.rpt", "*.qor.snap.rpt", "*.grc.rpt",
+        "*.qor_group_sum.rpt", "*.qor_sum.rpt", "*.qor.snap.rpt", "*.grc.rpt",
     ]
     sig = []
     if run_type == "FE":

@@ -446,6 +446,32 @@ def _parse_stage_fc_timing(text, section_name):
     return (_trip(wv[0], tv[0], nv[0]), _trip(wv[1], tv[1], nv[1]))
 
 
+def _parse_stage_fc_group_timing(text, section_name):
+    low = text.lower()
+    if section_name.lower().startswith("setup") and "no setup violations found" in low:
+        return ("0/0/0", "0/0/0")
+    if section_name.lower().startswith("hold") and "no hold violations found" in low:
+        return ("0/0/0", "0/0/0")
+    m = re.search(section_name + r".*?(?=\n\s*(?:Setup violations|Hold violations|END_CMD|Report :|$))",
+                  text, re.S | re.I)
+    if not m:
+        return ("-", "-")
+    sec = m.group(0)
+    for line in sec.splitlines():
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        total_nums = re.findall(r"[-+]?\d+(?:\.\d+)?", cells[0])
+        r2r_nums = re.findall(r"[-+]?\d+(?:\.\d+)?", cells[1])
+        if len(total_nums) >= 3 and len(r2r_nums) >= 3:
+            return (
+                _trip(total_nums[0], total_nums[1], total_nums[2]),
+                _trip(r2r_nums[0], r2r_nums[1], r2r_nums[2]))
+    return ("-", "-")
+
+
 def _parse_stage_innovus_setup(text):
     header = None
     rows = {}
@@ -731,13 +757,23 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
     # Keep old FE-like fallbacks for compatibility with older runs.
     qor_sum = _find_stage_rpt(
         run_dir, stage_name, source,
-        ["{}.qor_sum.rpt".format(stage_name), "*.qor_sum.rpt"],
+        ["{}.qor_group_sum.rpt".format(stage_name), "*.qor_group_sum.rpt"],
         stage_path=stage_path, finder=finder)
+    use_group_sum = bool(qor_sum)
+    if not qor_sum:
+        qor_sum = _find_stage_rpt(
+            run_dir, stage_name, source,
+            ["{}.qor_sum.rpt".format(stage_name), "*.qor_sum.rpt"],
+            stage_path=stage_path, finder=finder)
     qor_path = qor_sum
     if qor_sum:
         text = _read_stage_text(qor_sum)
-        setup_total, setup_r2r = _parse_stage_fc_timing(text, "Setup violations")
-        hold_total, hold_r2r = _parse_stage_fc_timing(text, "Hold violations")
+        if use_group_sum:
+            setup_total, setup_r2r = _parse_stage_fc_group_timing(text, "Setup violations")
+            hold_total, hold_r2r = _parse_stage_fc_group_timing(text, "Hold violations")
+        else:
+            setup_total, setup_r2r = _parse_stage_fc_timing(text, "Setup violations")
+            hold_total, hold_r2r = _parse_stage_fc_timing(text, "Hold violations")
         result["setup_total"] = setup_total
         result["setup_r2r"] = setup_r2r
         result["hold_total"] = hold_total
