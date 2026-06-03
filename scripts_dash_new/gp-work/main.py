@@ -3644,11 +3644,11 @@ class BEStageSummaryDialog(QDialog):
         if key == "std_util":
             util = metrics.get("util", {}) if isinstance(metrics.get("util", {}), dict) else {}
             return util.get("std_util_str", metrics.get("std_util_str", "-"))
-        if key == "vt_inst":
+        if key in ("vt_inst", "vth_inst"):
             if vth.get("stage_vt_inst"):
                 return vth.get("stage_vt_inst")
             return vth.get("vt_inst", vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-")))
-        if key == "vt_area":
+        if key in ("vt_area", "vth_area"):
             if vth.get("stage_vt_area"):
                 return vth.get("stage_vt_area")
             return vth.get("vt_area", vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-")))
@@ -4107,10 +4107,14 @@ class StatusPackageDialog(QDialog):
         if key == "std_util":
             util = metrics.get("util", {}) if isinstance(metrics.get("util", {}), dict) else {}
             return util.get("std_util_str", metrics.get("std_util_str", "-"))
-        if key == "vt_inst":
-            return vth.get("stage_vt_inst", vth.get("vt_inst", "-"))
-        if key == "vt_area":
-            return vth.get("stage_vt_area", vth.get("vt_area", "-"))
+        if key in ("vt_inst", "vth_inst"):
+            return vth.get("stage_vt_inst", vth.get(
+                "vt_inst", vth.get("lvt_rvt_hvt_inst",
+                                   vth.get("lvt_rvt_inst", "-"))))
+        if key in ("vt_area", "vth_area"):
+            return vth.get("stage_vt_area", vth.get(
+                "vt_area", vth.get("lvt_rvt_hvt_area",
+                                   vth.get("lvt_rvt_area", "-"))))
         if key == "cong":
             return cong.get("cong_both", metrics.get("congestion", "-"))
         return metrics.get(key, "-")
@@ -11333,7 +11337,78 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
 
-    def load_stage_signoff_for_branch(self, item):
+    def _stage_signoff_is_missing(self, text):
+        val = str(text or "").strip()
+        if val in ("", "-", "N/A", "NA"):
+            return True
+        up = val.upper()
+        return up in ("NONUPF -", "NONUPF - -", "NONUPF - N/A",
+                      "UPF -", "UPF - -", "UPF - N/A")
+
+    def _mark_stage_signoff_checking(self, be_item, be_run):
+        try:
+            if not self._is_live_tree_item(be_item):
+                return
+            for st in be_run.get("stages", []) or []:
+                if self._stage_signoff_is_missing(st.get("st_n", "")):
+                    st["st_n"] = "CHECKING"
+                if self._stage_signoff_is_missing(st.get("st_u", "")):
+                    st["st_u"] = "CHECKING"
+                if self._stage_signoff_is_missing(st.get("vslp_status", "")):
+                    st["vslp_status"] = "CHECKING"
+            for i in range(be_item.childCount()):
+                ch = be_item.child(i)
+                if ch.data(0, Qt.UserRole) != "STAGE":
+                    continue
+                if self._stage_signoff_is_missing(ch.text(7)):
+                    ch.setText(7, "NONUPF - CHECKING")
+                if self._stage_signoff_is_missing(ch.text(8)):
+                    ch.setText(8, "UPF - CHECKING")
+                if self._stage_signoff_is_missing(ch.text(9)):
+                    ch.setText(9, "CHECKING")
+                self._apply_fm_color(ch, 7, ch.text(7))
+                self._apply_fm_color(ch, 8, ch.text(8))
+                self._apply_vslp_color(ch, 9, ch.text(9))
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _load_stage_signoff_for_path(self, be_path):
+        try:
+            item = self._signoff_items_by_path.get(be_path)
+            if not self._is_live_tree_item(item):
+                return
+            be_run = item.data(0, Qt.UserRole + 11)
+            if not be_run or be_run.get("run_type") != "BE":
+                return
+            if be_run.get("_stage_detail_loaded") or be_run.get("_stage_detail_loading"):
+                return
+            self.load_stage_signoff_for_branch(item, silent=True)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def _queue_stage_signoff_for_branch(self, be_item, delay_ms=250):
+        try:
+            if not self._is_live_tree_item(be_item):
+                return
+            be_run = be_item.data(0, Qt.UserRole + 11)
+            if not be_run or be_run.get("run_type") != "BE":
+                return
+            if be_run.get("_stage_detail_loaded") or be_run.get("_stage_detail_loading"):
+                return
+            be_path = be_run.get("path", "")
+            if not be_path:
+                return
+            QTimer.singleShot(delay_ms, lambda p=be_path: self._load_stage_signoff_for_path(p))
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
+
+    def load_stage_signoff_for_branch(self, item, silent=False):
         try:
             if item is not None and item.data(0, Qt.UserRole) == "STAGE":
                 item = item.parent()
@@ -11344,22 +11419,31 @@ class PDDashboard(QMainWindow):
                 be_run = item.data(0, Qt.UserRole + 10)
             if not be_run or be_run.get("run_type") != "BE":
                 return
+            if be_run.get("_stage_detail_loaded"):
+                if not silent:
+                    self.status_bar.showMessage(
+                        "FM/VSLP details are already loaded for this branch.", 2500)
+                return
             if be_run.get("_stage_detail_loading"):
-                self.status_bar.showMessage(
-                    "FM/VSLP detail lookup is already running for this branch.", 3000)
+                if not silent:
+                    self.status_bar.showMessage(
+                        "FM/VSLP detail lookup is already running for this branch.", 3000)
                 return
             self._apply_stage_index_cache_to_be_run(be_run)
             from workers import StageDetailWorker
             be_run["_stage_detail_loading"] = True
+            self._mark_stage_signoff_checking(item, be_run)
             w = StageDetailWorker(be_run)
             w.finished.connect(self._on_stage_details_loaded)
             self._workers.start("stage_detail", w, list_name="_stage_workers")
-            self.status_bar.showMessage(
-                "Loading BE stage FM/VSLP details in background...", 3000)
+            if not silent:
+                self.status_bar.showMessage(
+                    "Loading BE stage FM/VSLP details in background...", 3000)
         except Exception as e:
             try:
-                self.status_bar.showMessage(
-                    "FM/VSLP detail lookup failed: {}".format(e), 5000)
+                if not silent:
+                    self.status_bar.showMessage(
+                        "FM/VSLP detail lookup failed: {}".format(e), 5000)
             except Exception:
                 pass
 
@@ -11393,11 +11477,13 @@ class PDDashboard(QMainWindow):
                            for s in be_run.get("stages", []) or []):
                         self.status_bar.showMessage(
                             "PNR stage index is still updating in background.", 2500)
+                    self._queue_stage_signoff_for_branch(item)
                     return
         be_run = item.data(0, Qt.UserRole + 11)
         if be_run:
             self._apply_stage_index_cache_to_be_run(be_run)
             self._update_stage_children_in_place(item, be_run)
+            self._queue_stage_signoff_for_branch(item)
 
     def _on_stage_details_loaded(self, be_path, run_name, enriched_stages):
         """Called by StageDetailWorker using stable identifiers only."""
@@ -13822,6 +13908,16 @@ class PDDashboard(QMainWindow):
         for st in enriched:
             base = cur.get(st.get("name", ""), {})
             if base:
+                st = dict(st)
+                for signoff_key in ("st_n", "st_u", "vslp_status"):
+                    old_val = str(base.get(signoff_key, "") or "").strip()
+                    new_val = str(st.get(signoff_key, "") or "").strip()
+                    if old_val and old_val.upper() not in ("-", "N/A", "NA"):
+                        if not new_val or new_val.upper() in ("-", "N/A", "NA"):
+                            st[signoff_key] = base.get(signoff_key)
+                for path_key in ("fm_u_path", "fm_n_path", "vslp_rpt_path"):
+                    if base.get(path_key) and not st.get(path_key):
+                        st[path_key] = base.get(path_key)
                 base.update(st)
                 merged.append(base)
             else:
@@ -13935,6 +14031,15 @@ class PDDashboard(QMainWindow):
             self._merge_stage_index_into_run(run, enriched)
             self._branch_status_cache[key] = list(run.get("stages", []) or [])
         self._apply_stage_index_cache_to_visible_items()
+        for item in self._iter_tree_items():
+            try:
+                be_run = item.data(0, Qt.UserRole + 11)
+                if be_run and item.isExpanded():
+                    self._queue_stage_signoff_for_branch(item, delay_ms=500)
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
         self.status_bar.showMessage("PNR stage status index updated.", 3000)
 
     def _disk_cache_file(self):
@@ -15342,11 +15447,11 @@ class PDDashboard(QMainWindow):
             std_area = self._num(area.get("std_cell_area", "-"))
             factor = getattr(self, "gate_count_unit_area", 0.2419) or 0.2419
             return str(int(std_area / factor)) if std_area is not None and factor else "-"
-        if key == "vth_area":
+        if key in ("vth_area", "vt_area"):
             if vth.get("stage_vt_area"):
                 return vth.get("stage_vt_area")
             return vth.get("vt_area", vth.get("lvt_rvt_hvt_area", vth.get("lvt_rvt_area", "-")))
-        if key == "vth_inst":
+        if key in ("vth_inst", "vt_inst"):
             if vth.get("stage_vt_inst"):
                 return vth.get("stage_vt_inst")
             return vth.get("vt_inst", vth.get("lvt_rvt_hvt_inst", vth.get("lvt_rvt_inst", "-")))
