@@ -161,7 +161,7 @@ _PROJECT_INI_DOCS = [
         ("PNR_TOOL_NAMES", "fc innovus", [
             "Space-separated PNR tool directory names scanned under each block."]),
         ("SUMMARY_SCRIPT", "", [
-            "summary.py path used for Compare QoR / report_qor.html generation."]),
+            "summary.py path used for Compare QoR / qor_report.html generation."]),
         ("FIREFOX_PATH", "/usr/bin/firefox", [
             "Browser executable used to open HTML reports."]),
         ("MAIL_UTIL", "/user/vwpmailsystem/MAIL/send_mail_for_rhel7", [
@@ -1150,12 +1150,15 @@ class AdvancedMailDialog(QDialog):
                 f"{len(self.attachments)} file(s): {names}")
 
     def _attach_qor(self):
-        # New summary.py writes report_qor.html in the launch PWD.
+        # New summary.py writes qor_report.html in the launch PWD.
         import glob as _glob
-        direct = os.path.join(os.getcwd(), "report_qor.html")
+        direct = os.path.join(os.getcwd(), "qor_report.html")
+        fallback_direct = os.path.join(os.getcwd(), "report_qor.html")
         hits = []
         if os.path.exists(direct):
             hits = [direct]
+        elif os.path.exists(fallback_direct):
+            hits = [fallback_direct]
         else:
             hits.extend(_glob.glob(
                 os.path.join(os.getcwd(), "qor_metrices", "**", "*.html"),
@@ -1168,7 +1171,7 @@ class AdvancedMailDialog(QDialog):
         else:
             QMessageBox.warning(
                 self, "Not Found",
-                "No report_qor.html or QoR HTML found.")
+                "No qor_report.html or QoR HTML found.")
 
     def _browse_files(self):
         files, _ = QFileDialog.getOpenFileNames(
@@ -1736,9 +1739,11 @@ class _LegacyQoRWorker(QThread):
     def run(self):
         try:
             script_dir = os.path.dirname(os.path.abspath(self.script_path))
+            launch_cwd = os.getcwd()
+            start_time = time.time()
             cmd = [self.python_bin, self.script_path] + self.run_dirs
             result = subprocess.run(
-                cmd, cwd=script_dir,
+                cmd, cwd=launch_cwd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=600)
@@ -1753,13 +1758,25 @@ class _LegacyQoRWorker(QThread):
                     if html_path:
                         break
             if html_path and not os.path.isabs(html_path):
-                html_path = os.path.join(script_dir, html_path)
-            # Also search qor_metrices/ in script dir
+                html_path = os.path.join(launch_cwd, html_path)
             if not html_path or not os.path.exists(html_path):
                 import glob as _g
-                hits = _g.glob(os.path.join(
+                candidates = [
+                    os.path.join(launch_cwd, "qor_report.html"),
+                    os.path.join(launch_cwd, "report_qor.html"),
+                    os.path.join(script_dir, "qor_report.html"),
+                    os.path.join(script_dir, "report_qor.html"),
+                ]
+                candidates.extend(_g.glob(os.path.join(
                     script_dir, "qor_metrices", "**", "*.html"),
-                    recursive=True)
+                    recursive=True))
+                hits = []
+                for p in candidates:
+                    try:
+                        if p and os.path.exists(p) and os.path.getmtime(p) >= start_time:
+                            hits.append(p)
+                    except Exception:
+                        pass
                 if hits:
                     html_path = sorted(hits, key=os.path.getmtime)[-1]
             self.finished.emit(
@@ -12110,7 +12127,10 @@ class PDDashboard(QMainWindow):
             needle = val if val is not None else q
             for name, blob, stage_name_text, log_text, path_text, status_text, active_text in stage_blobs:
                 if key == "stage":
-                    text = stage_name_text
+                    # Field-qualified stage search should identify the actual
+                    # PNR stage row, not every row carrying the same active
+                    # marker/path text.
+                    text = str(name or "").lower()
                 elif key == "log":
                     text = log_text
                 elif key == "path":
@@ -12524,6 +12544,19 @@ class PDDashboard(QMainWindow):
             self._search_match_items = matches
 
         _collect_search_matches()
+
+        if _do_search:
+            for _match_item in list(getattr(self, "_search_match_items", []) or []):
+                try:
+                    parent = _match_item.parent()
+                    while parent is not None:
+                        parent.setHidden(False)
+                        parent.setExpanded(True)
+                        parent = parent.parent()
+                except RuntimeError:
+                    continue
+                except Exception:
+                    continue
         self._visible_run_item_cache = list(visible_run_items)
 
         self.tree.blockSignals(False)
@@ -14533,7 +14566,7 @@ class PDDashboard(QMainWindow):
         else:
             QMessageBox.warning(
                 self, "QoR Compare",
-                "QoR script ran but no report_qor.html output was found.\n"
+                "QoR script ran but no qor_report.html output was found.\n"
                 "Check terminal output for errors.")
 
     def _run_single_stage_qor(self, item, b_name, r_rtl, base_run):

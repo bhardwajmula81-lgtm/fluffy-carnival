@@ -2251,7 +2251,7 @@ class QoRWorker(QThread):
 
     def run(self):
         try:
-            # New summary.py writes report_qor.html in the launch PWD.
+            # New summary.py writes qor_report.html in the launch PWD.
             script_dir = os.path.dirname(os.path.abspath(self.script_path))
             launch_cwd = os.getcwd()
             start_time = time.time()
@@ -2304,6 +2304,7 @@ class QoRWorker(QThread):
                 html_path = ""
             if not html_path or not os.path.exists(html_path):
                 candidates = [
+                    os.path.join(launch_cwd, "qor_report.html"),
                     os.path.join(launch_cwd, "report_qor.html"),
                     os.path.join(script_dir, "qor_report.html"),
                     os.path.join(script_dir, "report_qor.html"),
