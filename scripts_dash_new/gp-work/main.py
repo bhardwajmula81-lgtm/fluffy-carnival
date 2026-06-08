@@ -120,10 +120,241 @@ def _atomic_write_gzip_json(path, data, indent=None, sort_keys=False):
     _atomic_replace_path(path, _write)
 
 
+_PROJECT_INI_DOCS = [
+    ("PROJECT", [
+        ("PROJECT_PREFIX", "S5K2P5SP", [
+            "Project/top-block prefix. IR is applied only when block matches this prefix."]),
+        ("BASE_WS_FE_DIR", "", [
+            "Front-end workspace root. Example: /user/proj.fe/proj/WS"]),
+        ("BASE_WS_BE_DIR", "", [
+            "Back-end workspace root. Example: /user/proj.be/proj/WS"]),
+        ("BASE_OUTFEED_DIR", "", [
+            "Published outfeed root. Expected: {root}/{BLOCK}/{EVT}/..."]),
+        ("BASE_IR_DIR", "", [
+            "Space-separated RedHawk IR log roots to scan for redhawk.log* files."]),
+        ("BLOCKS", "", [
+            "Comma-separated block whitelist. Empty means scan every discovered block."]),
+    ]),
+    ("PERFORMANCE", [
+        ("SCAN_IR_ON_START", "false", [
+            "true/false. Scan RedHawk IR logs at startup. Usually keep false for speed."]),
+        ("SCAN_OWNER_ON_START", "false", [
+            "true/false. Resolve owner/user names during startup scan."]),
+        ("SCAN_SIGNOFF_ON_START", "false", [
+            "true/false. Scan FE signoff FM/VSLP/PT during startup."]),
+        ("AUTO_SIZE_ON_START", "false", [
+            "true/false. Calculate disk sizes automatically at startup."]),
+        ("BACKGROUND_SIGNOFF_AFTER_SCAN", "true", [
+            "true/false. Queue background FE signoff after the main scan completes."]),
+        ("SIGNOFF_BG_WORKERS", "6", [
+            "Integer worker count for background signoff scans. Lower if NFS is busy."]),
+    ]),
+    ("SCAN_IGNORE", [
+        ("FE_RUN_PATTERNS", "", [
+            "Comma-separated fnmatch patterns for FE runs to ignore. Example: test*,*_backup"]),
+        ("BE_RUN_PATTERNS", "", [
+            "Comma-separated fnmatch patterns for BE runs to ignore. Example: backup_*"]),
+        ("PNR_STAGE_PATTERNS", "backup_*", [
+            "Comma-separated fnmatch patterns for PNR stages to ignore. Example: backup_*,*_old"]),
+    ]),
+    ("TOOLS", [
+        ("PNR_TOOL_NAMES", "fc innovus", [
+            "Space-separated PNR tool directory names scanned under each block."]),
+        ("SUMMARY_SCRIPT", "", [
+            "summary.py path used for Compare QoR / report_qor.html generation."]),
+        ("FIREFOX_PATH", "/usr/bin/firefox", [
+            "Browser executable used to open HTML reports."]),
+        ("MAIL_UTIL", "/user/vwpmailsystem/MAIL/send_mail_for_rhel7", [
+            "Mail command used for HTML status/QoR emails."]),
+        ("USER_INFO_UTIL", "/usr/local/bin/user_info", [
+            "User lookup command for resolving names to email IDs."]),
+        ("PYTHON_BIN", "python3.6", [
+            "Python executable used for external helper scripts."]),
+        ("QOR_TIMEOUT_SEC", "600", [
+            "Seconds before Compare QoR helper is cancelled."]),
+        ("USER_INFO_TIMEOUT_SEC", "5", [
+            "Seconds before user_info lookup is cancelled."]),
+    ]),
+]
+
+
+_MAIL_INI_DOCS = [
+    ("PERMANENT_MEMBERS", [
+        ("always_to", "", [
+            "Comma-separated email IDs or user IDs always added to To."]),
+        ("always_cc", "", [
+            "Comma-separated email IDs or user IDs always added to CC."]),
+    ]),
+    ("KNOWN_USERS", [
+        ("users", "", [
+            "Comma-separated cached user IDs/emails used by mail autocomplete."]),
+    ]),
+]
+
+
+_USER_PREF_INI_DOCS = [
+    ("UI", [
+        ("main_splitter", "", ["Saved main splitter sizes. Internal UI state."]),
+        ("last_source", "ALL", ["Last Source dropdown value: ALL, WS, OUTFEED, ALL-merged."]),
+        ("last_rtl", "", ["Last selected RTL release label."]),
+        ("last_view", "All Runs", ["Last View dropdown value. Example: All Runs, BE Only, Pinned Only."]),
+        ("last_mode", "Standard", ["Column preset: Compact, Standard, Full."]),
+        ("last_sort", "Start Date Old->New", ["Run sort mode restored on startup."]),
+        ("last_search", "", ["Last search text. Empty means no active search."]),
+        ("search_mode", "Filter", ["Search behavior: Filter hides non-matches; Highlight keeps rows visible."]),
+        ("search_highlight_color", "#fff200", ["Hex color for search matches. Default neon yellow."]),
+        ("last_auto", "Off", ["Auto-refresh dropdown value."]),
+        ("search_history", "", ["Recent search history separated by |||."]),
+        ("col_widths", "", ["Saved tree column widths. Internal UI state."]),
+        ("col_hidden", "", ["Saved tree hidden-column mask. Internal UI state."]),
+        ("show_relative_time", "false", ["true/false. Display timestamps relative to now."]),
+        ("convert_to_ist", "false", ["true/false. Convert timestamps to IST from KST."]),
+        ("hide_block_nodes", "false", ["true/false. Hide block grouping level in the tree."]),
+        ("prefer_complete_outfeed_duplicate", "false", [
+            "true/false. Prefer complete OUTFEED FE rows over matching WS FE rows."]),
+        ("closure_enabled", "false", ["true/false. Enable closure scorecard coloring."]),
+        ("status_regression_enabled", "false", ["true/false. Enable status regression detection."]),
+        ("qor_regression_enabled", "false", ["true/false. Enable QoR regression detection from cached metrics."]),
+        ("enable_fe_hover_metrics", "false", ["true/false. Show FE metrics on hover."]),
+        ("gate_count_unit_area", "0.241900", ["Gate Count = Std Cell Area / this value."]),
+        ("tapeout_date", "", ["Optional YYYY-MM-DD tapeout date for title countdown."]),
+        ("pnr_signoff_load_mode", "lazy", [
+            "off = never load BE-stage FM/VSLP automatically.",
+            "lazy = load when a BE branch is expanded.",
+            "visible_after_scan = load visible BE branches after scan.",
+            "all_after_scan = load all BE branches after scan."]),
+        ("pnr_signoff_show_checking", "true", [
+            "true/false. Show CHECKING while BE-stage FM/VSLP is being resolved."]),
+    ]),
+    ("PRESETS", [
+        ("compact", "", ["Comma-separated visible column indexes for Compact mode."]),
+        ("standard", "", ["Comma-separated visible column indexes for Standard mode."]),
+        ("full", "", ["Comma-separated visible column indexes for Full mode."]),
+    ]),
+    ("STATUS_PACKAGE", [
+        ("marked_runs_json", "[]", ["JSON list of run IDs marked for status package generation."]),
+        ("marked_blocks", "", ["Legacy block marking field. Empty when run-level marks are used."]),
+    ]),
+    ("QOR", [
+        ("script_path", "", ["Per-user override for summary.py Compare QoR script path."]),
+    ]),
+    ("MILESTONES", [
+        ("map", "", ["JSON map of RTL substring patterns to milestone labels."]),
+    ]),
+]
+
+
+def _ini_docs_for_path(path):
+    name = os.path.basename(path or "").lower()
+    if name == "project_config.ini":
+        return _PROJECT_INI_DOCS
+    if name == "mail_users.ini":
+        return _MAIL_INI_DOCS
+    if name.startswith("user_prefs_") and name.endswith(".ini"):
+        return _USER_PREF_INI_DOCS
+    return None
+
+
+def _ini_needs_doc_refresh(path):
+    if not _ini_docs_for_path(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            first = f.readline().strip()
+        return first != "# Flow Pulse generated configuration."
+    except Exception:
+        return True
+
+
+def _cfg_get_case_insensitive(config, section, option, default=""):
+    try:
+        if not config.has_section(section):
+            return default
+        target = option.lower()
+        for opt in config.options(section):
+            if opt.lower() == target:
+                return config.get(section, opt, raw=True)
+    except Exception:
+        pass
+    return default
+
+
+def _render_ini_value(value):
+    text = str(value if value is not None else "")
+    if "\n" not in text:
+        return text
+    return "\n\t".join(text.splitlines())
+
+
+def _render_documented_config(config, docs):
+    if not docs:
+        buf = io.StringIO()
+        config.write(buf)
+        return buf.getvalue()
+    lines = [
+        "# Flow Pulse generated configuration.",
+        "# Edit values below as needed. Comments are regenerated on save.",
+        "",
+    ]
+    known_sections = set()
+    for section, entries in docs:
+        known_sections.add(section.lower())
+        if not config.has_section(section):
+            try:
+                config.add_section(section)
+            except Exception:
+                pass
+        lines.append("[{}]".format(section))
+        known_options = set()
+        for option, default, comments in entries:
+            known_options.add(option.lower())
+            for comment in comments:
+                lines.append("# {}: {}".format(option, comment))
+            value = _cfg_get_case_insensitive(config, section, option, default)
+            lines.append("{} = {}".format(option, _render_ini_value(value)))
+            lines.append("")
+        try:
+            custom = []
+            for opt in config.options(section):
+                if opt.lower() not in known_options:
+                    custom.append(opt)
+            if custom:
+                lines.append("# Custom options in this section.")
+                for opt in sorted(custom):
+                    lines.append("{} = {}".format(
+                        opt, _render_ini_value(config.get(section, opt, raw=True))))
+                lines.append("")
+        except Exception:
+            pass
+        lines.append("")
+    unknown_sections = []
+    try:
+        for section in config.sections():
+            if section.lower() not in known_sections:
+                unknown_sections.append(section)
+    except Exception:
+        unknown_sections = []
+    if unknown_sections:
+        lines.append("# ----------------------------------------------------------------------")
+        lines.append("# Unknown/custom options")
+        lines.append("# These sections are preserved but are not documented by Flow Pulse.")
+        lines.append("# ----------------------------------------------------------------------")
+        lines.append("")
+        for section in sorted(unknown_sections):
+            lines.append("[{}]".format(section))
+            try:
+                for opt in sorted(config.options(section)):
+                    lines.append("{} = {}".format(
+                        opt, _render_ini_value(config.get(section, opt, raw=True))))
+            except Exception:
+                pass
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def _write_config_atomic(config, path):
-    buf = io.StringIO()
-    config.write(buf)
-    _atomic_write_text(path, buf.getvalue())
+    docs = _ini_docs_for_path(path)
+    _atomic_write_text(path, _render_documented_config(config, docs))
 
 def _load_project_config():
     """Load project_config.ini if present, else use hardcoded defaults."""
@@ -175,7 +406,7 @@ def _load_project_config():
                 if not cfg.has_option(sec, key):
                     cfg.set(sec, key, val)
                     changed = True
-        if changed:
+        if changed or _ini_needs_doc_refresh(cfg_file):
             try:
                 _write_config_atomic(cfg, cfg_file)
             except Exception as e:
@@ -203,6 +434,11 @@ def _load_mail_config():
             debug_log("main: mail config create failed", e)
     else:
         mc.read(mc_file)
+        if _ini_needs_doc_refresh(mc_file):
+            try:
+                _write_config_atomic(mc, mc_file)
+            except Exception as e:
+                debug_log("main: mail config doc refresh failed", e)
     return mc, mc_file
 
 _proj_cfg   = _load_project_config()
@@ -429,6 +665,11 @@ if (not os.path.exists(USER_PREFS_FILE)) and os.path.exists(OLD_USER_PREFS_FILE)
 prefs = configparser.ConfigParser()
 if os.path.exists(USER_PREFS_FILE):
     prefs.read(USER_PREFS_FILE)
+    if _ini_needs_doc_refresh(USER_PREFS_FILE):
+        try:
+            _write_config_atomic(prefs, USER_PREFS_FILE)
+        except Exception as e:
+            debug_log("main: user prefs doc refresh failed", e)
 
 
 def _ensure_pref_section(section):
@@ -4903,6 +5144,13 @@ class PDDashboard(QMainWindow):
             'UI', 'qor_regression_enabled', fallback='false').lower() == 'true'
         self.enable_fe_hover_metrics = prefs.get(
             'UI', 'enable_fe_hover_metrics', fallback='false').lower() == 'true'
+        self.pnr_signoff_load_mode = prefs.get(
+            'UI', 'pnr_signoff_load_mode', fallback='lazy').strip().lower()
+        if self.pnr_signoff_load_mode not in (
+                "off", "lazy", "visible_after_scan", "all_after_scan"):
+            self.pnr_signoff_load_mode = "lazy"
+        self.pnr_signoff_show_checking = prefs.get(
+            'UI', 'pnr_signoff_show_checking', fallback='true').lower() == 'true'
         self._hover_metric_cache     = {}
         self._hover_metric_worker    = None
         self._hover_metric_path      = ""
@@ -7671,6 +7919,8 @@ class PDDashboard(QMainWindow):
         self._status_regression_enabled = False
         self._qor_regression_enabled = False
         self.enable_fe_hover_metrics = False
+        self.pnr_signoff_load_mode = "lazy"
+        self.pnr_signoff_show_checking = True
         self._clear_fe_hover_metric_tooltips()
         try:
             self.auto_refresh_timer.stop()
@@ -7713,6 +7963,8 @@ class PDDashboard(QMainWindow):
                 ('status_regression_enabled', 'false'),
                 ('qor_regression_enabled', 'false'),
                 ('enable_fe_hover_metrics', 'false'),
+                ('pnr_signoff_load_mode', 'lazy'),
+                ('pnr_signoff_show_checking', 'true'),
                 ('gate_count_unit_area', '0.241900')):
             prefs.set('UI', key, val)
         try:
@@ -11392,6 +11644,9 @@ class PDDashboard(QMainWindow):
 
     def _queue_stage_signoff_for_branch(self, be_item, delay_ms=250):
         try:
+            mode = str(getattr(self, "pnr_signoff_load_mode", "lazy") or "lazy").lower()
+            if mode == "off":
+                return
             if not self._is_live_tree_item(be_item):
                 return
             be_run = be_item.data(0, Qt.UserRole + 11)
@@ -11432,7 +11687,8 @@ class PDDashboard(QMainWindow):
             self._apply_stage_index_cache_to_be_run(be_run)
             from workers import StageDetailWorker
             be_run["_stage_detail_loading"] = True
-            self._mark_stage_signoff_checking(item, be_run)
+            if getattr(self, "pnr_signoff_show_checking", True):
+                self._mark_stage_signoff_checking(item, be_run)
             w = StageDetailWorker(be_run)
             w.finished.connect(self._on_stage_details_loaded)
             self._workers.start("stage_detail", w, list_name="_stage_workers")
@@ -13495,6 +13751,30 @@ class PDDashboard(QMainWindow):
             "Uses already cached metrics only. It does not parse QoR reports during scan. Default: off.")
         gen_l.addRow("", qor_reg_cb)
 
+        pnr_signoff_combo = QComboBox()
+        _pnr_modes = [
+            ("Off", "off"),
+            ("Lazy on expand", "lazy"),
+            ("Visible after scan", "visible_after_scan"),
+            ("All after scan", "all_after_scan"),
+        ]
+        for label, value in _pnr_modes:
+            pnr_signoff_combo.addItem(label, value)
+        cur_mode = getattr(self, "pnr_signoff_load_mode", "lazy")
+        mode_idx = 1
+        for i in range(pnr_signoff_combo.count()):
+            if pnr_signoff_combo.itemData(i) == cur_mode:
+                mode_idx = i
+                break
+        pnr_signoff_combo.setCurrentIndex(mode_idx)
+        pnr_signoff_combo.setToolTip(
+            "Controls automatic BE-stage FM/VSLP loading. Lazy keeps expand fast and loads only opened branches.")
+        gen_l.addRow("PNR FM/VSLP load:", pnr_signoff_combo)
+
+        pnr_checking_cb = QCheckBox("Show CHECKING while PNR FM/VSLP is loading")
+        pnr_checking_cb.setChecked(getattr(self, "pnr_signoff_show_checking", True))
+        gen_l.addRow("", pnr_checking_cb)
+
         gate_factor_spin = QDoubleSpinBox()
         gate_factor_spin.setDecimals(6)
         gate_factor_spin.setRange(0.000001, 100.0)
@@ -13718,7 +13998,7 @@ class PDDashboard(QMainWindow):
         row_qor.addWidget(browse_btn)
         qor_l.addRow("summary.py path:", row_qor)
         qor_l.addWidget(QLabel(
-            "<small><i>Saved to user_prefs.ini. "
+            "<small><i>Saved to dashboard_notes/user_prefs_&lt;user&gt;.ini. "
             "Also add QOR_SUMMARY_SCRIPT = '...' to config.py "
             "to make it permanent.</i></small>"))
         tabs.addTab(qor_w, "QoR Script")
@@ -13776,6 +14056,12 @@ class PDDashboard(QMainWindow):
                   'true' if self._status_regression_enabled else 'false')
         prefs.set('UI', 'qor_regression_enabled',
                   'true' if self._qor_regression_enabled else 'false')
+        self.pnr_signoff_load_mode = str(
+            pnr_signoff_combo.currentData() or "lazy").lower()
+        self.pnr_signoff_show_checking = pnr_checking_cb.isChecked()
+        prefs.set('UI', 'pnr_signoff_load_mode', self.pnr_signoff_load_mode)
+        prefs.set('UI', 'pnr_signoff_show_checking',
+                  'true' if self.pnr_signoff_show_checking else 'false')
         self.gate_count_unit_area = gate_factor_spin.value()
         prefs.set('UI', 'gate_count_unit_area',
                   "{:.6f}".format(self.gate_count_unit_area))
@@ -13841,6 +14127,10 @@ class PDDashboard(QMainWindow):
         if new_ms_map:
             self._milestone_map = new_ms_map
             self._save_milestone_map(new_ms_map)
+        try:
+            _write_config_atomic(prefs, USER_PREFS_FILE)
+        except Exception as e:
+            debug_log("main: settings prefs save failed", e)
 
         self.apply_theme_and_spacing()
         if _need_rebuild:
@@ -14031,10 +14321,19 @@ class PDDashboard(QMainWindow):
             self._merge_stage_index_into_run(run, enriched)
             self._branch_status_cache[key] = list(run.get("stages", []) or [])
         self._apply_stage_index_cache_to_visible_items()
+        mode = str(getattr(self, "pnr_signoff_load_mode", "lazy") or "lazy").lower()
         for item in self._iter_tree_items():
             try:
                 be_run = item.data(0, Qt.UserRole + 11)
-                if be_run and item.isExpanded():
+                should_load = False
+                if be_run:
+                    if mode == "all_after_scan":
+                        should_load = True
+                    elif mode == "visible_after_scan":
+                        should_load = not item.isHidden()
+                    elif mode == "lazy":
+                        should_load = item.isExpanded()
+                if should_load:
                     self._queue_stage_signoff_for_branch(item, delay_ms=500)
             except RuntimeError:
                 continue
