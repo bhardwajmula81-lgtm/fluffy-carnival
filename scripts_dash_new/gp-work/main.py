@@ -11189,7 +11189,10 @@ class PDDashboard(QMainWindow):
             child.setText(23, "CONFIG")
             child.setForeground(0, QColor("#1565c0" if not self.is_dark_mode else "#90caf9"))
             tooltip_text += "\n[IN ACTIVE FILTER CONFIG]"
-        tooltip_text += f"\nSize: -\n"
+        cached_size = self._disk_cache_size_text(run.get("path", ""))
+        if cached_size:
+            child.setText(6, cached_size)
+        tooltip_text += "\nSize: {}\n".format(cached_size or "-")
         child.setToolTip(0, tooltip_text)
         child.setExpanded(False)
 
@@ -12079,6 +12082,20 @@ class PDDashboard(QMainWindow):
             pass
         if not q:
             return False
+        key_re = re.compile(
+            r"^(rtl|block|user|owner|source|stage|log|status|path|run|name|type|runtime|start|end|note):(.+)$")
+        terms = []
+        for part in re.split(r"\s*;\s*", q):
+            part = part.strip()
+            if not part:
+                continue
+            m_part = key_re.match(part)
+            if m_part:
+                terms.append((m_part.group(1), m_part.group(2).strip()))
+            else:
+                terms.append((None, part))
+        if not terms:
+            return False
         info = (run or {}).get("info", {}) or {}
         fields = {
             "run": (run or {}).get("r_name", ""),
@@ -12098,7 +12115,7 @@ class PDDashboard(QMainWindow):
             "end": info.get("end", ""),
             "note": notes or "",
         }
-        stage_blobs = []
+        stage_rows = []
         for st in (run or {}).get("stages", []) or []:
             name_text = str(st.get("name", "") or "")
             active_text = str(st.get("active_stage", "") or "")
@@ -12106,15 +12123,17 @@ class PDDashboard(QMainWindow):
                 name_text, st.get("stage_status", ""),
                 active_text, st.get("log_path", ""),
                 st.get("stage_path", ""))
-            fields["stage"] += " " + st_blob
+            fields["stage"] += " " + name_text
             fields["log"] += " " + str(st.get("log_path", ""))
             fields["path"] += " " + str(st.get("stage_path", ""))
-            stage_blobs.append((name_text, st_blob.lower(),
-                                (name_text + " " + active_text).lower(),
-                                str(st.get("log_path", "")).lower(),
-                                str(st.get("stage_path", "")).lower(),
-                                str(st.get("stage_status", "")).lower(),
-                                active_text.lower()))
+            stage_rows.append({
+                "name": name_text,
+                "name_l": name_text.lower(),
+                "blob": st_blob.lower(),
+                "log": str(st.get("log_path", "")).lower(),
+                "path": str(st.get("stage_path", "")).lower(),
+                "status": str(st.get("stage_status", "")).lower(),
+            })
 
         def _match_text(text, needle):
             text = str(text or "").lower()
@@ -12122,44 +12141,30 @@ class PDDashboard(QMainWindow):
                 return fnmatch.fnmatch(text, "*" + needle + "*")
             return needle in text
 
-        def _record_stage_hits(key=None, val=None):
+        def _stage_hits_for(key, val):
             hits = set()
-            needle = val if val is not None else q
-            for name, blob, stage_name_text, log_text, path_text, status_text, active_text in stage_blobs:
+            needle = val or ""
+            for row in stage_rows:
                 if key == "stage":
-                    # Field-qualified stage search should identify the actual
-                    # PNR stage row, not every row carrying the same active
-                    # marker/path text.
-                    text = str(name or "").lower()
+                    # Field-qualified stage search means the PNR stage row
+                    # name itself. Do not match active marker, log path or BE
+                    # path here, otherwise every row under that branch can
+                    # light up when only one stage was requested.
+                    text = row["name_l"]
                 elif key == "log":
-                    text = log_text
+                    text = row["log"]
                 elif key == "path":
-                    text = path_text
+                    text = row["path"]
                 elif key == "status":
-                    text = status_text + " " + active_text
+                    text = row["status"]
                 elif key in ("run", "name", "rtl", "block", "source", "user", "owner", "type", "runtime", "start", "end", "note"):
                     text = ""
                 else:
-                    text = blob + " " + log_text + " " + path_text + " " + status_text + " " + active_text
+                    text = row["blob"] + " " + row["log"] + " " + row["path"] + " " + row["status"]
                 if text and _match_text(text, needle):
-                    hits.add(name)
-            try:
-                run["_search_stage_hits"] = hits
-            except Exception:
-                pass
-            return bool(hits)
+                    hits.add(row["name"])
+            return hits
 
-        m = re.match(r"^(rtl|block|user|owner|source|stage|log|status|path|run|name|type|runtime|start|end|note):(.+)$", q)
-        if m:
-            key = m.group(1)
-            val = m.group(2).strip()
-            stage_hit = _record_stage_hits(key, val)
-            direct_hit = False if key == "stage" else _match_text(fields.get(key, ""), val)
-            try:
-                run["_search_direct_hit"] = bool(direct_hit)
-            except Exception:
-                pass
-            return direct_hit or stage_hit
         base_blob = (run or {}).get("_search_blob")
         if not base_blob:
             base_blob = " ".join(str(fields.get(k, "")) for k in (
@@ -12171,16 +12176,45 @@ class PDDashboard(QMainWindow):
             except Exception:
                 pass
         combined = (base_blob + " " + str(notes or "").lower())
-        stage_hit = _record_stage_hits(None, q)
-        direct_hit = (fnmatch.fnmatch(combined, "*" + q + "*")
-                      if "*" in q else q in combined)
+        direct_hit_all = True
+        direct_hit_any = False
+        final_stage_hits = None
+        for key, val in terms:
+            if key:
+                direct_ok = False if key == "stage" else _match_text(fields.get(key, ""), val)
+                stage_hits = _stage_hits_for(key, val)
+            else:
+                direct_ok = _match_text(combined, val)
+                stage_hits = _stage_hits_for(None, val)
+            term_ok = bool(direct_ok or stage_hits)
+            if not term_ok:
+                try:
+                    run["_search_stage_hits"] = set()
+                    run["_search_direct_hit"] = False
+                except Exception:
+                    pass
+                return False
+            if direct_ok:
+                direct_hit_any = True
+            else:
+                direct_hit_all = False
+            if stage_hits:
+                if final_stage_hits is None:
+                    final_stage_hits = set(stage_hits)
+                else:
+                    final_stage_hits &= set(stage_hits)
+
+        if final_stage_hits is None:
+            final_stage_hits = set()
+        # For compound run+stage searches, only the exact stage rows should be
+        # highlighted/navigated. The parent run remains visible as an ancestor.
+        direct_hit = bool(direct_hit_any and direct_hit_all and not final_stage_hits)
         try:
+            run["_search_stage_hits"] = final_stage_hits
             run["_search_direct_hit"] = bool(direct_hit)
         except Exception:
             pass
-        if "*" in q:
-            return direct_hit or stage_hit
-        return direct_hit or stage_hit
+        return bool(direct_hit or final_stage_hits)
 
     def refresh_view(self):
         src_mode = self.src_combo.currentText()
@@ -12233,6 +12267,39 @@ class PDDashboard(QMainWindow):
         self._visible_run_item_cache = None
         self._search_match_items = []
         self._search_match_index = -1
+        _search_matches_live = []
+        _search_seen_live = set()
+
+        def _item_visible_now(it):
+            try:
+                if it is None or it.isHidden():
+                    return False
+                parent = it.parent()
+                while parent is not None:
+                    if parent.isHidden():
+                        return False
+                    parent = parent.parent()
+                return True
+            except RuntimeError:
+                return False
+            except Exception:
+                return False
+
+        def _register_search_match(it):
+            try:
+                key = id(it)
+                if key not in _search_seen_live:
+                    _search_seen_live.add(key)
+                    _search_matches_live.append(it)
+            except RuntimeError:
+                pass
+            except Exception:
+                pass
+
+        def _mark_search_item(it, active):
+            self._set_item_search_highlight(it, active)
+            if active:
+                _register_search_match(it)
 
         def _search_notes(note_id):
             if note_id in _note_text_cache:
@@ -12418,7 +12485,7 @@ class PDDashboard(QMainWindow):
                     passes = True
                 rt_type_run = run.get("run_type") if run else None
                 item.setHidden(not passes)
-                self._set_item_search_highlight(item, bool(_do_search and run and run.get("_search_direct_hit")))
+                _mark_search_item(item, bool(_do_search and run and run.get("_search_direct_hit")))
                 if passes and run:
                     visible_runs.append(run)
                     if run.get("run_type") == "FE":
@@ -12446,7 +12513,7 @@ class PDDashboard(QMainWindow):
                                 hide_stage = not passes
                             else:
                                 hide_stage = not matched_stage
-                            self._set_item_search_highlight(ch, matched_stage)
+                            _mark_search_item(ch, matched_stage)
                             if matched_stage:
                                 item.setExpanded(True)
                         if _pinned_only:
@@ -12476,7 +12543,7 @@ class PDDashboard(QMainWindow):
                                     cnid = "{} : {}".format(child_run.get("rtl", ""), child_run.get("r_name", ""))
                                     cnotes = _search_notes(cnid)
                                     child_run["_search_hit"] = self._search_matches_run(child_run, raw_query, cnotes)
-                                self._set_item_search_highlight(ch, bool(child_run and child_run.get("_search_direct_hit")))
+                                _mark_search_item(ch, bool(child_run and child_run.get("_search_direct_hit")))
                             except Exception:
                                 pass
                         if _pinned_only:
@@ -12497,7 +12564,7 @@ class PDDashboard(QMainWindow):
                                 matched_stage = st_item.text(0).lower() in hits
                                 if not _highlight_mode:
                                     st_item.setHidden(not matched_stage)
-                                self._set_item_search_highlight(st_item, matched_stage)
+                                _mark_search_item(st_item, matched_stage)
                             item.setExpanded(True)
                             ch.setExpanded(True)
                 return passes
@@ -12510,40 +12577,10 @@ class PDDashboard(QMainWindow):
             self.apply_tree_filters()
             self._visible_run_item_cache = None
 
-        def _collect_search_matches():
-            matches = []
-            seen = set()
-            def _add(it):
-                try:
-                    key = id(it)
-                    if key not in seen and not it.isHidden():
-                        seen.add(key)
-                        matches.append(it)
-                except RuntimeError:
-                    pass
-            def _walk(node):
-                for ci in range(node.childCount()):
-                    ch = node.child(ci)
-                    try:
-                        if ch.isHidden():
-                            continue
-                        nt = ch.data(0, _UR)
-                        run = ch.data(0, _UR10)
-                        if _do_search and run and run.get("_search_direct_hit"):
-                            _add(ch)
-                        if _do_search and nt == "STAGE":
-                            parent = ch.parent()
-                            prun = parent.data(0, _UR10) if parent is not None else None
-                            hits = set(str(x).lower() for x in (prun or {}).get("_search_stage_hits", []) or [])
-                            if ch.text(0).lower() in hits:
-                                _add(ch)
-                        _walk(ch)
-                    except RuntimeError:
-                        pass
-            _walk(self.tree.invisibleRootItem())
-            self._search_match_items = matches
-
-        _collect_search_matches()
+        self._search_match_items = [
+            it for it in _search_matches_live
+            if _item_visible_now(it)
+        ]
 
         if _do_search:
             for _match_item in list(getattr(self, "_search_match_items", []) or []):
@@ -12939,6 +12976,9 @@ class PDDashboard(QMainWindow):
             QTimer.singleShot(50, self._build_tree)
 
         elif calc_size_act and res == calc_size_act:
+            if self._apply_disk_cache_size_to_item(item):
+                self.status_bar.showMessage("Size loaded from disk usage cache.", 2500)
+                return
             item.setText(6, "Calc...")
             item_id = f"{item.text(0)}|{item.text(1)}|{item.text(15)}"
             self.item_map[item_id] = item
@@ -12984,6 +13024,9 @@ class PDDashboard(QMainWindow):
                 path  = child.text(15)
                 if (path and path != "N/A"
                         and child.text(6) in ["-", "N/A", "Calc..."]):
+                    if self._apply_disk_cache_size_to_item(child):
+                        gather(child)
+                        continue
                     item_id = (f"{child.text(0)}|"
                                f"{child.text(1)}|{child.text(15)}")
                     self.item_map[item_id] = child
@@ -13000,8 +13043,12 @@ class PDDashboard(QMainWindow):
     def _on_batch_sizes(self, batch):
         """Handle a batch of (item_id, size_str) tuples from BatchSizeWorker.
         One call per 50 results instead of one call per result - keeps UI fluid."""
+        changed = False
         for item_id, size_str in batch:
-            self.update_item_size(item_id, size_str)
+            if self.update_item_size(item_id, size_str, save_cache=False):
+                changed = True
+        if changed:
+            self._save_disk_cache()
 
     # ------------------------------------------------------------------
     # BACKGROUND OWNER LOOKUP
@@ -13128,18 +13175,23 @@ class PDDashboard(QMainWindow):
     def _on_signoff_finished(self):
         self.status_bar.showMessage("Owner/FM/VSLP background scan finished", 5000)
 
-    def update_item_size(self, item_id, size_str):
+    def update_item_size(self, item_id, size_str, save_cache=True):
         item = self.item_map.get(item_id)
         if item is None:
-            return
+            return False
         try:
             item.setText(6, size_str)
             old = item.toolTip(0)
             if old:
                 item.setToolTip(0, re.sub(
                     r'Size: .*?\n', f'Size: {size_str}\n', old))
+            changed = self._update_disk_cache_from_item_size(item, size_str)
+            if changed and save_cache:
+                self._save_disk_cache()
+            return changed
         except RuntimeError:
             self.item_map.pop(item_id, None)
+        return False
 
     def _schedule_tree_column_fit(self, item=None):
         try:
@@ -14374,6 +14426,104 @@ class PDDashboard(QMainWindow):
                 continue
         self.status_bar.showMessage("PNR stage status index updated.", 3000)
 
+    def _disk_cache_key(self, path):
+        try:
+            path = str(path or "")
+            if not path or path in ("N/A", "-"):
+                return ""
+            return os.path.normpath(path)
+        except Exception:
+            return str(path or "")
+
+    def _disk_cache_size_text(self, path):
+        key = self._disk_cache_key(path)
+        if not key:
+            return ""
+        rec = (getattr(self, "_disk_cache", {}) or {}).get(key)
+        if not rec:
+            rec = (getattr(self, "_disk_cache", {}) or {}).get(str(path or ""))
+        try:
+            if not rec or not rec.get("exists", True):
+                return ""
+            gb = float(rec.get("size_gb", 0.0) or 0.0)
+        except Exception:
+            return ""
+        if gb <= 0:
+            return ""
+        if gb >= 1024.0:
+            return "{:.1f}T".format(gb / 1024.0)
+        if gb >= 1.0:
+            return "{:.1f}G".format(gb)
+        return "{:.1f}M".format(gb * 1024.0)
+
+    def _size_text_to_gb(self, size_text):
+        text = str(size_text or "").strip()
+        m = re.match(r"^([0-9.]+)\s*([KMGTP]?)$", text, re.I)
+        if not m:
+            return None
+        val = float(m.group(1))
+        unit = (m.group(2) or "B").upper()
+        if unit == "T":
+            return val * 1024.0
+        if unit == "G":
+            return val
+        if unit == "M":
+            return val / 1024.0
+        if unit == "K":
+            return val / (1024.0 * 1024.0)
+        return val / (1024.0 * 1024.0 * 1024.0)
+
+    def _update_disk_cache_from_item_size(self, item, size_text):
+        try:
+            path = item.text(15)
+            key = self._disk_cache_key(path)
+            gb = self._size_text_to_gb(size_text)
+            if not key or gb is None:
+                return False
+            run = item.data(0, Qt.UserRole + 10) or {}
+            rec = dict((getattr(self, "_disk_cache", {}) or {}).get(key, {}) or {})
+            rec.update({
+                "path": path,
+                "size_gb": gb,
+                "source": run.get("source", item.text(2)),
+                "run_type": run.get("run_type", ""),
+                "block": run.get("block", ""),
+                "rtl": run.get("rtl", item.text(1)),
+                "run_name": run.get("r_name", item.text(0)),
+                "owner": run.get("owner", item.text(5)),
+                "exists": True,
+                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            if not hasattr(self, "_disk_cache") or self._disk_cache is None:
+                self._disk_cache = {}
+            self._disk_cache[key] = rec
+            return True
+        except Exception:
+            return False
+
+    def _apply_disk_cache_size_to_item(self, item):
+        try:
+            cached = self._disk_cache_size_text(item.text(15))
+            if not cached:
+                return False
+            item.setText(6, cached)
+            old = item.toolTip(0)
+            if old:
+                item.setToolTip(0, re.sub(
+                    r"Size: .*?\n", "Size: {}\n".format(cached), old))
+            return True
+        except RuntimeError:
+            return False
+        except Exception:
+            return False
+
+    def _apply_disk_cache_sizes_to_tree(self):
+        try:
+            for item in self._iter_tree_items():
+                self._apply_disk_cache_size_to_item(item)
+        except Exception:
+            pass
+
     def _disk_cache_file(self):
         return os.path.join(
             self._user_project_dir(),
@@ -14479,6 +14629,7 @@ class PDDashboard(QMainWindow):
             self._disk_cache = data.pop("__cache__", {}) or {}
             data.pop("__pending_count__", None)
             self._save_disk_cache()
+            self._apply_disk_cache_sizes_to_tree()
         self._disk_data = data
         # Re-enable disk button
         if hasattr(self, 'disk_btn'):
