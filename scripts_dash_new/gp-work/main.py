@@ -31,6 +31,16 @@ except Exception:
     def debug_log(context, exc=None):
         pass
 
+try:
+    from metric_registry import get_metric_value as _registry_metric_value, get_metric_profile, metric_label
+except Exception:
+    def _registry_metric_value(metrics, key, default='-'):
+        return default
+    def get_metric_profile(name, config_obj=None):
+        return []
+    def metric_label(key):
+        return key
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QLineEdit, QTreeWidget, QTreeWidgetItem,
@@ -125,11 +135,11 @@ _PROJECT_INI_DOCS = [
         ("PROJECT_PREFIX", "S5K2P5SP", [
             "Project/top-block prefix. IR is applied only when block matches this prefix."]),
         ("BASE_WS_FE_DIR", "", [
-            "Front-end workspace root. Example: /user/proj.fe/proj/WS"]),
+            "Front-end workspace root(s). Multiple roots can be comma, semicolon, or whitespace separated. Example: /path1,/path2"]),
         ("BASE_WS_BE_DIR", "", [
-            "Back-end workspace root. Example: /user/proj.be/proj/WS"]),
+            "Back-end workspace root(s). Multiple roots can be comma, semicolon, or whitespace separated. Example: /path1,/path2"]),
         ("BASE_OUTFEED_DIR", "", [
-            "Published outfeed root. Expected: {root}/{BLOCK}/{EVT}/..."]),
+            "Published outfeed root(s). Multiple roots can be comma, semicolon, or whitespace separated. Expected: {root}/{BLOCK}/{EVT}/..."]),
         ("BASE_IR_DIR", "", [
             "Space-separated RedHawk IR log roots to scan for redhawk.log* files."]),
         ("BLOCKS", "", [
@@ -156,6 +166,20 @@ _PROJECT_INI_DOCS = [
             "Comma-separated fnmatch patterns for BE runs to ignore. Example: backup_*"]),
         ("PNR_STAGE_PATTERNS", "backup_*", [
             "Comma-separated fnmatch patterns for PNR stages to ignore. Example: backup_*,*_old"]),
+    ]),
+    ("METRIC_TABLES", [
+        ("fe_block_summary", "mbit.percent,cgc.percent,area.instance_count,area.std_cell_area,gate_count,vth.area_pct,timing.r2r_setup,timing.r2r_hold,logic_depth,power.total,runtime.runtime", [
+            "Comma-separated metric keys for FE Block Summary."]),
+        ("qor_summary_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.leakage,power.total,runtime.runtime", [
+            "Comma-separated metric keys for FE QoR Summary profile."]),
+        ("qor_summary_pnr", "timing.r2r_setup,timing.setup_total,timing.r2r_hold,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime", [
+            "Comma-separated metric keys for PNR QoR Summary profile."]),
+        ("be_stage_summary", "timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime", [
+            "Comma-separated metric keys for BE Stage Summary."]),
+        ("latest_outfeed_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_count_area,gate_count,congestion.total,vth.area_pct,logic_depth,power.total,runtime.start,runtime.end,runtime.runtime", [
+            "Comma-separated metric keys for Latest OUTFEED FE table."]),
+        ("latest_outfeed_be", "timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.start,runtime.end,runtime.runtime", [
+            "Comma-separated metric keys for Latest OUTFEED BE table."]),
     ]),
     ("TOOLS", [
         ("PNR_TOOL_NAMES", "fc innovus", [
@@ -230,6 +254,14 @@ _USER_PREF_INI_DOCS = [
         ("compact", "", ["Comma-separated visible column indexes for Compact mode."]),
         ("standard", "", ["Comma-separated visible column indexes for Standard mode."]),
         ("full", "", ["Comma-separated visible column indexes for Full mode."]),
+    ]),
+    ("METRIC_TABLES", [
+        ("fe_block_summary", "", ["User override for FE Block Summary metric order. Empty uses default."]),
+        ("qor_summary_fe", "", ["User override for FE QoR Summary metric order."]),
+        ("qor_summary_pnr", "", ["User override for PNR QoR Summary metric order."]),
+        ("be_stage_summary", "", ["User override for BE Stage Summary metric order."]),
+        ("latest_outfeed_fe", "", ["User override for Latest OUTFEED FE table metric order."]),
+        ("latest_outfeed_be", "", ["User override for Latest OUTFEED BE table metric order."]),
     ]),
     ("STATUS_PACKAGE", [
         ("marked_runs_json", "[]", ["JSON list of run IDs marked for status package generation."]),
@@ -554,6 +586,25 @@ def _get_user_email(username):
 
 def _split_mail_tokens(text):
     return [x.strip() for x in re.split(r'[,;\s]+', text or '') if x.strip()]
+
+
+def _split_path_list(text):
+    if isinstance(text, (list, tuple, set, frozenset)):
+        vals = text
+    else:
+        vals = re.split(r'[,;\s]+', str(text or ""))
+    out = []
+    seen = set()
+    for val in vals:
+        p = str(val or "").strip()
+        if not p:
+            continue
+        key = os.path.normpath(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
 
 
 def _resolve_mail_recipients(tokens):
@@ -1417,8 +1468,10 @@ class DiskUsageDialog(QDialog):
         path_map = {"WS (FE)": BASE_WS_FE_DIR,
                      "WS (BE)": BASE_WS_BE_DIR,
                      "OUTFEED": BASE_OUTFEED_DIR}
+        roots = _split_path_list(path_map.get(cat, "/"))
+        part_path = roots[0] if roots else "/"
         self.part_lbl.setText(
-            self._partition_info(path_map.get(cat, "/")))
+            self._partition_info(part_path))
 
         # Pie chart
         pie_data = {u: v["total"] for u, v in data.items()}
@@ -1560,8 +1613,9 @@ class QoRSummaryDialog(QDialog):
         # Congestion: cong_both already formatted as "Both%/V%/H%"
         cong_str = _v(cong, "cong_both")
 
-        # Power: key is "leakage", value includes unit e.g. "87.468 uW"
-        pwr_str = _v(power, "leakage")
+        # Power values include units, e.g. "87.468 uW" or "1.2352e+04 uW".
+        pwr_str = _registry_metric_value(metrics, "power.leakage", "-")
+        total_pwr_str = _registry_metric_value(metrics, "power.total", "-")
 
         # Util string: from utilization report
         util_str = _v(metrics.get("util", {}), "std_util_str", "std_util")
@@ -1618,10 +1672,38 @@ class QoRSummaryDialog(QDialog):
                 ("MBIT Ratio",                     _v(metrics, "mbit"),         False, "mbit"),
                 ("CGC Ratio",                      metrics.get("cgc", "-"),     False, "cgc"),
                 ("Power",                          None,                        True,  None),
-                ("Cell Leakage Power",             pwr_str,                     False, "leakage"),
-                ("Runtime",                        metrics.get("runtime","-"),  False, "runtime"),
+                ("Cell Internal Power",             _registry_metric_value(metrics, "power.cell_internal", "-"), False, "power.cell_internal"),
+                ("Net Switching Power",             _registry_metric_value(metrics, "power.net_switching", "-"), False, "power.net_switching"),
+                ("Total Dynamic Power",             _registry_metric_value(metrics, "power.total_dynamic", "-"), False, "power.total_dynamic"),
+                ("Cell Leakage Power",              pwr_str,                     False, "power.leakage"),
+                ("Total Power",                     total_pwr_str,               False, "power.total"),
+                ("Runtime",                         metrics.get("runtime","-"),  False, "runtime"),
                 ("Logic Depth",                    metrics.get("logic_depth","-"), False, "logic_depth"),
             ]
+
+        if metrics.get("stage"):
+            base_profile_keys = [
+                "timing.r2r_setup", "timing.setup_total", "timing.r2r_hold",
+                "timing.hold_total", "congestion.total", "area.std_cell_count_area",
+                "gate_count", "util.std_cell", "util.total", "vth.inst_pct",
+                "vth.area_pct", "clock.skew_latency", "clock.repeater_count_area",
+                "runtime.runtime"]
+            extra_metric_keys = _metric_profile_extra_keys(
+                "qor_summary_pnr", base_profile_keys)
+        else:
+            base_profile_keys = [
+                "timing.r2r_setup", "timing.r2r_hold", "area.std_cell_area",
+                "gate_count", "power.cell_internal", "power.net_switching",
+                "power.total_dynamic", "power.leakage", "power.total",
+                "runtime.runtime", "logic_depth"]
+            extra_metric_keys = _metric_profile_extra_keys(
+                "qor_summary_fe", base_profile_keys)
+        if extra_metric_keys:
+            rows.append(("Registry Metrics", None, True, None))
+            for _metric_key in extra_metric_keys:
+                rows.append((metric_label(_metric_key),
+                             _registry_metric_value(metrics, _metric_key, "-"),
+                             False, _metric_key))
 
         # Table
         tbl = QTableWidget(0, 2)
@@ -3050,6 +3132,37 @@ class _TimelineChartWidget(QWidget):
                 return
         super().mousePressEvent(event)
 
+
+def _metric_profile_extra_keys(profile_name, base_keys):
+    """Return profile keys appended beyond the stable built-in table columns."""
+    try:
+        cfg_obj = None
+        for candidate in (globals().get("prefs"), globals().get("_proj_cfg")):
+            try:
+                if (candidate is not None and
+                        candidate.has_section("METRIC_TABLES") and
+                        candidate.has_option("METRIC_TABLES", profile_name) and
+                        candidate.get("METRIC_TABLES", profile_name).strip()):
+                    cfg_obj = candidate
+                    break
+            except Exception:
+                continue
+        keys = get_metric_profile(profile_name, cfg_obj)
+    except Exception as exc:
+        try:
+            debug_log("main: metric profile load failed {}".format(profile_name), exc)
+        except Exception:
+            pass
+        keys = []
+    seen = set(base_keys or [])
+    extras = []
+    for key in keys or []:
+        key = str(key).strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        extras.append(key)
+    return extras
 class BlockSummaryDialog(QDialog):
     """Block synthesis summary table.
     One row per selected run. User clicks Generate to start loading.
@@ -3062,7 +3175,14 @@ class BlockSummaryDialog(QDialog):
         "R2R Setup (W/T/F)",
         "R2R Hold (W/T/F)",
         "Logic Depth",
+        "Total Power",
         "Runtime"
+    ]
+    DEFAULT_METRIC_KEYS = [
+        "mbit.percent", "cgc.percent", "area.instance_count",
+        "area.std_cell_area", "gate_count", "vth.area_pct",
+        "timing.r2r_setup", "timing.r2r_hold", "logic_depth",
+        "power.total", "runtime.runtime",
     ]
     # Column indices for coloring / chart reads
     _COL_R2R_SETUP = 8
@@ -3083,6 +3203,10 @@ class BlockSummaryDialog(QDialog):
         self._pending  = []
         self._active_worker = None
         self._cancelled = False
+        self._extra_metric_keys = _metric_profile_extra_keys(
+            "fe_block_summary", self.DEFAULT_METRIC_KEYS)
+        self._headers = list(self.HEADERS) + [
+            metric_label(k) for k in self._extra_metric_keys]
 
         layout = QVBoxLayout(self)
 
@@ -3111,17 +3235,17 @@ class BlockSummaryDialog(QDialog):
         tab_tbl_layout = QVBoxLayout(tab_tbl)
         tab_tbl_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.tbl = QTableWidget(0, len(self.HEADERS))
-        self.tbl.setHorizontalHeaderLabels(self.HEADERS)
+        self.tbl = QTableWidget(0, len(self._headers))
+        self.tbl.setHorizontalHeaderLabels(self._headers)
         hh = self.tbl.horizontalHeader()
         hh.setSectionsMovable(True)
         hh.setStretchLastSection(False)
-        for c in range(len(self.HEADERS)):
+        for c in range(len(self._headers)):
             hh.setSectionResizeMode(c, QHeaderView.Interactive)
         self.tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.tbl.setColumnWidth(0, 120)
         self.tbl.setColumnWidth(1, 360)
-        for c in range(2, len(self.HEADERS)):
+        for c in range(2, len(self._headers)):
             self.tbl.setColumnWidth(c, 120)
         self.tbl.setEditTriggers(QTableWidget.NoEditTriggers)
         self.tbl.setAlternatingRowColors(True)
@@ -3417,12 +3541,18 @@ class BlockSummaryDialog(QDialog):
         r2r_setup   = metrics.get("r2r_setup",    "-")
         r2r_hold    = metrics.get("r2r_hold",     "-")
         logic_depth = metrics.get("logic_depth",  "-")
+        power_data = metrics.get("power", {})
+        if not isinstance(power_data, dict):
+            power_data = {}
+        total_power = _registry_metric_value(metrics, "power.total", "-")
 
         # Runtime: prefer fresh value from metrics over passed-in runtime arg
         rt = metrics.get("runtime", runtime) or runtime or "-"
 
         vals = [blk, run_name, mbit, cgc, inst, std_area,
-                gc, vth_str, r2r_setup, r2r_hold, logic_depth, rt]
+                gc, vth_str, r2r_setup, r2r_hold, logic_depth, total_power, rt]
+        vals.extend(_registry_metric_value(metrics, key, "-")
+                    for key in self._extra_metric_keys)
 
         # run_path stored in metrics - need it for double-click open
         _run_path = metrics.get("run_dir", "")
@@ -3600,7 +3730,7 @@ class BlockSummaryDialog(QDialog):
     _COL_PATH_KEY = {
         2: "mbit", 3: "cgc", 4: "instance_count", 5: "std_cell_area",
         7: "vth", 8: "r2r_setup", 9: "r2r_hold", 10: "logic_depth",
-        11: "runtime",
+        11: "total_power", 12: "runtime",
     }
 
     _COL_REPORT = {
@@ -3610,7 +3740,8 @@ class BlockSummaryDialog(QDialog):
         8:  ["qor.*.rpt"],
         9:  ["qor.*.rpt"],
         10: ["report_logic_depth.summary.*.rpt"],
-        11: ["runtime.V2.rpt"],
+        11: ["report_power_info.mission.ss*.rpt", "report_power*.rpt"],
+        12: ["runtime.V2.rpt"],
     }
 
     def _open_cell_report(self, item):
@@ -3806,6 +3937,12 @@ class BEStageSummaryDialog(QDialog):
         "VT Inst%", "VT Area%", "Skew/Latency",
         "Clock Repeater Count/Area", "Runtime",
     ]
+    DEFAULT_METRIC_KEYS = [
+        "timing.r2r_setup", "timing.setup_total", "timing.hold_total",
+        "congestion.total", "area.std_cell_count_area", "gate_count",
+        "util.std_cell", "util.total", "vth.inst_pct", "vth.area_pct",
+        "clock.skew_latency", "clock.repeater_count_area", "runtime.runtime",
+    ]
 
     def __init__(self, title, tasks, is_dark, parent=None):
         super().__init__(parent)
@@ -3821,6 +3958,10 @@ class BEStageSummaryDialog(QDialog):
         self._worker = None
         self._cancelled = False
         self.is_dark = is_dark
+        self._extra_metric_keys = _metric_profile_extra_keys(
+            "be_stage_summary", self.DEFAULT_METRIC_KEYS)
+        self._headers = list(self.HEADERS) + [
+            metric_label(k) for k in self._extra_metric_keys]
         layout = QVBoxLayout(self)
 
         hdr = QLabel("<b>{}</b>".format(html.escape(str(title))))
@@ -3831,11 +3972,11 @@ class BEStageSummaryDialog(QDialog):
         self.status_lbl.setStyleSheet("color: #1976d2;")
         layout.addWidget(self.status_lbl)
 
-        self.tbl = QTableWidget(0, len(self.HEADERS))
-        self.tbl.setHorizontalHeaderLabels(self.HEADERS)
+        self.tbl = QTableWidget(0, len(self._headers))
+        self.tbl.setHorizontalHeaderLabels(self._headers)
         hh = self.tbl.horizontalHeader()
         hh.setSectionsMovable(True)
-        for c in range(len(self.HEADERS)):
+        for c in range(len(self._headers)):
             hh.setSectionResizeMode(c, QHeaderView.Interactive)
             self.tbl.setColumnWidth(c, 115)
         self.tbl.setColumnWidth(1, 260)
@@ -3883,6 +4024,9 @@ class BEStageSummaryDialog(QDialog):
         layout.addLayout(btn_row)
 
     def _metric_value(self, metrics, key):
+        rv = _registry_metric_value(metrics, key, None)
+        if rv not in (None, ""):
+            return str(rv)
         metrics = metrics or {}
         area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
         vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
@@ -3970,7 +4114,7 @@ class BEStageSummaryDialog(QDialog):
             return
         self.tbl.setSortingEnabled(False)
         self.tbl.setRowCount(0)
-        headers = list(self.HEADERS)
+        headers = list(self._headers)
         headers[11] = self._vt_header_label(rows, "Inst%")
         headers[12] = self._vt_header_label(rows, "Area%")
         self.tbl.setHorizontalHeaderLabels(headers)
@@ -4065,6 +4209,8 @@ class BEStageSummaryDialog(QDialog):
              if self._metric_value(metrics, "runtime") not in ("", "-", "N/A")
              else task.get("runtime", "-")),
         ]
+        values.extend(_registry_metric_value(metrics, key, "-")
+                      for key in self._extra_metric_keys)
         r = self.tbl.rowCount()
         self.tbl.insertRow(r)
         for c, val in enumerate(values):
@@ -4150,6 +4296,14 @@ class StatusPackageDialog(QDialog):
         self.is_dark = is_dark
         self._worker = None
         self._cancelled = False
+        self._fe_extra_metric_keys = _metric_profile_extra_keys(
+            "fe_block_summary", BlockSummaryDialog.DEFAULT_METRIC_KEYS)
+        self._be_extra_metric_keys = _metric_profile_extra_keys(
+            "be_stage_summary", BEStageSummaryDialog.DEFAULT_METRIC_KEYS)
+        self._fe_headers = list(self.FE_HEADERS) + [
+            metric_label(k) for k in self._fe_extra_metric_keys]
+        self._be_headers = list(self.BE_HEADERS) + [
+            metric_label(k) for k in self._be_extra_metric_keys]
 
         layout = QVBoxLayout(self)
         hdr = QLabel("<b>Block Status Package</b>")
@@ -4177,8 +4331,8 @@ class StatusPackageDialog(QDialog):
         layout.addWidget(pair_tbl)
 
         self.tabs = QTabWidget()
-        self.fe_tbl = self._make_table(self.FE_HEADERS)
-        self.be_tbl = self._make_table(self.BE_HEADERS)
+        self.fe_tbl = self._make_table(self._fe_headers)
+        self.be_tbl = self._make_table(self._be_headers)
         self.tabs.addTab(self.fe_tbl, "FE Summary")
         self.tabs.addTab(self.be_tbl, "BE Stage Summary")
         layout.addWidget(self.tabs, 1)
@@ -4342,11 +4496,17 @@ class StatusPackageDialog(QDialog):
             metrics.get("setup_r2r", metrics.get("r2r_setup", "-")),
             metrics.get("hold_r2r", metrics.get("r2r_hold", "-")),
             metrics.get("logic_depth", "-"),
+            _registry_metric_value(metrics, "power.total", "-"),
             metrics.get("runtime", row.get("runtime", "-")),
         ]
+        values.extend(_registry_metric_value(metrics, key, "-")
+                      for key in self._fe_extra_metric_keys)
         self._add_values(self.fe_tbl, values)
 
     def _metric_value(self, metrics, key):
+        rv = _registry_metric_value(metrics, key, None)
+        if rv not in (None, ""):
+            return str(rv)
         metrics = metrics or {}
         area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
         vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}
@@ -4399,6 +4559,8 @@ class StatusPackageDialog(QDialog):
             if self._metric_value(metrics, "runtime") not in ("", "-", "N/A")
             else row.get("runtime", "-"),
         ]
+        values.extend(_registry_metric_value(metrics, key, "-")
+                      for key in self._be_extra_metric_keys)
         self._add_values(self.be_tbl, values)
 
     def _current_summary_table(self):
@@ -4780,18 +4942,35 @@ class LatestOutfeedStatusDialog(QDialog):
         layout.addWidget(self.alias_tbl)
 
         tabs = QTabWidget()
-        self.fe_tbl = self._make_table([
+        fe_base_keys = [
+            "timing.r2r_setup", "timing.r2r_hold",
+            "area.std_cell_count_area", "gate_count", "congestion.total",
+            "vth.area_pct", "logic_depth", "runtime.start", "runtime.end",
+            "runtime.runtime"]
+        be_base_keys = [
+            "timing.r2r_setup", "timing.setup_total", "timing.hold_total",
+            "congestion.total", "area.std_cell_count_area", "gate_count",
+            "util.std_cell", "util.total", "vth.inst_pct", "vth.area_pct",
+            "clock.skew_latency", "clock.repeater_count_area", "runtime.start",
+            "runtime.end", "runtime.runtime"]
+        fe_headers = [
             "Alias", "Block", "RTL", "FE Run",
             "R2R Setup W/T/N", "R2R Hold W/T/N",
             "Std Cell Count/Area", "Gate Count", "Congestion",
-            "VT Area%", "Logic Depth", "Path", "Start", "End", "Runtime"])
-        self.be_tbl = self._make_table([
+            "VT Area%", "Logic Depth", "Path", "Start", "End", "Runtime"]
+        fe_headers += [metric_label(k) for k in _metric_profile_extra_keys(
+            "latest_outfeed_fe", fe_base_keys)]
+        be_headers = [
             "Alias", "Block", "RTL", "BE Run", "Latest Stage", "Status",
             "R2R Setup W/T/N", "Total Setup W/T/N", "Hold W/T/N",
             "Cong/Shorts", "Std Cell Count/Area", "GC",
             "Std Cell/Std Only Util", "Total Util", "VT Inst%", "VT Area%",
             "Skew/Latency", "Clock Repeater Count/Area", "Path",
-            "Start", "End", "Runtime"])
+            "Start", "End", "Runtime"]
+        be_headers += [metric_label(k) for k in _metric_profile_extra_keys(
+            "latest_outfeed_be", be_base_keys)]
+        self.fe_tbl = self._make_table(fe_headers)
+        self.be_tbl = self._make_table(be_headers)
         tabs.addTab(self.fe_tbl, "FE QoR")
         tabs.addTab(self.be_tbl, "Latest BE Stage QoR")
         layout.addWidget(tabs, 1)
@@ -5884,6 +6063,14 @@ class PDDashboard(QMainWindow):
             QMessageBox.information(
                 self, "Lightweight Snapshot",
                 "Snapshot could not be loaded:\n" + str(fp))
+            return
+        self._load_snapshot_payload_view(payload)
+
+    def _load_snapshot_payload_view(self, payload):
+        if not isinstance(payload, dict):
+            QMessageBox.information(
+                self, "Snapshot",
+                "Snapshot payload is invalid.")
             return
         scan_data = self._restore_scan_data_shape(
             payload.get("scan_data", {}))
@@ -10007,8 +10194,8 @@ class PDDashboard(QMainWindow):
     def _latest_outfeed_scan_runs(self, cancel_cb=None):
         cancel_cb = cancel_cb or (lambda: False)
         runs = []
-        base = globals().get("BASE_OUTFEED_DIR", "")
-        if not base or not os.path.isdir(base):
+        bases = _split_path_list(globals().get("BASE_OUTFEED_DIR", ""))
+        if not bases:
             return runs
 
         def _ignored(name, patterns):
@@ -10021,112 +10208,117 @@ class PDDashboard(QMainWindow):
         ignore_fe = globals().get("IGNORE_FE_RUN_PATTERNS", "")
         ignore_be = globals().get("IGNORE_BE_RUN_PATTERNS", "")
         project = globals().get("PROJECT_PREFIX", "")
-        try:
-            block_entries = list(os.scandir(base))
-        except Exception:
-            return runs
-        for block_ent in block_entries:
+        for base in bases:
             if cancel_cb():
                 return runs
+            if not base or not os.path.isdir(base):
+                continue
             try:
-                if not block_ent.is_dir():
-                    continue
+                block_entries = list(os.scandir(base))
             except Exception:
                 continue
-            block = block_ent.name
-            try:
-                evt_entries = list(os.scandir(block_ent.path))
-            except Exception:
-                continue
-            for evt_ent in evt_entries:
+            for block_ent in block_entries:
                 if cancel_cb():
                     return runs
                 try:
-                    if not evt_ent.is_dir() or not evt_ent.name.startswith("EVT"):
+                    if not block_ent.is_dir():
                         continue
                 except Exception:
                     continue
-                evt = evt_ent.name
-                rtl = normalize_rtl(evt) if "normalize_rtl" in globals() else ((project + "_" + evt) if project else evt)
-                fc_dir = os.path.join(evt_ent.path, "fc")
-                if os.path.isdir(fc_dir):
+                block = block_ent.name
+                try:
+                    evt_entries = list(os.scandir(block_ent.path))
+                except Exception:
+                    continue
+                for evt_ent in evt_entries:
+                    if cancel_cb():
+                        return runs
                     try:
-                        fc_entries = list(os.scandir(fc_dir))
-                    except Exception:
-                        fc_entries = []
-                    for ent in fc_entries:
-                        if cancel_cb():
-                            return runs
-                        try:
-                            if not ent.is_dir():
-                                continue
-                        except Exception:
+                        if not evt_ent.is_dir() or not evt_ent.name.startswith("EVT"):
                             continue
-                        name = ent.name
-                        if name.endswith("-BE"):
+                    except Exception:
+                        continue
+                    evt = evt_ent.name
+                    rtl = normalize_rtl(evt) if "normalize_rtl" in globals() else ((project + "_" + evt) if project else evt)
+                    fc_dir = os.path.join(evt_ent.path, "fc")
+                    if os.path.isdir(fc_dir):
+                        try:
+                            fc_entries = list(os.scandir(fc_dir))
+                        except Exception:
+                            fc_entries = []
+                        for ent in fc_entries:
+                            if cancel_cb():
+                                return runs
+                            try:
+                                if not ent.is_dir():
+                                    continue
+                            except Exception:
+                                continue
+                            name = ent.name
+                            if name.endswith("-BE"):
+                                if _ignored(name, ignore_be):
+                                    continue
+                                stages = self._latest_outfeed_stage_list(ent.path, "fc", cancel_cb)
+                                info = self._latest_outfeed_be_info(ent.path, stages)
+                                runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "BE",
+                                             "block": block, "rtl": rtl, "r_name": name,
+                                             "path": ent.path, "stages": stages,
+                                             "info": info, "start": info.get("start", "-"),
+                                             "end": info.get("end", "-"), "runtime": info.get("runtime", "-")})
+                            elif name.endswith("-FE"):
+                                if _ignored(name, ignore_fe):
+                                    continue
+                                info = self._latest_outfeed_fe_info(ent.path)
+                                runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "FE",
+                                             "block": block, "rtl": rtl, "r_name": name,
+                                             "path": ent.path, "info": info,
+                                             "start": info.get("start", "-"), "end": info.get("end", "-"),
+                                             "runtime": info.get("runtime", "-")})
+                            else:
+                                try:
+                                    child_entries = list(os.scandir(ent.path))
+                                except Exception:
+                                    child_entries = []
+                                for child in child_entries:
+                                    if cancel_cb():
+                                        return runs
+                                    try:
+                                        if not child.is_dir():
+                                            continue
+                                    except Exception:
+                                        continue
+                                    cname = child.name
+                                    if cname.endswith("-FE") and not _ignored(cname, ignore_fe):
+                                        info = self._latest_outfeed_fe_info(child.path)
+                                        runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "FE",
+                                                     "block": block, "rtl": rtl, "r_name": cname,
+                                                     "path": child.path, "info": info,
+                                                     "start": info.get("start", "-"), "end": info.get("end", "-"),
+                                                     "runtime": info.get("runtime", "-")})
+                    inv_dir = os.path.join(evt_ent.path, "innovus")
+                    if os.path.isdir(inv_dir):
+                        try:
+                            inv_entries = list(os.scandir(inv_dir))
+                        except Exception:
+                            inv_entries = []
+                        for ent in inv_entries:
+                            if cancel_cb():
+                                return runs
+                            try:
+                                if not ent.is_dir():
+                                    continue
+                            except Exception:
+                                continue
+                            name = ent.name
                             if _ignored(name, ignore_be):
                                 continue
-                            stages = self._latest_outfeed_stage_list(ent.path, "fc", cancel_cb)
+                            stages = self._latest_outfeed_stage_list(ent.path, "innovus", cancel_cb)
                             info = self._latest_outfeed_be_info(ent.path, stages)
-                            runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "BE",
+                            runs.append({"source": "OUTFEED", "tool": "innovus", "run_type": "BE",
                                          "block": block, "rtl": rtl, "r_name": name,
-                                         "path": ent.path, "stages": stages,
-                                         "info": info, "start": info.get("start", "-"),
-                                         "end": info.get("end", "-"), "runtime": info.get("runtime", "-")})
-                        elif name.endswith("-FE"):
-                            if _ignored(name, ignore_fe):
-                                continue
-                            info = self._latest_outfeed_fe_info(ent.path)
-                            runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "FE",
-                                         "block": block, "rtl": rtl, "r_name": name,
-                                         "path": ent.path, "info": info,
+                                         "path": ent.path, "stages": stages, "info": info,
                                          "start": info.get("start", "-"), "end": info.get("end", "-"),
                                          "runtime": info.get("runtime", "-")})
-                        else:
-                            try:
-                                child_entries = list(os.scandir(ent.path))
-                            except Exception:
-                                child_entries = []
-                            for child in child_entries:
-                                if cancel_cb():
-                                    return runs
-                                try:
-                                    if not child.is_dir():
-                                        continue
-                                except Exception:
-                                    continue
-                                cname = child.name
-                                if cname.endswith("-FE") and not _ignored(cname, ignore_fe):
-                                    info = self._latest_outfeed_fe_info(child.path)
-                                    runs.append({"source": "OUTFEED", "tool": "fc", "run_type": "FE",
-                                                 "block": block, "rtl": rtl, "r_name": cname,
-                                                 "path": child.path, "info": info,
-                                                 "start": info.get("start", "-"), "end": info.get("end", "-"),
-                                                 "runtime": info.get("runtime", "-")})
-                inv_dir = os.path.join(evt_ent.path, "innovus")
-                if os.path.isdir(inv_dir):
-                    try:
-                        inv_entries = list(os.scandir(inv_dir))
-                    except Exception:
-                        inv_entries = []
-                    for ent in inv_entries:
-                        if cancel_cb():
-                            return runs
-                        try:
-                            if not ent.is_dir():
-                                continue
-                        except Exception:
-                            continue
-                        name = ent.name
-                        if _ignored(name, ignore_be):
-                            continue
-                        stages = self._latest_outfeed_stage_list(ent.path, "innovus", cancel_cb)
-                        info = self._latest_outfeed_be_info(ent.path, stages)
-                        runs.append({"source": "OUTFEED", "tool": "innovus", "run_type": "BE",
-                                     "block": block, "rtl": rtl, "r_name": name,
-                                     "path": ent.path, "stages": stages, "info": info,
-                                     "start": info.get("start", "-"), "end": info.get("end", "-"),
-                                     "runtime": info.get("runtime", "-")})
         return self._dedupe_latest_outfeed_runs(runs)
 
     def _dedupe_latest_outfeed_runs(self, runs):
@@ -10334,11 +10526,19 @@ class PDDashboard(QMainWindow):
         end = run.get("end", "-") or "-"
         vt_area = self._metric_value(metrics, "vth_area") if hasattr(self, "_metric_value") else "-"
         logic_depth = metrics.get("logic_depth", "-")
-        return {"values": [
+        values = [
             alias, run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
             metrics.get("r2r_setup", "-"), metrics.get("r2r_hold", "-"), std_ca,
             self._latest_gate_count_from_metrics(metrics), cong, vt_area,
-            logic_depth, run.get("path", ""), start, end, runtime],
+            logic_depth, run.get("path", ""), start, end, runtime]
+        values.extend(_registry_metric_value(metrics, key, "-")
+                      for key in _metric_profile_extra_keys(
+                          "latest_outfeed_fe", [
+                              "timing.r2r_setup", "timing.r2r_hold",
+                              "area.std_cell_count_area", "gate_count",
+                              "congestion.total", "vth.area_pct", "logic_depth",
+                              "runtime.start", "runtime.end", "runtime.runtime"]))
+        return {"values": values,
             "missing": missing}
 
     def _latest_be_qor_row(self, alias, run, missing_map, cancel_cb):
@@ -10369,7 +10569,7 @@ class PDDashboard(QMainWindow):
         missing = missing_map.get(name, [])
         vt_inst = self._metric_value(metrics, "vth_inst") if hasattr(self, "_metric_value") else "-"
         vt_area = self._metric_value(metrics, "vth_area") if hasattr(self, "_metric_value") else "-"
-        return {"values": [
+        values = [
             alias, run.get("block", ""), run.get("rtl", ""), run.get("r_name", ""),
             name, st.get("stage_status", "COMPLETED"),
             metrics.get("r2r_setup", "-"), metrics.get("setup_total", "-"), hold,
@@ -10378,7 +10578,18 @@ class PDDashboard(QMainWindow):
             metrics.get("std_cell_only_util", "-"), metrics.get("total_util", "-"),
             vt_inst, vt_area, metrics.get("skew_latency", "-"),
             metrics.get("clock_repeater_count_area", "-"),
-            st.get("stage_path", run.get("path", "")), start, end, runtime],
+            st.get("stage_path", run.get("path", "")), start, end, runtime]
+        values.extend(_registry_metric_value(metrics, key, "-")
+                      for key in _metric_profile_extra_keys(
+                          "latest_outfeed_be", [
+                              "timing.r2r_setup", "timing.setup_total",
+                              "timing.hold_total", "congestion.total",
+                              "area.std_cell_count_area", "gate_count",
+                              "util.std_cell", "util.total", "vth.inst_pct",
+                              "vth.area_pct", "clock.skew_latency",
+                              "clock.repeater_count_area", "runtime.start",
+                              "runtime.end", "runtime.runtime"]))
+        return {"values": values,
             "missing": missing}
 
     def _is_complete_outfeed_fe(self, run):
@@ -14492,6 +14703,7 @@ class PDDashboard(QMainWindow):
                 "run_name": run.get("r_name", item.text(0)),
                 "owner": run.get("owner", item.text(5)),
                 "exists": True,
+                "size_status": "manual",
                 "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
             if not hasattr(self, "_disk_cache") or self._disk_cache is None:
@@ -15915,6 +16127,9 @@ class PDDashboard(QMainWindow):
             return None
 
     def _metric_value(self, metrics, key):
+        rv = _registry_metric_value(metrics, key, None)
+        if rv not in (None, ""):
+            return str(rv)
         metrics = metrics or {}
         area = metrics.get("area", {}) if isinstance(metrics.get("area", {}), dict) else {}
         vth = metrics.get("vth", {}) if isinstance(metrics.get("vth", {}), dict) else {}

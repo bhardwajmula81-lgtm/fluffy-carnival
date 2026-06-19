@@ -117,8 +117,8 @@ def get_fm_info(report_path):
     try:
         with open(report_path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                if "No failing compare points" in line: return "PASS"
-                m = re.search(r'(\d+)\s+Failing compare points', line)
+                if re.search(r'No\s+failing\s+compare\s+points?', line, re.IGNORECASE): return "PASS"
+                m = re.search(r'(\d+)\s+Failing\s+compare\s+points?', line, re.IGNORECASE)
                 if m: return f"{m.group(1)} FAILS"
     except: pass
     return "ERR"

@@ -14,6 +14,12 @@ except Exception:
     def debug_log(context, exc=None):
         pass
 
+try:
+    from metric_registry import apply_flat_metrics
+except Exception:
+    def apply_flat_metrics(metrics, scope=None, tool=None):
+        return metrics
+
 # ===========================================================================
 # PATH HELPERS
 # ===========================================================================
@@ -321,25 +327,46 @@ def parse_congestion(file_path, verified=False):
 
 
 def parse_power(file_path, verified=False):
-    """Extract Cell Leakage Power = X.XX uW from power report."""
-    result = {"leakage": "-"}
+    """Extract power values from report_power_info*.rpt."""
+    result = {
+        "cell_internal": "-",
+        "net_switching": "-",
+        "total_dynamic": "-",
+        "leakage": "-",
+        "total_power": "-",
+    }
     if not file_path or ((not verified) and not os.path.exists(file_path)):
         return result
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             for line in f:
-                m = re.search(
-                    r"Cell Leakage Power\s*=\s*([-\d.eE+]+)\s*([a-zA-Z]+)", line)
-                if m:
-                    try:
-                        result["leakage"] = "{:g} {}".format(
-                            float(m.group(1)), m.group(2))
-                    except ValueError:
-                        result["leakage"] = "{} {}".format(
-                            m.group(1), m.group(2))
-                    break
-    except Exception:
-        pass
+                checks = [
+                    ("cell_internal", r"Cell Internal Power\s*=\s*([-\d.eE+]+)\s*([a-zA-Z]+)"),
+                    ("net_switching", r"Net Switching Power\s*=\s*([-\d.eE+]+)\s*([a-zA-Z]+)"),
+                    ("total_dynamic", r"Total Dynamic Power\s*=\s*([-\d.eE+]+)\s*([a-zA-Z]+)"),
+                    ("leakage", r"Cell Leakage Power\s*=\s*([-\d.eE+]+)\s*([a-zA-Z]+)"),
+                    ("total_power", r"\bTotal\s+Power\s*[=:]\s*([-\d.eE+]+)\s*([a-zA-Z]+)"),
+                ]
+                for key, pat in checks:
+                    if result.get(key) == "-":
+                        m = re.search(pat, line, re.I)
+                        if m:
+                            result[key] = "{} {}".format(m.group(1), m.group(2))
+
+                stripped = line.strip()
+                if (result.get("total_power") == "-" and
+                        stripped.lower().startswith("total ") and
+                        "=" not in stripped and ":" not in stripped):
+                    pairs = re.findall(r"([-\d.eE+]+)\s*([a-zA-Z]+)", stripped)
+                    if len(pairs) >= 4:
+                        num, unit = pairs[-1]
+                        result["total_power"] = "{} {}".format(num, unit)
+
+                if all(result.get(k) != "-" for k in ("leakage", "total_power")):
+                    if result.get("cell_internal") != "-" and result.get("net_switching") != "-":
+                        break
+    except Exception as e:
+        debug_log("metric_extract: parse_power failed {}".format(file_path), e)
     return result
 
 
@@ -729,6 +756,12 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
         "mbit":          mbit_path,
         "congestion":    cong_path,
         "leakage":       pwr_path,
+        "total_power":   pwr_path,
+        "power.cell_internal": pwr_path,
+        "power.net_switching": pwr_path,
+        "power.total_dynamic": pwr_path,
+        "power.leakage": pwr_path,
+        "power.total":   pwr_path,
         "area":          area_path,
         "total_area":    area_path,
         "instance_count": area_path,
@@ -739,6 +772,7 @@ def extract_fe_metrics(run_dir, source="WS", block=None, cancel_check=None):
         "runtime":       _rt_path if os.path.exists(_rt_path) else None,
     }
 
+    apply_flat_metrics(result, scope="FE")
     return result
 
 
@@ -961,6 +995,12 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         "mbit":          mbit_path,
         "congestion":    cong_path,
         "leakage":       pwr_path,
+        "total_power":   pwr_path,
+        "power.cell_internal": pwr_path,
+        "power.net_switching": pwr_path,
+        "power.total_dynamic": pwr_path,
+        "power.leakage": pwr_path,
+        "power.total":   pwr_path,
         "area":          area_path,
         "total_area":    area_path,
         "instance_count": area_path,
@@ -972,4 +1012,5 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         "runtime":       runtime_path,
     }
 
+    apply_flat_metrics(result, scope="PNR")
     return result

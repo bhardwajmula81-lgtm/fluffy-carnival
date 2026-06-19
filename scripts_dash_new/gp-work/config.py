@@ -33,9 +33,9 @@ if not os.path.exists(NOTES_DIR):
 _PROJECT_INI_DOCS = [
     ("PROJECT", [
         ("PROJECT_PREFIX", "S5K2P5SP", ["Project/top-block prefix."]),
-        ("BASE_WS_FE_DIR", "", ["Front-end workspace root."]),
-        ("BASE_WS_BE_DIR", "", ["Back-end workspace root."]),
-        ("BASE_OUTFEED_DIR", "", ["Published outfeed root."]),
+        ("BASE_WS_FE_DIR", "", ["Front-end workspace root(s). Multiple roots can be comma, semicolon, or whitespace separated."]),
+        ("BASE_WS_BE_DIR", "", ["Back-end workspace root(s). Multiple roots can be comma, semicolon, or whitespace separated."]),
+        ("BASE_OUTFEED_DIR", "", ["Published outfeed root(s). Multiple roots can be comma, semicolon, or whitespace separated."]),
         ("BASE_IR_DIR", "", ["Space-separated RedHawk IR log roots."]),
         ("BLOCKS", "", ["Comma-separated block whitelist. Empty scans all blocks."]),
     ]),
@@ -51,6 +51,14 @@ _PROJECT_INI_DOCS = [
         ("FE_RUN_PATTERNS", "", ["Comma-separated fnmatch patterns for FE runs to ignore."]),
         ("BE_RUN_PATTERNS", "", ["Comma-separated fnmatch patterns for BE runs to ignore."]),
         ("PNR_STAGE_PATTERNS", "backup_*", ["Comma-separated fnmatch patterns for PNR stages to ignore."]),
+    ]),
+    ("METRIC_TABLES", [
+        ("fe_block_summary", "mbit.percent,cgc.percent,area.instance_count,area.std_cell_area,gate_count,vth.area_pct,timing.r2r_setup,timing.r2r_hold,logic_depth,power.total,runtime.runtime", ["Comma-separated metric keys for FE Block Summary."]),
+        ("qor_summary_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.leakage,power.total,runtime.runtime", ["Comma-separated metric keys for FE QoR Summary."]),
+        ("qor_summary_pnr", "timing.r2r_setup,timing.setup_total,timing.r2r_hold,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime", ["Comma-separated metric keys for PNR QoR Summary."]),
+        ("be_stage_summary", "timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime", ["Comma-separated metric keys for BE Stage Summary."]),
+        ("latest_outfeed_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_count_area,gate_count,congestion.total,vth.area_pct,logic_depth,power.total,runtime.start,runtime.end,runtime.runtime", ["Comma-separated metric keys for Latest OUTFEED FE status."]),
+        ("latest_outfeed_be", "timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.start,runtime.end,runtime.runtime", ["Comma-separated metric keys for Latest OUTFEED BE status."]),
     ]),
     ("TOOLS", [
         ("PNR_TOOL_NAMES", "fc innovus", ["Space-separated PNR tool directory names."]),
@@ -227,6 +235,14 @@ DEFAULT_CONFIG = {
         'FE_RUN_PATTERNS': '',
         'BE_RUN_PATTERNS': '',
         'PNR_STAGE_PATTERNS': 'backup_*'
+    },
+    'METRIC_TABLES': {
+        'fe_block_summary': 'mbit.percent,cgc.percent,area.instance_count,area.std_cell_area,gate_count,vth.area_pct,timing.r2r_setup,timing.r2r_hold,logic_depth,power.total,runtime.runtime',
+        'qor_summary_fe': 'timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.leakage,power.total,runtime.runtime',
+        'qor_summary_pnr': 'timing.r2r_setup,timing.setup_total,timing.r2r_hold,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime',
+        'be_stage_summary': 'timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime',
+        'latest_outfeed_fe': 'timing.r2r_setup,timing.r2r_hold,area.std_cell_count_area,gate_count,congestion.total,vth.area_pct,logic_depth,power.total,runtime.start,runtime.end,runtime.runtime',
+        'latest_outfeed_be': 'timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.start,runtime.end,runtime.runtime'
     },
     'TOOLS': {
         'PNR_TOOL_NAMES': 'fc innovus',

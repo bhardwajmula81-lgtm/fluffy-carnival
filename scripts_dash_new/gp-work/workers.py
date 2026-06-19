@@ -22,9 +22,12 @@ except Exception:
 
 try:
     from metric_extract import extract_fe_metrics, extract_pnr_stage_metrics
+    from metric_registry import apply_flat_metrics
     _METRICS_AVAILABLE = True
 except ImportError:
     _METRICS_AVAILABLE = False
+    def apply_flat_metrics(metrics, scope=None, tool=None):
+        return metrics
 
 
 _METRIC_CACHE_LOCK = threading.Lock()
@@ -213,6 +216,7 @@ def _extract_metrics_cached(run_path, block, run_type, source,
     cached = _metric_cache_get(key, sig)
     if cached is not None:
         out = dict(cached)
+        apply_flat_metrics(out)
         out["_cache"] = "hit"
         return out
     if run_type == "FE":
@@ -224,6 +228,7 @@ def _extract_metrics_cached(run_path, block, run_type, source,
     if isinstance(metrics, dict):
         if metrics.get("_cancelled"):
             return metrics
+        apply_flat_metrics(metrics)
         metrics["_cache"] = "miss"
         _metric_cache_put(key, sig, metrics)
     return metrics
@@ -288,7 +293,7 @@ def _format_size_bytes(total_size):
     return "{:.1f}T".format(total_size)
 
 
-def _du_size(path, timeout_sec=180):
+def _du_size(path, timeout_sec=60):
     """Fast filesystem size using system du. Falls back to None on timeout/error."""
     if not path or not os.path.exists(path):
         return "N/A"
@@ -317,9 +322,38 @@ def _QOR_TIMEOUT_SEC():
     except Exception:
         return 600
 
+def _path_list(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set, frozenset)):
+        vals = raw
+    else:
+        vals = re.split(r'[,;\s]+', str(raw))
+    out = []
+    seen = set()
+    for val in vals:
+        p = str(val or "").strip()
+        if not p:
+            continue
+        key = os.path.normpath(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
 def _BASE_WS_FE():   return _g("BASE_WS_FE_DIR")
 def _BASE_WS_BE():   return _g("BASE_WS_BE_DIR")
 def _BASE_OUTFEED(): return _g("BASE_OUTFEED_DIR")
+def _BASE_WS_FE_LIST():   return _path_list(_BASE_WS_FE())
+def _BASE_WS_BE_LIST():   return _path_list(_BASE_WS_BE())
+def _BASE_OUTFEED_LIST(): return _path_list(_BASE_OUTFEED())
+def _is_ws_fe_base(path):
+    try:
+        n = os.path.normpath(path)
+        return n in set(os.path.normpath(p) for p in _BASE_WS_FE_LIST())
+    except Exception:
+        return path == _BASE_WS_FE()
 def _BASE_IR():      return _g("BASE_IR_DIR", "")
 def _PROJECT():      return _g("PROJECT_PREFIX", "S5K2P5SP")
 def _PNR_TOOLS():    return _g("PNR_TOOL_NAMES", "fc innovus")
@@ -456,7 +490,13 @@ def get_dynamic_evt_path(rtl_tag, block_name):
     m = re.search(r"(EVT\d+_ML\d+_DEV\d+)", str(rtl_tag))
     if not m:
         return ""
-    return os.path.join(_BASE_OUTFEED(), block_name, m.group(1))
+    evt = m.group(1)
+    candidates = [os.path.join(base, block_name, evt)
+                  for base in _BASE_OUTFEED_LIST()]
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return cand
+    return candidates[0] if candidates else ""
 
 def get_outfeed_evt_base(run_dir):
     """Return {BASE_OUTFEED}/{BLK}/{EVT} for an OUTFEED fc/innovus run."""
@@ -696,9 +736,9 @@ def get_fm_info(report_path):
     try:
         with open(report_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if "No failing compare points" in line:
+                if re.search(r"No\s+failing\s+compare\s+points?", line, re.IGNORECASE):
                     return "PASS"
-                m = re.search(r"(\d+)\s+Failing compare points", line)
+                m = re.search(r"(\d+)\s+Failing\s+compare\s+points?", line, re.IGNORECASE)
                 if m:
                     return f"{m.group(1)} FAILS"
     except Exception:
@@ -761,7 +801,7 @@ class BatchSizeWorker(QThread):
             self.sizes_batch_ready.emit(batch)
 
     def get_size(self, path):
-        fast = _du_size(path, timeout_sec=180)
+        fast = _du_size(path, timeout_sec=60)
         if fast is not None:
             return fast
         if not path or not os.path.exists(path):
@@ -920,7 +960,7 @@ class SingleSizeWorker(QThread):
         if self._is_cancelled or not self.path or not os.path.exists(self.path):
             self.result.emit(self.item_id, "N/A")
             return
-        fast = _du_size(self.path, timeout_sec=180)
+        fast = _du_size(self.path, timeout_sec=60)
         if fast is not None:
             if not self._is_cancelled:
                 self.result.emit(self.item_id, fast)
@@ -991,21 +1031,61 @@ class DiskScannerWorker(QThread):
             return results
         try:
             cmd    = ['du', '-sk'] + paths
-            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=300).decode('utf-8', errors='ignore')
+            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=60).decode('utf-8', errors='ignore')
             for line in output.strip().split('\n'):
                 if self._is_cancelled or self.isInterruptionRequested():
                     return results
                 if not line:
                     continue
-                parts = line.split('\t')
+                parts = line.split(None, 1)
                 if len(parts) >= 2:
-                    sz_kb     = int(parts[0])
-                    full_path = parts[1]
-                    owner = get_owner(full_path)
-                    results.append((owner, sz_kb, full_path))
-        except:
-            pass
+                    try:
+                        sz_kb     = int(parts[0])
+                        full_path = parts[1]
+                        owner = get_owner(full_path)
+                        results.append((owner, sz_kb, full_path, "updated"))
+                    except Exception as e:
+                        debug_log("DiskScannerWorker: failed to parse du line {}".format(line), e)
+        except Exception as e:
+            debug_log("DiskScannerWorker: batch du failed, using scandir fallback", e)
+            for path in paths:
+                if self._is_cancelled or self.isInterruptionRequested():
+                    return results
+                sz_kb = self._scandir_size_kb(path)
+                if sz_kb is None:
+                    continue
+                results.append((get_owner(path), sz_kb, path, "fallback"))
         return results
+
+    def _scandir_size_kb(self, path):
+        if not path or not os.path.exists(path):
+            return None
+        total = self._scandir_size_bytes(path)
+        if total is None:
+            return None
+        return int((total + 1023) / 1024)
+
+    def _scandir_size_bytes(self, path):
+        if self._is_cancelled or self.isInterruptionRequested():
+            return None
+        total = 0
+        try:
+            for entry in os.scandir(path):
+                if self._is_cancelled or self.isInterruptionRequested():
+                    return None
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        child = self._scandir_size_bytes(entry.path)
+                        if child is not None:
+                            total += child
+                except Exception:
+                    continue
+        except Exception as e:
+            debug_log("DiskScannerWorker: scandir size failed {}".format(path), e)
+            return None
+        return total
 
     def _category_for_run(self, run):
         src = run.get("source", "WS")
@@ -1060,7 +1140,8 @@ class DiskScannerWorker(QThread):
         pending = []
         for path, run in current.items():
             rec = cache.get(path)
-            if self.force or not rec:
+            stale_owner = rec and str(rec.get("owner", "")).strip() in ("", "Unknown")
+            if self.force or not rec or stale_owner:
                 pending.append(path)
             else:
                 rec["path"] = path
@@ -1070,19 +1151,23 @@ class DiskScannerWorker(QThread):
                 rec["rtl"] = run.get("rtl", "")
                 rec["run_name"] = run.get("r_name", "")
                 rec["category"] = self._category_for_run(run)
+                rec["size_status"] = rec.get("size_status") or "cached"
         for i in range(0, len(pending), 25):
             if self._is_cancelled or self.isInterruptionRequested():
                 return None
             chunk = pending[i:i + 25]
-            for owner, sz_kb, full_path in self._get_batch_dir_info(chunk):
+            for owner, sz_kb, full_path, size_status in self._get_batch_dir_info(chunk):
                 if self._is_cancelled or self.isInterruptionRequested():
                     return None
                 path = os.path.normpath(full_path)
                 run = current.get(path, {})
+                run_owner = str(run.get("owner", "") or "").strip()
+                calc_owner = str(owner or "").strip()
+                final_owner = calc_owner if calc_owner and calc_owner != "Unknown" else (run_owner or "Unknown")
                 cache[path] = {
                     "path": path,
                     "size_gb": sz_kb / float(1024 ** 2),
-                    "owner": owner or run.get("owner", "Unknown"),
+                    "owner": final_owner,
                     "source": run.get("source", ""),
                     "run_type": run.get("run_type", ""),
                     "block": run.get("block", ""),
@@ -1090,6 +1175,7 @@ class DiskScannerWorker(QThread):
                     "run_name": run.get("r_name", ""),
                     "category": self._category_for_run(run),
                     "exists": True,
+                    "size_status": size_status,
                     "updated_at": now,
                 }
         data = self._build_data_from_cache(cache)
@@ -1110,14 +1196,19 @@ class DiskScannerWorker(QThread):
             return
 
         # OUTFEED: outfeed/{BLOCK}/EVT*/fc/* and innovus/*
-        outfeed_targets = glob.glob(os.path.join(_BASE_OUTFEED(), "*", "EVT*", "fc", "*"))
-        outfeed_targets.extend(glob.glob(os.path.join(_BASE_OUTFEED(), "*", "EVT*", "innovus", "*")))
+        outfeed_targets = []
+        for out_base in _BASE_OUTFEED_LIST():
+            outfeed_targets.extend(glob.glob(os.path.join(out_base, "*", "EVT*", "fc", "*")))
+            outfeed_targets.extend(glob.glob(os.path.join(out_base, "*", "EVT*", "innovus", "*")))
         if not outfeed_targets:
-            outfeed_targets = glob.glob(os.path.join(_BASE_OUTFEED(), "*"))
+            for out_base in _BASE_OUTFEED_LIST():
+                outfeed_targets.extend(glob.glob(os.path.join(out_base, "*")))
 
         targets_map = {
-            "WS (FE)": glob.glob(os.path.join(_BASE_WS_FE(), "*")),
-            "WS (BE)": glob.glob(os.path.join(_BASE_WS_BE(), "*")),
+            "WS (FE)": [p for base in _BASE_WS_FE_LIST()
+                        for p in glob.glob(os.path.join(base, "*"))],
+            "WS (BE)": [p for base in _BASE_WS_BE_LIST()
+                        for p in glob.glob(os.path.join(base, "*"))],
             "OUTFEED":  outfeed_targets,
         }
 
@@ -1321,7 +1412,7 @@ class ScannerWorker(QThread):
             except Exception:
                 fc_entries = []
 
-            if ws_base == _BASE_WS_FE():
+            if _is_ws_fe_base(ws_base):
                 for name, rd in fc_entries:
                     if self._cancel_requested():
                         return tasks, releases_found
@@ -1378,10 +1469,20 @@ class ScannerWorker(QThread):
         disc_max_w = min(20, (os.cpu_count() or 4) * 4)
         disc_futures = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=disc_max_w) as disc_ex:
-            for ws_base in [_BASE_WS_FE(), _BASE_WS_BE()]:
+            ws_bases = []
+            ws_seen = set()
+            for _base in (_BASE_WS_FE_LIST() + _BASE_WS_BE_LIST()):
+                _key = os.path.normpath(_base)
+                if _key in ws_seen:
+                    continue
+                ws_seen.add(_key)
+                ws_bases.append(_base)
+            for ws_base in ws_bases:
                 if self._cancel_requested():
                     self.finished.emit(ws_data, out_data, {}, scan_stats)
                     return
+                if not ws_base:
+                    continue
                 if not os.path.exists(ws_base):
                     continue
                 try:
@@ -1409,11 +1510,16 @@ class ScannerWorker(QThread):
 
         # --- Outfeed discovery ---
         self.status_update.emit("Discovering OUTFEED directories...")
-        if os.path.exists(_BASE_OUTFEED()):
+        for outfeed_base in _BASE_OUTFEED_LIST():
+            if self._cancel_requested():
+                self.finished.emit(ws_data, out_data, {}, scan_stats)
+                return
+            if not outfeed_base or not os.path.exists(outfeed_base):
+                continue
             try:
-                outfeed_entries = list(os.scandir(_BASE_OUTFEED()))
+                outfeed_entries = list(os.scandir(outfeed_base))
             except Exception as e:
-                debug_log("ScannerWorker: list OUTFEED root failed", e)
+                debug_log("ScannerWorker: list OUTFEED root failed {}".format(outfeed_base), e)
                 outfeed_entries = []
             for ent in outfeed_entries:
                 if self._cancel_requested():
