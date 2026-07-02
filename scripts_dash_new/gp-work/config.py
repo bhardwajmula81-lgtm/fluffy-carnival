@@ -44,7 +44,7 @@ _PROJECT_INI_DOCS = [
         ("SCAN_OWNER_ON_START", "false", ["true/false. Resolve owner names at startup."]),
         ("SCAN_SIGNOFF_ON_START", "false", ["true/false. Scan FE signoff at startup."]),
         ("AUTO_SIZE_ON_START", "false", ["true/false. Calculate disk size at startup."]),
-        ("BACKGROUND_SIGNOFF_AFTER_SCAN", "true", ["true/false. Queue background signoff after scan."]),
+        ("BACKGROUND_SIGNOFF_AFTER_SCAN", "false", ["true/false. Queue background signoff after scan."]),
         ("SIGNOFF_BG_WORKERS", "6", ["Worker count for background signoff scans."]),
     ]),
     ("SCAN_IGNORE", [
@@ -54,7 +54,7 @@ _PROJECT_INI_DOCS = [
     ]),
     ("METRIC_TABLES", [
         ("fe_block_summary", "mbit.percent,cgc.percent,area.instance_count,area.std_cell_area,gate_count,vth.area_pct,timing.r2r_setup,timing.r2r_hold,logic_depth,power.total,runtime.runtime", ["Comma-separated metric keys for FE Block Summary."]),
-        ("qor_summary_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.leakage,power.total,runtime.runtime", ["Comma-separated metric keys for FE QoR Summary."]),
+        ("qor_summary_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.total,runtime.runtime", ["Comma-separated metric keys for FE QoR Summary."]),
         ("qor_summary_pnr", "timing.r2r_setup,timing.setup_total,timing.r2r_hold,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime", ["Comma-separated metric keys for PNR QoR Summary."]),
         ("be_stage_summary", "timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime", ["Comma-separated metric keys for BE Stage Summary."]),
         ("latest_outfeed_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_count_area,gate_count,congestion.total,vth.area_pct,logic_depth,power.total,runtime.start,runtime.end,runtime.runtime", ["Comma-separated metric keys for Latest OUTFEED FE status."]),
@@ -228,7 +228,7 @@ DEFAULT_CONFIG = {
         'SCAN_OWNER_ON_START': 'false',
         'SCAN_SIGNOFF_ON_START': 'false',
         'AUTO_SIZE_ON_START': 'false',
-        'BACKGROUND_SIGNOFF_AFTER_SCAN': 'true',
+        'BACKGROUND_SIGNOFF_AFTER_SCAN': 'false',
         'SIGNOFF_BG_WORKERS': '6'
     },
     'SCAN_IGNORE': {
@@ -238,7 +238,7 @@ DEFAULT_CONFIG = {
     },
     'METRIC_TABLES': {
         'fe_block_summary': 'mbit.percent,cgc.percent,area.instance_count,area.std_cell_area,gate_count,vth.area_pct,timing.r2r_setup,timing.r2r_hold,logic_depth,power.total,runtime.runtime',
-        'qor_summary_fe': 'timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.leakage,power.total,runtime.runtime',
+        'qor_summary_fe': 'timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.total,runtime.runtime',
         'qor_summary_pnr': 'timing.r2r_setup,timing.setup_total,timing.r2r_hold,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime',
         'be_stage_summary': 'timing.r2r_setup,timing.setup_total,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime',
         'latest_outfeed_fe': 'timing.r2r_setup,timing.r2r_hold,area.std_cell_count_area,gate_count,congestion.total,vth.area_pct,logic_depth,power.total,runtime.start,runtime.end,runtime.runtime',

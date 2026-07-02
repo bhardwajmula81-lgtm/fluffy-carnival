@@ -530,9 +530,40 @@ def _parse_stage_innovus_setup(text):
 
 
 def _parse_stage_innovus_hold(text):
+    header = None
+    rows = {}
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if not cells:
+            continue
+        if cells[0].lower().startswith("hold mode"):
+            header = [c.lower() for c in cells]
+        elif header and cells[0].lower().startswith("wns"):
+            rows["wns"] = cells
+        elif header and cells[0].lower().startswith("tns"):
+            rows["tns"] = cells
+        elif header and cells[0].lower().startswith("violating"):
+            rows["num"] = cells
+            break
+    if header and all(k in rows for k in ("wns", "tns", "num")):
+        try:
+            all_i = header.index("all")
+            r2r_i = header.index("reg2reg")
+            def clean(v):
+                return str(v).strip().lstrip("+")
+            return (
+                _trip(clean(rows["wns"][all_i]), clean(rows["tns"][all_i]), clean(rows["num"][all_i])),
+                _trip(clean(rows["wns"][r2r_i]), clean(rows["tns"][r2r_i]), clean(rows["num"][r2r_i])))
+        except Exception:
+            pass
     m = re.search(r"#\s*HOLD.*?View\s*:\s*ALL\s+([-\d.]+)\s+([-\d.]+)\s+(\d+)",
                   text, re.S | re.I)
-    return _trip(m.group(1), m.group(2), m.group(3)) if m else "-"
+    if m:
+        legacy = _trip(m.group(1), m.group(2), m.group(3))
+        return (legacy, legacy)
+    return ("-", "-")
 
 
 def _parse_stage_grc(text):
@@ -830,12 +861,19 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
             qor_path = setup_path
         hold_path = _find_stage_rpt(
             run_dir, stage_name, source,
-            ["{}.qor.snap.rpt".format(stage_name), "*.qor.snap.rpt"],
+            ["{}_hold.summary.gz".format(b),
+             "{}_hold.summary".format(b),
+             "*_hold.summary.gz",
+             "*_hold.summary",
+             "{}.qor.snap.rpt".format(stage_name),
+             "*.qor.snap.rpt"],
             stage_path=stage_path, finder=finder)
         if hold_path:
-            hold_all = _parse_stage_innovus_hold(_read_stage_text(hold_path))
-            result["hold_all"] = hold_all
-            result["r2r_hold"] = hold_all
+            hold_total, hold_r2r = _parse_stage_innovus_hold(_read_stage_text(hold_path))
+            result["hold_total"] = hold_total
+            result["hold_r2r"] = hold_r2r
+            result["hold_all"] = hold_total
+            result["r2r_hold"] = hold_r2r
             if not qor_path:
                 qor_path = hold_path
 

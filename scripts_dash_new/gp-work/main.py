@@ -154,7 +154,7 @@ _PROJECT_INI_DOCS = [
             "true/false. Scan FE signoff FM/VSLP/PT during startup."]),
         ("AUTO_SIZE_ON_START", "false", [
             "true/false. Calculate disk sizes automatically at startup."]),
-        ("BACKGROUND_SIGNOFF_AFTER_SCAN", "true", [
+        ("BACKGROUND_SIGNOFF_AFTER_SCAN", "false", [
             "true/false. Queue background FE signoff after the main scan completes."]),
         ("SIGNOFF_BG_WORKERS", "6", [
             "Integer worker count for background signoff scans. Lower if NFS is busy."]),
@@ -170,7 +170,7 @@ _PROJECT_INI_DOCS = [
     ("METRIC_TABLES", [
         ("fe_block_summary", "mbit.percent,cgc.percent,area.instance_count,area.std_cell_area,gate_count,vth.area_pct,timing.r2r_setup,timing.r2r_hold,logic_depth,power.total,runtime.runtime", [
             "Comma-separated metric keys for FE Block Summary."]),
-        ("qor_summary_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.leakage,power.total,runtime.runtime", [
+        ("qor_summary_fe", "timing.r2r_setup,timing.r2r_hold,area.std_cell_area,gate_count,power.total,runtime.runtime", [
             "Comma-separated metric keys for FE QoR Summary profile."]),
         ("qor_summary_pnr", "timing.r2r_setup,timing.setup_total,timing.r2r_hold,timing.hold_total,congestion.total,area.std_cell_count_area,gate_count,util.std_cell,util.total,vth.inst_pct,vth.area_pct,clock.skew_latency,clock.repeater_count_area,runtime.runtime", [
             "Comma-separated metric keys for PNR QoR Summary profile."]),
@@ -408,7 +408,7 @@ def _load_project_config():
             'SCAN_OWNER_ON_START':   'false',
             'SCAN_SIGNOFF_ON_START': 'false',
             'AUTO_SIZE_ON_START':    'false',
-            'BACKGROUND_SIGNOFF_AFTER_SCAN': 'true',
+            'BACKGROUND_SIGNOFF_AFTER_SCAN': 'false',
             'SIGNOFF_BG_WORKERS': '6',
         },
         'SCAN_IGNORE': {
@@ -514,7 +514,7 @@ SCAN_OWNER_ON_START   = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_OWNER_ON_START
 SCAN_SIGNOFF_ON_START = _proj_cfg.getboolean('PERFORMANCE', 'SCAN_SIGNOFF_ON_START', fallback=False)
 AUTO_SIZE_ON_START    = _proj_cfg.getboolean('PERFORMANCE', 'AUTO_SIZE_ON_START',    fallback=False)
 BACKGROUND_SIGNOFF_AFTER_SCAN = _proj_cfg.getboolean(
-    'PERFORMANCE', 'BACKGROUND_SIGNOFF_AFTER_SCAN', fallback=True)
+    'PERFORMANCE', 'BACKGROUND_SIGNOFF_AFTER_SCAN', fallback=False)
 SIGNOFF_BG_WORKERS = _proj_cfg.getint('PERFORMANCE', 'SIGNOFF_BG_WORKERS', fallback=6)
 IGNORE_FE_RUN_PATTERNS = _proj_cfg.get(
     'SCAN_IGNORE', 'FE_RUN_PATTERNS', fallback='')
@@ -1614,7 +1614,6 @@ class QoRSummaryDialog(QDialog):
         cong_str = _v(cong, "cong_both")
 
         # Power values include units, e.g. "87.468 uW" or "1.2352e+04 uW".
-        pwr_str = _registry_metric_value(metrics, "power.leakage", "-")
         total_pwr_str = _registry_metric_value(metrics, "power.total", "-")
 
         # Util string: from utilization report
@@ -1672,10 +1671,6 @@ class QoRSummaryDialog(QDialog):
                 ("MBIT Ratio",                     _v(metrics, "mbit"),         False, "mbit"),
                 ("CGC Ratio",                      metrics.get("cgc", "-"),     False, "cgc"),
                 ("Power",                          None,                        True,  None),
-                ("Cell Internal Power",             _registry_metric_value(metrics, "power.cell_internal", "-"), False, "power.cell_internal"),
-                ("Net Switching Power",             _registry_metric_value(metrics, "power.net_switching", "-"), False, "power.net_switching"),
-                ("Total Dynamic Power",             _registry_metric_value(metrics, "power.total_dynamic", "-"), False, "power.total_dynamic"),
-                ("Cell Leakage Power",              pwr_str,                     False, "power.leakage"),
                 ("Total Power",                     total_pwr_str,               False, "power.total"),
                 ("Runtime",                         metrics.get("runtime","-"),  False, "runtime"),
                 ("Logic Depth",                    metrics.get("logic_depth","-"), False, "logic_depth"),
@@ -1693,8 +1688,7 @@ class QoRSummaryDialog(QDialog):
         else:
             base_profile_keys = [
                 "timing.r2r_setup", "timing.r2r_hold", "area.std_cell_area",
-                "gate_count", "power.cell_internal", "power.net_switching",
-                "power.total_dynamic", "power.leakage", "power.total",
+                "gate_count", "power.total",
                 "runtime.runtime", "logic_depth"]
             extra_metric_keys = _metric_profile_extra_keys(
                 "qor_summary_fe", base_profile_keys)
@@ -2231,11 +2225,41 @@ class StageMetricLookupWorker(QThread):
             return ("-", "-")
 
     def _parse_innovus_hold(self, text):
+        header = None
+        rows = {}
+        for line in text.splitlines():
+            if "|" not in line:
+                continue
+            cells = self._pipe_cells(line)
+            if not cells:
+                continue
+            if cells[0].lower().startswith("hold mode"):
+                header = [c.lower() for c in cells]
+                continue
+            if header and cells[0].lower().startswith("wns"):
+                rows["wns"] = cells
+            elif header and cells[0].lower().startswith("tns"):
+                rows["tns"] = cells
+            elif header and cells[0].lower().startswith("violating"):
+                rows["num"] = cells
+                break
+        if header and all(k in rows for k in ("wns", "tns", "num")):
+            try:
+                all_i = header.index("all")
+                r2r_i = header.index("reg2reg")
+                def clean(v):
+                    return str(v).strip().lstrip("+")
+                total = self._trip(clean(rows["wns"][all_i]), clean(rows["tns"][all_i]), clean(rows["num"][all_i]))
+                r2r = self._trip(clean(rows["wns"][r2r_i]), clean(rows["tns"][r2r_i]), clean(rows["num"][r2r_i]))
+                return (total, r2r)
+            except Exception:
+                pass
         m = re.search(r"#\s*HOLD.*?View\s*:\s*ALL\s+([-\d.]+)\s+([-\d.]+)\s+(\d+)",
                       text, re.S | re.I)
         if m:
-            return self._trip(m.group(1), m.group(2), m.group(3))
-        return "-"
+            legacy = self._trip(m.group(1), m.group(2), m.group(3))
+            return (legacy, legacy)
+        return ("-", "-")
 
     def _parse_congestion(self, text):
         m = re.search(
@@ -2349,9 +2373,19 @@ class StageMetricLookupWorker(QThread):
                     result["setup_r2r"] = setup_r2r
                     result["timing_report"] = setup_path
                     result["report_dir"] = os.path.dirname(setup_path)
-                hold_path = self._find_file(["{}.qor.snap.rpt".format(self.stage_name), "*.qor.snap.rpt"])
+                hold_path = self._find_file([
+                    "{}_hold.summary.gz".format(self.block),
+                    "{}_hold.summary".format(self.block),
+                    "*_hold.summary.gz",
+                    "*_hold.summary",
+                    "{}.qor.snap.rpt".format(self.stage_name),
+                    "*.qor.snap.rpt"])
                 if hold_path:
-                    result["hold_all"] = self._parse_innovus_hold(self._read_text(hold_path))
+                    hold_total, hold_r2r = self._parse_innovus_hold(self._read_text(hold_path))
+                    result["hold_total"] = hold_total
+                    result["hold_r2r"] = hold_r2r
+                    result["hold_all"] = hold_total
+                    result["r2r_hold"] = hold_r2r
                     result["hold_report"] = hold_path
                     result["report_dir"] = os.path.dirname(hold_path)
 
@@ -3159,6 +3193,9 @@ def _metric_profile_extra_keys(profile_name, base_keys):
     for key in keys or []:
         key = str(key).strip()
         if not key or key in seen:
+            continue
+        if (profile_name in ("qor_summary_fe", "fe_block_summary") and
+                key.startswith("power.") and key != "power.total"):
             continue
         seen.add(key)
         extras.append(key)
@@ -5351,6 +5388,9 @@ class PDDashboard(QMainWindow):
         self._hover_metric_worker    = None
         self._hover_metric_path      = ""
         self._columns_fitted_once   = False
+        self._run_name_width_ready  = False
+        self._run_name_min_width    = 420
+        self._run_name_max_width    = 900
         self._initial_size_calc_done= False
         self._last_scan_time        = ""
         self.run_filter_config      = None
@@ -6354,6 +6394,10 @@ class PDDashboard(QMainWindow):
                 sname + ".qor_group_sum.rpt",
                 sname + ".qor_sum.rpt",
                 sname + "_p*.summary.gz",
+                block + "_hold.summary.gz",
+                block + "_hold.summary",
+                "*_hold.summary.gz",
+                "*_hold.summary",
                 sname + ".qor.snap.rpt",
                 sname + ".grc.rpt",
                 sname + ".sec_get_area.rpt",
@@ -7891,12 +7935,10 @@ class PDDashboard(QMainWindow):
         self.tree.setMouseTracking(True)
         self.tree.viewport().setMouseTracking(True)
         self.tree.itemEntered.connect(self._on_tree_item_hovered)
-
-        # Auto-fit Run Name column on expand/collapse (throttled 150ms)
+        # Run Name width is fitted once after build. Do not refit on every
+        # expand/collapse; that path is hot for BE -> PNR navigation.
         self._col0_resize_timer.timeout.connect(
             self._fit_run_name_column)
-        self.tree.itemExpanded.connect(self._schedule_tree_column_fit)
-        self.tree.itemCollapsed.connect(self._schedule_tree_column_fit)
 
         for i in [15, 16, 17, 18, 19, 20, 21, 23]:
             self.tree.setColumnHidden(i, True)
@@ -8087,7 +8129,7 @@ class PDDashboard(QMainWindow):
         self.tree.setUpdatesEnabled(True)
         self.tree.expandAll()
         self.tree.blockSignals(False)
-        self.tree.resizeColumnToContents(0)
+        self._fit_run_name_column()
 
     def safe_collapse_all(self):
         self.tree.collapseAll()
@@ -8202,7 +8244,7 @@ class PDDashboard(QMainWindow):
                     child.setExpanded(False)
         _expand(self.tree.invisibleRootItem())
         self.tree.setUpdatesEnabled(True)
-        self.tree.resizeColumnToContents(0)
+        self._fit_run_name_column()
 
     # ------------------------------------------------------------------
     # SHORTCUTS
@@ -10465,9 +10507,12 @@ class PDDashboard(QMainWindow):
         dirs = self._latest_stage_report_dirs(be_path, st)
         is_innovus = ((run or {}).get("tool") == "innovus") or ("/innovus/" in (be_path or "").replace("\\", "/"))
         if is_innovus:
+            block = (run or {}).get("block", "*")
             required = [
                 ("setup", [name + "_p*.summary.gz", name + "_p*.summary", "*_p*.summary.gz"]),
-                ("hold", [name + ".qor.snap.rpt", "*.qor.snap.rpt"]),
+                ("hold", [block + "_hold.summary.gz", block + "_hold.summary",
+                          "*_hold.summary.gz", "*_hold.summary",
+                          name + ".qor.snap.rpt", "*.qor.snap.rpt"]),
                 ("congestion", [name + ".grc.rpt", "*.grc.rpt"]),
                 ("area/util", [name + ".sec_get_area.rpt", "*.sec_get_area.rpt"]),
             ]
@@ -11219,31 +11264,31 @@ class PDDashboard(QMainWindow):
 
         self.refresh_view()
 
-        # Fill real Unix owners after the tree is visible. This avoids using
-        # unreliable run-name guesses while keeping startup responsive.
-        QTimer.singleShot(250, self.start_bg_owner_lookup)
+        # Fill real Unix owners after the tree is visible. Stagger background
+        # work so NFS-heavy helpers do not all start together after scan.
+        QTimer.singleShot(1000, self.start_bg_owner_lookup)
 
-        # --- Deferred post-build work so UI is interactive immediately ---
-        # fit_all_columns: 23-column resize is expensive on main thread;
-        # defer 100ms so tree paints first and user can interact.
-        if not self._columns_fitted_once:
-            self._columns_fitted_once = True
-            QTimer.singleShot(100, self.fit_all_columns)
+        # Full fit_all_columns is manual-only. It performs a full Qt
+        # measurement pass over visible cells. Use one smart Run Name width
+        # instead, computed from a small visible sample.
+        if not self._run_name_width_ready:
+            self._run_name_width_ready = True
+            QTimer.singleShot(150, self._fit_run_name_column)
 
         # Folder-size calculation is expensive on NFS. Run it on startup only
-        # when explicitly enabled in project_config.ini.
+        # when explicitly enabled in project_config.ini, and after lighter work.
         if AUTO_SIZE_ON_START and not self._initial_size_calc_done:
             self._initial_size_calc_done = True
-            QTimer.singleShot(2000, self.calculate_all_sizes)
-
-        if (BACKGROUND_SIGNOFF_AFTER_SCAN and not SCAN_SIGNOFF_ON_START
-                and not self._signoff_bg_done):
-            QTimer.singleShot(1200, self.start_bg_signoff_scan)
+            QTimer.singleShot(9000, self.calculate_all_sizes)
 
         # Optional scorecard/regression pass deferred until after the tree paints.
         if (self._closure_enabled or self._status_regression_enabled
                 or self._qor_regression_enabled):
-            QTimer.singleShot(300, self._run_closure_pass)
+            QTimer.singleShot(2000, self._run_closure_pass)
+
+        if (BACKGROUND_SIGNOFF_AFTER_SCAN and not SCAN_SIGNOFF_ON_START
+                and not self._signoff_bg_done):
+            QTimer.singleShot(6000, self.start_bg_signoff_scan)
         if getattr(self, "_force_default_expand", False):
             self._force_default_expand = False
             QTimer.singleShot(50, self._expand_to_rtl_level)
@@ -11253,7 +11298,7 @@ class PDDashboard(QMainWindow):
             QTimer.singleShot(50, self._expand_to_rtl_level)
         # Pre-warm log paths later so it does not compete with the FM/VSLP
         # background scan immediately after tree build.
-        QTimer.singleShot(5000, self._prefetch_log_paths)
+        QTimer.singleShot(10000, self._prefetch_log_paths)
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -13405,33 +13450,74 @@ class PDDashboard(QMainWindow):
         return False
 
     def _schedule_tree_column_fit(self, item=None):
+        # Kept for compatibility with older call sites, but intentionally not
+        # wired to expand/collapse. Column fitting during BE expand is visible
+        # UI lag on large trees.
         try:
-            if item is not None and item.data(0, Qt.UserRole + 11):
+            if getattr(self, "_building_tree", False):
                 return
-        except RuntimeError:
-            return
+            self._col0_resize_timer.start()
         except Exception:
             pass
-        self._col0_resize_timer.start()
+
+    def _clamp_run_name_width(self, width):
+        try:
+            return max(self._run_name_min_width,
+                       min(int(width), self._run_name_max_width))
+        except Exception:
+            return 520
+
+    def _sample_run_name_width(self, max_rows=80):
+        """Compute one stable Run Name width from a small visible sample."""
+        try:
+            fm = self.tree.fontMetrics()
+            sampled_width = [self._run_name_min_width]
+            seen = [0]
+
+            def text_px(txt):
+                try:
+                    return fm.horizontalAdvance(txt)
+                except AttributeError:
+                    return fm.width(txt)
+
+            def walk(node):
+                for i in range(node.childCount()):
+                    if seen[0] >= max_rows:
+                        return
+                    child = node.child(i)
+                    try:
+                        if child.isHidden():
+                            continue
+                        txt = child.text(0) or ""
+                        if txt:
+                            sampled_width[0] = max(sampled_width[0], text_px(txt) + 90)
+                        seen[0] += 1
+                        walk(child)
+                    except RuntimeError:
+                        continue
+            walk(self.tree.invisibleRootItem())
+            return self._clamp_run_name_width(sampled_width[0])
+        except Exception:
+            return self._clamp_run_name_width(self.tree.columnWidth(0) or 520)
 
     def fit_all_columns(self):
+        # Manual action only. This remains available, but it is no longer run
+        # automatically after scan or after BE expand.
         self.tree.setUpdatesEnabled(False)
         try:
             for i in range(self.tree.columnCount()):
                 if not self.tree.isColumnHidden(i):
                     self.tree.resizeColumnToContents(i)
+            self.tree.setColumnWidth(
+                0, self._clamp_run_name_width(self.tree.columnWidth(0) + 24))
         finally:
             self.tree.setUpdatesEnabled(True)
-        self._fit_run_name_column()
 
     def _fit_run_name_column(self):
         try:
-            self.tree.resizeColumnToContents(0)
-            w = self.tree.columnWidth(0)
-            self.tree.setColumnWidth(0, max(380, min(w + 24, 760)))
+            self.tree.setColumnWidth(0, self._sample_run_name_width())
         except Exception:
             pass
-
     # ------------------------------------------------------------------
     # CSV EXPORT
     # ------------------------------------------------------------------

@@ -38,7 +38,7 @@ REPORT_SOURCES = {
     "PNR.INNOVUS": {
         "stage_runtime": ["{stage}.runtime.rpt"],
         "stage_setup": ["{stage}_p*.summary.gz", "*_p*.summary.gz"],
-        "stage_hold": ["{stage}.qor.snap.rpt", "*.qor.snap.rpt"],
+        "stage_hold": ["{block}_hold.summary.gz", "{block}_hold.summary", "*_hold.summary.gz", "*_hold.summary", "{stage}.qor.snap.rpt", "*.qor.snap.rpt"],
         "stage_area": ["{stage}.sec_get_area.rpt", "*.sec_get_area.rpt"],
         "stage_vth": ["{stage}.sec_vth_use.rpt", "*.sec_vth_use.rpt"],
         "stage_congestion": ["{stage}.grc.rpt", "*.grc.rpt"],
@@ -56,7 +56,7 @@ TABLE_PROFILES = {
     ],
     "qor_summary_fe": [
         "timing.r2r_setup", "timing.r2r_hold", "area.std_cell_area", "gate_count",
-        "power.leakage", "power.total", "runtime.runtime",
+        "power.total", "runtime.runtime",
     ],
     "qor_summary_pnr": [
         "timing.r2r_setup", "timing.setup_total", "timing.r2r_hold", "timing.hold_total",
