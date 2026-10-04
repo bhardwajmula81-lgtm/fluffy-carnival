@@ -24,6 +24,7 @@ import tarfile
 import html
 import io
 import hashlib
+from performance_support import format_disk_bytes, disk_record_fresh, nonoverlapping_disk_records
 
 try:
     from debug_log import debug_log
@@ -56,7 +57,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint, QRect
 from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
 from PyQt5.QtGui import (QColor, QFont, QKeySequence, QBrush,
-                         QPainter, QPen, QPixmap, QIcon, QPolygon, QImage)
+                         QPainter, QPen, QPixmap, QIcon, QPolygon, QImage, QImageReader)
 
 # ===========================================================================
 # CONFIG + MAIL HELPERS (module-level, loaded once at startup)
@@ -1387,8 +1388,25 @@ class PieChartWidget(QWidget):
             start += span
 
 
+class PartitionInfoWorker(QThread):
+    result_ready = pyqtSignal(str, str)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            total, used, free = shutil.disk_usage(self.path)
+            text = "Total: {:.1f} GB  Used: {:.1f} GB  Free: {:.1f} GB".format(
+                total / float(1024 ** 3), used / float(1024 ** 3), free / float(1024 ** 3))
+        except Exception:
+            text = "Partition information unavailable"
+        self.result_ready.emit(self.path, text)
+
+
 class DiskUsageDialog(QDialog):
-    """Full disk usage dialog -- exact logic from original script."""
+    """Cached allocated run usage, with asynchronous partition information."""
     def __init__(self, disk_data, is_dark, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Disk Space Usage")
@@ -1470,8 +1488,11 @@ class DiskUsageDialog(QDialog):
                      "OUTFEED": BASE_OUTFEED_DIR}
         roots = _split_path_list(path_map.get(cat, "/"))
         part_path = roots[0] if roots else "/"
-        self.part_lbl.setText(
-            self._partition_info(part_path))
+        # statvfs on an NFS mount can block; the dialog uses cached run totals.
+        failures = sum(1 for rec in getattr(self.parent_win, "_disk_cache", {}).values() if rec.get("error"))
+        self._partition_path = part_path
+        self._disk_summary_suffix = (" - {} run sizes unavailable/stale".format(failures) if failures else "")
+        self._request_partition_info()
 
         # Pie chart
         pie_data = {u: v["total"] for u, v in data.items()}
@@ -1510,6 +1531,30 @@ class DiskUsageDialog(QDialog):
 
         self._building = False
 
+    def _request_partition_info(self):
+        cache = getattr(self, "_partition_cache", {})
+        self._partition_cache = cache
+        path = self._partition_path
+        if path in cache:
+            self.part_lbl.setText(cache[path] + self._disk_summary_suffix)
+            return
+        self.part_lbl.setText("Loading partition information..." + self._disk_summary_suffix)
+        if getattr(self, "_partition_worker", None) is not None:
+            return
+        worker = PartitionInfoWorker(path)
+        self._partition_worker = worker
+        worker.result_ready.connect(self._on_partition_info)
+        if self.parent_win is not None:
+            self.parent_win._workers.start("partition", worker)
+        else:
+            QThread.finished.__get__(worker, QThread).connect(worker.deleteLater)
+            worker.start()
+
+    def _on_partition_info(self, path, text):
+        self._partition_cache[path] = text
+        self._partition_worker = None
+        self._request_partition_info()
+
     def _on_item_changed(self, item, col):
         if self._building or col != 0: return
         self.tree.blockSignals(True)
@@ -1522,6 +1567,10 @@ class DiskUsageDialog(QDialog):
         if self.parent_win:
             self.recalc_btn.setEnabled(False)
             self.recalc_btn.setText("Calculating...")
+            if self.parent_win._disk_work_busy():
+                self.recalc_btn.setEnabled(True)
+                self.recalc_btn.setText("Recalculate Disk Usage")
+                return
             self.parent_win.start_bg_disk_scan(force=True)
 
     def _send_mail(self):
@@ -1887,6 +1936,8 @@ class FeCongestionLookupWorker(QThread):
             if os.path.exists(log_path):
                 with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
                     for line in f:
+                        if self.isInterruptionRequested():
+                            return
                         m = re.search(r'^\s*INFO\s*:\s*FP_VER\s*[-:]\s*(\S.*)$', line)
                         if not m:
                             continue
@@ -1908,7 +1959,11 @@ class FeCongestionLookupWorker(QThread):
                 pats.extend(["congestion.window.*.jpg", "congestion.window.*.jpeg"])
                 matches = []
                 for name in os.listdir(rpt_dir):
+                    if self.isInterruptionRequested():
+                        return
                     for pat in pats:
+                        if self.isInterruptionRequested():
+                            return
                         if fnmatch.fnmatch(name, pat):
                             matches.append(os.path.join(rpt_dir, name))
                             break
@@ -1916,14 +1971,17 @@ class FeCongestionLookupWorker(QThread):
                     matches.sort(key=lambda p: os.path.getmtime(p), reverse=True)
                     img_path = matches[0]
                     try:
-                        with open(img_path, 'rb') as f:
-                            img.loadFromData(f.read())
+                        reader = QImageReader(img_path)
+                        reader.setScaledSize(reader.size().scaled(800, 600, Qt.KeepAspectRatio))
+                        img = reader.read()
                     except Exception:
                         img = QImage()
         except Exception:
             img_path = ""
             img = QImage()
 
+        if self.isInterruptionRequested():
+            return
         self.finished.emit(self.token, self.run_path, self.block, fp_ver, img_path, img)
 
 
@@ -2044,6 +2102,8 @@ class StageScreenshotLookupWorker(QThread):
         img = QImage()
         try:
             for d in self._candidate_dirs():
+                if self.isInterruptionRequested():
+                    return
                 if not os.path.isdir(d):
                     continue
                 names = [n for n in os.listdir(d)
@@ -2051,6 +2111,8 @@ class StageScreenshotLookupWorker(QThread):
                 if not names:
                     continue
                 for label, pats in labels:
+                    if self.isInterruptionRequested():
+                        return
                     if label in found:
                         continue
                     hit = self._match(names, pats)
@@ -2058,8 +2120,9 @@ class StageScreenshotLookupWorker(QThread):
                         found[label] = os.path.join(d, hit)
                 if "Congestion Map" in found and img.isNull():
                     try:
-                        with open(found["Congestion Map"], 'rb') as f:
-                            img.loadFromData(f.read())
+                        reader = QImageReader(found["Congestion Map"])
+                        reader.setScaledSize(reader.size().scaled(800, 600, Qt.KeepAspectRatio))
+                        img = reader.read()
                     except Exception:
                         img = QImage()
                 if len(found) == len(labels):
@@ -2067,6 +2130,8 @@ class StageScreenshotLookupWorker(QThread):
         except Exception:
             found = {}
             img = QImage()
+        if self.isInterruptionRequested():
+            return
         self.finished.emit(
             self.token, self.be_path, self.stage_name, self.block, found, img)
 
@@ -2083,6 +2148,7 @@ class StageMetricLookupWorker(QThread):
         self.block = block or ""
         self.runtime = runtime or "-"
         self.gate_factor = gate_factor or 0.2419
+        self._report_names = {}
 
     def _candidate_report_dirs(self):
         dirs = [
@@ -2101,12 +2167,17 @@ class StageMetricLookupWorker(QThread):
         return out
 
     def _find_file(self, patterns):
+        if self.isInterruptionRequested():
+            return ""
         hits = []
         for d in self._candidate_report_dirs():
             try:
-                if not os.path.isdir(d):
-                    continue
-                names = os.listdir(d)
+                if d not in self._report_names:
+                    try:
+                        self._report_names[d] = os.listdir(d)
+                    except OSError:
+                        self._report_names[d] = []
+                names = self._report_names[d]
             except Exception:
                 continue
             for pat in patterns:
@@ -2125,6 +2196,8 @@ class StageMetricLookupWorker(QThread):
             return sorted(hits)[-1]
 
     def _read_text(self, path):
+        if self.isInterruptionRequested():
+            return ""
         if not path or not os.path.exists(path):
             return ""
         try:
@@ -2414,6 +2487,8 @@ class StageMetricLookupWorker(QThread):
                 result["report_dir"] = os.path.dirname(cts)
         except Exception as e:
             result["error"] = str(e)
+        if self.isInterruptionRequested():
+            return
         self.finished.emit(self.token, self.be_path, self.stage_name, result)
 
 # ---------------------------------------------------------------------------
@@ -5165,7 +5240,7 @@ class PDDashboard(QMainWindow):
                 except Exception:
                     pass
             try:
-                worker.finished.connect(
+                QThread.finished.__get__(worker, QThread).connect(
                     lambda *_args, w=worker, g=group, a=attr_name, l=list_name:
                     self._finished(g, w, a, l))
             except Exception:
@@ -5600,6 +5675,7 @@ class PDDashboard(QMainWindow):
         return False
 
     def _shutdown_all_workers(self):
+        self._invalidate_inspector_work()
         self._workers.cancel_all(3000)
         self.size_workers = self._stop_worker_list_now(
             getattr(self, "size_workers", []), 3000)
@@ -7231,33 +7307,8 @@ class PDDashboard(QMainWindow):
     # BACKGROUND LOG-PATH CACHE WARM-UP
     # ------------------------------------------------------------------
     def _prefetch_log_paths(self):
-        """Collect all log + error-log paths from tree items and prefetch
-        them in background threads so the first click on any item is
-        instant (no blocking NFS stat on the main thread)."""
-        paths = []
-        _GROUP = frozenset(("BLOCK","MILESTONE","RTL",
-                            "IGNORED_ROOT","STANDALONE_ROOT","__PLACEHOLDER__"))
-        _UR   = Qt.UserRole
-        _UR10 = Qt.UserRole + 10
-        def _collect(node):
-            for i in range(node.childCount()):
-                child = node.child(i)
-                nt = child.data(0, _UR)
-                if nt not in _GROUP:
-                    lv = child.text(16)
-                    if lv and lv not in ("N/A", ""):
-                        paths.append(lv)
-                    # Also prefetch error log path for FE runs
-                    run = child.data(0, _UR10)
-                    if run and run.get("run_type") == "FE":
-                        rp = run.get("path", "")
-                        if rp and rp != "N/A":
-                            paths.append(os.path.join(
-                                rp, "logs", "compile_opt.error.log"))
-                _collect(child)
-        _collect(self.tree.invisibleRootItem())
-        if paths:
-            prefetch_path_cache(paths)
+        # Kept for old callers. Selection workers now resolve only requested paths.
+        return
 
     # ------------------------------------------------------------------
     # CLOSURE PASS (deferred -- runs after tree is fully painted)
@@ -7272,7 +7323,7 @@ class PDDashboard(QMainWindow):
                     continue
                 if name and item.text(0) != name:
                     continue
-                run = item.data(0, Qt.UserRole + 10) or item.data(0, Qt.UserRole + 11)
+                run = item.data(0, Qt.UserRole + 10) or self._be_run_for_item(item)
                 if run and run.get("path") == path:
                     return item
                 if item.text(15) == path:
@@ -7541,7 +7592,7 @@ class PDDashboard(QMainWindow):
         top_layout.addWidget(self._label("RTL Release:"))
         self.rel_combo = QComboBox()
         self.rel_combo.setMinimumWidth(220)
-        self.rel_combo.currentIndexChanged.connect(self.refresh_view)
+        self.rel_combo.currentIndexChanged.connect(self._on_rtl_changed)
         top_layout.addWidget(self.rel_combo)
 
         self._add_separator(top_layout)
@@ -8027,6 +8078,8 @@ class PDDashboard(QMainWindow):
                 for i, w in enumerate(wv):
                     if i < self.tree.columnCount() and int(w) > 0:
                         self.tree.setColumnWidth(i, int(w))
+                        if i == 0:
+                            self._run_name_width_ready = True
         except Exception:
             pass
 
@@ -8119,7 +8172,7 @@ class PDDashboard(QMainWindow):
                 if child.childCount() == 1:
                     ph = child.child(0)
                     if ph.data(0, Qt.UserRole) == "__PLACEHOLDER__":
-                        be_run = child.data(0, Qt.UserRole + 11)
+                        be_run = self._be_run_for_item(child)
                         if be_run:
                             child.removeChild(ph)
                             self._add_stages(child, be_run, ign_root)
@@ -8186,6 +8239,7 @@ class PDDashboard(QMainWindow):
                     combo.setCurrentIndex(idx)
                 combo.blockSignals(False)
         if hasattr(self, "rel_combo"):
+            self._preferred_rtl = "[ SHOW ALL ]"
             self.rel_combo.blockSignals(True)
             idx = self.rel_combo.findText("[ SHOW ALL ]")
             if idx >= 0:
@@ -8622,43 +8676,54 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # ITEM CHECK
     # ------------------------------------------------------------------
+    def _on_rtl_changed(self, index=0):
+        self._preferred_rtl = self.rel_combo.currentText()
+        _ensure_pref_section('UI')
+        prefs.set('UI', 'last_rtl', self._preferred_rtl)
+        self.refresh_view()
+
+    def _be_run_for_item(self, item):
+        if item is None:
+            return None
+        run = getattr(item, "_flow_be_run", None)
+        if run is None:
+            run = item.data(0, Qt.UserRole + 11)
+            if run:
+                item._flow_be_run = run
+        return run
+
     def _on_item_check_changed(self, item, col=0):
-        if self._building_tree:
-            return
-        if col != 0:
+        if self._building_tree or col != 0:
             return
         state = item.checkState(0)
-        self.tree.blockSignals(True)
-        # Cascade to already-loaded STAGE children
-        for i in range(item.childCount()):
-            ch = item.child(i)
-            ch_type = ch.data(0, Qt.UserRole)
-            if ch_type == "STAGE":
-                ch.setCheckState(0, state)
-            elif ch_type == "__PLACEHOLDER__":
-                # Stages not yet expanded -- force-load them now so
-                # cascade works even before user expands the BE run.
-                be_run = item.data(0, Qt.UserRole + 11)
-                if be_run:
-                    ign_root = self._ensure_ign_root(
-                        self.tree.invisibleRootItem())
-                    item.removeChild(ch)
-                    self._add_stages(item, be_run, ign_root)
-                    # Now cascade to freshly created stage children
-                    for j in range(item.childCount()):
-                        s = item.child(j)
-                        if s.data(0, Qt.UserRole) == "STAGE":
-                            s.setCheckState(0, state)
-                break
-        self.tree.blockSignals(False)
-        path = item.text(15)
-        if not path or path == "N/A":
+        if state == getattr(item, "_flow_check_state", Qt.Unchecked):
             return
-        if state == Qt.Checked:
-            self._checked_paths.add(path)
-        else:
-            self._checked_paths.discard(path)
-        self._update_status_bar()
+        item._flow_check_state = state
+        previous = self.tree.blockSignals(True)
+        try:
+            paths = [item.text(15)]
+            run = self._be_run_for_item(item)
+            if run:
+                # Keep lazy children lazy. Their checkboxes inherit this state later.
+                paths.extend(st.get("_origin_stage_path") or st.get("stage_path", "")
+                             for st in run.get("stages", []))
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if child.data(0, Qt.UserRole) == "STAGE":
+                    child._flow_check_state = state
+                    child.setCheckState(0, state)
+                    paths.append(child.text(15))
+            for path in paths:
+                if path and path not in ("N/A", "-"):
+                    if state == Qt.Checked:
+                        self._checked_paths.add(path)
+                    else:
+                        self._checked_paths.discard(path)
+        finally:
+            self.tree.blockSignals(previous)
+        self.sb_selected.setText("     Selected: {}".format(len(self._checked_paths)))
+        if self.view_combo.currentText() == "Selected Only":
+            self.search_timer.start(80)
 
     def _on_tree_item_hovered(self, item, column):
         """Optional FE hover hook. Debounced so pointer movement does not queue NFS work."""
@@ -8845,6 +8910,13 @@ class PDDashboard(QMainWindow):
     def _cache_put_limited(self, cache_obj, key, value, limit=500):
         try:
             cache_obj[key] = value
+            if cache_obj is getattr(self, "_cong_image_cache", None) or cache_obj is getattr(self, "_stage_screenshot_cache", None):
+                def image_bytes(val):
+                    img = val[1] if isinstance(val, tuple) else val
+                    return img.byteCount() if isinstance(img, QImage) else 0
+                total = sum(image_bytes(val) for val in cache_obj.values())
+                while cache_obj and total > 64 * 1024 * 1024:
+                    total -= image_bytes(cache_obj.pop(next(iter(cache_obj))))
             while len(cache_obj) > limit:
                 cache_obj.pop(next(iter(cache_obj)))
         except Exception:
@@ -8931,6 +9003,54 @@ class PDDashboard(QMainWindow):
             lambda t=token, bp=be_path, sp=stage_path, sn=stage_name, b=block, rt=runtime, k=key:
                 self._start_stage_metric_lookup(t, bp, sp, sn, b, rt, k))
 
+    def _queue_inspector_worker(self, group, worker, token_attr, token, attr_name=None, list_name=None):
+        pending = getattr(self, "_inspector_pending", {})
+        old = pending.pop(group, None)
+        if old:
+            old[0].deleteLater()
+        worker._flow_generation = getattr(self, "_lookup_generation", 0)
+        pending[group] = (worker, token_attr, token, attr_name, list_name)
+        self._inspector_pending = pending
+        self._pump_inspector_workers()
+
+    def _pump_inspector_workers(self):
+        active = self._keep_running_workers(getattr(self, "_inspector_active", []))
+        self._inspector_active = active
+        pending = getattr(self, "_inspector_pending", {})
+        for group in list(pending):
+            worker, token_attr, token, attr_name, list_name = pending[group]
+            if (getattr(self, "_closing_wait_for_workers", False)
+                    or token != getattr(self, token_attr)
+                    or worker._flow_generation != getattr(self, "_lookup_generation", 0)):
+                pending.pop(group)
+                worker.deleteLater()
+                continue
+            if len(active) >= 2:
+                continue
+            pending.pop(group)
+            self._workers.start(group, worker, attr_name=attr_name, list_name=list_name)
+            active.append(worker)
+        if pending:
+            if not hasattr(self, "_inspector_queue_timer"):
+                self._inspector_queue_timer = QTimer(self)
+                self._inspector_queue_timer.setSingleShot(True)
+                self._inspector_queue_timer.timeout.connect(self._pump_inspector_workers)
+            self._inspector_queue_timer.start(50)
+
+    def _lookup_result_is_current_generation(self):
+        worker = self.sender()
+        if worker is None:
+            return True
+        return (not worker.isInterruptionRequested()
+                and getattr(worker, "_flow_generation", -1) == getattr(self, "_lookup_generation", 0))
+
+    def _invalidate_inspector_work(self):
+        self._lookup_generation = getattr(self, "_lookup_generation", 0) + 1
+        for field in ("_stage_metric_request_token", "_fe_cong_request_token", "_stage_screenshot_request_token", "_selection_info_token"):
+            setattr(self, field, getattr(self, field, 0) + 1)
+        self._pump_inspector_workers()
+        self._drain_stage_detail_queue()
+
     def _start_stage_metric_lookup(self, token, be_path, stage_path, stage_name, block, runtime, key):
         if token != self._stage_metric_request_token:
             return
@@ -8939,10 +9059,12 @@ class PDDashboard(QMainWindow):
             getattr(self, "gate_count_unit_area", 0.2419))
         worker._cache_key = key
         worker.finished.connect(self._on_stage_metric_lookup_done)
-        self._workers.start("stage_metric", worker,
-                            list_name="_stage_metric_workers")
+        self._queue_inspector_worker("stage_metric", worker, "_stage_metric_request_token", token,
+                                     list_name="_stage_metric_workers")
 
     def _on_stage_metric_lookup_done(self, token, be_path, stage_name, metrics):
+        if not self._lookup_result_is_current_generation():
+            return
         cache_key = None
         sender = self.sender()
         try:
@@ -8980,6 +9102,9 @@ class PDDashboard(QMainWindow):
     # INSPECTOR / SELECTION
     # ------------------------------------------------------------------
     def on_tree_selection_changed(self):
+        self._selection_info_token += 1
+        for worker in self._keep_running_workers(getattr(self, "_inspector_active", [])):
+            worker.requestInterruption()
         sel = self.tree.selectedItems()
         self.fe_error_btn.setVisible(False)
         self.current_error_log_path = None
@@ -9081,8 +9206,8 @@ class PDDashboard(QMainWindow):
                 self.fe_error_btn.setVisible(True)
                 worker = SelectionInfoWorker(token, path)
                 worker.finished.connect(self._on_selection_info_done)
-                self._workers.start("selection_info", worker,
-                                    attr_name="_selection_info_worker")
+                self._queue_inspector_worker("selection_info", worker, "_selection_info_token", token,
+                                             attr_name="_selection_info_worker")
 
     def _show_fe_error_count(self, err_count, err_path):
         self.current_error_log_path = err_path
@@ -9097,6 +9222,8 @@ class PDDashboard(QMainWindow):
         self.fe_error_btn.setVisible(True)
 
     def _on_selection_info_done(self, token, run_path, err_count, err_path):
+        if not self._lookup_result_is_current_generation():
+            return
         if token != getattr(self, "_selection_info_token", 0):
             return
         sel = self.tree.selectedItems()
@@ -9233,23 +9360,14 @@ class PDDashboard(QMainWindow):
             return
         worker = StageScreenshotLookupWorker(token, be_path, stage_path, stage_name, block)
         worker.finished.connect(self._on_stage_screenshot_lookup_done)
-        self._workers.start("stage_screenshot", worker,
-                            list_name="_stage_screenshot_workers")
+        worker._cache_key = (be_path or "", stage_path or "", stage_name or "", block or "")
+        self._queue_inspector_worker("stage_screenshot", worker, "_stage_screenshot_request_token", token,
+                                     list_name="_stage_screenshot_workers")
 
     def _on_stage_screenshot_lookup_done(self, token, be_path, stage_name, block, found, img):
-        key = ""
-        try:
-            sel = self.tree.selectedItems()
-            if sel and sel[0].data(0, Qt.UserRole) == "STAGE":
-                sd = sel[0].data(0, Qt.UserRole + 81) or {}
-                key = ((sd.get("_origin_be_path")
-                        or sel[0].parent().text(15) or ""),
-                       (sd.get("_origin_stage_path")
-                        or sd.get("stage_path")
-                        or sel[0].text(15) or ""),
-                       stage_name or "", block or "")
-        except Exception:
-            key = ""
+        if not self._lookup_result_is_current_generation():
+            return
+        key = getattr(self.sender(), "_cache_key", None)
         if key:
             self._cache_put_limited(
                 self._stage_screenshot_cache, key,
@@ -9294,10 +9412,12 @@ class PDDashboard(QMainWindow):
             return
         worker = FeCongestionLookupWorker(token, run_path, block)
         worker.finished.connect(self._on_fe_congestion_lookup_done)
-        self._workers.start("fe_cong", worker,
-                            list_name="_fe_cong_workers")
+        self._queue_inspector_worker("fe_cong", worker, "_fe_cong_request_token", token,
+                                     list_name="_fe_cong_workers")
 
     def _on_fe_congestion_lookup_done(self, token, run_path, block, fp_ver, img_path, img):
+        if not self._lookup_result_is_current_generation():
+            return
         key = (run_path or "", block or "")
         self._cache_put_limited(self._fp_ver_cache, run_path, fp_ver or "-")
         self._cache_put_limited(self._cong_img_cache, key, img_path or "")
@@ -9844,6 +9964,19 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
         self._running_items = []
+        self._invalidate_inspector_work()
+        self._workers.cancel_group("stage_index")
+        self._stage_index_worker = None
+        self._workers.cancel_group("disk")
+        self._disk_scan_worker = None
+        self.disk_btn.setEnabled(True)
+        self.disk_btn.setText("Disk Space")
+        self._disk_data = None
+        self._stage_metric_cache.clear()
+        self._stage_screenshot_cache.clear()
+        self._cong_image_cache.clear()
+        self._cong_img_cache.clear()
+        self._fp_ver_cache.clear()
         clear_path_cache()
         self.size_workers = self._cancel_worker_list_keep_running(
             self.size_workers)
@@ -9924,7 +10057,7 @@ class PDDashboard(QMainWindow):
                 self._record_run_history(r)
         self._save_run_history()
         self._save_lightweight_snapshot_async(stats)
-        self.start_bg_disk_scan(force=False)
+        # Disk recursion is opt-in; AUTO_SIZE_ON_START is handled after build.
         self.start_stage_index_worker()
 
         self._rebuild_filter_dropdowns()
@@ -9958,7 +10091,7 @@ class PDDashboard(QMainWindow):
             releases.update(self.out_data.get("releases", {}).keys())
             blocks.update(self.out_data.get("blocks", set()))
 
-        current_rtl = self.rel_combo.currentText()
+        current_rtl = getattr(self, "_preferred_rtl", None) or self.rel_combo.currentText()
         self.rel_combo.blockSignals(True)
         self.rel_combo.clear()
         valid = [r for r in releases
@@ -9985,6 +10118,9 @@ class PDDashboard(QMainWindow):
         self.blk_list.blockSignals(False)
 
     def _restore_filter_state(self):
+        if getattr(self, "_filter_state_restored", False):
+            return
+        self._filter_state_restored = True
         try:
             src  = prefs.get('UI', 'last_source', fallback='ALL')
             rtl  = prefs.get('UI', 'last_rtl',    fallback='[ SHOW ALL ]')
@@ -10002,6 +10138,8 @@ class PDDashboard(QMainWindow):
                 self.src_combo.blockSignals(True)
                 self.src_combo.setCurrentIndex(idx)
                 self.src_combo.blockSignals(False)
+            self._preferred_rtl = rtl
+            self._rebuild_filter_dropdowns()
             if self.rel_combo.findText(rtl) >= 0:
                 self.rel_combo.blockSignals(True)
                 self.rel_combo.setCurrentText(rtl)
@@ -11036,6 +11174,7 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     def _build_tree(self):
         """Build the full tree once. Filtering done by setHidden() only."""
+        self._invalidate_inspector_work()
         self._closure_pass_token = getattr(self, "_closure_pass_token", 0) + 1
         try:
             self._live_timer.stop()
@@ -11049,7 +11188,7 @@ class PDDashboard(QMainWindow):
             self._stage_screenshot_workers)
         self._stage_metric_workers = self._cancel_worker_list_keep_running(
             self._stage_metric_workers)
-        self._stop_worker_if_running(getattr(self, "_owner_lookup_worker", None))
+        self._cancel_worker_if_possible(getattr(self, "_owner_lookup_worker", None))
         self._owner_lookup_worker = None
         self._owner_items_by_path = {}
         self.item_map.clear()
@@ -11298,7 +11437,7 @@ class PDDashboard(QMainWindow):
             QTimer.singleShot(50, self._expand_to_rtl_level)
         # Pre-warm log paths later so it does not compete with the FM/VSLP
         # background scan immediately after tree build.
-        QTimer.singleShot(10000, self._prefetch_log_paths)
+        # Selection workers resolve their own paths; no automatic global prefetch.
 
     # ------------------------------------------------------------------
     # CREATE RUN ITEM
@@ -11331,6 +11470,10 @@ class PDDashboard(QMainWindow):
 
     def _create_run_item(self, parent_item, run):
         child = CustomTreeItem(parent_item)
+        child._flow_run = run
+        if run.get("run_type") == "BE":
+            child._flow_be_run = run
+            run["_stage_detail_loading"] = False
         child.setFlags(
             Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
         child.setCheckState(0, Qt.Unchecked)
@@ -11504,10 +11647,29 @@ class PDDashboard(QMainWindow):
                 p.setForeground(22, self._colors["note"])
         return p
 
+    def _stage_render_key(self, run):
+        return tuple((st.get("name"), st.get("_stage_order"), st.get("stage_status"),
+                      st.get("active_stage"), st.get("st_n"), st.get("st_u"),
+                      st.get("vslp_status"), st.get("stage_path"), st.get("log"),
+                      st.get("fm_u_path"), st.get("fm_n_path"), st.get("vslp_rpt_path"),
+                      st.get("sta_rpt_path"), st.get("_origin_source"),
+                      st.get("_origin_stage_path"), st.get("_origin_be_path"),
+                      tuple((st.get("info") or {}).get(k) for k in ("start", "end", "runtime")))
+                     for st in run.get("stages", []))
+
     def _add_stages(self, be_item, be_run, ign_root):
+        previous = self.tree.blockSignals(True)
+        try:
+            self._populate_stage_rows(be_item, be_run, ign_root)
+            be_item._flow_render_key = self._stage_render_key(be_run)
+        finally:
+            self.tree.blockSignals(previous)
+
+    def _populate_stage_rows(self, be_item, be_run, ign_root):
         self._apply_stage_index_cache_to_be_run(be_run)
         stages = list(be_run.get("stages", []))
         stages.sort(key=lambda st: st.get("_stage_order", st.get("_stage_index", 9999)))
+        rows = []
         for pos, stage in enumerate(stages):
             origin_source = (stage.get("_origin_source")
                              or stage.get("_merged_stage_source")
@@ -11517,7 +11679,7 @@ class PDDashboard(QMainWindow):
                               or be_run.get("path", ""))
             origin_stage_path = (stage.get("_origin_stage_path")
                                  or stage.get("stage_path", ""))
-            s_item = CustomTreeItem(be_item)
+            s_item = CustomTreeItem()
             s_item.setData(0, Qt.UserRole, "STAGE")
             s_item.setData(0, Qt.UserRole + 80, pos)
             stage["_origin_source"] = origin_source
@@ -11526,7 +11688,10 @@ class PDDashboard(QMainWindow):
             s_item.setData(0, Qt.UserRole + 81, dict(stage))
             s_item.setFlags(
                 Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
-            s_item.setCheckState(0, Qt.Unchecked)
+            checked = (stage.get("stage_path") in self._checked_paths
+                       or be_item.checkState(0) == Qt.Checked)
+            s_item._flow_check_state = Qt.Checked if checked else Qt.Unchecked
+            s_item.setCheckState(0, s_item._flow_check_state)
             s_item.setText(0,  stage.get("name", ""))
             s_item.setText(1, be_item.text(1) if be_item else "")
             s_item.setText(2, origin_source)
@@ -11580,6 +11745,9 @@ class PDDashboard(QMainWindow):
             self._apply_status_color(s_item, 3, status)
             if status == "RUNNING":
                 s_item.setForeground(3, QColor("#f57c00"))
+
+            rows.append(s_item)
+        be_item.addChildren(rows)
 
     def _refresh_stage_children_from_run(self, be_item, be_run):
         checked = {}
@@ -11823,7 +11991,7 @@ class PDDashboard(QMainWindow):
                 self._refresh_open_branch_status_dialog(be_path, None)
                 return
             be_run = (be_item.data(0, Qt.UserRole + 10) or
-                      be_item.data(0, Qt.UserRole + 11))
+                      self._be_run_for_item(be_item))
             cur_path = be_run.get("path") if be_run else ""
             try:
                 same_path = os.path.normpath(cur_path or "") == cache_key
@@ -11907,7 +12075,7 @@ class PDDashboard(QMainWindow):
             item = self._signoff_items_by_path.get(be_path)
             if not self._is_live_tree_item(item):
                 return
-            be_run = item.data(0, Qt.UserRole + 11)
+            be_run = self._be_run_for_item(item)
             if not be_run or be_run.get("run_type") != "BE":
                 return
             if be_run.get("_stage_detail_loaded") or be_run.get("_stage_detail_loading"):
@@ -11925,7 +12093,7 @@ class PDDashboard(QMainWindow):
                 return
             if not self._is_live_tree_item(be_item):
                 return
-            be_run = be_item.data(0, Qt.UserRole + 11)
+            be_run = self._be_run_for_item(be_item)
             if not be_run or be_run.get("run_type") != "BE":
                 return
             if be_run.get("_stage_detail_loaded") or be_run.get("_stage_detail_loading"):
@@ -11933,7 +12101,18 @@ class PDDashboard(QMainWindow):
             be_path = be_run.get("path", "")
             if not be_path:
                 return
-            QTimer.singleShot(delay_ms, lambda p=be_path: self._load_stage_signoff_for_path(p))
+            queued = getattr(self, "_scheduled_stage_signoff", set())
+            generation = getattr(self, "_lookup_generation", 0)
+            key = (generation, be_path)
+            if key in queued:
+                return
+            queued.add(key)
+            self._scheduled_stage_signoff = queued
+            def start_lookup():
+                queued.discard(key)
+                if generation == getattr(self, "_lookup_generation", 0):
+                    self._load_stage_signoff_for_path(be_path)
+            QTimer.singleShot(delay_ms, start_lookup)
         except RuntimeError:
             pass
         except Exception:
@@ -11945,7 +12124,7 @@ class PDDashboard(QMainWindow):
                 item = item.parent()
             if item is None:
                 return
-            be_run = item.data(0, Qt.UserRole + 11)
+            be_run = self._be_run_for_item(item)
             if not be_run:
                 be_run = item.data(0, Qt.UserRole + 10)
             if not be_run or be_run.get("run_type") != "BE":
@@ -11960,14 +12139,14 @@ class PDDashboard(QMainWindow):
                     self.status_bar.showMessage(
                         "FM/VSLP detail lookup is already running for this branch.", 3000)
                 return
-            self._apply_stage_index_cache_to_be_run(be_run)
-            from workers import StageDetailWorker
+            be_path = be_run.get("path", "")
+            if not be_path:
+                return
+            pending = getattr(self, "_pending_stage_details", {})
+            pending[be_path] = (item, be_run, getattr(self, "_lookup_generation", 0))
+            self._pending_stage_details = pending
             be_run["_stage_detail_loading"] = True
-            if getattr(self, "pnr_signoff_show_checking", True):
-                self._mark_stage_signoff_checking(item, be_run)
-            w = StageDetailWorker(be_run)
-            w.finished.connect(self._on_stage_details_loaded)
-            self._workers.start("stage_detail", w, list_name="_stage_workers")
+            self._drain_stage_detail_queue()
             if not silent:
                 self.status_bar.showMessage(
                     "Loading BE stage FM/VSLP details in background...", 3000)
@@ -11979,51 +12158,61 @@ class PDDashboard(QMainWindow):
             except Exception:
                 pass
 
+    def _drain_stage_detail_queue(self):
+        active = self._keep_running_workers(getattr(self, "_stage_workers", []))
+        pending = getattr(self, "_pending_stage_details", {})
+        for path in list(pending):
+            item, run, generation = pending[path]
+            if (generation != getattr(self, "_lookup_generation", 0)
+                    or getattr(self, "_closing_wait_for_workers", False)
+                    or not self._is_live_tree_item(item)):
+                run["_stage_detail_loading"] = False
+                pending.pop(path)
+                continue
+            if len(active) >= 2:
+                break
+            pending.pop(path)
+            self._apply_stage_index_cache_to_be_run(run)
+            if getattr(self, "pnr_signoff_show_checking", True):
+                self._mark_stage_signoff_checking(item, run)
+            from workers import StageDetailWorker
+            worker = StageDetailWorker(run)
+            worker._flow_generation = generation
+            worker.finished.connect(self._on_stage_details_loaded)
+            self._workers.start("stage_detail", worker, list_name="_stage_workers")
+            active.append(worker)
+        if pending:
+            if not hasattr(self, "_stage_detail_queue_timer"):
+                self._stage_detail_queue_timer = QTimer(self)
+                self._stage_detail_queue_timer.setSingleShot(True)
+                self._stage_detail_queue_timer.timeout.connect(self._drain_stage_detail_queue)
+            self._stage_detail_queue_timer.start(100)
+
     def on_item_expanded(self, item):
-        if item.childCount() == 1:
-            ph = item.child(0)
-            if ph.data(0, Qt.UserRole) == "__PLACEHOLDER__":
-                be_run = item.data(0, Qt.UserRole + 11)
-                if be_run:
-                    ign_root = self._ensure_ign_root(
-                        self.tree.invisibleRootItem())
-                    parent_checked = item.checkState(0) == Qt.Checked
-                    try:
-                        self.tree.setUpdatesEnabled(False)
-                        item.removeChild(ph)
-                        self._add_stages(item, be_run, ign_root)
-                        # Propagate parent check state to newly created stages
-                        if parent_checked:
-                            self.tree.blockSignals(True)
-                            for i in range(item.childCount()):
-                                ch = item.child(i)
-                                if ch.data(0, Qt.UserRole) == "STAGE":
-                                    ch.setCheckState(0, Qt.Checked)
-                            self.tree.blockSignals(False)
-                    finally:
-                        try:
-                            self.tree.setUpdatesEnabled(True)
-                        except Exception:
-                            pass
-                    if any(not s.get("_stage_index_loaded")
-                           for s in be_run.get("stages", []) or []):
-                        self.status_bar.showMessage(
-                            "PNR stage index is still updating in background.", 2500)
-                    self._queue_stage_signoff_for_branch(item)
-                    return
-        be_run = item.data(0, Qt.UserRole + 11)
-        if be_run:
-            self._apply_stage_index_cache_to_be_run(be_run)
-            self._update_stage_children_in_place(item, be_run)
-            self._queue_stage_signoff_for_branch(item)
+        run = self._be_run_for_item(item)
+        if not run:
+            return
+        self._apply_stage_index_cache_to_be_run(run)
+        if item.childCount() == 1 and item.child(0).data(0, Qt.UserRole) == "__PLACEHOLDER__":
+            previous = self.tree.blockSignals(True)
+            try:
+                item.takeChild(0)
+                self._add_stages(item, run, None)
+            finally:
+                self.tree.blockSignals(previous)
+        else:
+            self._update_stage_children_in_place(item, run)
+        self._queue_stage_signoff_for_branch(item)
 
     def _on_stage_details_loaded(self, be_path, run_name, enriched_stages):
         """Called by StageDetailWorker using stable identifiers only."""
+        if not self._lookup_result_is_current_generation():
+            return
         try:
             be_item = self._signoff_items_by_path.get(be_path)
             if be_item is None:
                 return
-            be_run = be_item.data(0, Qt.UserRole + 11)
+            be_run = self._be_run_for_item(be_item)
             if not be_run or be_run.get("path") != be_path:
                 return
             if run_name and be_run.get("r_name") != run_name and be_item.text(0) != run_name:
@@ -12187,7 +12376,7 @@ class PDDashboard(QMainWindow):
 
     def _reorder_stage_children_by_runtime(self):
         def _sort_one(parent):
-            if not parent or not parent.data(0, Qt.UserRole + 11):
+            if not parent or not self._be_run_for_item(parent):
                 return
             if parent.childCount() <= 1:
                 return
@@ -12211,7 +12400,7 @@ class PDDashboard(QMainWindow):
 
     def _reorder_stage_children_for_item(self, be_item):
         try:
-            if not be_item or not be_item.data(0, Qt.UserRole + 11):
+            if not be_item or not self._be_run_for_item(be_item):
                 return
             if be_item.childCount() <= 1:
                 return
@@ -12866,7 +13055,7 @@ class PDDashboard(QMainWindow):
             self.search_count_lbl.setVisible(False)
 
         self._update_status_bar(visible_runs)
-        QTimer.singleShot(80, self._fit_run_name_column)
+        # Filtering must preserve the user-selected column width.
 
     # ------------------------------------------------------------------
     # COLUMN FILTER
@@ -13232,6 +13421,9 @@ class PDDashboard(QMainWindow):
             QTimer.singleShot(50, self._build_tree)
 
         elif calc_size_act and res == calc_size_act:
+            if self._disk_work_busy():
+                self.status_bar.showMessage("A disk calculation is already running.", 2500)
+                return
             if self._apply_disk_cache_size_to_item(item):
                 self.status_bar.showMessage("Size loaded from disk usage cache.", 2500)
                 return
@@ -13239,7 +13431,7 @@ class PDDashboard(QMainWindow):
             item_id = f"{item.text(0)}|{item.text(1)}|{item.text(15)}"
             self.item_map[item_id] = item
             worker = SingleSizeWorker(item_id, run_path)
-            worker.result.connect(self.update_item_size)
+            worker.record_ready.connect(lambda key, rec: self._on_size_records([(key, rec)]))
             self._workers.start("sizes", worker, list_name="size_workers")
 
         elif fm_n_act     and res == fm_n_act:     self._open_file_or_warn(fm_n_path, "NONUPF Formality Report")
@@ -13273,28 +13465,58 @@ class PDDashboard(QMainWindow):
     # SIZE CALCULATION
     # ------------------------------------------------------------------
     def calculate_all_sizes(self):
+        if self._disk_work_busy():
+            self.status_bar.showMessage("A disk calculation is already running.", 2500)
+            return
         size_tasks = []
-        def gather(node):
-            for i in range(node.childCount()):
-                child = node.child(i)
-                path  = child.text(15)
-                if (path and path != "N/A"
-                        and child.text(6) in ["-", "N/A", "Calc..."]):
-                    if self._apply_disk_cache_size_to_item(child):
-                        gather(child)
-                        continue
-                    item_id = (f"{child.text(0)}|"
-                               f"{child.text(1)}|{child.text(15)}")
-                    self.item_map[item_id] = child
-                    size_tasks.append((item_id, path))
-                    child.setText(6, "Calc...")
-                gather(child)
-        gather(self.tree.invisibleRootItem())
+        for child in self._iter_tree_items():
+            run = getattr(child, "_flow_run", None) or child.data(0, Qt.UserRole + 10)
+            if not run or run.get("run_type") not in ("FE", "BE"):
+                continue
+            path = child.text(15)
+            if not path or path in ("N/A", "-"):
+                continue
+            if self._apply_disk_cache_size_to_item(child):
+                continue
+            item_id = "{}|{}|{}".format(child.text(0), child.text(1), path)
+            self.item_map[item_id] = child
+            size_tasks.append((item_id, path))
+            child.setText(6, "Calc...")
         if size_tasks:
             worker = BatchSizeWorker(size_tasks)
             # Use batch signal: ~10 deliveries instead of 500 individual signals
-            worker.sizes_batch_ready.connect(self._on_batch_sizes)
+            worker.records_batch_ready.connect(self._on_size_records)
             self._workers.start("sizes", worker, list_name="size_workers")
+
+    def _disk_work_busy(self):
+        return (self._worker_is_running(getattr(self, "_disk_scan_worker", None))
+                or any(self._worker_is_running(w) for w in getattr(self, "size_workers", [])))
+
+    def _on_size_records(self, batch):
+        for item_id, result in batch:
+            path = result.get("path", "")
+            key = self._disk_cache_key(path)
+            if not key:
+                continue
+            rec = dict(self._disk_cache.get(key, {}))
+            if result.get("size_bytes") is not None:
+                rec.update(result)
+                rec["size_gb"] = result["size_bytes"] / float(1024 ** 3)
+            else:
+                rec["size_status"] = result.get("size_status", "error")
+                rec["error"] = result.get("error", "Disk usage unavailable")
+            item = self.item_map.get(item_id)
+            if self._is_live_tree_item(item):
+                run = getattr(item, "_flow_run", None) or item.data(0, Qt.UserRole + 10) or {}
+                rec.update(path=path, source=run.get("source", item.text(2)),
+                           run_type=run.get("run_type", ""), owner=run.get("owner", item.text(5)),
+                           category="OUTFEED" if item.text(2) == "OUTFEED" else ("WS (BE)" if run.get("run_type") == "BE" else "WS (FE)"))
+                self._disk_cache[key] = rec
+                self._apply_disk_cache_size_to_item(item)
+            else:
+                self._disk_cache[key] = rec
+        self._disk_data = None
+        self._save_disk_cache()
 
     def _on_batch_sizes(self, batch):
         """Handle a batch of (item_id, size_str) tuples from BatchSizeWorker.
@@ -14602,6 +14824,10 @@ class PDDashboard(QMainWindow):
     def _apply_stage_index_cache_to_be_run(self, be_run):
         if not be_run:
             return
+        epoch = getattr(self, "_stage_index_epoch", 0)
+        if be_run.get("_flow_index_epoch") == epoch:
+            return
+        be_run["_flow_index_epoch"] = epoch
         key = self._norm_stage_key(be_run.get("path", ""))
         cached = self._stage_index_cache.get(key)
         if cached:
@@ -14621,7 +14847,7 @@ class PDDashboard(QMainWindow):
     def _apply_stage_index_cache_to_visible_items(self):
         for item in self._iter_tree_items():
             try:
-                be_run = item.data(0, Qt.UserRole + 11)
+                be_run = self._be_run_for_item(item)
                 if not be_run:
                     continue
                 self._apply_stage_index_cache_to_be_run(be_run)
@@ -14633,6 +14859,17 @@ class PDDashboard(QMainWindow):
                 continue
 
     def _update_stage_children_in_place(self, be_item, be_run):
+        key = self._stage_render_key(be_run)
+        if getattr(be_item, "_flow_render_key", None) == key:
+            return
+        previous = self.tree.blockSignals(True)
+        try:
+            self._write_stage_children(be_item, be_run)
+            be_item._flow_render_key = key
+        finally:
+            self.tree.blockSignals(previous)
+
+    def _write_stage_children(self, be_item, be_run):
         stages = {}
         for st in (be_run.get("stages", []) or []):
             stages[st.get("name", "")] = st
@@ -14682,6 +14919,9 @@ class PDDashboard(QMainWindow):
             pass
 
     def _on_stage_index_loaded(self, index_data):
+        if self.sender() is not None and self.sender() is not self._stage_index_worker:
+            return
+        self._stage_index_epoch = getattr(self, "_stage_index_epoch", 0) + 1
         if not isinstance(index_data, dict):
             return
         for key, enriched in index_data.items():
@@ -14706,7 +14946,7 @@ class PDDashboard(QMainWindow):
         mode = str(getattr(self, "pnr_signoff_load_mode", "lazy") or "lazy").lower()
         for item in self._iter_tree_items():
             try:
-                be_run = item.data(0, Qt.UserRole + 11)
+                be_run = self._be_run_for_item(item)
                 should_load = False
                 if be_run:
                     if mode == "all_after_scan":
@@ -14733,25 +14973,13 @@ class PDDashboard(QMainWindow):
             return str(path or "")
 
     def _disk_cache_size_text(self, path):
-        key = self._disk_cache_key(path)
-        if not key:
-            return ""
-        rec = (getattr(self, "_disk_cache", {}) or {}).get(key)
-        if not rec:
-            rec = (getattr(self, "_disk_cache", {}) or {}).get(str(path or ""))
-        try:
-            if not rec or not rec.get("exists", True):
-                return ""
-            gb = float(rec.get("size_gb", 0.0) or 0.0)
-        except Exception:
-            return ""
-        if gb <= 0:
-            return ""
-        if gb >= 1024.0:
-            return "{:.1f}T".format(gb / 1024.0)
-        if gb >= 1.0:
-            return "{:.1f}G".format(gb)
-        return "{:.1f}M".format(gb * 1024.0)
+        rec = self._disk_cache.get(self._disk_cache_key(path), {})
+        size = rec.get("size_bytes")
+        if size is None and rec.get("size_gb") is not None:
+            size = float(rec["size_gb"]) * 1024 ** 3
+        if size is None:
+            return "Timeout" if rec.get("size_status") == "timeout" else ("Error" if rec.get("error") else "")
+        return format_disk_bytes(size)
 
     def _size_text_to_gb(self, size_text):
         text = str(size_text or "").strip()
@@ -14804,12 +15032,16 @@ class PDDashboard(QMainWindow):
             cached = self._disk_cache_size_text(item.text(15))
             if not cached:
                 return False
+            rec = self._disk_cache.get(self._disk_cache_key(item.text(15)), {})
             item.setText(6, cached)
+            item.setToolTip(6, ("Last measured size; refresh failed: " + rec.get("error", ""))
+                            if rec.get("error") and rec.get("size_gb") is not None else
+                            (rec.get("error") or "Allocated disk space (du -sk); cached measurement"))
             old = item.toolTip(0)
             if old:
                 item.setToolTip(0, re.sub(
                     r"Size: .*?\n", "Size: {}\n".format(cached), old))
-            return True
+            return disk_record_fresh(rec)
         except RuntimeError:
             return False
         except Exception:
@@ -14839,17 +15071,33 @@ class PDDashboard(QMainWindow):
         return {}
 
     def _save_disk_cache(self):
-        try:
-            payload = {
-                "schema": "flow_pulse_disk_cache_v1",
-                "project": PROJECT_PREFIX,
-                "user": _safe_user_name(),
-                "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "entries": getattr(self, "_disk_cache", {}) or {},
-            }
-            _atomic_write_json(self._disk_cache_file(), payload, indent=2, sort_keys=True)
-        except Exception:
-            pass
+        payload = {"schema": "flow_pulse_disk_cache_v2", "project": PROJECT_PREFIX,
+                   "user": _safe_user_name(), "entries": {k: dict(v) for k, v in self._disk_cache.items()}}
+        if not hasattr(self, "_disk_save_lock"):
+            self._disk_save_lock = threading.Lock()
+        def write_pending():
+            while True:
+                with self._disk_save_lock:
+                    data = self._pending_disk_save
+                    self._pending_disk_save = None
+                    if data is None:
+                        self._disk_save_thread = None
+                        return
+                try:
+                    _atomic_write_json(self._disk_cache_file(), data, indent=2, sort_keys=True)
+                except Exception as exc:
+                    debug_log("Disk cache save failed", exc)
+        with self._disk_save_lock:
+            self._pending_disk_save = payload
+            writer = getattr(self, "_disk_save_thread", None)
+            if writer is not None and writer.is_alive():
+                return
+            writer = threading.Thread(target=write_pending)
+            writer.daemon = False
+            self._disk_save_thread = writer
+            self._io_threads = [t for t in getattr(self, "_io_threads", []) if t.is_alive()]
+            self._io_threads.append(writer)
+            writer.start()
 
     def _current_disk_run_targets(self):
         runs = []
@@ -14864,29 +15112,14 @@ class PDDashboard(QMainWindow):
         return runs
 
     def _disk_data_from_cache(self):
-        data = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
-        for path, rec in (getattr(self, "_disk_cache", {}) or {}).items():
-            try:
-                if not rec.get("exists", True):
-                    continue
-                size = float(rec.get("size_gb", 0.0) or 0.0)
-                if size <= 0.01:
-                    continue
-                cat = rec.get("category") or ("OUTFEED" if rec.get("source") == "OUTFEED"
-                                               else ("WS (BE)" if rec.get("run_type") == "BE" else "WS (FE)"))
-                owner = rec.get("owner") or "Unknown"
-                if cat not in data:
-                    data[cat] = {}
-                if owner not in data[cat]:
-                    data[cat][owner] = {"total": 0, "dirs": []}
-                data[cat][owner]["total"] += size
-                data[cat][owner]["dirs"].append((rec.get("path") or path, size))
-            except Exception:
-                pass
-        for cat in data:
-            for owner in data[cat]:
-                data[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
-        return data
+        # Same aggregation rules as recalculation; nested paths are not added twice.
+        paths = set(self._disk_cache_key(run.get("path")) for run in self._current_disk_run_targets())
+        cache = {key: rec for key, rec in self._disk_cache.items() if key in paths}
+        worker = DiskScannerWorker([], cache)
+        try:
+            return worker._build_data_from_cache(cache)
+        finally:
+            worker.deleteLater()
 
     def open_disk_usage(self):
         data = getattr(self, "_disk_data", None)
@@ -14901,28 +15134,25 @@ class PDDashboard(QMainWindow):
         self._disk_dialog = None
 
     def start_bg_disk_scan(self, force=False):
-        if (not force and hasattr(self, '_disk_scan_worker')
-                and self._worker_is_running(self._disk_scan_worker)):
+        if self._disk_work_busy():
+            self.status_bar.showMessage("A disk calculation is already running.", 2500)
             return
-        if force:
-            self._stop_worker_if_running(getattr(self, "_disk_scan_worker", None))
-        # Disable disk button while scanning
-        if hasattr(self, 'disk_btn'):
-            self.disk_btn.setEnabled(False)
-            self.disk_btn.setText("Scanning Disk...")
-        worker = DiskScannerWorker(
-            self._current_disk_run_targets(),
-            getattr(self, "_disk_cache", {}),
-            force=force)
-        # DiskScannerWorker uses finished_scan signal
-        sig = getattr(worker, "finished_scan", None)
-        if sig is None:
-            sig = worker.finished
-        sig.connect(self._on_bg_disk_scan_finished)
-        self._workers.start("disk", worker,
-                            attr_name="_disk_scan_worker")
+        targets = self._current_disk_run_targets()
+        if not targets:
+            self.status_bar.showMessage("No run directories to measure.", 2500)
+            return
+        self.disk_btn.setEnabled(False)
+        self.disk_btn.setText("Scanning Disk...")
+        worker = DiskScannerWorker(targets, self._disk_cache, force=force)
+        worker.finished_scan.connect(self._on_bg_disk_scan_finished)
+        worker.progress.connect(lambda done, total: self.status_bar.showMessage("Disk usage: {} / {} runs".format(done, total)))
+        self._workers.start("disk", worker, attr_name="_disk_scan_worker")
 
     def _on_bg_disk_scan_finished(self, data):
+        if self.sender() is not None and self.sender() is not getattr(self, "_disk_scan_worker", None):
+            return
+        errors = data.pop("__errors__", {}) if isinstance(data, dict) else {}
+        self._disk_errors = errors
         if isinstance(data, dict) and "__cache__" in data:
             self._disk_cache = data.pop("__cache__", {}) or {}
             data.pop("__pending_count__", None)
@@ -14933,6 +15163,8 @@ class PDDashboard(QMainWindow):
         if hasattr(self, 'disk_btn'):
             self.disk_btn.setEnabled(True)
             self.disk_btn.setText("Disk Space")
+        if errors:
+            self.status_bar.showMessage("Disk calculation: {} failed; previous sizes retained where available.".format(len(errors)), 10000)
         dlg = getattr(self, "_disk_dialog", None)
         try:
             if dlg is not None and dlg.isVisible():
@@ -16145,7 +16377,7 @@ class PDDashboard(QMainWindow):
         if be_item and be_item.data(0, Qt.UserRole) == "STAGE":
             be_item = be_item.parent()
         be_run = ((be_item.data(0, Qt.UserRole + 10) or
-                   be_item.data(0, Qt.UserRole + 11)) if be_item else None)
+                   self._be_run_for_item(be_item)) if be_item else None)
         if not be_run or be_run.get("run_type") != "BE":
             QMessageBox.information(
                 self, "Branch Status", "Right-click a BE run row to open branch status.")

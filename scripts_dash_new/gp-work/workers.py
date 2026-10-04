@@ -11,6 +11,8 @@ import threading
 import datetime
 import getpass
 import time
+from performance_support import (measure_disk_usage, disk_record_fresh,
+                                 format_disk_bytes, nonoverlapping_disk_records)
 
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -284,28 +286,11 @@ def clear_metric_cache():
 
 
 def _format_size_bytes(total_size):
-    if not total_size or total_size <= 0:
-        return "N/A"
-    for unit in ['K', 'M', 'G']:
-        total_size /= 1024.0
-        if total_size < 1024.0:
-            return "{:.1f}{}".format(total_size, unit)
-    return "{:.1f}T".format(total_size)
+    return format_disk_bytes(total_size)
 
 
 def _du_size(path, timeout_sec=60):
-    """Fast filesystem size using system du. Falls back to None on timeout/error."""
-    if not path or not os.path.exists(path):
-        return "N/A"
-    try:
-        out = subprocess.check_output(
-            ['du', '-sk', path], stderr=subprocess.DEVNULL,
-            timeout=timeout_sec)
-        line = out.decode('utf-8', errors='ignore').splitlines()[0]
-        kb = int(line.split()[0])
-        return _format_size_bytes(kb * 1024)
-    except Exception:
-        return None
+    return format_disk_bytes(measure_disk_usage(path, timeout=timeout_sec).get("size_bytes"))
 
 # ---------------------------------------------------------------------------
 # Lazy constant resolution -- these are defined in main.py at module level
@@ -442,11 +427,12 @@ def clear_path_cache():
         _owner_cache.clear()
 
 def prefetch_path_cache(paths):
-    unique = [p for p in set(paths) if p]
+    with _path_cache_lock:
+        unique = [p for p in set(paths) if p and p not in _path_cache]
     if not unique:
         return
     with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(30, len(unique))) as ex:
+            max_workers=min(4, len(unique))) as ex:
         results = list(ex.map(os.path.exists, unique))
     with _path_cache_lock:
         for p, r in zip(unique, results):
@@ -767,81 +753,34 @@ def get_vslp_info(report_path):
 # BatchSizeWorker -- calculates folder sizes for multiple items in background
 # ===========================================================================
 class BatchSizeWorker(QThread):
-    # Batch signal: emits list[(item_id, size_str)] every 50 results
-    # instead of one signal per item - prevents flooding the main-thread event queue.
     sizes_batch_ready = pyqtSignal(list)
-    # Keep old signal for backward-compat with any direct callers
-    size_calculated   = pyqtSignal(str, str)
+    records_batch_ready = pyqtSignal(list)
+    size_calculated = pyqtSignal(str, str)
 
     def __init__(self, tasks):
         super().__init__()
-        self.tasks = tasks
+        self.tasks = list(tasks)
         self._is_cancelled = False
-
-    def run(self):
-        max_w = min(8, max(2, (os.cpu_count() or 4)))
-        batch = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_w) as executor:
-            futures = {executor.submit(self.get_size, path): item_id
-                       for item_id, path in self.tasks}
-            for future in concurrent.futures.as_completed(futures):
-                if self._is_cancelled:
-                    break
-                item_id = futures[future]
-                try:
-                    size_str = future.result()
-                except Exception:
-                    size_str = "N/A"
-                batch.append((item_id, size_str))
-                # Emit in chunks of 50 - about 10 signal deliveries vs 500
-                if len(batch) >= 50:
-                    self.sizes_batch_ready.emit(batch)
-                    batch = []
-        if batch and not self._is_cancelled:
-            self.sizes_batch_ready.emit(batch)
-
-    def get_size(self, path):
-        fast = _du_size(path, timeout_sec=60)
-        if fast is not None:
-            return fast
-        if not path or not os.path.exists(path):
-            return "N/A"
-        total_size = 0
-        try:
-            for entry in os.scandir(path):
-                if self._is_cancelled:
-                    return "N/A"
-                try:
-                    if entry.is_file(follow_symlinks=False):
-                        total_size += entry.stat(follow_symlinks=False).st_size
-                    elif entry.is_dir(follow_symlinks=False):
-                        total_size += self._calc_dir(entry.path)
-                except Exception:
-                    continue
-        except Exception:
-            return "N/A"
-        return _format_size_bytes(total_size)
-
-    def _calc_dir(self, path):
-        total = 0
-        try:
-            for entry in os.scandir(path):
-                if self._is_cancelled or self.isInterruptionRequested():
-                    return total
-                if entry.is_file(follow_symlinks=False):
-                    total += entry.stat().st_size
-                elif entry.is_dir(follow_symlinks=False):
-                    total += self._calc_dir(entry.path)
-        except:
-            pass
-        return total
 
     def cancel(self):
         self._is_cancelled = True
-        try:
-            self.requestInterruption()
-        except Exception:
-            pass
+        self.requestInterruption()
+
+    def run(self):
+        by_path = {}
+        for item_id, path in self.tasks:
+            by_path.setdefault(os.path.normpath(path), []).append(item_id)
+        batch = []
+        for path, item_ids in by_path.items():
+            if self._is_cancelled or self.isInterruptionRequested():
+                break
+            record = measure_disk_usage(path, lambda: self._is_cancelled or self.isInterruptionRequested())
+            for item_id in item_ids:
+                batch.append((item_id, dict(record)))
+            # Small deliveries also expose progress for slow individual runs.
+            self.records_batch_ready.emit(batch)
+            self.sizes_batch_ready.emit([(key, format_disk_bytes(rec.get("size_bytes"))) for key, rec in batch])
+            batch = []
 
 
 # ===========================================================================
@@ -949,60 +888,22 @@ class OwnerLookupWorker(QThread):
 # ===========================================================================
 class SingleSizeWorker(QThread):
     result = pyqtSignal(str, str)
+    record_ready = pyqtSignal(str, dict)
 
     def __init__(self, item_id, path):
         super().__init__()
-        self.item_id = item_id
-        self.path = path
+        self.item_id, self.path = item_id, path
         self._is_cancelled = False
-
-    def run(self):
-        if self._is_cancelled or not self.path or not os.path.exists(self.path):
-            self.result.emit(self.item_id, "N/A")
-            return
-        fast = _du_size(self.path, timeout_sec=60)
-        if fast is not None:
-            if not self._is_cancelled:
-                self.result.emit(self.item_id, fast)
-            return
-        total_size = 0
-        try:
-            for entry in os.scandir(self.path):
-                if self._is_cancelled:
-                    self.result.emit(self.item_id, "N/A")
-                    return
-                try:
-                    if entry.is_file(follow_symlinks=False):
-                        total_size += entry.stat(follow_symlinks=False).st_size
-                    elif entry.is_dir(follow_symlinks=False):
-                        total_size += self._calc_dir(entry.path)
-                except Exception:
-                    continue
-            self.result.emit(self.item_id, _format_size_bytes(total_size))
-        except Exception:
-            if not self._is_cancelled:
-                self.result.emit(self.item_id, "N/A")
-
-    def _calc_dir(self, path):
-        total = 0
-        try:
-            for entry in os.scandir(path):
-                if self._is_cancelled or self.isInterruptionRequested():
-                    return total
-                if entry.is_file(follow_symlinks=False):
-                    total += entry.stat().st_size
-                elif entry.is_dir(follow_symlinks=False):
-                    total += self._calc_dir(entry.path)
-        except:
-            pass
-        return total
 
     def cancel(self):
         self._is_cancelled = True
-        try:
-            self.requestInterruption()
-        except Exception:
-            pass
+        self.requestInterruption()
+
+    def run(self):
+        record = measure_disk_usage(self.path, lambda: self._is_cancelled or self.isInterruptionRequested())
+        if not self._is_cancelled:
+            self.record_ready.emit(self.item_id, record)
+            self.result.emit(self.item_id, format_disk_bytes(record.get("size_bytes")))
 
 
 # ===========================================================================
@@ -1010,242 +911,76 @@ class SingleSizeWorker(QThread):
 # ===========================================================================
 class DiskScannerWorker(QThread):
     finished_scan = pyqtSignal(dict)
+    progress = pyqtSignal(int, int)
 
     def __init__(self, run_targets=None, disk_cache=None, force=False):
         super().__init__()
         self._is_cancelled = False
-        self.run_targets = list(run_targets or [])
-        self.disk_cache = dict(disk_cache or {})
+        self.run_targets = [dict(run) for run in (run_targets or [])]
+        self.disk_cache = {key: dict(value) for key, value in (disk_cache or {}).items()}
         self.force = bool(force)
 
     def cancel(self):
         self._is_cancelled = True
-        try:
-            self.requestInterruption()
-        except Exception:
-            pass
-
-    def _get_batch_dir_info(self, paths):
-        results = []
-        if self._is_cancelled or self.isInterruptionRequested() or not paths:
-            return results
-        try:
-            cmd    = ['du', '-sk'] + paths
-            output = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=60).decode('utf-8', errors='ignore')
-            for line in output.strip().split('\n'):
-                if self._is_cancelled or self.isInterruptionRequested():
-                    return results
-                if not line:
-                    continue
-                parts = line.split(None, 1)
-                if len(parts) >= 2:
-                    try:
-                        sz_kb     = int(parts[0])
-                        full_path = parts[1]
-                        owner = get_owner(full_path)
-                        results.append((owner, sz_kb, full_path, "updated"))
-                    except Exception as e:
-                        debug_log("DiskScannerWorker: failed to parse du line {}".format(line), e)
-        except Exception as e:
-            debug_log("DiskScannerWorker: batch du failed, using scandir fallback", e)
-            for path in paths:
-                if self._is_cancelled or self.isInterruptionRequested():
-                    return results
-                sz_kb = self._scandir_size_kb(path)
-                if sz_kb is None:
-                    continue
-                results.append((get_owner(path), sz_kb, path, "fallback"))
-        return results
-
-    def _scandir_size_kb(self, path):
-        if not path or not os.path.exists(path):
-            return None
-        total = self._scandir_size_bytes(path)
-        if total is None:
-            return None
-        return int((total + 1023) / 1024)
-
-    def _scandir_size_bytes(self, path):
-        if self._is_cancelled or self.isInterruptionRequested():
-            return None
-        total = 0
-        try:
-            for entry in os.scandir(path):
-                if self._is_cancelled or self.isInterruptionRequested():
-                    return None
-                try:
-                    if entry.is_file(follow_symlinks=False):
-                        total += entry.stat(follow_symlinks=False).st_size
-                    elif entry.is_dir(follow_symlinks=False):
-                        child = self._scandir_size_bytes(entry.path)
-                        if child is not None:
-                            total += child
-                except Exception:
-                    continue
-        except Exception as e:
-            debug_log("DiskScannerWorker: scandir size failed {}".format(path), e)
-            return None
-        return total
+        self.requestInterruption()
 
     def _category_for_run(self, run):
-        src = run.get("source", "WS")
-        rtype = run.get("run_type", "")
-        if src == "OUTFEED":
-            return "OUTFEED"
-        if rtype == "BE":
-            return "WS (BE)"
-        return "WS (FE)"
+        return "OUTFEED" if run.get("source") == "OUTFEED" else ("WS (BE)" if run.get("run_type") == "BE" else "WS (FE)")
 
     def _build_data_from_cache(self, cache):
         results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
-        for _path, rec in (cache or {}).items():
-            try:
-                if not rec.get("exists", True):
-                    continue
-                gb_sz = float(rec.get("size_gb", 0.0) or 0.0)
-                if gb_sz <= 0.01:
-                    continue
-                cat = rec.get("category") or "WS (FE)"
-                owner = rec.get("owner") or "Unknown"
-                full_path = rec.get("path") or _path
-                if cat not in results:
-                    results[cat] = {}
-                if owner not in results[cat]:
-                    results[cat][owner] = {"total": 0, "dirs": []}
-                results[cat][owner]["total"] += gb_sz
-                results[cat][owner]["dirs"].append((full_path, gb_sz))
-            except Exception:
+        for path, rec in nonoverlapping_disk_records(cache):
+            if not rec.get("exists", True):
                 continue
-        for cat in results:
-            for owner in results[cat]:
-                results[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
+            gb = float(rec.get("size_gb", 0.0) or 0.0)
+            if gb < 0:
+                continue
+            owner = rec.get("owner") or "Unknown"
+            entry = results.setdefault(rec.get("category") or "WS (FE)", {}).setdefault(owner, {"total": 0, "dirs": []})
+            entry["total"] += gb
+            entry["dirs"].append((path, gb))
+        for category in results.values():
+            for owner in category.values():
+                owner["dirs"].sort(key=lambda pair: pair[1], reverse=True)
         return results
 
-    def _run_incremental_cache_scan(self):
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        cache = {}
+    def run(self):
         current = {}
         for run in self.run_targets:
+            raw = run.get("path")
+            if raw and raw not in ("N/A", "-"):
+                current[os.path.normpath(raw)] = run
+        cache, errors = {}, {}
+        for index, (path, run) in enumerate(current.items()):
             if self._is_cancelled or self.isInterruptionRequested():
-                return None
-            path = os.path.normpath(str(run.get("path", "") or ""))
-            if not path or path == "N/A":
-                continue
-            current[path] = run
-        for path, rec in self.disk_cache.items():
-            npath = os.path.normpath(str(path or ""))
-            if npath in current:
-                cache[npath] = dict(rec or {})
-                cache[npath]["exists"] = True
-        pending = []
-        for path, run in current.items():
-            rec = cache.get(path)
-            stale_owner = rec and str(rec.get("owner", "")).strip() in ("", "Unknown")
-            if self.force or not rec or stale_owner:
-                pending.append(path)
-            else:
-                rec["path"] = path
-                rec["source"] = run.get("source", "")
-                rec["run_type"] = run.get("run_type", "")
-                rec["block"] = run.get("block", "")
-                rec["rtl"] = run.get("rtl", "")
-                rec["run_name"] = run.get("r_name", "")
-                rec["category"] = self._category_for_run(run)
-                rec["size_status"] = rec.get("size_status") or "cached"
-        for i in range(0, len(pending), 25):
-            if self._is_cancelled or self.isInterruptionRequested():
-                return None
-            chunk = pending[i:i + 25]
-            for owner, sz_kb, full_path, size_status in self._get_batch_dir_info(chunk):
-                if self._is_cancelled or self.isInterruptionRequested():
-                    return None
-                path = os.path.normpath(full_path)
-                run = current.get(path, {})
-                run_owner = str(run.get("owner", "") or "").strip()
-                calc_owner = str(owner or "").strip()
-                final_owner = calc_owner if calc_owner and calc_owner != "Unknown" else (run_owner or "Unknown")
-                cache[path] = {
-                    "path": path,
-                    "size_gb": sz_kb / float(1024 ** 2),
-                    "owner": final_owner,
-                    "source": run.get("source", ""),
-                    "run_type": run.get("run_type", ""),
-                    "block": run.get("block", ""),
-                    "rtl": run.get("rtl", ""),
-                    "run_name": run.get("r_name", ""),
-                    "category": self._category_for_run(run),
-                    "exists": True,
-                    "size_status": size_status,
-                    "updated_at": now,
-                }
-        data = self._build_data_from_cache(cache)
-        data["__cache__"] = cache
-        data["__pending_count__"] = len(pending)
-        return data
-
-    def run(self):
-        if self.run_targets:
-            data = self._run_incremental_cache_scan()
-            if data is not None and not self._is_cancelled and not self.isInterruptionRequested():
-                self.finished_scan.emit(data)
-            return
-
-        results = {"WS (FE)": {}, "WS (BE)": {}, "OUTFEED": {}}
-        if self._is_cancelled or self.isInterruptionRequested():
-            self.finished_scan.emit(results)
-            return
-
-        # OUTFEED: outfeed/{BLOCK}/EVT*/fc/* and innovus/*
-        outfeed_targets = []
-        for out_base in _BASE_OUTFEED_LIST():
-            outfeed_targets.extend(glob.glob(os.path.join(out_base, "*", "EVT*", "fc", "*")))
-            outfeed_targets.extend(glob.glob(os.path.join(out_base, "*", "EVT*", "innovus", "*")))
-        if not outfeed_targets:
-            for out_base in _BASE_OUTFEED_LIST():
-                outfeed_targets.extend(glob.glob(os.path.join(out_base, "*")))
-
-        targets_map = {
-            "WS (FE)": [p for base in _BASE_WS_FE_LIST()
-                        for p in glob.glob(os.path.join(base, "*"))],
-            "WS (BE)": [p for base in _BASE_WS_BE_LIST()
-                        for p in glob.glob(os.path.join(base, "*"))],
-            "OUTFEED":  outfeed_targets,
-        }
-
-        tasks = []
-        for cat, paths in targets_map.items():
-            if self._is_cancelled or self.isInterruptionRequested():
-                self.finished_scan.emit(results)
                 return
-            valid_paths = [p for p in paths if os.path.isdir(p)]
-            for i in range(0, len(valid_paths), 50):
-                chunk = valid_paths[i:i + 50]
-                tasks.append((cat, chunk))
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
-            future_to_cat = {executor.submit(self._get_batch_dir_info, t[1]): t[0] for t in tasks}
-            for future in concurrent.futures.as_completed(future_to_cat):
-                if self._is_cancelled or self.isInterruptionRequested():
-                    break
-                cat = future_to_cat[future]
-                try:
-                    batch_results = future.result()
-                    for owner, sz_kb, full_path in batch_results:
-                        if sz_kb > 0:
-                            gb_sz = sz_kb / (1024 ** 2)
-                            if gb_sz > 0.01:
-                                if owner not in results[cat]:
-                                    results[cat][owner] = {"total": 0, "dirs": []}
-                                results[cat][owner]["total"] += gb_sz
-                                results[cat][owner]["dirs"].append((full_path, gb_sz))
-                except Exception as e:
-                    debug_log("DiskScannerWorker: batch directory size failed", e)
-
-        for cat in results:
-            for owner in results[cat]:
-                results[cat][owner]["dirs"].sort(key=lambda x: x[1], reverse=True)
-
-        if not self._is_cancelled and not self.isInterruptionRequested():
+            rec = dict(self.disk_cache.get(path, {}))
+            max_age = 60 if run.get("fe_status") == "RUNNING" or any(s.get("stage_status") == "RUNNING" for s in run.get("stages", [])) else 3600
+            if self.force or not disk_record_fresh(rec, max_age):
+                result = measure_disk_usage(path, lambda: self._is_cancelled or self.isInterruptionRequested())
+                if result["size_status"] == "cancelled":
+                    return
+                if result.get("size_bytes") is not None:
+                    rec.update(result)
+                    rec["size_gb"] = result["size_bytes"] / float(1024 ** 3)
+                else:
+                    # Keep the previous measured value, explicitly marked stale.
+                    rec["size_status"] = result["size_status"]
+                    rec["error"] = result.get("error", "Disk usage unavailable")
+                    errors[path] = rec["error"]
+            owner = run.get("owner") or rec.get("owner") or "Unknown"
+            if owner == "Unknown" and not rec.get("error"):
+                owner = get_owner(path)
+            rec.update(path=path, owner=owner, source=run.get("source", ""),
+                       run_type=run.get("run_type", ""), block=run.get("block", ""),
+                       rtl=run.get("rtl", ""), run_name=run.get("r_name", ""),
+                       category=self._category_for_run(run), exists=True)
+            cache[path] = rec
+            self.progress.emit(index + 1, len(current))
+        results = self._build_data_from_cache(cache)
+        results["__cache__"] = cache
+        results["__errors__"] = errors
+        if not self._is_cancelled:
             self.finished_scan.emit(results)
 
 
