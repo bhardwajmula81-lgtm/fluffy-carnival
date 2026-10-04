@@ -52,7 +52,7 @@ from PyQt5.QtWidgets import (
     QFormLayout, QDialog, QDialogButtonBox, QFontComboBox,
     QSpinBox, QDoubleSpinBox, QAbstractSpinBox, QColorDialog, QTabWidget, QTableWidget,
     QTableWidgetItem, QScrollArea, QAbstractItemView, QSizePolicy,
-    QToolTip
+    QToolTip, QCompleter
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QThread, QDate, QPoint, QRect
 from PyQt5.QtWidgets import QDateEdit as _QDateEditImport
@@ -1565,12 +1565,6 @@ class DiskUsageDialog(QDialog):
 
     def _recalc(self):
         if self.parent_win:
-            self.recalc_btn.setEnabled(False)
-            self.recalc_btn.setText("Calculating...")
-            if self.parent_win._disk_work_busy():
-                self.recalc_btn.setEnabled(True)
-                self.recalc_btn.setText("Recalculate Disk Usage")
-                return
             self.parent_win.start_bg_disk_scan(force=True)
 
     def _send_mail(self):
@@ -3532,14 +3526,6 @@ class BlockSummaryDialog(QDialog):
         self.prog.setVisible(False)
         self.gen_btn.setEnabled(True)
         self._draw_charts()
-
-    def _on_row_done(self, blk, run_name, runtime, metrics):
-        if self._cancelled:
-            return
-        self._add_row(blk, run_name, runtime, metrics)
-        self._done_count += 1
-        self.prog.setValue(self._done_count)
-        QTimer.singleShot(10, self._load_next)
 
     def closeEvent(self, event):
         if self._stop_active_worker():
@@ -7724,7 +7710,7 @@ class PDDashboard(QMainWindow):
         resource_menu = self.actions_menu.addMenu("Storage / Team")
         resource_menu.addAction("Calculate All Run Sizes",
                                 self.calculate_all_sizes)
-        resource_menu.addAction("Disk Space", self.open_disk_usage)
+        self.disk_action = resource_menu.addAction("Disk Space", self.open_disk_usage)
         resource_menu.addAction("Team Workload View", self.show_team_workload)
         resource_menu.addAction("Metric Cache Status", self.show_metric_cache_status)
         resource_menu.addAction("Clear Metric Cache", self.clear_metric_cache)
@@ -9969,8 +9955,7 @@ class PDDashboard(QMainWindow):
         self._stage_index_worker = None
         self._workers.cancel_group("disk")
         self._disk_scan_worker = None
-        self.disk_btn.setEnabled(True)
-        self.disk_btn.setText("Disk Space")
+        self._set_disk_scan_busy(False)
         self._disk_data = None
         self._stage_metric_cache.clear()
         self._stage_screenshot_cache.clear()
@@ -11986,12 +11971,12 @@ class PDDashboard(QMainWindow):
                             be_item = item
                             break
             if be_item is None:
-                be_item = self._find_item_by_path(be_path, run_name)
+                be_item = self._find_tree_item_by_path(be_path, name=run_name or None)
             if be_item is None:
                 self._refresh_open_branch_status_dialog(be_path, None)
                 return
-            be_run = (be_item.data(0, Qt.UserRole + 10) or
-                      self._be_run_for_item(be_item))
+            be_run = (self._be_run_for_item(be_item) or
+                      be_item.data(0, Qt.UserRole + 10))
             cur_path = be_run.get("path") if be_run else ""
             try:
                 same_path = os.path.normpath(cur_path or "") == cache_key
@@ -15104,8 +15089,11 @@ class PDDashboard(QMainWindow):
         seen = set()
         for run in ((self.ws_data or {}).get("all_runs", []) +
                     (self.out_data or {}).get("all_runs", [])):
-            path = os.path.normpath(str(run.get("path", "") or ""))
-            if not path or path == "N/A" or path in seen:
+            raw_path = str(run.get("path", "") or "").strip()
+            if raw_path in ("", "N/A", "-", "."):
+                continue
+            path = os.path.normpath(raw_path)
+            if path in seen:
                 continue
             seen.add(path)
             runs.append(run)
@@ -15136,17 +15124,25 @@ class PDDashboard(QMainWindow):
     def start_bg_disk_scan(self, force=False):
         if self._disk_work_busy():
             self.status_bar.showMessage("A disk calculation is already running.", 2500)
-            return
+            return False
         targets = self._current_disk_run_targets()
         if not targets:
             self.status_bar.showMessage("No run directories to measure.", 2500)
-            return
-        self.disk_btn.setEnabled(False)
-        self.disk_btn.setText("Scanning Disk...")
+            return False
+        self._set_disk_scan_busy(True)
         worker = DiskScannerWorker(targets, self._disk_cache, force=force)
         worker.finished_scan.connect(self._on_bg_disk_scan_finished)
         worker.progress.connect(lambda done, total: self.status_bar.showMessage("Disk usage: {} / {} runs".format(done, total)))
         self._workers.start("disk", worker, attr_name="_disk_scan_worker")
+        return True
+
+    def _set_disk_scan_busy(self, busy):
+        self.disk_action.setEnabled(not busy)
+        self.disk_action.setText("Scanning Disk..." if busy else "Disk Space")
+        dlg = self._disk_dialog
+        if dlg is not None:
+            dlg.recalc_btn.setEnabled(not busy)
+            dlg.recalc_btn.setText("Calculating..." if busy else "Recalculate Disk Usage")
 
     def _on_bg_disk_scan_finished(self, data):
         if self.sender() is not None and self.sender() is not getattr(self, "_disk_scan_worker", None):
@@ -15159,10 +15155,7 @@ class PDDashboard(QMainWindow):
             self._save_disk_cache()
             self._apply_disk_cache_sizes_to_tree()
         self._disk_data = data
-        # Re-enable disk button
-        if hasattr(self, 'disk_btn'):
-            self.disk_btn.setEnabled(True)
-            self.disk_btn.setText("Disk Space")
+        self._set_disk_scan_busy(False)
         if errors:
             self.status_bar.showMessage("Disk calculation: {} failed; previous sizes retained where available.".format(len(errors)), 10000)
         dlg = getattr(self, "_disk_dialog", None)
