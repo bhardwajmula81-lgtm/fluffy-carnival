@@ -266,6 +266,8 @@ def get_metric_value(metrics, key, default="-"):
     if not isinstance(metrics, dict):
         return default
     ckey = canonical_metric_key(key)
+    if ckey == "clock.skew_latency" and "cts" not in str(metrics.get("stage", "")).lower():
+        return default
     if ckey:
         flat = metrics.get("_flat")
         if isinstance(flat, dict) and ckey in flat:

@@ -1013,6 +1013,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
     if cts_path:
         result.update(_parse_stage_cts(_read_stage_text(cts_path)))
         result["cts_report"] = cts_path
+    if "cts" not in str(stage_name).lower():
+        result.pop("skew_latency", None)
 
     if _cancelled(cancel_check):
         result["_cancelled"] = True
@@ -1046,7 +1048,8 @@ def extract_pnr_stage_metrics(run_dir, stage_name, source="WS", block=None,
         "memory_area":   util_path,
         "macro_area":    util_path,
         "vth":           cell_path,
-        "skew_latency":  cts_path,
+        "skew_latency":  cts_path if "cts" in str(stage_name).lower() else "",
+        "clock_repeater_count_area": cts_path,
         "runtime":       runtime_path,
     }
 

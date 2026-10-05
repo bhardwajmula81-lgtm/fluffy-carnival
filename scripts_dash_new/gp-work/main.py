@@ -25,6 +25,8 @@ import html
 import io
 import hashlib
 from performance_support import format_disk_bytes, disk_record_fresh, nonoverlapping_disk_records
+from dashboard_search import parse_query, match_run, stage_key
+from signoff_status import SignoffCheckDialog
 
 try:
     from debug_log import debug_log
@@ -1621,6 +1623,9 @@ class QoRSummaryDialog(QDialog):
     def __init__(self, run_name, metrics, is_dark, parent=None):
         super().__init__(parent)
         self.setWindowTitle("QoR Summary: " + str(run_name))
+        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
+        self.setWindowModality(Qt.NonModal)
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.resize(600, 750)
         layout = QVBoxLayout(self)
 
@@ -1689,7 +1694,7 @@ class QoRSummaryDialog(QDialog):
                 (vt_label + " Area",               lvt_rvt_hvt_area,             False, "vth"),
                 ("Clock",                          None,                         True,  None),
                 ("Skew/Latency",                   metrics.get("skew_latency", "-"), False, "skew_latency"),
-                ("Clock Repeater Count/Area",      metrics.get("clock_repeater_count_area", "-"), False, "skew_latency"),
+                ("Clock Repeater Count/Area",      metrics.get("clock_repeater_count_area", "-"), False, "clock_repeater_count_area"),
                 ("Runtime",                        metrics.get("runtime","-"),  False, "runtime"),
             ]
         else:
@@ -1742,6 +1747,8 @@ class QoRSummaryDialog(QDialog):
                              _registry_metric_value(metrics, _metric_key, "-"),
                              False, _metric_key))
 
+        if "cts" not in str(metrics.get("stage", "")).lower():
+            rows = [row for row in rows if row[0] != "Skew/Latency"]
         # Table
         tbl = QTableWidget(0, 2)
         tbl.setHorizontalHeaderLabels(["Metric", "Value"])
@@ -2479,6 +2486,8 @@ class StageMetricLookupWorker(QThread):
                 result.update(self._parse_cts(self._read_text(cts)))
                 result["cts_report"] = cts
                 result["report_dir"] = os.path.dirname(cts)
+            if "cts" not in self.stage_name.lower():
+                result.pop("skew_latency", None)
         except Exception as e:
             result["error"] = str(e)
         if self.isInterruptionRequested():
@@ -4122,6 +4131,8 @@ class BEStageSummaryDialog(QDialog):
         layout.addLayout(btn_row)
 
     def _metric_value(self, metrics, key):
+        if key in ("skew_latency", "clock.skew_latency") and "cts" not in str((metrics or {}).get("stage", "")).lower():
+            return "-"
         rv = _registry_metric_value(metrics, key, None)
         if rv not in (None, ""):
             return str(rv)
@@ -4602,6 +4613,8 @@ class StatusPackageDialog(QDialog):
         self._add_values(self.fe_tbl, values)
 
     def _metric_value(self, metrics, key):
+        if key in ("skew_latency", "clock.skew_latency") and "cts" not in str((metrics or {}).get("stage", "")).lower():
+            return "-"
         rv = _registry_metric_value(metrics, key, None)
         if rv not in (None, ""):
             return str(rv)
@@ -7143,22 +7156,18 @@ class PDDashboard(QMainWindow):
             stage_path = None
 
         if self._worker_is_running(getattr(self, "_metric_worker", None)):
-            self.status_bar.showMessage("Stopping previous QoR extraction...", 3000)
-            if not self._stop_worker_attr("_metric_worker"):
-                QMessageBox.information(
-                    self, "QoR Summary",
-                    "Previous QoR extraction is still running. Please try again in a moment.")
-                return
+            self.status_bar.showMessage("QoR extraction is in progress. Open the next summary when it finishes.", 4000)
+            return
 
         # Show progress indicator in status bar
         self.status_bar.showMessage(
             f"Extracting QoR metrics for {run_name}...")
-        self.setEnabled(False)
-
         worker = MetricWorker(
             actual_path, item.data(0, Qt.UserRole + 2) or "",
             run_type, source, stage_name, stage_path)
-        self._metric_item_name = run_name
+        self._metric_item_name = "{}{} | {}".format(
+            os.path.basename(actual_path) + " / " if is_stage else "",
+            run_name, source)
         self._metric_dark      = dark
         worker.finished.connect(self._on_metric_done)
         self._workers.start("metrics", worker, attr_name="_metric_worker")
@@ -7183,7 +7192,7 @@ class PDDashboard(QMainWindow):
         dlg = QoRSummaryDialog(
             self._metric_item_name, metrics,
             self._metric_dark, self)
-        dlg.exec_()
+        self._show_independent_dialog(dlg)
 
     def _fmt_ts(self, raw):
         """Apply IST conversion and/or relative formatting to a raw timestamp."""
@@ -7595,7 +7604,12 @@ class PDDashboard(QMainWindow):
 
         self.search = QLineEdit()
         self.search.setPlaceholderText(
-            "Search runs, blocks, status, runtime...  [Ctrl+F]")
+            "Search runs or stage:chip_finish  [Ctrl+F]")
+        self.search.setClearButtonEnabled(True)
+        self.search.setToolTip("stage:chip_finish matches exactly; stage:*cts* uses wildcards.\n"
+                               "Combine fields with ; e.g. run:trial; stage:chip_finish.\n"
+                               "Enter/F3: next match. Shift+F3: previous. Clear restores expansion.")
+        self.search.returnPressed.connect(lambda: self._jump_search_match(1))
         self.search.setMinimumWidth(260)
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.textChanged.connect(lambda: self.search_timer.start(250))
@@ -7615,23 +7629,23 @@ class PDDashboard(QMainWindow):
 
         # Search result count label
         self.search_count_lbl = QLabel("")
-        self.search_count_lbl.setFixedWidth(70)
+        self.search_count_lbl.setMinimumWidth(90)
         self.search_count_lbl.setStyleSheet(
             "font-size: 11px; color: #1976d2; font-weight: bold;")
         self.search_count_lbl.setVisible(False)
         top_layout.addWidget(self.search_count_lbl)
 
         self.search_prev_btn = QToolButton()
-        self.search_prev_btn.setText("<")
-        self.search_prev_btn.setFixedSize(28, 24)
-        self.search_prev_btn.setToolTip("Previous search match (N)")
+        self.search_prev_btn.setText("Prev.")
+        self.search_prev_btn.setFixedSize(50, 26)
+        self.search_prev_btn.setToolTip("Previous search match (Shift+F3)")
         self.search_prev_btn.clicked.connect(lambda: self._jump_search_match(-1))
         top_layout.addWidget(self.search_prev_btn)
 
         self.search_next_btn = QToolButton()
-        self.search_next_btn.setText(">")
-        self.search_next_btn.setFixedSize(28, 24)
-        self.search_next_btn.setToolTip("Next search match (M)")
+        self.search_next_btn.setText("Next")
+        self.search_next_btn.setFixedSize(50, 26)
+        self.search_next_btn.setToolTip("Next search match (F3 or Enter)")
         self.search_next_btn.clicked.connect(lambda: self._jump_search_match(1))
         top_layout.addWidget(self.search_next_btn)
 
@@ -8293,6 +8307,9 @@ class PDDashboard(QMainWindow):
         QShortcut(QKeySequence("Ctrl+R"), self,      self.start_quick_refresh)
         QShortcut(QKeySequence("Ctrl+Shift+R"), self, self.start_fs_scan)
         QShortcut(QKeySequence("Ctrl+F"), self,      lambda: self.search.setFocus())
+        QShortcut(QKeySequence("F3"), self, lambda: self._jump_search_match(1))
+        QShortcut(QKeySequence("Shift+F3"), self, lambda: self._jump_search_match(-1))
+        QShortcut(QKeySequence("Escape"), self.search, self.search.clear, context=Qt.WidgetShortcut)
         QShortcut(QKeySequence("Ctrl+E"), self,      self.safe_expand_all)
         QShortcut(QKeySequence("Ctrl+W"), self,      self.safe_collapse_all)
         QShortcut(QKeySequence("Ctrl+C"), self.tree, self._copy_tree_cell)
@@ -8354,46 +8371,54 @@ class PDDashboard(QMainWindow):
         self.tree.setCurrentItem(item)
         self.tree.scrollToItem(item, QAbstractItemView.PositionAtCenter)
 
-    def _jump_search_match(self, direction):
-        """Navigate among current search matches without changing filters."""
+    def _jump_search_match(self, direction, refresh_pending=True):
         if not self._search_text_active():
             return
-        items = []
-        for it in list(getattr(self, "_search_match_items", []) or []):
-            try:
-                if it is not None and not it.isHidden():
-                    items.append(it)
-            except RuntimeError:
-                pass
-        if not items:
+        if refresh_pending and self.search_timer.isActive():
             self.refresh_view()
-            for it in list(getattr(self, "_search_match_items", []) or []):
-                try:
-                    if it is not None and not it.isHidden():
-                        items.append(it)
-                except RuntimeError:
-                    pass
-        if not items:
+            return
+        targets = getattr(self, "_search_match_targets", [])
+        if not targets:
             self.status_bar.showMessage("No search matches", 2000)
             return
-        curr = self.tree.currentItem()
+        index = getattr(self, "_search_match_index", -1)
+        index = ((index + direction) % len(targets)) if index >= 0 else (0 if direction >= 0 else len(targets)-1)
+        self._search_match_index = index
+        run_item, key = targets[index]
+        self._collapse_search_reveal()
+        self._revealing_search_match = True
         try:
-            idx = items.index(curr)
-        except ValueError:
-            idx = getattr(self, "_search_match_index", -1)
-        if direction >= 0:
-            idx = (idx + 1) % len(items)
-        else:
-            idx = (idx - 1) % len(items)
-        self._search_match_index = idx
-        target = items[idx]
-        parent = target.parent()
-        while parent is not None:
-            parent.setExpanded(True)
-            parent = parent.parent()
-        self._nav_to_item(target)
-        self.status_bar.showMessage(
-            "Search match {}/{}".format(idx + 1, len(items)), 2000)
+            target = run_item
+            if key is not None:
+                run = run_item.data(0, Qt.UserRole + 10)
+                if not run_item.isExpanded():
+                    run_item.setExpanded(True)
+                    self._search_auto_expanded.append(run_item)
+                self.on_item_expanded(run_item)
+                self._apply_stage_search_visibility(run_item, run)
+                for i in range(run_item.childCount()):
+                    child = run_item.child(i)
+                    data = child.data(0, Qt.UserRole + 81) or {}
+                    if child.data(0, Qt.UserRole) == "STAGE" and stage_key(data) == key:
+                        target = child
+                        break
+            if target.isHidden():
+                self.status_bar.showMessage("Match is hidden by a column filter", 2000)
+                return
+            parent = target.parent()
+            while parent is not None:
+                if not parent.isExpanded():
+                    parent.setExpanded(True)
+                    self._search_auto_expanded.append(parent)
+                parent = parent.parent()
+            self._nav_to_item(target)
+        except RuntimeError:
+            self._search_match_targets = []
+            return
+        finally:
+            self._revealing_search_match = False
+        self._update_search_count()
+        self.status_bar.showMessage("Search match {}/{}".format(index + 1, len(targets)), 2000)
 
     def _nav_next_run(self):
         """N key: navigate to next visible FE run."""
@@ -8928,7 +8953,8 @@ class PDDashboard(QMainWindow):
             ("Gate Count", metrics.get("gate_count")),
             ("Std Cell Only Util%", metrics.get("std_cell_only_util")),
             ("Total Util%", metrics.get("total_util")),
-            ("Skew/Latency", metrics.get("skew_latency")),
+            ("Skew/Latency", metrics.get("skew_latency")
+             if "cts" in str(metrics.get("stage", "")).lower() else None),
             ("Clock Repeater Count/Area", metrics.get("clock_repeater_count_area")),
         ]
         vt_label = metrics.get("vt_label")
@@ -8945,7 +8971,7 @@ class PDDashboard(QMainWindow):
             lines.append("Report dir: {}".format(rpt_dir))
         paths = metrics.get("_paths") if isinstance(metrics.get("_paths"), dict) else {}
         cts_report = metrics.get("cts_report") or paths.get("skew_latency")
-        if cts_report and cts_report != "-":
+        if cts_report and cts_report != "-" and "cts" in str(metrics.get("stage", "")).lower():
             lines.append("CTS report: {}".format(cts_report))
         if metrics.get("error"):
             lines.append("")
@@ -9868,7 +9894,7 @@ class PDDashboard(QMainWindow):
             if not self._is_live_tree_item(item):
                 continue
             try:
-                run = item.data(0, Qt.UserRole + 10)
+                run = getattr(item, "_flow_run", None) or item.data(0, Qt.UserRole + 10)
                 if not run:
                     continue
                 status = row.get("fe_status", run.get("fe_status", item.text(3)))
@@ -9879,6 +9905,7 @@ class PDDashboard(QMainWindow):
                 run["is_comp"] = is_comp
                 run["info"] = info
                 item.setData(0, Qt.UserRole + 10, run)
+                item._flow_run = run
                 _dot_map = {
                     "COMPLETED":   "#388e3c", "RUNNING":    "#1976d2",
                     "NOT STARTED": "#9e9e9e", "INTERRUPTED":"#e65100",
@@ -10169,7 +10196,7 @@ class PDDashboard(QMainWindow):
         self._last_source_mode = new_src
         self._apply_column_visibility()
         self._rebuild_filter_dropdowns()
-        if "ALL-merged" in (new_src, old_src) and self.ws_data is not None:
+        if new_src != old_src and self.ws_data is not None:
             QTimer.singleShot(0, self._build_tree)
         else:
             self.refresh_view()
@@ -10989,6 +11016,10 @@ class PDDashboard(QMainWindow):
             src_mode = self.src_combo.currentText()
         except Exception:
             src_mode = "ALL"
+        if src_mode == "WS":
+            return ws_runs
+        if src_mode == "OUTFEED":
+            return out_runs
         if src_mode == "ALL-merged":
             return self._merged_runs_for_tree(ws_runs, out_runs)
         if not getattr(self, "prefer_complete_outfeed_duplicate", False):
@@ -11189,6 +11220,10 @@ class PDDashboard(QMainWindow):
                 self._signoff_worker.cancel()
             self._signoff_bg_done = False
 
+        self._search_saved_expansion = None
+        self._search_auto_expanded = []
+        self._search_match_targets = []
+        self._active_search_query = ""
         self._building_tree = True
 
         # Save expand state before clear so filter/ignore actions don't collapse tree
@@ -11220,7 +11255,7 @@ class PDDashboard(QMainWindow):
                 fe_base = run["r_name"]
                 if fe_base.endswith("-FE"):
                     fe_base = fe_base[:-3]
-                fe_info[(run["block"], fe_base)] = run["rtl"]
+                fe_info.setdefault((run["block"], fe_base, run.get("source")), set()).add(run["rtl"])
 
         for run in runs_to_process:
             if run["run_type"] == "BE":
@@ -11236,9 +11271,9 @@ class PDDashboard(QMainWindow):
                 else:
                     fe_name_from_be = r[:idx]   # everything before first _
                 # O(1) dict lookup instead of O(n) iteration
-                fe_rtl = fe_info.get((run["block"], fe_name_from_be))
-                if fe_rtl:
-                    run["rtl"] = fe_rtl
+                fe_rtls = fe_info.get((run["block"], fe_name_from_be, run.get("source")), set())
+                if run.get("rtl") in (None, "", "Unknown", "N/A") and len(fe_rtls) == 1:
+                    run["rtl"] = next(iter(fe_rtls))
 
         root            = self.tree.invisibleRootItem()
         ign_root        = self._get_node(root, "[ Ignored Runs ]", "IGNORED_ROOT")
@@ -11307,8 +11342,9 @@ class PDDashboard(QMainWindow):
                 fe_text = run["r_name"]
                 fe_base = fe_text[:-3] if fe_text.endswith("-FE") else fe_text
                 src     = run["source"]
-                _fe_lookup[(run["block"], fe_base, src)]  = run_item
-                _fe_lookup[(run["block"], fe_base, "")]   = run_item  # source-agnostic fallback
+                release_key = re.sub(r"_syn\d+$", "", run.get("rtl", ""))
+                _fe_lookup[(run["block"], fe_base, src, release_key)] = run_item
+                _fe_lookup[(run["block"], fe_base, "", release_key)] = run_item
 
             elif run["run_type"] == "BE":
                 be_block  = run["block"]
@@ -11323,8 +11359,10 @@ class PDDashboard(QMainWindow):
                     fe_name_from_be = _r[:_idx]
 
                 # O(1) lookup: exact source first, then source-agnostic fallback
-                fe_parent = (_fe_lookup.get((be_block, fe_name_from_be, be_source))
-                             or _fe_lookup.get((be_block, fe_name_from_be, "")))
+                release_key = re.sub(r"_syn\d+$", "", run.get("rtl", ""))
+                fe_parent = _fe_lookup.get((be_block, fe_name_from_be, be_source, release_key))
+                if fe_parent is None and self.src_combo.currentText() == "ALL-merged":
+                    fe_parent = _fe_lookup.get((be_block, fe_name_from_be, "", release_key))
 
                 if _build_be_only:
                     actual_parent = parent_for_run
@@ -12187,7 +12225,9 @@ class PDDashboard(QMainWindow):
                 self.tree.blockSignals(previous)
         else:
             self._update_stage_children_in_place(item, run)
-        self._queue_stage_signoff_for_branch(item)
+        self._apply_stage_search_visibility(item, run)
+        if not getattr(self, "_revealing_search_match", False):
+            self._queue_stage_signoff_for_branch(item)
 
     def _on_stage_details_loaded(self, be_path, run_name, enriched_stages):
         """Called by StageDetailWorker using stable identifiers only."""
@@ -12222,6 +12262,8 @@ class PDDashboard(QMainWindow):
         except Exception:
             pass
         self._stage_workers = self._keep_running_workers(self._stage_workers)
+        if self.search.text().strip():
+            self.search_timer.start(250)
 
     # ------------------------------------------------------------------
     # REFRESH VIEW (pure hide/show -- zero item creation)
@@ -12490,280 +12532,58 @@ class PDDashboard(QMainWindow):
                 yield run
 
     def _set_item_search_highlight(self, item, active):
-        try:
-            if active:
-                color = QColor(getattr(self, "search_highlight_color", "#fff200"))
-                if not color.isValid():
-                    color = QColor("#fff200")
-                brush = QBrush(color)
-            else:
-                brush = QBrush()
-            for c in range(min(self.tree.columnCount(), 15)):
-                item.setBackground(c, brush)
-        except Exception:
-            pass
+        active = bool(active)
+        if getattr(item, "_flow_search_highlight", False) == active:
+            return
+        color = QColor(getattr(self, "search_highlight_color", "#fff200"))
+        if not color.isValid():
+            color = QColor("#fff200")
+        item.setBackground(0, QBrush(color) if active else QBrush())
+        item._flow_search_highlight = active
 
     def _search_matches_run(self, run, query, notes=""):
-        q = str(query or "").strip().lower()
-        try:
-            run["_search_stage_hits"] = set()
-            run["_search_direct_hit"] = False
-        except Exception:
-            pass
-        if not q:
-            return False
-        key_re = re.compile(
-            r"^(rtl|block|user|owner|source|stage|log|status|path|run|name|type|runtime|start|end|note):(.+)$")
-        terms = []
-        for part in re.split(r"\s*;\s*", q):
-            part = part.strip()
-            if not part:
-                continue
-            m_part = key_re.match(part)
-            if m_part:
-                terms.append((m_part.group(1), m_part.group(2).strip()))
-            else:
-                terms.append((None, part))
-        if not terms:
-            return False
-        info = (run or {}).get("info", {}) or {}
-        fields = {
-            "run": (run or {}).get("r_name", ""),
-            "name": (run or {}).get("r_name", ""),
-            "rtl": (run or {}).get("rtl", ""),
-            "block": (run or {}).get("block", ""),
-            "source": (run or {}).get("source", ""),
-            "type": (run or {}).get("run_type", ""),
-            "status": "{} {}".format((run or {}).get("fe_status", ""), (run or {}).get("st_n", "")),
-            "stage": "{} {}".format((run or {}).get("st_u", ""), (run or {}).get("vslp_status", "")),
-            "user": "{} {} {}".format((run or {}).get("owner", ""), (run or {}).get("user", ""), (run or {}).get("path", "")),
-            "owner": "{} {} {}".format((run or {}).get("owner", ""), (run or {}).get("user", ""), (run or {}).get("path", "")),
-            "path": (run or {}).get("path", ""),
-            "log": (run or {}).get("log_path", ""),
-            "runtime": info.get("runtime", ""),
-            "start": info.get("start", ""),
-            "end": info.get("end", ""),
-            "note": notes or "",
-        }
-        stage_rows = []
-        for st in (run or {}).get("stages", []) or []:
-            name_text = str(st.get("name", "") or "")
-            active_text = str(st.get("active_stage", "") or "")
-            st_blob = "{} {} {} {} {}".format(
-                name_text, st.get("stage_status", ""),
-                active_text, st.get("log_path", ""),
-                st.get("stage_path", ""))
-            fields["stage"] += " " + name_text
-            fields["log"] += " " + str(st.get("log_path", ""))
-            fields["path"] += " " + str(st.get("stage_path", ""))
-            stage_rows.append({
-                "name": name_text,
-                "name_l": name_text.lower(),
-                "blob": st_blob.lower(),
-                "log": str(st.get("log_path", "")).lower(),
-                "path": str(st.get("stage_path", "")).lower(),
-                "status": str(st.get("stage_status", "")).lower(),
-            })
-
-        def _match_text(text, needle):
-            text = str(text or "").lower()
-            if "*" in needle:
-                return fnmatch.fnmatch(text, "*" + needle + "*")
-            return needle in text
-
-        def _stage_hits_for(key, val):
-            hits = set()
-            needle = val or ""
-            for row in stage_rows:
-                if key == "stage":
-                    # Field-qualified stage search means the PNR stage row
-                    # name itself. Do not match active marker, log path or BE
-                    # path here, otherwise every row under that branch can
-                    # light up when only one stage was requested.
-                    text = row["name_l"]
-                elif key == "log":
-                    text = row["log"]
-                elif key == "path":
-                    text = row["path"]
-                elif key == "status":
-                    text = row["status"]
-                elif key in ("run", "name", "rtl", "block", "source", "user", "owner", "type", "runtime", "start", "end", "note"):
-                    text = ""
-                else:
-                    text = row["blob"] + " " + row["log"] + " " + row["path"] + " " + row["status"]
-                if text and _match_text(text, needle):
-                    hits.add(row["name"])
-            return hits
-
-        base_blob = (run or {}).get("_search_blob")
-        if not base_blob:
-            base_blob = " ".join(str(fields.get(k, "")) for k in (
-                "run", "name", "rtl", "block", "source", "type", "status",
-                "user", "owner", "path", "log", "runtime", "start", "end",
-                "note")).lower()
-            try:
-                run["_search_blob"] = base_blob
-            except Exception:
-                pass
-        combined = (base_blob + " " + str(notes or "").lower())
-        direct_hit_all = True
-        direct_hit_any = False
-        final_stage_hits = None
-        for key, val in terms:
-            if key:
-                direct_ok = False if key == "stage" else _match_text(fields.get(key, ""), val)
-                stage_hits = _stage_hits_for(key, val)
-            else:
-                direct_ok = _match_text(combined, val)
-                stage_hits = _stage_hits_for(None, val)
-            term_ok = bool(direct_ok or stage_hits)
-            if not term_ok:
-                try:
-                    run["_search_stage_hits"] = set()
-                    run["_search_direct_hit"] = False
-                except Exception:
-                    pass
-                return False
-            if direct_ok:
-                direct_hit_any = True
-            else:
-                direct_hit_all = False
-            if stage_hits:
-                if final_stage_hits is None:
-                    final_stage_hits = set(stage_hits)
-                else:
-                    final_stage_hits &= set(stage_hits)
-
-        if final_stage_hits is None:
-            final_stage_hits = set()
-        # For compound run+stage searches, only the exact stage rows should be
-        # highlighted/navigated. The parent run remains visible as an ancestor.
-        direct_hit = bool(direct_hit_any and direct_hit_all and not final_stage_hits)
-        try:
-            run["_search_stage_hits"] = final_stage_hits
-            run["_search_direct_hit"] = bool(direct_hit)
-        except Exception:
-            pass
-        return bool(direct_hit or final_stage_hits)
+        direct, hits = match_run(run, parse_query(query), notes)
+        run["_search_direct_hit"] = direct
+        run["_search_stage_keys"] = hits
+        run["_search_stage_hits"] = set(key[0] for key in hits)
+        return bool(direct or hits)
 
     def refresh_view(self):
+        if getattr(self, "_building_tree", False):
+            return
+        self.search_timer.stop()
         src_mode = self.src_combo.currentText()
-        sel_rtl  = self.rel_combo.currentText()
-        preset   = self.view_combo.currentText()
-
-        raw_query      = self.search.text().lower().strip()
-        search_pattern = ("*" if not raw_query
-                          else (f"*{raw_query}*"
-                                if '*' not in raw_query else raw_query))
-
-        checked_blks = set(
-            self.blk_list.item(i).data(Qt.UserRole)
-            for i in range(self.blk_list.count())
-            if self.blk_list.item(i).checkState() == Qt.Checked)
-
-        self._apply_column_visibility()
-
-        self.tree.blockSignals(True)
-        self.tree.setUpdatesEnabled(False)
-
-        visible_runs = []
-
-        # Pre-compute filter constants outside the loop
-        _src_ws      = (src_mode == "WS")
-        _src_out     = (src_mode == "OUTFEED")
-        _sel_rtl_all = (sel_rtl == "[ SHOW ALL ]")
-        _sel_rtl_sfx = sel_rtl + "_"
-        _do_search   = (search_pattern != "*")
-        _highlight_mode = False
-        try:
-            _highlight_mode = self.search_mode_combo.currentText() == "Highlight"
-        except Exception:
-            _highlight_mode = False
-        _fe_only       = (preset == "FE Only")
-        _be_only       = (preset == "BE Only")
-        _completed_only = (preset == "Completed Only")
-        _run_only      = (preset == "Running Only")
-        _fail_only     = (preset == "Failed Only")
-        _today_only    = (preset == "Today's Runs")
-        _pinned_only   = (preset == "Pinned Only")
-        _selected_only = (preset == "Selected Only")
-        _checked_set   = self._checked_paths
-        _pins          = self.user_pins
-        _rfc           = None if self.ignore_run_filter else self.run_filter_config
-        _notes         = self.global_notes
-        _personal_notes = self.personal_notes
+        sel_rtl = self.rel_combo.currentText()
+        preset = self.view_combo.currentText()
+        raw_query = self.search.text().lower().strip()
+        terms = parse_query(raw_query)
+        checked_blks = set(self.blk_list.item(i).data(Qt.UserRole)
+                           for i in range(self.blk_list.count())
+                           if self.blk_list.item(i).checkState() == Qt.Checked)
+        _src_ws, _src_out = src_mode == "WS", src_mode == "OUTFEED"
+        _sel_rtl_all, _sel_rtl_sfx = sel_rtl == "[ SHOW ALL ]", sel_rtl + "_"
+        _do_search = bool(terms)
+        _highlight_mode = self.search_mode_combo.currentText() == "Highlight"
+        _fe_only, _be_only = preset == "FE Only", preset == "BE Only"
+        _completed_only, _run_only = preset == "Completed Only", preset == "Running Only"
+        _fail_only, _today_only = preset == "Failed Only", preset == "Today's Runs"
+        _pinned_only, _selected_only = preset == "Pinned Only", preset == "Selected Only"
+        _checked_set, _pins = self._checked_paths, self.user_pins
+        _rfc = None if self.ignore_run_filter else self.run_filter_config
+        _notes, _personal_notes = self.global_notes, self.personal_notes
         _note_text_cache = self._note_text_cache
-        visible_run_items = []
-        self._visible_run_item_cache = None
-        self._search_match_items = []
-        self._search_match_index = -1
-        _search_matches_live = []
-        _search_seen_live = set()
-
-        def _item_visible_now(it):
-            try:
-                if it is None or it.isHidden():
-                    return False
-                parent = it.parent()
-                while parent is not None:
-                    if parent.isHidden():
-                        return False
-                    parent = parent.parent()
-                return True
-            except RuntimeError:
-                return False
-            except Exception:
-                return False
-
-        def _register_search_match(it):
-            try:
-                key = id(it)
-                if key not in _search_seen_live:
-                    _search_seen_live.add(key)
-                    _search_matches_live.append(it)
-            except RuntimeError:
-                pass
-            except Exception:
-                pass
-
-        def _mark_search_item(it, active):
-            self._set_item_search_highlight(it, active)
-            if active:
-                _register_search_match(it)
+        self._apply_column_visibility()
+        visible_runs, visible_run_items, targets = [], [], []
+        previous_query = getattr(self, "_active_search_query", "")
+        query_changed = raw_query != previous_query
+        root = self.tree.invisibleRootItem()
 
         def _search_notes(note_id):
-            if note_id in _note_text_cache:
-                return _note_text_cache[note_id]
-            notes = " | ".join(_note_lines(_notes.get(note_id, [])))
-            if note_id in _personal_notes:
-                notes += " | " + _personal_notes.get(note_id, "")
-            _note_text_cache[note_id] = notes
-            return notes
+            if note_id not in _note_text_cache:
+                _note_text_cache[note_id] = " | ".join(_note_lines(_notes.get(note_id, []))) + " | " + _personal_notes.get(note_id, "")
+            return _note_text_cache[note_id]
 
-        _pinned_desc_items = set()
-        if _pinned_only:
-            def _mark_pinned_desc(item):
-                has_pinned = False
-                run = item.data(0, _UR10)
-                if run:
-                    for st in run.get("stages", []) or []:
-                        sp = st.get("stage_path", "")
-                        if sp and sp in _pins:
-                            has_pinned = True
-                            break
-                for i in range(item.childCount()):
-                    ch = item.child(i)
-                    p = ch.text(15)
-                    child_has = bool(p and p in _pins)
-                    if _mark_pinned_desc(ch):
-                        child_has = True
-                    if child_has:
-                        has_pinned = True
-                if has_pinned:
-                    _pinned_desc_items.add(id(item))
-                return has_pinned
-
-        def _passes(run):
+        def _passes(run, parent_run=None):
             if run is None:
                 return False
             src = run["source"]
@@ -12772,8 +12592,10 @@ class PDDashboard(QMainWindow):
             if _src_out and src != "OUTFEED": return False
             path = run["path"]
             is_golden = (_pins.get(path) == "golden")
-            if _pinned_only and path not in _pins:    return False
-            if _selected_only and path not in _checked_set: return False
+            if _pinned_only and path not in _pins and not any(
+                    st.get("stage_path") in _pins for st in run.get("stages", [])): return False
+            if _selected_only and path not in _checked_set and not any(
+                    st.get("stage_path") in _checked_set for st in run.get("stages", [])): return False
             if not is_golden:
                 if run["block"] not in checked_blks:
                     return False
@@ -12810,19 +12632,15 @@ class PDDashboard(QMainWindow):
                     return False
             if _fe_only and rt_type != "FE": return False
             if _be_only and rt_type != "BE": return False
-            if _completed_only and not (
-                    rt_type == "FE" and run.get("is_comp")):
-                return False
-            if _run_only and not (
-                    rt_type == "FE"
-                    and run.get("fe_status", "") == "RUNNING"):
-                return False
-            if _fail_only:
-                if not ("FAILS" in run.get("st_n","")
-                        or "FAILS" in run.get("st_u","")
-                        or run.get("fe_status","")
-                        in ("FAILED","FATAL ERROR","ERROR")):
-                    return False
+            status_run = parent_run if rt_type == "BE" and parent_run else run
+            if _completed_only and not status_run.get("is_comp"): return False
+            if _run_only and not (status_run.get("fe_status") == "RUNNING" or any(
+                    st.get("stage_status") == "RUNNING" for st in run.get("stages", []))): return False
+            if _fail_only and not ("FAILS" in str(status_run.get("st_n", "")) or
+                    "FAILS" in str(status_run.get("st_u", "")) or
+                    status_run.get("fe_status") in ("FAILED", "FATAL ERROR", "ERROR") or any(
+                    st.get("stage_status") in ("FAILED", "FATAL ERROR", "ERROR")
+                    for st in run.get("stages", []))): return False
             if _today_only:
                 rt = relative_time(run["info"].get("start",""))
                 if not (rt.endswith("ago")
@@ -12833,213 +12651,101 @@ class PDDashboard(QMainWindow):
             if _do_search:
                 note_id  = "{} : {}".format(rtl, run["r_name"])
                 notes    = _search_notes(note_id)
-                _hit = self._search_matches_run(run, raw_query, notes)
+                _hit = self._match_search_terms(run, terms, notes)
                 run["_search_hit"] = bool(_hit)
                 if (not _hit) and (not _highlight_mode):
                     return False
             return True
 
-        _UR   = Qt.UserRole
-        _UR10 = Qt.UserRole + 10
-        _GROUP_TYPES = frozenset(
-            ("BLOCK","MILESTONE","RTL","IGNORED_ROOT","STANDALONE_ROOT"))
 
-        def _clear_all_search_highlights():
-            def _walk(node):
-                for ci in range(node.childCount()):
-                    ch = node.child(ci)
-                    self._set_item_search_highlight(ch, False)
-                    _walk(ch)
-            try:
-                _walk(self.tree.invisibleRootItem())
-            except RuntimeError:
-                pass
-            except Exception:
-                pass
-
-        _clear_all_search_highlights()
-
-        if _pinned_only:
-            _mark_pinned_desc(self.tree.invisibleRootItem())
-
-        def _update_visibility(item):
-            node_type = item.data(0, _UR)
-            if node_type == "__PLACEHOLDER__":
-                item.setHidden(True)
-                return False
-            # Standalone PNR Runs: hide in FE Only / BE Only views
-            if node_type == "STANDALONE_ROOT":
-                hide_it = (_fe_only or _be_only)
-                item.setHidden(hide_it)
-                if not hide_it:
-                    any_visible = False
-                    for i in range(item.childCount()):
-                        if _update_visibility(item.child(i)):
-                            any_visible = True
-                    item.setHidden(not any_visible)
-                    return not item.isHidden()
-                return False
-            # Group nodes (BLOCK, MILESTONE, RTL, IGNORED_ROOT) recurse
-            # into children. Never auto-expand - preserve user's expand state.
-            if node_type in _GROUP_TYPES or node_type == "MILESTONE":
-                # Short-circuit: if this is a BLOCK node whose block is
-                # entirely excluded by the block-list filter, hide it and
-                # skip recursing all its children - big win when many blocks
-                # are unchecked (skips 70-80% of tree walk).
-                if node_type == "BLOCK" and item.text(0) not in checked_blks:
-                    item.setHidden(True)
-                    return False
+        def _walk(item, parent_run=None):
+            run = getattr(item, "_flow_run", None)
+            if not run:
                 any_visible = False
                 for i in range(item.childCount()):
-                    if _update_visibility(item.child(i)):
+                    if _walk(item.child(i), parent_run):
                         any_visible = True
                 item.setHidden(not any_visible)
-                # No setExpanded() - user expand state is preserved
                 return any_visible
-            else:
-                run         = item.data(0, _UR10)
-                passes      = _passes(run)
-                own_passes  = passes
-                child_search_passes = {}
-                if (not passes and _do_search and run
-                        and run.get("run_type") == "FE" and not _fe_only):
-                    for ci in range(item.childCount()):
-                        citem = item.child(ci)
-                        crun = citem.data(0, _UR10)
-                        if crun and crun.get("run_type") == "BE":
-                            cp = _passes(crun)
-                            child_search_passes[id(citem)] = cp
-                            if cp:
-                                passes = True
-                if _pinned_only and not passes and id(item) in _pinned_desc_items:
-                    passes = True
-                rt_type_run = run.get("run_type") if run else None
-                item.setHidden(not passes)
-                _mark_search_item(item, bool(_do_search and run and run.get("_search_direct_hit")))
-                if passes and run:
-                    visible_runs.append(run)
-                    if run.get("run_type") == "FE":
-                        visible_run_items.append(item)
-                if (_do_search and run and run.get("run_type") == "BE"
-                        and run.get("_search_stage_hits") and not item.isHidden()):
-                    self._ensure_stage_rows_visible(item, run)
-                    item.setExpanded(True)
-                for i in range(item.childCount()):
-                    ch = item.child(i)
-                    if ch.data(0, _UR) == "__PLACEHOLDER__":
-                        ch.setHidden(True)
-                    elif ch.data(0, _UR) == "STAGE":
-                        # When BE-only: hide synthesis stages of FE parent
-                        hide_stage = not passes or (
-                            _be_only and rt_type_run == "FE")
-                        stage_hits = set()
-                        try:
-                            stage_hits = set(str(x).lower() for x in (run.get("_search_stage_hits") or []))
-                        except Exception:
-                            stage_hits = set()
-                        if _do_search and stage_hits and rt_type_run == "BE":
-                            matched_stage = ch.text(0).lower() in stage_hits
-                            if _highlight_mode:
-                                hide_stage = not passes
-                            else:
-                                hide_stage = not matched_stage
-                            _mark_search_item(ch, matched_stage)
-                            if matched_stage:
-                                item.setExpanded(True)
-                        if _pinned_only:
-                            parent_pinned = bool(run and run.get("path") in _pins)
-                            stage_pinned = bool(ch.text(15) and ch.text(15) in _pins)
-                            hide_stage = not (parent_pinned or stage_pinned)
-                        ch.setHidden(hide_stage)
-                        if not (_do_search and stage_hits and rt_type_run == "BE"):
-                            self._set_item_search_highlight(ch, False)
+            run["_search_hit"] = run["_search_direct_hit"] = False
+            run["_search_stage_keys"] = set()
+            run["_search_stage_hits"] = set()
+            own = _passes(run, parent_run)
+            run["_view_passes"] = own
+            item._flow_search_run = run
+            descendant = False
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if getattr(child, "_flow_run", None):
+                    if _walk(child, run):
+                        descendant = True
+            visible = own or descendant
+            item.setHidden(not visible)
+            self._set_item_search_highlight(item, own and _do_search and run.get("_search_direct_hit"))
+            if own:
+                visible_runs.append(run)
+                if run.get("run_type") == "FE":
+                    visible_run_items.append(item)
+                if _do_search:
+                    if run.get("_search_direct_hit"):
+                        targets.append((item, None))
                     else:
-                        # BE child run under FE item: hide when FE-only
-                        child_run = ch.data(0, _UR10)
-                        child_rt  = child_run.get("run_type") if child_run else None
-                        child_passes = passes
-                        if _do_search and not own_passes and id(ch) in child_search_passes:
-                            child_passes = child_search_passes.get(id(ch), False)
-                        if child_run and child_rt == "BE" and _rfc is not None:
-                            be_allowed = self._filter_allowed_names(
-                                child_run.get("source", ""), child_run.get("rtl", ""),
-                                child_run.get("block", ""), "BE")
-                            if be_allowed:
-                                child_passes = _passes(child_run)
-                        hide_child = not child_passes or (_fe_only and child_rt == "BE")
-                        if _highlight_mode and _do_search:
-                            try:
-                                if child_run:
-                                    cnid = "{} : {}".format(child_run.get("rtl", ""), child_run.get("r_name", ""))
-                                    cnotes = _search_notes(cnid)
-                                    child_run["_search_hit"] = self._search_matches_run(child_run, raw_query, cnotes)
-                                _mark_search_item(ch, bool(child_run and child_run.get("_search_direct_hit")))
-                            except Exception:
-                                pass
-                        if _pinned_only:
-                            child_path = child_run.get("path") if child_run else ch.text(15)
-                            hide_child = not (
-                                (child_path and child_path in _pins)
-                                or id(ch) in _pinned_desc_items)
-                        ch.setHidden(hide_child)
-                        if (_do_search and child_run
-                                and child_run.get("_search_stage_hits")
-                                and not hide_child):
-                            self._ensure_stage_rows_visible(ch, child_run)
-                            hits = set(str(x).lower() for x in (child_run.get("_search_stage_hits") or []))
-                            for si in range(ch.childCount()):
-                                st_item = ch.child(si)
-                                if st_item.data(0, _UR) != "STAGE":
-                                    continue
-                                matched_stage = st_item.text(0).lower() in hits
-                                if not _highlight_mode:
-                                    st_item.setHidden(not matched_stage)
-                                _mark_search_item(st_item, matched_stage)
-                            item.setExpanded(True)
-                            ch.setExpanded(True)
-                return passes
+                        for stage in sorted(run.get("stages", []), key=lambda st: st.get("_stage_order", st.get("_stage_index", 9999))):
+                            key = stage_key(stage)
+                            if key in run.get("_search_stage_keys", set()) and self._stage_in_view(run, stage):
+                                targets.append((item, key))
+            self._apply_stage_search_visibility(item, run)
+            return visible
 
-        root = self.tree.invisibleRootItem()
-        for i in range(root.childCount()):
-            _update_visibility(root.child(i))
-
-        if self.active_col_filters:
-            self.apply_tree_filters()
-            self._visible_run_item_cache = None
-
-        self._search_match_items = [
-            it for it in _search_matches_live
-            if _item_visible_now(it)
-        ]
-
-        if _do_search:
-            for _match_item in list(getattr(self, "_search_match_items", []) or []):
-                try:
-                    parent = _match_item.parent()
-                    while parent is not None:
-                        parent.setHidden(False)
-                        parent.setExpanded(True)
-                        parent = parent.parent()
-                except RuntimeError:
-                    continue
-                except Exception:
-                    continue
-        self._visible_run_item_cache = list(visible_run_items)
-
-        self.tree.blockSignals(False)
-        self.tree.setUpdatesEnabled(True)
-        # FEAT 6: Show search result count when search is active
-        if raw_query:
-            match_count = len(getattr(self, "_search_match_items", []) or [])
-            label = "{} match".format(match_count)
-            if not _highlight_mode:
-                label = "{} found".format(match_count)
-            self.search_count_lbl.setText(label)
-            self.search_count_lbl.setVisible(True)
-        else:
-            self.search_count_lbl.setVisible(False)
-
+        previous_signals = self.tree.blockSignals(True)
+        previous_updates = self.tree.updatesEnabled()
+        previous_sorting = self.tree.isSortingEnabled()
+        self.tree.setUpdatesEnabled(False)
+        self.tree.setSortingEnabled(False)
+        try:
+            if raw_query and not previous_query:
+                self._search_saved_expansion = []
+                def _save(node):
+                    for i in range(node.childCount()):
+                        child = node.child(i)
+                        if child.isExpanded():
+                            self._search_saved_expansion.append(child)
+                        _save(child)
+                _save(root)
+            if query_changed:
+                self._collapse_search_reveal()
+            self._active_search_query = raw_query
+            for i in range(root.childCount()):
+                _walk(root.child(i))
+            if self.active_col_filters:
+                self.apply_tree_filters()
+            def _visible(item):
+                while item is not None:
+                    if item.isHidden():
+                        return False
+                    item = item.parent()
+                return True
+            self._search_match_targets = [(it, key) for it, key in targets if _visible(it)]
+            self._search_match_items = [it for it, key in self._search_match_targets if key is None]
+            self._visible_run_item_cache = [it for it in visible_run_items if _visible(it)]
+            if query_changed:
+                self._search_match_index = -1
+            if not raw_query:
+                for it in getattr(self, "_search_saved_expansion", None) or []:
+                    try:
+                        it.setExpanded(True)
+                    except RuntimeError:
+                        pass
+                self._search_saved_expansion = None
+        finally:
+            self.tree.setSortingEnabled(previous_sorting)
+            self.tree.blockSignals(previous_signals)
+            self.tree.setUpdatesEnabled(previous_updates)
+        self._update_search_count()
         self._update_status_bar(visible_runs)
+        # Only one branch is revealed; other matching stages remain virtual.
+        if query_changed and self._search_match_targets:
+            self._jump_search_match(1, refresh_pending=False)
         # Filtering must preserve the user-selected column width.
 
     # ------------------------------------------------------------------
@@ -13069,7 +12775,7 @@ class PDDashboard(QMainWindow):
                     del self.active_col_filters[col]
             else:
                 self.active_col_filters[col] = selected
-            self.apply_tree_filters()
+            self.refresh_view()
 
     def apply_tree_filters(self):
         for col in range(self.tree.columnCount()):
@@ -13100,6 +12806,92 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # CONTEXT MENU
     # ------------------------------------------------------------------
+    def _show_independent_dialog(self, dialog):
+        if not hasattr(self, "_independent_dialogs"):
+            self._independent_dialogs = []
+        self._independent_dialogs.append(dialog)
+        def _released(*args):
+            if dialog in self._independent_dialogs:
+                self._independent_dialogs.remove(dialog)
+        dialog.destroyed.connect(_released)
+        dialog.show()
+
+    def show_signoff_check_status(self, item):
+        stage = None
+        if item.data(0, Qt.UserRole) == "STAGE":
+            stage = dict(item.data(0, Qt.UserRole + 81) or {})
+            item = item.parent()
+        run = dict(item.data(0, Qt.UserRole + 10) or {}) if item else {}
+        if not run:
+            return
+        self._show_independent_dialog(SignoffCheckDialog(run, stage, self))
+
+    def _match_search_terms(self, run, terms, notes):
+        direct, hits = match_run(run, terms, notes)
+        run["_search_direct_hit"] = direct
+        run["_search_stage_keys"] = hits
+        run["_search_stage_hits"] = set(key[0] for key in hits)
+        return bool(direct or hits)
+
+    def _collapse_search_reveal(self):
+        previous = self.tree.blockSignals(True)
+        try:
+            for item in reversed(getattr(self, "_search_auto_expanded", [])):
+                try:
+                    item.setExpanded(False)
+                except RuntimeError:
+                    pass
+        finally:
+            self._search_auto_expanded = []
+            self.tree.blockSignals(previous)
+
+    def _stage_in_view(self, run, stage):
+        source = stage.get("_origin_source") or stage.get("source") or run.get("source")
+        mode = self.src_combo.currentText()
+        if mode in ("WS", "OUTFEED") and source != mode:
+            return False
+        preset = self.view_combo.currentText()
+        if preset == "Pinned Only" and run.get("path") not in self.user_pins and stage.get("stage_path") not in self.user_pins:
+            return False
+        if preset == "Selected Only" and run.get("path") not in self._checked_paths and stage.get("stage_path") not in self._checked_paths:
+            return False
+        return True
+
+    def _apply_stage_search_visibility(self, item, run):
+        active = bool(self.search.text().strip())
+        highlight = self.search_mode_combo.currentText() == "Highlight"
+        state = getattr(item, "_flow_search_run", run)
+        hits = state.get("_search_stage_keys", set())
+        own = state.get("_view_passes", True)
+        for i in range(item.childCount()):
+            child = item.child(i)
+            node_type = child.data(0, Qt.UserRole)
+            if node_type == "__PLACEHOLDER__":
+                child.setHidden(not own)
+                continue
+            if node_type != "STAGE":
+                continue
+            stage = child.data(0, Qt.UserRole + 81) or {"name": child.text(0), "stage_path": child.text(15)}
+            matched = stage_key(stage) in hits
+            visible = own and self._stage_in_view(run, stage)
+            if active and not highlight and not state.get("_search_direct_hit"):
+                visible = visible and matched
+            if self.view_combo.currentText() == "BE Only" and run.get("run_type") == "FE":
+                visible = False
+            if visible and self.active_col_filters:
+                visible = not any(child.text(col).strip() not in values for col, values in self.active_col_filters.items())
+            child.setHidden(not visible)
+            self._set_item_search_highlight(child, active and matched and visible)
+
+    def _update_search_count(self):
+        count = len(getattr(self, "_search_match_targets", []))
+        index = getattr(self, "_search_match_index", -1)
+        self.search_count_lbl.setVisible(bool(self.search.text().strip()))
+        self.search_count_lbl.setText("{}/{}".format(index+1, count) if 0 <= index < count else "{} found".format(count))
+        self.search_prev_btn.setEnabled(count > 0)
+        self.search_next_btn.setEnabled(count > 0)
+
+
     def on_context_menu(self, pos):
         item = self.tree.itemAt(pos)
         if not item:
@@ -13230,6 +13022,7 @@ class PDDashboard(QMainWindow):
             m.addSeparator()
             qor_act = m.addAction("Run Single Stage QoR")
 
+        signoff_check_act = m.addAction("Signoff Check Status") if (is_run_row or is_stage) else None
         # QoR Summary action
         qor_sum_act = None
         if (run_path and run_path != "N/A") or is_stage:
@@ -13270,6 +13063,10 @@ class PDDashboard(QMainWindow):
 
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         if not res:
+            return
+
+        if signoff_check_act and res == signoff_check_act:
+            self.show_signoff_check_status(item)
             return
 
         # Show QoR Summary -- launch MetricWorker on demand
@@ -13555,7 +13352,7 @@ class PDDashboard(QMainWindow):
         try:
             item.setText(5, owner)
             item.setToolTip(5, owner)
-            run = item.data(0, Qt.UserRole + 10)
+            run = getattr(item, "_flow_run", None) or item.data(0, Qt.UserRole + 10)
             if run:
                 run["owner"] = owner
             for i in range(item.childCount()):
@@ -13619,7 +13416,7 @@ class PDDashboard(QMainWindow):
             item = self._signoff_items_by_path.get(path)
             if not item:
                 continue
-            run = item.data(0, Qt.UserRole + 10)
+            run = getattr(item, "_flow_run", None) or item.data(0, Qt.UserRole + 10)
             if run:
                 if row.get("owner") and row.get("owner") != "Unknown":
                     run["owner"] = row["owner"]
@@ -14947,6 +14744,8 @@ class PDDashboard(QMainWindow):
             except Exception:
                 continue
         self.status_bar.showMessage("PNR stage status index updated.", 3000)
+        if self.search.text().strip():
+            self.search_timer.start(250)
 
     def _disk_cache_key(self, path):
         try:
@@ -16438,6 +16237,8 @@ class PDDashboard(QMainWindow):
             return None
 
     def _metric_value(self, metrics, key):
+        if key in ("skew_latency", "clock.skew_latency") and "cts" not in str((metrics or {}).get("stage", "")).lower():
+            return "-"
         rv = _registry_metric_value(metrics, key, None)
         if rv not in (None, ""):
             return str(rv)

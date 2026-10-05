@@ -35,7 +35,7 @@ except ImportError:
 _METRIC_CACHE_LOCK = threading.Lock()
 _METRIC_CACHE_DATA = None
 _METRIC_CACHE_DIRTY = False
-_METRIC_CACHE_VERSION = 1
+_METRIC_CACHE_VERSION = 2
 
 def _atomic_write_gzip_json(path, data, sort_keys=False):
     path = os.path.abspath(path)
@@ -1478,7 +1478,8 @@ class ScannerWorker(QThread):
 
         if self._cancel_requested():
             return None
-        evt_base     = get_dynamic_evt_path(rtl, b_name)
+        evt_base     = (get_outfeed_evt_base(rd) if source == "OUTFEED"
+                        else get_dynamic_evt_path(rtl, b_name))
         if self._cancel_requested():
             return None
         owner        = get_owner(rd) if _SCAN_OWNER_ON_START() else "Unknown"
