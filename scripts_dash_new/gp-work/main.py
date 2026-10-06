@@ -770,11 +770,11 @@ def load_personal_notes():
     out = {}
     for key, val in data.items():
         if isinstance(val, dict):
-            txt = val.get("text", "")
-        elif isinstance(val, list):
-            txt = "\n".join(str(x) for x in val)
+            val = val.get("text", "")
+        if isinstance(val, (list, tuple)):
+            txt = "\n".join(_note_lines(val))
         else:
-            txt = str(val)
+            txt = "" if val is None else str(val)
         if txt.strip():
             out[key] = txt.strip()
     return out
@@ -818,7 +818,7 @@ def _normalize_shared_entry(note_id, entry, idx):
         text = entry.get("text", "")
         if isinstance(text, (list, tuple)):
             text = "\n".join(_note_lines(text))
-        text = str(text).strip()
+        text = ("" if text is None else str(text)).strip()
         if not text:
             return None
         out = {
@@ -828,7 +828,7 @@ def _normalize_shared_entry(note_id, entry, idx):
             "updated_at": str(entry.get("updated_at", "") or ""),
         }
     else:
-        text = str(entry).strip()
+        text = ("" if entry is None else str(entry)).strip()
         if not text:
             return None
         out = {"id": "", "user": "unknown", "text": text, "updated_at": ""}
@@ -5364,6 +5364,7 @@ class PDDashboard(QMainWindow):
         self.ir_data      = {}
         self.global_notes = load_all_notes()
         self.personal_notes = load_personal_notes()
+        self._current_note_id = None
         self.user_pins    = load_user_pins()
         self.status_package_marks = self._load_status_package_marks()
         self._branch_status_cache = {}
@@ -8041,6 +8042,10 @@ class PDDashboard(QMainWindow):
         self.shared_note_input.setMaximumHeight(70)
         self.shared_save_btn = QPushButton("Add Shared Note")
         self.shared_save_btn.clicked.connect(self.save_shared_inspector_note)
+        for widget in (self.ins_note, self.ins_save_btn,
+                       self.shared_note_input, self.shared_save_btn):
+            widget.setEnabled(False)
+        self._toggle_personal_note_box(False)
         ins_layout.addWidget(self.ins_lbl)
         ins_layout.addWidget(self.stage_metric_box)
         ins_layout.addWidget(self.personal_note_box)
@@ -9122,6 +9127,7 @@ class PDDashboard(QMainWindow):
         self.current_error_log_path = None
 
         if not sel:
+            self._current_note_id = None
             self.ins_lbl.setText("Select a run to view details.")
             self.meta_run_name.setText("")
             self.meta_path.clear()
@@ -9133,6 +9139,8 @@ class PDDashboard(QMainWindow):
             self.ins_save_btn.setEnabled(False)
             self.shared_note_history.clear()
             self.shared_note_input.clear()
+            self.shared_note_input.setEnabled(False)
+            self.shared_save_btn.setEnabled(False)
             return
 
         item     = sel[0]
@@ -9167,6 +9175,8 @@ class PDDashboard(QMainWindow):
 
         self.ins_note.setEnabled(True)
         self.ins_save_btn.setEnabled(True)
+        self.shared_note_input.setEnabled(True)
+        self.shared_save_btn.setEnabled(True)
 
         if is_stage:
             p_name = item.parent().text(0)
@@ -9583,12 +9593,23 @@ class PDDashboard(QMainWindow):
         except Exception:
             return 0
 
+    def _note_id_for_item(self, item):
+        """Use the same persisted key for a run and its stage rows."""
+        if item.data(0, Qt.UserRole) == "STAGE":
+            item = item.parent()
+            if item is None:
+                return None
+        if item.data(0, Qt.UserRole) == "RTL":
+            return item.text(0)
+        return "{} : {}".format(item.text(1), item.text(0))
+
     def _refresh_current_note_widgets(self, note_id, item=None):
-        if item is None:
-            sel = self.tree.selectedItems()
-            item = sel[0] if sel else None
-        if item is not None:
-            self._apply_note_display_to_item(item, note_id)
+        # Modal editors run an event loop: a completed scan/filter may have
+        # deleted 'item' while the editor was open. Resolve live rows by the
+        # saved note key, never by a retained QTreeWidgetItem wrapper.
+        for live_item in self._iter_tree_items():
+            if self._note_id_for_item(live_item) == note_id:
+                self._apply_note_display_to_item(live_item, note_id)
         if getattr(self, "_current_note_id", None) == note_id:
             self.ins_note.setPlainText(self.personal_notes.get(note_id, ""))
             self.shared_note_history.setPlainText(self._shared_notes_text(note_id))
@@ -9609,24 +9630,36 @@ class PDDashboard(QMainWindow):
                                     "No shared notes from your user for this item.")
             return
         dlg = EditSharedNotesDialog(mine, note_id, self)
-        if dlg.exec_():
+        while dlg.exec_():
             edited_ids = set(e.get("id") for e in mine)
-            others = [e for e in entries if e.get("id") not in edited_ids]
+            # Preserve entries added by other users while this editor was open.
+            latest = load_shared_note_entries().get(note_id, [])
+            others = [e for e in latest if e.get("id") not in edited_ids]
             if save_shared_note_entries(note_id, others + dlg.get_entries()):
                 self.global_notes = load_all_notes()
                 self._note_text_cache = {}
                 self._refresh_current_note_widgets(note_id, item)
+                break
+            self._warn_note_save_failed()
+
+    def _note_selection_is_current(self):
+        # Tree rebuilds suppress selection signals while deleting the old rows.
+        selected = self.tree.selectedItems()
+        return bool(selected and self._current_note_id and
+                    self._note_id_for_item(selected[0]) == self._current_note_id)
 
     def save_inspector_note(self):
-        if not hasattr(self, "_current_note_id"):
+        if not self._note_selection_is_current():
             return
-        save_personal_note(self._current_note_id, self.ins_note.toPlainText())
+        if not save_personal_note(self._current_note_id, self.ins_note.toPlainText()):
+            self._warn_note_save_failed()
+            return
         self.personal_notes = load_personal_notes()
         self._note_text_cache = {}
         self._refresh_current_note_widgets(self._current_note_id)
 
     def save_shared_inspector_note(self):
-        if not hasattr(self, "_current_note_id"):
+        if not self._note_selection_is_current():
             return
         text = self.shared_note_input.toPlainText()
         if not text.strip():
@@ -9634,8 +9667,17 @@ class PDDashboard(QMainWindow):
         if save_shared_note(self._current_note_id, text):
             self.global_notes = load_all_notes()
             self._note_text_cache = {}
+        else:
+            self._warn_note_save_failed()
+            return
         self._refresh_current_note_widgets(self._current_note_id)
         self._update_status_bar()
+
+    def _warn_note_save_failed(self):
+        QMessageBox.warning(
+            self, "Note Not Saved",
+            "The note could not be written to the notes folder. "
+            "Your text has been kept so you can retry.\n\n" + NOTES_DIR)
 
     # ------------------------------------------------------------------
     # THEME
@@ -13064,6 +13106,15 @@ class PDDashboard(QMainWindow):
         res = m.exec_(self.tree.viewport().mapToGlobal(pos))
         if not res:
             return
+        # A scan may rebuild the tree while the context menu's event loop runs.
+        try:
+            attached = item.treeWidget() is self.tree
+        except RuntimeError:
+            attached = False
+        if not attached:
+            self.status_bar.showMessage(
+                "The run list changed. Select the run again to use this action.", 5000)
+            return
 
         if signoff_check_act and res == signoff_check_act:
             self.show_signoff_check_status(item)
@@ -13138,11 +13189,14 @@ class PDDashboard(QMainWindow):
         elif edit_note_act and res == edit_note_act:
             dlg = EditNoteDialog(self.personal_notes.get(note_identifier, ""),
                                  note_identifier, self)
-            if dlg.exec_():
-                save_personal_note(note_identifier, dlg.get_text())
+            while dlg.exec_():
+                if not save_personal_note(note_identifier, dlg.get_text()):
+                    self._warn_note_save_failed()
+                    continue
                 self.personal_notes = load_personal_notes()
                 self._note_text_cache = {}
                 self._refresh_current_note_widgets(note_identifier, item)
+                break
 
         elif edit_shared_note_act and res == edit_shared_note_act:
             self.edit_my_shared_notes(note_identifier, item)
