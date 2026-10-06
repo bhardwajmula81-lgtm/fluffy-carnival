@@ -166,7 +166,9 @@ class SignoffCheckDialog(QDialog):
         QTimer.singleShot(0, self.refresh)
 
     def refresh(self):
-        if self._closing or (self._worker and self._worker.isRunning()):
+        if self._closing or self._worker_is_running():
+            return
+        if getattr(self.parent(), '_closing_wait_for_workers', False):
             return
         self.table.setRowCount(0)
         self.refresh_button.setEnabled(False)
@@ -177,10 +179,38 @@ class SignoffCheckDialog(QDialog):
         worker.row_ready.connect(self._row)
         worker.failed.connect(self._failed)
         worker.finished.connect(self._finished)
-        self.parent()._workers.start('signoff_export', worker)
+        try:
+            self.parent()._workers.start('signoff_export', worker)
+        except Exception as exc:
+            self.message.setText('Check failed: ' + str(exc))
+            if self._worker_is_running():
+                worker.cancel()
+            else:
+                self._worker = None
+                self.refresh_button.setEnabled(True)
+                try:
+                    worker.deleteLater()
+                except RuntimeError:
+                    pass
+
+    def _worker_is_running(self):
+        worker = self._worker
+        if worker is None:
+            return False
+        try:
+            return worker.isRunning()
+        except RuntimeError:
+            # The dashboard registry owns/deletes QThreads. A Python wrapper
+            # can survive its C++ object; never call it again after this point.
+            self._worker = None
+            return False
+
+    def _accept_worker_result(self):
+        return (not self._closing and self._worker is not None
+                and self.sender() is self._worker)
 
     def _prepared(self, specs):
-        if self._closing:
+        if not self._accept_worker_result():
             return
         self.table.setRowCount(len(specs))
         for index, spec in enumerate(specs):
@@ -188,7 +218,7 @@ class SignoffCheckDialog(QDialog):
                 self.table.setItem(index, col, QTableWidgetItem(text))
 
     def _row(self, index, result):
-        if self._closing:
+        if not self._accept_worker_result():
             return
         cell = QTableWidgetItem(result['exported'])
         cell.setToolTip(result['errors'] or result['roots'])
@@ -201,10 +231,15 @@ class SignoffCheckDialog(QDialog):
             self.table.setCellWidget(index, column, button)
 
     def _failed(self, error):
-        if not self._closing:
+        if self._accept_worker_result():
             self.message.setText('Check failed: ' + error)
 
     def _finished(self):
+        if self.sender() is not self._worker:
+            return
+        # Clear the dialog reference at native QThread completion, before the
+        # dashboard registry processes deleteLater(). Do not own deletion here.
+        self._worker = None
         if self._closing:
             self.deleteLater()
             return
@@ -219,10 +254,18 @@ class SignoffCheckDialog(QDialog):
             except OSError as exc:
                 QMessageBox.warning(self, 'Open file', str(exc))
 
+    def accept(self):
+        self.close()
+
+    def reject(self):
+        # Escape calls reject(), bypassing closeEvent unless routed here.
+        self.close()
+
     def closeEvent(self, event):
         self._closing = True
-        if self._worker and self._worker.isRunning():
+        if self._worker_is_running():
             self._worker.cancel()
         else:
+            self._worker = None
             self.deleteLater()
         event.accept()
