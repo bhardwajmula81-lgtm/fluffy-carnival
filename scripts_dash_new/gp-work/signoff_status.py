@@ -1,8 +1,10 @@
-"""On-demand FM/VSLP export evidence. Filesystem work stays off the GUI thread."""
+"""On-demand FM/VCLP results and LDRC reports, off the GUI thread."""
 import copy
 import fnmatch
 import os
+import re
 import subprocess
+from PyQt5.QtGui import QColor
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                             QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox)
@@ -36,7 +38,7 @@ def check_specs(run, selected_stage=None):
                 '{}_{}.failpoint.rpt'.format(block, mode), '*.failpoint.rpt')
         roots = [os.path.join(base, 'vslp', clean, 'pre')] if base else []
         log_roots = [os.path.join(base, 'vslp', clean), roots[0]] if roots else []
-        add('FE', 'VSLP', roots, 'report_lp.rpt', log_roots=log_roots)
+        add('FE', 'VCLP', roots, 'report_lp.rpt', log_roots=log_roots)
     else:
         stages = [selected_stage] if selected_stage else run.get('stages', [])
         for stage in stages:
@@ -51,8 +53,75 @@ def check_specs(run, selected_stage=None):
                 add(stage.get('name', step), label, roots,
                     '{}_{}.failpoint.rpt'.format(block, mode), '*.failpoint.rpt')
             roots = [os.path.join(event, 'fm', d, step, 'pgnet') for d in dirs] if event else []
-            add(stage.get('name', step), 'VSLP', roots, 'report_lp.rpt')
+            add(stage.get('name', step), 'VCLP', roots, 'report_lp.rpt')
+    # LDRC is run-level, with no invented stage subdirectory. A selected stage
+    # can belong to a different BE origin in the ALL-merged view.
+    ldrc_base, ldrc_name = base, name
+    if selected_stage and selected_stage.get('_origin_be_path'):
+        origin = selected_stage['_origin_be_path']
+        ldrc_name = os.path.basename(os.path.normpath(origin))
+        if (selected_stage.get('_origin_source') or selected_stage.get('source') or source) == 'OUTFEED':
+            ldrc_base = get_outfeed_evt_base(origin)
+        else:
+            ldrc_base = selected_stage.get('_fm_base') or base
+    clean = re.sub(r'-(FE|BE)$', '', ldrc_name)
+    add('Run', 'LDRC', [os.path.join(ldrc_base, 'vcspyglass', clean)]
+        if ldrc_base and clean else [], 'summary.rpt')
     return checks
+
+
+def read_check_status(path, check, cancelled=lambda: False):
+    """Read conclusive report evidence; an existing report is never a pass."""
+    if not path:
+        return 'Not available', ''
+    in_summary = False
+    fm_failures = None
+    ldrc_summary = False
+    ldrc_table = False
+    ldrc_counts = dict(fatal=0, error=0, warning=0, info=0)
+    ldrc_rows = 0
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as report:
+            for line in report:
+                if cancelled():
+                    return 'Unknown', ''
+                if check == 'LDRC':
+                    if re.search(r'^\s*SUMMARY\s+REPORT\s*:', line, re.I):
+                        ldrc_summary = True
+                    elif ldrc_summary and re.search(r'Severity\s+Rule\s+Name\s+Count', line, re.I):
+                        ldrc_table = True
+                    elif ldrc_table:
+                        match = re.match(r'^\s*(fatal|error|warning|info)\s+\S+\s+([\d,]+)\b',
+                                         line.replace('|', ' '), re.I)
+                        if match:
+                            ldrc_counts[match.group(1).lower()] += int(match.group(2).replace(',', ''))
+                            ldrc_rows += 1
+                elif check.startswith('FM'):
+                    if re.search(r'No\s+failing\s+compare\s+points?', line, re.I):
+                        fm_failures = max(fm_failures or 0, 0)
+                    match = re.search(r'([\d,]+)\s+Failing\s+compare\s+points?', line, re.I)
+                    if match:
+                        fm_failures = max(fm_failures or 0, int(match.group(1).replace(',', '')))
+                else:
+                    if 'management summary' in line.lower():
+                        in_summary = True
+                    elif in_summary:
+                        match = re.match(r'^\s*Total\s+([\d,]+)\s+([\d,]+)(?:\s|$)',
+                                         line.replace('|', ' '), re.I)
+                        if match:
+                            errors, warnings = [int(n.replace(',', '')) for n in match.groups()]
+                            return '{} - Error: {}, Warning: {}'.format(
+                                'FAIL' if errors else 'PASS', errors, warnings), ''
+    except (OSError, ValueError) as exc:
+        return 'Unavailable', '{}: {}'.format(path, exc)
+    if check == 'LDRC' and ldrc_rows:
+        text = 'Error: {error}  Warning: {warning}  Info: {info}'.format(**ldrc_counts)
+        if ldrc_counts['fatal']:
+            text += '\nFatal: {}'.format(ldrc_counts['fatal'])
+        return text, ''
+    if fm_failures is not None:
+        return ('{} FAILS'.format(fm_failures) if fm_failures else 'PASS'), ''
+    return 'Unknown', ''
 
 
 def resolve_check(spec, cancelled=lambda: False):
@@ -95,7 +164,15 @@ def resolve_check(spec, cancelled=lambda: False):
         if cancelled():
             return None
     logs.sort(reverse=True)
+    status, status_error = read_check_status(reports[0][1] if reports else '', spec['check'], cancelled)
+    if cancelled():
+        return None
+    if status_error:
+        errors.append(status_error)
+    if not reports and report_errors:
+        status = 'Unavailable'
     return dict(stage=spec['stage'], check=spec['check'],
+                status=status,
                 exported=('Exported' if reports else 'Unavailable' if report_errors else
                           'Path unavailable' if not spec['roots'] else 'Not exported'),
                 report=reports[0][1] if reports else '',
@@ -143,14 +220,14 @@ class SignoffCheckDialog(QDialog):
         header = QLabel('{} | {} | {}'.format(run.get('r_name', ''), run.get('source', ''), run.get('rtl', '')))
         header.setTextFormat(Qt.PlainText)
         layout.addWidget(header)
-        note = QLabel('Exported means the report exists. Log availability is independent. PT will be added later.')
-        note.setWordWrap(True)
-        layout.addWidget(note)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(['Stage', 'Check', 'Report export', 'Report', 'Log'])
+        header.setWordWrap(True)
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(['Stage', 'Check', 'Report export', 'Status', 'Report', 'Log'])
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        self.table.horizontalHeader().setMinimumSectionSize(90)
         self.table.verticalHeader().hide()
         layout.addWidget(self.table)
         controls = QHBoxLayout()
@@ -214,7 +291,7 @@ class SignoffCheckDialog(QDialog):
             return
         self.table.setRowCount(len(specs))
         for index, spec in enumerate(specs):
-            for col, text in enumerate((spec['stage'], spec['check'], 'Checking...')):
+            for col, text in enumerate((spec['stage'], spec['check'], 'Checking...', 'Checking...')):
                 self.table.setItem(index, col, QTableWidgetItem(text))
 
     def _row(self, index, result):
@@ -223,12 +300,23 @@ class SignoffCheckDialog(QDialog):
         cell = QTableWidgetItem(result['exported'])
         cell.setToolTip(result['errors'] or result['roots'])
         self.table.setItem(index, 2, cell)
-        for column, key, title in ((3, 'report', 'Open report'), (4, 'log', 'Open log')):
+        status = QTableWidgetItem(result['status'])
+        status.setToolTip(result['errors'] or result['status'])
+        if 'FAIL' in result['status']:
+            status.setForeground(QColor('#d32f2f'))
+        elif result['status'].startswith('PASS'):
+            status.setForeground(QColor('#388e3c'))
+        elif result['check'] == 'LDRC' and result['status'].startswith('Error:'):
+            failed = re.search(r'(?:Error|Fatal):\s*[1-9]\d*', result['status'])
+            status.setForeground(QColor('#d32f2f' if failed else '#388e3c'))
+        self.table.setItem(index, 3, status)
+        for column, key, title in ((4, 'report', 'Open report'), (5, 'log', 'Open log')):
             button = QPushButton(title if result[key] else 'Not found')
             button.setEnabled(bool(result[key]))
             button.setToolTip(result[key] or result['errors'] or 'No file found')
             button.clicked.connect(lambda checked=False, path=result[key]: self._open(path))
             self.table.setCellWidget(index, column, button)
+        self.table.resizeRowToContents(index)
 
     def _failed(self, error):
         if self._accept_worker_result():
@@ -245,7 +333,7 @@ class SignoffCheckDialog(QDialog):
             return
         self.refresh_button.setEnabled(True)
         if not self.message.text().startswith('Check failed:'):
-            self.message.setText('Report availability checked. Refresh to check for new exports.')
+            self.message.setText('Checks updated.')
 
     def _open(self, path):
         if path:

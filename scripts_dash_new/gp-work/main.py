@@ -1390,6 +1390,16 @@ class PieChartWidget(QWidget):
             start += span
 
 
+def _format_disk_gb(value, precision=2):
+    """Keep the existing binary size calculation; choose a readable unit."""
+    value = float(value)
+    unit = "GB"
+    if value >= 1000.0:
+        value /= 1024.0
+        unit = "TB"
+    return "{:.{}f} {}".format(value, precision, unit)
+
+
 class PartitionInfoWorker(QThread):
     result_ready = pyqtSignal(str, str)
 
@@ -1400,8 +1410,8 @@ class PartitionInfoWorker(QThread):
     def run(self):
         try:
             total, used, free = shutil.disk_usage(self.path)
-            text = "Total: {:.1f} GB  Used: {:.1f} GB  Free: {:.1f} GB".format(
-                total / float(1024 ** 3), used / float(1024 ** 3), free / float(1024 ** 3))
+            text = "Total: {}  Used: {}  Free: {}".format(
+                *[_format_disk_gb(v / float(1024 ** 3), 1) for v in (total, used, free)])
         except Exception:
             text = "Partition information unavailable"
         self.result_ready.emit(self.path, text)
@@ -1429,9 +1439,9 @@ class DiskUsageDialog(QDialog):
         top_row.addWidget(self.combo)
         top_row.addSpacing(20)
         self.part_lbl = QLabel("")
+        self.part_lbl.setWordWrap(True)
         self.part_lbl.setStyleSheet("font-weight: bold; color: #d32f2f;")
-        top_row.addWidget(self.part_lbl)
-        top_row.addStretch()
+        top_row.addWidget(self.part_lbl, 1)
         layout.addLayout(top_row)
 
         # Main body -- pie + tree
@@ -1442,7 +1452,7 @@ class DiskUsageDialog(QDialog):
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["User / Path", "Size (GB)"])
+        self.tree.setHeaderLabels(["User / Path", "Size"])
         self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.tree.setAlternatingRowColors(True)
@@ -1473,8 +1483,8 @@ class DiskUsageDialog(QDialog):
             total, used, free = shutil.disk_usage(path)
             t = total/(1024**3); u = used/(1024**3); f = free/(1024**3)
             pct = (used/total)*100 if total > 0 else 0
-            return (f"Total: {t:.1f} GB  Used: {u:.1f} GB ({pct:.0f}%)"
-                    f"  Free: {f:.1f} GB")
+            return "Total: {}  Used: {} ({:.0f}%)  Free: {}".format(
+                _format_disk_gb(t, 1), _format_disk_gb(u, 1), pct, _format_disk_gb(f, 1))
         except Exception:
             return ""
 
@@ -1509,7 +1519,7 @@ class DiskUsageDialog(QDialog):
                 u_item.flags() | Qt.ItemIsUserCheckable)
             u_item.setCheckState(0, Qt.Unchecked)
             u_item.setText(0, user)
-            u_item.setText(1, f"{info['total']:.2f} GB")
+            u_item.setText(1, _format_disk_gb(info["total"]))
             from PyQt5.QtGui import QBrush
             color = QColor(
                 ["#ef5350","#42a5f5","#66bb6a","#ffa726",
@@ -1526,7 +1536,7 @@ class DiskUsageDialog(QDialog):
                 d_item.setCheckState(0, Qt.Unchecked)
                 d_item.setText(0, os.path.basename(dir_path))
                 d_item.setToolTip(0, dir_path)
-                d_item.setText(1, f"{dir_sz:.2f} GB")
+                d_item.setText(1, _format_disk_gb(dir_sz))
                 d_item.setData(0, Qt.UserRole,     user)
                 d_item.setData(0, Qt.UserRole + 1, dir_path)
                 d_item.setData(0, Qt.UserRole + 2, dir_sz)
@@ -1597,7 +1607,7 @@ class DiskUsageDialog(QDialog):
         for owner, items in sorted(user_runs.items()):
             lines.append(f"Owner: {owner}")
             for path, sz in items:
-                lines.append(f"  {path}  [{sz:.2f} GB]")
+                lines.append("  {}  [{}]".format(path, _format_disk_gb(sz)))
             lines.append("")
         lines.append("Thank you.")
 
@@ -7570,38 +7580,37 @@ class PDDashboard(QMainWindow):
         root_layout.setSpacing(4)
 
         # ---- TOOLBAR ----
-        toolbar_layout = QHBoxLayout()
+        toolbar_layout = QVBoxLayout()
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(6)
-        top_layout = toolbar_layout
+        top_layout = FlowLayout()
+        search_layout = QHBoxLayout()
+        search_layout.setSpacing(6)
         top_layout.setSpacing(6)
 
-        top_layout.addWidget(self._label("Source:"))
         self.src_combo = QComboBox()
         self.src_combo.addItems(["ALL", "ALL-merged", "WS", "OUTFEED"])
-        self.src_combo.setFixedWidth(125)
+        self.src_combo.setMinimumWidth(125)
         self._last_source_mode = self.src_combo.currentText()
         self.src_combo.currentIndexChanged.connect(self.on_source_changed)
-        top_layout.addWidget(self.src_combo)
+        self._add_toolbar_field(top_layout, "Source:", self.src_combo)
 
-        self._add_separator(top_layout)
-        top_layout.addWidget(self._label("RTL Release:"))
         self.rel_combo = QComboBox()
-        self.rel_combo.setMinimumWidth(220)
+        self.rel_combo.setMinimumWidth(180)
+        self.rel_combo.setMinimumContentsLength(18)
+        self.rel_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.rel_combo.currentIndexChanged.connect(self._on_rtl_changed)
-        top_layout.addWidget(self.rel_combo)
+        self._add_toolbar_field(top_layout, "RTL Release:", self.rel_combo)
 
-        self._add_separator(top_layout)
-        top_layout.addWidget(self._label("View:"))
         self.view_combo = QComboBox()
         self.view_combo.addItems([
             "All Runs", "FE Only", "BE Only",
             "Completed Only", "Running Only", "Failed Only", "Today's Runs",
             "Pinned Only", "Selected Only"])
-        self.view_combo.setFixedWidth(120)
+        self.view_combo.setMinimumWidth(120)
         self._last_view_preset = self.view_combo.currentText()
         self.view_combo.currentIndexChanged.connect(self._on_view_changed)
-        top_layout.addWidget(self.view_combo)
+        self._add_toolbar_field(top_layout, "View:", self.view_combo)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText(
@@ -7611,22 +7620,22 @@ class PDDashboard(QMainWindow):
                                "Combine fields with ; e.g. run:trial; stage:chip_finish.\n"
                                "Enter/F3: next match. Shift+F3: previous. Clear restores expansion.")
         self.search.returnPressed.connect(lambda: self._jump_search_match(1))
-        self.search.setMinimumWidth(260)
+        self.search.setMinimumWidth(120)
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.textChanged.connect(lambda: self.search_timer.start(250))
         self.search.setContextMenuPolicy(Qt.CustomContextMenu)
         self.search.customContextMenuRequested.connect(
             self._show_search_history)
-        top_layout.addWidget(self.search)
+        search_layout.addWidget(self.search, 1)
 
         self.search_mode_combo = QComboBox()
         self.search_mode_combo.addItems(["Filter", "Highlight"])
-        self.search_mode_combo.setFixedWidth(92)
+        self.search_mode_combo.setMinimumWidth(92)
         self.search_mode_combo.setToolTip(
             "Filter hides non-matches. Highlight keeps rows visible and marks matches.")
         self.search_mode_combo.currentIndexChanged.connect(
             lambda: self.search_timer.start(80))
-        top_layout.addWidget(self.search_mode_combo)
+        search_layout.addWidget(self.search_mode_combo)
 
         # Search result count label
         self.search_count_lbl = QLabel("")
@@ -7634,23 +7643,22 @@ class PDDashboard(QMainWindow):
         self.search_count_lbl.setStyleSheet(
             "font-size: 11px; color: #1976d2; font-weight: bold;")
         self.search_count_lbl.setVisible(False)
-        top_layout.addWidget(self.search_count_lbl)
+        search_layout.addWidget(self.search_count_lbl)
 
-        self.search_prev_btn = QToolButton()
+        self.search_prev_btn = QPushButton()
         self.search_prev_btn.setText("Prev.")
-        self.search_prev_btn.setFixedSize(50, 26)
+        self.search_prev_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.search_prev_btn.setToolTip("Previous search match (Shift+F3)")
         self.search_prev_btn.clicked.connect(lambda: self._jump_search_match(-1))
-        top_layout.addWidget(self.search_prev_btn)
+        search_layout.addWidget(self.search_prev_btn)
 
-        self.search_next_btn = QToolButton()
+        self.search_next_btn = QPushButton()
         self.search_next_btn.setText("Next")
-        self.search_next_btn.setFixedSize(50, 26)
+        self.search_next_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.search_next_btn.setToolTip("Next search match (F3 or Enter)")
         self.search_next_btn.clicked.connect(lambda: self._jump_search_match(1))
-        top_layout.addWidget(self.search_next_btn)
+        search_layout.addWidget(self.search_next_btn)
 
-        top_layout.addStretch(1)
 
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setToolTip(
@@ -7660,11 +7668,10 @@ class PDDashboard(QMainWindow):
 
         self.auto_combo = QComboBox()
         self.auto_combo.addItems(["Off", "1 Min", "5 Min", "10 Min"])
-        self.auto_combo.setFixedWidth(75)
+        self.auto_combo.setMinimumWidth(75)
         self.auto_combo.currentIndexChanged.connect(self.on_auto_refresh_changed)
         top_layout.addWidget(self.auto_combo)
 
-        self._add_separator(top_layout)
 
         # Utilities menu (renamed from Actions)
         self.actions_btn  = QPushButton("Utilities")
@@ -7749,10 +7756,8 @@ class PDDashboard(QMainWindow):
         self.settings_btn.clicked.connect(self.open_settings)
         top_layout.addWidget(self.settings_btn)
 
-        self._add_separator(top_layout)
 
         # Mode dropdown
-        top_layout.addWidget(self._label("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Standard", "Compact", "Full"])
         self.mode_combo.setMinimumWidth(112)
@@ -7762,15 +7767,18 @@ class PDDashboard(QMainWindow):
             lambda i: self._set_col_preset(
                 {"Standard": 2, "Compact": 1, "Full": 3}.get(
                     self.mode_combo.currentText(), 2)))
-        top_layout.addWidget(self.mode_combo)
+        self._add_toolbar_field(top_layout, "Mode:", self.mode_combo)
 
-        self._add_separator(top_layout)
 
         # Notes toggle button
         self.notes_toggle_btn = QPushButton("Notes  >")
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
 
+        toolbar_layout.addLayout(top_layout)
+        toolbar_layout.addLayout(search_layout)
+        self.toolbar_flow = top_layout
+        self.search_controls_layout = search_layout
         root_layout.addLayout(toolbar_layout)
 
         # ---- PROGRESS BAR ----
@@ -8001,13 +8009,14 @@ class PDDashboard(QMainWindow):
         self.tree.itemChanged.connect(self._on_item_check_changed)
 
         self.main_splitter.addWidget(self.tree)
-        root_layout.addWidget(self.main_splitter)
+        root_layout.addWidget(self.main_splitter, 1)
 
         # ---- INSPECTOR DOCK ----
         self.inspector = QWidget()
         ins_layout = QVBoxLayout(self.inspector)
         self.ins_lbl = QLabel("Select a run to view details.")
         self.ins_lbl.setWordWrap(True)
+        self.ins_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.stage_metric_box = QGroupBox("BE Stage Metrics")
         stage_metric_layout = QVBoxLayout(self.stage_metric_box)
         stage_metric_layout.setContentsMargins(6, 6, 6, 6)
@@ -8058,7 +8067,13 @@ class PDDashboard(QMainWindow):
         self.inspector_dock.setAllowedAreas(
             Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.inspector_dock.setTitleBarWidget(QWidget())
-        self.inspector_dock.setWidget(self.inspector)
+        self.inspector_scroll = QScrollArea()
+        self.inspector_scroll.setWidgetResizable(True)
+        self.inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.inspector_scroll.setFrameShape(QFrame.NoFrame)
+        self.inspector_scroll.setWidget(self.inspector)
+        self.inspector_dock.setMinimumWidth(280)
+        self.inspector_dock.setWidget(self.inspector_scroll)
         self.addDockWidget(Qt.RightDockWidgetArea, self.inspector_dock)
         self.inspector_dock.hide()
 
@@ -8130,6 +8145,15 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # HELPER WIDGETS
     # ------------------------------------------------------------------
+    def _add_toolbar_field(self, layout, label, control):
+        group = QWidget()
+        row = QHBoxLayout(group)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
+        row.addWidget(QLabel(label))
+        row.addWidget(control)
+        layout.addWidget(group)
+
     def _label(self, text):
         l = QLabel(text)
         return l
@@ -8161,6 +8185,7 @@ class PDDashboard(QMainWindow):
             self.notes_toggle_btn.setText("Notes  >")
         else:
             self.inspector_dock.show()
+            self.resizeDocks([self.inspector_dock], [320], Qt.Horizontal)
             self.notes_toggle_btn.setText("<  Notes")
 
     def safe_expand_all(self):
