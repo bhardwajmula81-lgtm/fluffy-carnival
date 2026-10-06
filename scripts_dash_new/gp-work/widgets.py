@@ -2,9 +2,25 @@ import math
 import re
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLayout,
                               QScrollArea, QLineEdit, QCompleter, QDialog)
-from PyQt5.QtCore import Qt, QRect, QRectF, QSize, QStringListModel
+from PyQt5.QtCore import Qt, QRect, QRectF, QSize, QStringListModel, pyqtSignal
 from PyQt5.QtGui import QColor, QBrush, QPainter, QPen, QFont
 from PyQt5.QtWidgets import QTreeWidgetItem
+
+
+class CompactSearchField(QLineEdit):
+    """A read-only preview that opens the dashboard's full search controls."""
+    activated = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setPlaceholderText('Search...  Ctrl+F')
+        self.setAccessibleName('Open search')
+        self.setCursor(Qt.PointingHandCursor)
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self.activated.emit()
 
 
 class FlowLayout(QLayout):

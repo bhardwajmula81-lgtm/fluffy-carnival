@@ -7584,33 +7584,44 @@ class PDDashboard(QMainWindow):
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(6)
         top_layout = FlowLayout()
-        search_layout = QHBoxLayout()
+        self.search_panel = QWidget()
+        search_layout = QHBoxLayout(self.search_panel)
+        search_layout.setContentsMargins(0, 0, 0, 0)
         search_layout.setSpacing(6)
-        top_layout.setSpacing(6)
+        top_layout.setSpacing(8)
 
         self.src_combo = QComboBox()
         self.src_combo.addItems(["ALL", "ALL-merged", "WS", "OUTFEED"])
-        self.src_combo.setMinimumWidth(125)
+        self.src_combo.setMinimumWidth(105)
         self._last_source_mode = self.src_combo.currentText()
         self.src_combo.currentIndexChanged.connect(self.on_source_changed)
         self._add_toolbar_field(top_layout, "Source:", self.src_combo)
 
         self.rel_combo = QComboBox()
-        self.rel_combo.setMinimumWidth(180)
-        self.rel_combo.setMinimumContentsLength(18)
+        self.rel_combo.setMinimumWidth(150)
+        self.rel_combo.setMinimumContentsLength(12)
         self.rel_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.rel_combo.currentIndexChanged.connect(self._on_rtl_changed)
-        self._add_toolbar_field(top_layout, "RTL Release:", self.rel_combo)
+        self._add_toolbar_field(top_layout, "RTL:", self.rel_combo)
 
         self.view_combo = QComboBox()
         self.view_combo.addItems([
             "All Runs", "FE Only", "BE Only",
             "Completed Only", "Running Only", "Failed Only", "Today's Runs",
             "Pinned Only", "Selected Only"])
-        self.view_combo.setMinimumWidth(120)
+        self.view_combo.setMinimumWidth(108)
+        self.view_combo.setMinimumContentsLength(10)
+        self.view_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self._last_view_preset = self.view_combo.currentText()
         self.view_combo.currentIndexChanged.connect(self._on_view_changed)
         self._add_toolbar_field(top_layout, "View:", self.view_combo)
+
+        self.search_launcher = CompactSearchField()
+        self.search_launcher.setMinimumWidth(140)
+        self.search_launcher.setMaximumWidth(160)
+        self.search_launcher.setToolTip("Open search (Ctrl+F)")
+        self.search_launcher.activated.connect(self.show_search_panel)
+        top_layout.addWidget(self.search_launcher)
 
         self.search = QLineEdit()
         self.search.setPlaceholderText(
@@ -7620,9 +7631,10 @@ class PDDashboard(QMainWindow):
                                "Combine fields with ; e.g. run:trial; stage:chip_finish.\n"
                                "Enter/F3: next match. Shift+F3: previous. Clear restores expansion.")
         self.search.returnPressed.connect(lambda: self._jump_search_match(1))
-        self.search.setMinimumWidth(120)
+        self.search.setMinimumWidth(100)
         self.search.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.search.textChanged.connect(lambda: self.search_timer.start(250))
+        self.search.textChanged.connect(self._sync_compact_search)
         self.search.setContextMenuPolicy(Qt.CustomContextMenu)
         self.search.customContextMenuRequested.connect(
             self._show_search_history)
@@ -7639,7 +7651,7 @@ class PDDashboard(QMainWindow):
 
         # Search result count label
         self.search_count_lbl = QLabel("")
-        self.search_count_lbl.setMinimumWidth(90)
+        self.search_count_lbl.setMinimumWidth(48)
         self.search_count_lbl.setStyleSheet(
             "font-size: 11px; color: #1976d2; font-weight: bold;")
         self.search_count_lbl.setVisible(False)
@@ -7659,18 +7671,32 @@ class PDDashboard(QMainWindow):
         self.search_next_btn.clicked.connect(lambda: self._jump_search_match(1))
         search_layout.addWidget(self.search_next_btn)
 
+        self.hide_search_btn = QToolButton()
+        self.hide_search_btn.setIcon(self.style().standardIcon(QStyle.SP_TitleBarCloseButton))
+        self.hide_search_btn.setStyleSheet("QToolButton { padding: 4px; }")
+        self.hide_search_btn.setAccessibleName("Hide search")
+        self.hide_search_btn.setToolTip("Hide search (Esc). The current filter stays applied.")
+        self.hide_search_btn.clicked.connect(self.hide_search_panel)
+        search_layout.addWidget(self.hide_search_btn)
 
+        refresh_group = QWidget()
+        refresh_layout = QHBoxLayout(refresh_group)
+        refresh_layout.setContentsMargins(2, 0, 2, 0)
+        refresh_layout.setSpacing(8)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setToolTip(
             "Quick refresh checks only in-progress FE runs. Use Utilities > Tree View > Full Rescan to rediscover all runs.")
         self.refresh_btn.clicked.connect(self.start_quick_refresh)
-        top_layout.addWidget(self.refresh_btn)
+        refresh_layout.addWidget(self.refresh_btn)
 
         self.auto_combo = QComboBox()
         self.auto_combo.addItems(["Off", "1 Min", "5 Min", "10 Min"])
-        self.auto_combo.setMinimumWidth(75)
+        self.auto_combo.setMinimumWidth(62)
+        self.auto_combo.setMinimumContentsLength(4)
+        self.auto_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.auto_combo.currentIndexChanged.connect(self.on_auto_refresh_changed)
-        top_layout.addWidget(self.auto_combo)
+        refresh_layout.addWidget(self.auto_combo)
+        top_layout.addWidget(refresh_group)
 
 
         # Utilities menu (renamed from Actions)
@@ -7748,19 +7774,26 @@ class PDDashboard(QMainWindow):
         snapshot_menu.addAction("Load Last Archive View", self.load_latest_archive_snapshot_view)
         snapshot_menu.addAction("Load Archive File...", self.load_archive_snapshot_file_view)
 
+        action_group = QWidget()
+        action_layout = QHBoxLayout(action_group)
+        action_layout.setContentsMargins(2, 0, 2, 0)
+        action_layout.setSpacing(8)
         self.actions_btn.setMenu(self.actions_menu)
-        top_layout.addWidget(self.actions_btn)
+        action_layout.addWidget(self.actions_btn)
 
         # Settings button -- always visible in toolbar
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self.open_settings)
-        top_layout.addWidget(self.settings_btn)
+        action_layout.addWidget(self.settings_btn)
+        top_layout.addWidget(action_group)
 
 
         # Mode dropdown
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(["Standard", "Compact", "Full"])
-        self.mode_combo.setMinimumWidth(112)
+        self.mode_combo.setMinimumWidth(88)
+        self.mode_combo.setMinimumContentsLength(8)
+        self.mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.mode_combo.setToolTip(
             "Column view preset  (keys: 1=Compact  2=Standard  3=Full)")
         self.mode_combo.currentIndexChanged.connect(
@@ -7776,7 +7809,8 @@ class PDDashboard(QMainWindow):
         top_layout.addWidget(self.notes_toggle_btn)
 
         toolbar_layout.addLayout(top_layout)
-        toolbar_layout.addLayout(search_layout)
+        toolbar_layout.addWidget(self.search_panel)
+        self.search_panel.hide()
         self.toolbar_flow = top_layout
         self.search_controls_layout = search_layout
         root_layout.addLayout(toolbar_layout)
@@ -8064,6 +8098,8 @@ class PDDashboard(QMainWindow):
         ins_layout.addWidget(self.shared_save_btn)
 
         self.inspector_dock = QDockWidget(self)
+        self.inspector_dock.visibilityChanged.connect(
+            lambda visible: self.notes_toggle_btn.setText("<  Notes" if visible else "Notes  >"))
         self.inspector_dock.setAllowedAreas(
             Qt.LeftDockWidgetArea | Qt.RightDockWidgetArea)
         self.inspector_dock.setTitleBarWidget(QWidget())
@@ -8179,6 +8215,21 @@ class PDDashboard(QMainWindow):
     # ------------------------------------------------------------------
     # DOCK / EXPAND / COLLAPSE
     # ------------------------------------------------------------------
+    def show_search_panel(self):
+        self.search_panel.show()
+        self.search.setFocus(Qt.ShortcutFocusReason)
+
+    def hide_search_panel(self):
+        self.search_panel.hide()
+        self.tree.setFocus(Qt.OtherFocusReason)
+
+    def _sync_compact_search(self, text):
+        self.search_launcher.setText(text)
+        self.search_launcher.setCursorPosition(0)
+        self.search_launcher.setToolTip(
+            ("Active search: " + text + "\nClick to edit or clear (Ctrl+F)")
+            if text.strip() else "Open search (Ctrl+F)")
+
     def toggle_notes_dock(self):
         if self.inspector_dock.isVisible():
             self.inspector_dock.hide()
@@ -8336,10 +8387,11 @@ class PDDashboard(QMainWindow):
     def _setup_shortcuts(self):
         QShortcut(QKeySequence("Ctrl+R"), self,      self.start_quick_refresh)
         QShortcut(QKeySequence("Ctrl+Shift+R"), self, self.start_fs_scan)
-        QShortcut(QKeySequence("Ctrl+F"), self,      lambda: self.search.setFocus())
+        QShortcut(QKeySequence("Ctrl+F"), self,      self.show_search_panel)
         QShortcut(QKeySequence("F3"), self, lambda: self._jump_search_match(1))
         QShortcut(QKeySequence("Shift+F3"), self, lambda: self._jump_search_match(-1))
-        QShortcut(QKeySequence("Escape"), self.search, self.search.clear, context=Qt.WidgetShortcut)
+        QShortcut(QKeySequence("Escape"), self.search_panel, self.hide_search_panel,
+                  context=Qt.WidgetWithChildrenShortcut)
         QShortcut(QKeySequence("Ctrl+E"), self,      self.safe_expand_all)
         QShortcut(QKeySequence("Ctrl+W"), self,      self.safe_collapse_all)
         QShortcut(QKeySequence("Ctrl+C"), self.tree, self._copy_tree_cell)
@@ -14360,7 +14412,7 @@ class PDDashboard(QMainWindow):
         shortcuts_list = [
             ("Ctrl+R",       "Quick refresh in-progress runs"),
             ("Ctrl+Shift+R", "Full rescan all workspaces"),
-            ("Ctrl+F",       "Focus the search bar"),
+            ("Ctrl+F",       "Open the search bar (Esc hides it)"),
             ("Ctrl+E",       "Expand all tree nodes"),
             ("Ctrl+W",       "Collapse all tree nodes"),
             ("Ctrl+C",       "Copy selected cell to clipboard"),
