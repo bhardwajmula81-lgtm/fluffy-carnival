@@ -86,6 +86,68 @@ class FlowLayout(QLayout):
         return y + row_height - rect.y() + bottom
 
 
+class ToolbarLayout(FlowLayout):
+    """Left filters, centered search and right actions, with safe row wrapping."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._center_widget = None
+        self._right_widget = None
+
+    def setZones(self, center_widget, right_widget):
+        self._center_widget = center_widget
+        self._right_widget = right_widget
+        self.invalidate()
+
+    def _arrange(self, rect, measure):
+        if self._center_widget is None or self._right_widget is None:
+            return super()._arrange(rect, measure)
+        left, top, right, bottom = self.getContentsMargins()
+        area = rect.adjusted(left, top, -right, -bottom)
+        gap = max(0, self.spacing())
+        zone_gap = max(24, gap)
+        rows, row, width = [], [], 0
+        right_zone = False
+        for item in self._items:
+            if item.widget() is self._right_widget:
+                right_zone = True
+            if item.isEmpty():
+                continue
+            size = item.sizeHint().expandedTo(item.minimumSize())
+            size.setWidth(max(item.minimumSize().width(), min(size.width(), area.width())))
+            centered = item.widget() is self._center_widget
+            space = (zone_gap if centered or (row and row[-1][2]) else gap) if row else 0
+            if row and width + space + size.width() > area.width():
+                rows.append(row)
+                row, width, space = [], 0, 0
+            row.append((item, size, centered, right_zone, space))
+            width += space + size.width()
+        if row:
+            rows.append(row)
+        y = area.y()
+        for row in rows:
+            row_width = sum(size.width() + space for _, size, _, _, space in row)
+            row_height = max(size.height() for _, size, _, _, _ in row)
+            free = max(0, area.width() - row_width)
+            positions = []
+            x = area.x()
+            for item, size, centered, is_right, space in row:
+                x += space
+                positions.append(x + (free if is_right else 0))
+                x += size.width()
+            for index, (item, size, centered, is_right, space) in enumerate(row):
+                if centered:
+                    lower = (positions[index-1] + row[index-1][1].width() + space
+                             if index else area.x())
+                    upper = (positions[index+1] - row[index+1][4] - size.width()
+                             if index + 1 < len(row) else area.right() + 1 - size.width())
+                    target = area.x() + (area.width() - size.width()) // 2
+                    positions[index] = max(lower, min(target, upper))
+                if not measure:
+                    item.setGeometry(QRect(positions[index], y, size.width(), row_height))
+            y += row_height + gap
+        return y - (gap if rows else 0) - rect.y() + bottom
+
+
 class _GanttCanvas(QWidget):
     def __init__(self, stages_data, is_dark=False, parent=None):
         super().__init__(parent)

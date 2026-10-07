@@ -7583,7 +7583,7 @@ class PDDashboard(QMainWindow):
         toolbar_layout = QVBoxLayout()
         toolbar_layout.setContentsMargins(0, 0, 0, 0)
         toolbar_layout.setSpacing(6)
-        top_layout = FlowLayout()
+        top_layout = ToolbarLayout()
         self.search_panel = QWidget()
         search_layout = QHBoxLayout(self.search_panel)
         search_layout.setContentsMargins(0, 0, 0, 0)
@@ -7807,6 +7807,7 @@ class PDDashboard(QMainWindow):
         self.notes_toggle_btn = QPushButton("Notes  >")
         self.notes_toggle_btn.clicked.connect(self.toggle_notes_dock)
         top_layout.addWidget(self.notes_toggle_btn)
+        top_layout.setZones(self.search_launcher, refresh_group)
 
         toolbar_layout.addLayout(top_layout)
         toolbar_layout.addWidget(self.search_panel)
