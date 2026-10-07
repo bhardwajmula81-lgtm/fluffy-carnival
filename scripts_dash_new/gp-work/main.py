@@ -7598,8 +7598,8 @@ class PDDashboard(QMainWindow):
         self._add_toolbar_field(top_layout, "Source:", self.src_combo)
 
         self.rel_combo = QComboBox()
-        self.rel_combo.setMinimumWidth(150)
-        self.rel_combo.setMinimumContentsLength(12)
+        self.rel_combo.setMinimumWidth(300)
+        self.rel_combo.setMinimumContentsLength(28)
         self.rel_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.rel_combo.currentIndexChanged.connect(self._on_rtl_changed)
         self._add_toolbar_field(top_layout, "RTL:", self.rel_combo)
